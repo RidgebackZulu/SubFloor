@@ -30,7 +30,11 @@ private struct BookmarkFile: Codable {
 }
 
 public final class BookmarkStore {
-    public enum LoadResult: Equatable, Sendable { case loaded, createdDefaults, recoveredFromCorrupt }
+    public enum LoadResult: Equatable, Sendable {
+        case loaded, createdDefaults, recoveredFromCorrupt
+        /// The file was unreadable and could be neither moved nor copied aside; it was left where it was.
+        case corruptNotPreserved
+    }
 
     public let url: URL
 
@@ -46,11 +50,40 @@ public final class BookmarkStore {
         do {
             return (try Self.read(from: url), .loaded)
         } catch {
-            let aside = url.deletingLastPathComponent().appendingPathComponent("bookmarks.corrupt.json")
-            try? FileManager.default.removeItem(at: aside)
-            try? FileManager.default.moveItem(at: url, to: aside)
-            return (Self.defaults, .recoveredFromCorrupt)
+            return (Self.defaults, preserveCorrupt())
         }
+    }
+
+    /// Moves the unreadable file to a fresh `bookmarks.corrupt-<timestamp>.json`, copying it if the move fails.
+    /// Existing backups are never overwritten or deleted.
+    private func preserveCorrupt() -> LoadResult {
+        let backup = uniqueBackupURL()
+        do {
+            try FileManager.default.moveItem(at: url, to: backup)
+            return .recoveredFromCorrupt
+        } catch {
+            do {
+                try FileManager.default.copyItem(at: url, to: backup)
+                return .recoveredFromCorrupt
+            } catch {
+                return .corruptNotPreserved
+            }
+        }
+    }
+
+    private func uniqueBackupURL() -> URL {
+        let dir = url.deletingLastPathComponent()
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let stamp = formatter.string(from: Date())
+        var candidate = dir.appendingPathComponent("bookmarks.corrupt-\(stamp).json")
+        var n = 1
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            candidate = dir.appendingPathComponent("bookmarks.corrupt-\(stamp)-\(n).json")
+            n += 1
+        }
+        return candidate
     }
 
     public func save(_ bookmarks: [Bookmark]) throws { try Self.write(bookmarks, to: url) }

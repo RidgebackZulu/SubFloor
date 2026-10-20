@@ -5,7 +5,11 @@ public enum FrequencyParser {
     /// Without a suffix: < 3000 → MHz, < 3 000 000 → kHz, otherwise Hz.
     public static func parse(_ text: String) -> Double? {
         var s = text.lowercased().filter { !" ,_".contains($0) }
-        if s.hasSuffix("hz") { s.removeLast(2) }
+        var explicitHz = false
+        if s.hasSuffix("hz") {
+            s.removeLast(2)
+            explicitHz = true
+        }
         var multiplier: Double?
         if let last = s.last, let m = ["k": 1e3, "m": 1e6, "g": 1e9][last] {
             multiplier = m
@@ -18,6 +22,8 @@ public enum FrequencyParser {
             multiplier = 1
         }
         guard s.allSatisfy({ $0.isNumber || $0 == "." }), let v = Double(s), v > 0, v.isFinite else { return nil }
+        // An explicit "Hz" with no k/m/g prefix means the value is already in Hz.
+        if multiplier == nil && explicitHz { multiplier = 1 }
         let hz: Double
         if let multiplier { hz = v * multiplier }
         else if v < 3_000 { hz = v * 1e6 }

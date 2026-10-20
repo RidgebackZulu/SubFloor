@@ -25,6 +25,12 @@ private func tempURL() -> URL {
     #expect(loaded == [b])
 }
 
+private func backupFiles(in dir: URL) throws -> [URL] {
+    try FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil).filter {
+        $0.lastPathComponent.hasPrefix("bookmarks.corrupt-") && $0.lastPathComponent.hasSuffix(".json")
+    }
+}
+
 @Test func corruptFileIsMovedAsideAndDefaultsRestored() throws {
     let url = tempURL()
     try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
@@ -32,8 +38,36 @@ private func tempURL() -> URL {
     let (loaded, result) = BookmarkStore(url: url).load()
     #expect(result == .recoveredFromCorrupt)
     #expect(loaded == BookmarkStore.defaults)
-    let corrupt = url.deletingLastPathComponent().appendingPathComponent("bookmarks.corrupt.json")
-    #expect(FileManager.default.fileExists(atPath: corrupt.path))
+    let backups = try backupFiles(in: url.deletingLastPathComponent())
+    #expect(backups.count == 1)
+    #expect(try backups.map { try Data(contentsOf: $0) } == [Data("{ nope".utf8)])
+}
+
+@Test func repeatedCorruptionKeepsEveryBackup() throws {
+    let url = tempURL()
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try Data("{ nope".utf8).write(to: url)
+    #expect(BookmarkStore(url: url).load().1 == .recoveredFromCorrupt)
+    try Data("{ second".utf8).write(to: url)
+    #expect(BookmarkStore(url: url).load().1 == .recoveredFromCorrupt)
+    let backups = try backupFiles(in: url.deletingLastPathComponent())
+    #expect(backups.count == 2)
+    #expect(Set(backups.map(\.path)).count == 2)
+    let bodies = Set(try backups.map { try String(contentsOf: $0, encoding: .utf8) })
+    #expect(bodies == ["{ nope", "{ second"])
+}
+
+@Test func unpreservableCorruptFileIsLeftInPlace() throws {
+    let url = tempURL()
+    let dir = url.deletingLastPathComponent()
+    try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    try Data("{ nope".utf8).write(to: url)
+    try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
+    defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path) }
+    let (loaded, result) = BookmarkStore(url: url).load()
+    #expect(result == .corruptNotPreserved)
+    #expect(loaded == BookmarkStore.defaults)
+    #expect(try Data(contentsOf: url) == Data("{ nope".utf8))
 }
 
 @Test func searchMatchesAllTokensCaseInsensitively() {
