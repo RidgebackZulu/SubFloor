@@ -49,7 +49,7 @@ public final class SyntheticSource: IQSource, @unchecked Sendable {
     private var _center: Double
     private var _antennaOffset: Double = 0
     private let queue = DispatchQueue(label: "subfloor.synthetic", qos: .userInteractive)
-    private var timer: DispatchSourceTimer?
+    private var timer: DispatchSourceTimer?   // guarded by `lock`
     private var sampleIndex = 0
     private var phases: [Double]
     private var envelopes: [Float]
@@ -77,18 +77,28 @@ public final class SyntheticSource: IQSource, @unchecked Sendable {
         stop()
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now(), repeating: .milliseconds(10), leeway: .milliseconds(1))
-        t.setEventHandler { [unowned self] in
-            let block = makeBlock(count: Int(sampleRate / 100))
+        t.setEventHandler { [weak self] in
+            guard let self else { return }
+            let block = self.makeBlock(count: Int(self.sampleRate / 100))
             block.withUnsafeBufferPointer { handler($0) }
         }
-        timer = t
+        lock.withLock { timer = t }
         t.resume()
     }
 
+    /// Hard barrier: when this returns, no handler is running or will run again.
+    /// Must not be called from the source's own queue (the `queue.sync` below would deadlock).
     public func stop() {
-        timer?.cancel()
-        timer = nil
+        let old = lock.withLock { () -> DispatchSourceTimer? in
+            let t = timer
+            timer = nil
+            return t
+        }
+        old?.cancel()
+        queue.sync {}   // lock is not held here
     }
+
+    deinit { timer?.cancel() }
 
     private func noise() -> Float {
         rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17

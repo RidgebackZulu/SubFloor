@@ -55,3 +55,50 @@ import Accelerate
 @Test func wavRejectsGarbage() {
     #expect(throws: IQFileError.self) { try IQFileSource.parseWAVHeader(Data("not a wav file at all....".utf8)) }
 }
+
+/// Builds a WAV header with a 16-byte stereo PCM fmt chunk and a data chunk of `dataFrames` frames.
+private func wavBytes(dataFrames: Int) -> Data {
+    var data = Data()
+    func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+    func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+    data.append(contentsOf: Array("RIFF".utf8)); u32(UInt32(36 + dataFrames * 4))
+    data.append(contentsOf: Array("WAVE".utf8))
+    data.append(contentsOf: Array("fmt ".utf8)); u32(16); u16(1); u16(2); u32(250_000); u32(250_000 * 4); u16(4); u16(16)
+    data.append(contentsOf: Array("data".utf8)); u32(UInt32(dataFrames * 4))
+    for i in 0..<dataFrames { u16(UInt16(bitPattern: Int16(i))); u16(UInt16(bitPattern: Int16(-i))) }
+    return data
+}
+
+@Test func wavTruncatedFmtChunkThrows() {
+    // Cut the file six bytes into the 16-byte fmt body, so the declared fmt size runs past the end.
+    let full = wavBytes(dataFrames: 0)
+    let truncated = full.prefix(12 + 8 + 6)
+    #expect(throws: IQFileError.self) { try IQFileSource.parseWAVHeader(Data(truncated)) }
+}
+
+@Test func wavEmptyDataChunkThrows() throws {
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("subfloor-test-\(UUID()).wav")
+    try wavBytes(dataFrames: 0).write(to: url)
+    defer { try? FileManager.default.removeItem(at: url) }
+    #expect(throws: IQFileError.self) { try IQFileSource(url: url, centerFrequency: 7_100_000) }
+}
+
+/// Thread-safe counter for blocks delivered by a source's handler.
+final class BlockCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var n = 0
+    func increment() { lock.withLock { n += 1 } }
+    var count: Int { lock.withLock { n } }
+}
+
+@Test func syntheticStopIsABarrier() async throws {
+    let source = SyntheticSource(sampleRate: 1_024_000, centerFrequency: 14_100_000, signals: [])
+    let counter = BlockCounter()
+    try source.start { _ in counter.increment() }
+    try await Task.sleep(for: .milliseconds(50))
+    source.stop()
+    let atStop = counter.count
+    #expect(atStop > 0)
+    try await Task.sleep(for: .milliseconds(50))
+    #expect(counter.count == atStop)
+}

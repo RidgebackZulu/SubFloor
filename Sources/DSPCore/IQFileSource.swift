@@ -30,8 +30,9 @@ public final class IQFileSource: IQSource, @unchecked Sendable {
     private let data: Data
     private let layout: WAVLayout
     private let queue = DispatchQueue(label: "subfloor.iqfile", qos: .userInteractive)
+    private let lock = NSLock()   // guards `timer`; never held across queue.sync
     private var timer: DispatchSourceTimer?
-    private var position = 0
+    private var position = 0   // touched only on `queue`
 
     public init(url: URL, centerFrequency: Double) throws {
         data = try Data(contentsOf: url, options: .alwaysMapped)
@@ -55,8 +56,13 @@ public final class IQFileSource: IQSource, @unchecked Sendable {
             let size = Int(u32(offset + 4))
             let body = offset + 8
             if id == "fmt " {
+                // Bounds-check before reading any field: 16 bytes minimum, 26 for WAVE_FORMAT_EXTENSIBLE.
+                guard size >= 16, body + size <= data.count else { throw IQFileError.unsupported("truncated fmt chunk") }
                 var audioFormat = u16(body)
-                if audioFormat == 0xFFFE { audioFormat = u16(body + 24) }
+                if audioFormat == 0xFFFE {
+                    guard size >= 26 else { throw IQFileError.unsupported("truncated fmt chunk") }
+                    audioFormat = u16(body + 24)
+                }
                 let channels = u16(body + 2)
                 let bits = u16(body + 14)
                 guard channels == 2 else { throw IQFileError.unsupported("\(channels) channels (need 2: I and Q)") }
@@ -98,24 +104,34 @@ public final class IQFileSource: IQSource, @unchecked Sendable {
         stop()
         let t = DispatchSource.makeTimerSource(queue: queue)
         t.schedule(deadline: .now(), repeating: .milliseconds(10), leeway: .milliseconds(1))
-        t.setEventHandler { [unowned self] in
-            var remaining = Int(sampleRate / 100)
+        t.setEventHandler { [weak self] in
+            guard let self else { return }
+            var remaining = Int(self.sampleRate / 100)
             while remaining > 0 {
-                let n = min(remaining, frameCount - position)
-                let block = readFrames(at: position, count: n)
+                let n = min(remaining, self.frameCount - self.position)
+                let block = self.readFrames(at: self.position, count: n)
                 block.withUnsafeBufferPointer { handler($0) }
-                position = (position + n) % frameCount
+                self.position = (self.position + n) % self.frameCount
                 remaining -= n
             }
         }
-        timer = t
+        lock.withLock { timer = t }
         t.resume()
     }
 
+    /// Hard barrier: when this returns, no handler is running or will run again.
+    /// Must not be called from the source's own queue (the `queue.sync` below would deadlock).
     public func stop() {
-        timer?.cancel()
-        timer = nil
+        let old = lock.withLock { () -> DispatchSourceTimer? in
+            let t = timer
+            timer = nil
+            return t
+        }
+        old?.cancel()
+        queue.sync {}   // lock is not held here
     }
+
+    deinit { timer?.cancel() }
 
     /// Recordings have a fixed centre; retuning is a no-op.
     public func setCenterFrequency(_ hz: Double) throws {}
