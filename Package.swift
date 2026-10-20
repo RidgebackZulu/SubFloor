@@ -12,9 +12,11 @@ let package = Package(
     targets: [
         .systemLibrary(name: "CSDRplay", path: "Sources/CSDRplay"),
         .target(name: "DSPCore", swiftSettings: fastMath),
+        .target(name: "Modems", dependencies: ["DSPCore"]),
         .target(name: "SubFloorCore", dependencies: ["DSPCore"]),
         .target(name: "SDRplayKit", dependencies: ["CSDRplay", "DSPCore"], linkerSettings: sdrplayLinker),
         .testTarget(name: "DSPCoreTests", dependencies: ["DSPCore"]),
+        .testTarget(name: "ModemsTests", dependencies: ["Modems", "DSPCore"]),
         .testTarget(name: "SubFloorCoreTests", dependencies: ["SubFloorCore", "DSPCore"]),
         .testTarget(name: "SDRplayKitTests", dependencies: ["SDRplayKit", "CSDRplay"], linkerSettings: sdrplayLinker),
     ]
