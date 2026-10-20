@@ -116,6 +116,9 @@ final class AppModel {
             break
         }
         restoreSession()
+        engine.audio.onError = { [weak self] message in
+            Task { @MainActor in self?.show(Banner(kind: .error, message: message, action: .retry)) }
+        }
         statsTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshStats() }
         }

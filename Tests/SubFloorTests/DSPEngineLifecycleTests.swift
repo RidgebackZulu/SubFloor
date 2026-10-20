@@ -1,3 +1,4 @@
+import AVFoundation
 import DSPCore
 import Foundation
 import Testing
@@ -22,12 +23,26 @@ import Testing
                 try engine.start(source: source, receiver: rx, spectrum: SpectrumSettings(), volume: 0.1)
             } catch {
                 // No usable audio device in this process: start must have cleaned up.
-                Issue.record("engine start failed in round \(round) (tolerated): \(error)")
+                print("engine start failed in round \(round) (tolerated, no audio device): \(error)")
                 engine.stop()
                 return
             }
             #expect(waitForFrame(engine))
             engine.stop()
         }
+    }
+
+    @Test func audioRestartsAfterConfigurationChange() {
+        let audio = AudioOutput()
+        do { try audio.start() } catch {
+            print("audio start failed (tolerated, no audio device): \(error)")
+            return
+        }
+        defer { audio.stop() }
+        NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: audio.engine)
+        #expect(audio.engine.isRunning)
+        audio.stop()
+        NotificationCenter.default.post(name: .AVAudioEngineConfigurationChange, object: audio.engine)
+        #expect(!audio.engine.isRunning)
     }
 }
