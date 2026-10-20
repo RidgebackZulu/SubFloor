@@ -39,6 +39,9 @@ struct QPSKViterbi {
     private var survivor = [UInt32](repeating: 0, count: states)
     private var nextSurvivor = [UInt32](repeating: 0, count: states)
     private var pushed = 0
+    /// How much the best path's metric grew on the last push: the correlation of the received shift
+    /// with the shift the code expects. Higher on average for the right phase sense.
+    private(set) var lastGain: Float = 0
 
     /// Feeds one differential symbol: the received phase shift as a vector (any scale), for example
     /// y[k]·conj(y[k-1]). Returns the bit decided `delay` symbols ago, once the delay has filled.
@@ -70,6 +73,7 @@ struct QPSKViterbi {
         var best = 0
         for s in 1..<Self.states where next[s] > next[best] { best = s }
         let top = next[best]
+        lastGain = top
         for s in 0..<Self.states { metric[s] = next[s] - top }
         swap(&survivor, &nextSurvivor)
         pushed += 1
@@ -79,6 +83,6 @@ struct QPSKViterbi {
 
     mutating func reset() {
         for s in 0..<Self.states { metric[s] = 0; survivor[s] = 0 }
-        pushed = 0
+        pushed = 0; lastGain = 0
     }
 }

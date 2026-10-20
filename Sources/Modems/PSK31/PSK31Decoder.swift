@@ -68,14 +68,20 @@ public final class PSK31SignalDecoder: SignalDecoder {
     private static let channelCutoffHz = 65.0
     private static let channelTransitionHz = 50.0
 
-    private static let fftSize = 512
-    private static let fftHop = 128
-    /// Half-width, in bins, of the local background a carrier line is measured against.
-    private static let backgroundBins = 24
     /// Carrier-line presence thresholds: line power over its local background, scaled so that noise
     /// reads like peak over median.
     private static let presenceOn: Float = 18
     private static let presenceOff: Float = 10
+    /// How far a line must stand out of its surroundings to count as the parent of an idle sideline:
+    /// the bins of a neighbour's broad cross-term hump rarely reach it (noise-like, P ≈ 0.4% per bin),
+    /// while a weak signal's own line sitting on such a hump does.
+    private static let sidelineParentHeight: Float = 8
+    /// An open path is declared falsely locked when its line at zero offset stays below this height
+    /// for this many consecutive estimates while a line is present elsewhere.
+    private static let absentLine: Float = 4
+    private static let misplacedEstimates = 3
+    /// A carrier line back within this many symbols is the same transmission.
+    private static let flickerSymbols = 64
     /// Without a carrier for this long, return to the assigned frequency.
     private static let returnAfterSeconds = 5.0
     /// Re-tune the NCO from the FFT only when the line is at least this far off, in Hz.
@@ -102,6 +108,9 @@ public final class PSK31SignalDecoder: SignalDecoder {
     /// after the carrier was found.
     private static let recoveryFit: Float = 0.6
     private static let recoverySettle = 8
+    /// Characters must start this many symbols after an estimated carrier start (it is found to a
+    /// few symbols; a character begun in the noise just before must not get through).
+    private static let startMargin = 2
     /// Mode detection.
     private static let modeWindow = 64
     private static let modeEvery = 8
@@ -151,19 +160,15 @@ public final class PSK31SignalDecoder: SignalDecoder {
     private var theta4: Float = 0, omega4: Float = 0
 
     // FFT presence / acquisition.
-    private let dft: vDSP_DFT_Setup
-    private var fftRing: [SIMD2<Float>]
-    private var fftHead = 0
-    private var sinceFFT = 0
-    private var freshSamples = 0
-    private var fftWindow: [Float]
-    private var fftInRe: [Float], fftInIm: [Float], fftOutRe: [Float], fftOutIm: [Float]
-    private var fftPower: [Float]
-    private var prefix: [Double] = []
+    private let lines: CarrierLineScanner
     private var line2: Float = 0, line4: Float = 0
     private var present = false
-    private var inconsistent = 0
+    /// Latest heights of the z² and z⁴ lines at zero offset.
+    private var line2AtZero: Float = 0, line4AtZero: Float = 0
+    private var inconsistent2 = 0, inconsistent4 = 0
     private var candidateHz = Double.nan
+    /// Symbol index at which the carrier line was last lost.
+    private var absentSince = Int.min
     private var absentEstimates = 0
     /// Symbol index of the last presence onset or NCO re-tune.
     private var acquiredAt = Int.min
@@ -174,13 +179,21 @@ public final class PSK31SignalDecoder: SignalDecoder {
     private var ampA: Float = 0
     private var isiC: Float = 0
     private var bpskVaricode = VaricodeAssembler()
-    private var bpskSquelch = Squelch()
+    private var bpskSquelch = PSK31Squelch()
+    private var bpskBalance = ConstellationBalance()
     private var bpskFit = [Float](repeating: 0, count: historyRing)
 
     // QPSK path.
     private var viterbi = QPSKViterbi()
     private var qpskVaricode = VaricodeAssembler()
-    private var qpskSquelch = Squelch()
+    private var qpskSquelch = PSK31Squelch()
+    private var qpskBalance = ConstellationBalance()
+    /// The QPSK code decoded in both phase senses (a transmission on the opposite sideband reverses
+    /// it); the sense whose best path fits better on average is used.
+    private var viterbiInverted = QPSKViterbi()
+    private var qpskVaricodeInverted = VaricodeAssembler()
+    private var senseGain: Float = 0
+    private var invertedGain: Float = 0
     private var qpskFit = [Float](repeating: 0, count: historyRing)
     private var qpskOdd = [Bool](repeating: false, count: historyRing)
     private var ampA4: Float = 0
@@ -237,14 +250,8 @@ public final class PSK31SignalDecoder: SignalDecoder {
         nextStrobe = samplesPerSymbol
         let w = -2 * Double.pi / samplesPerSymbol
         omStep = SIMD2(Float(cos(w)), Float(sin(w)))
-        dft = vDSP_DFT_zop_CreateSetup(nil, vDSP_Length(Self.fftSize), .FORWARD)!
-        fftRing = [SIMD2<Float>](repeating: .zero, count: Self.fftSize)
-        fftWindow = (0..<Self.fftSize).map { Float(0.5 - 0.5 * cos(2 * Double.pi * Double($0) / Double(Self.fftSize))) }
-        fftInRe = [Float](repeating: 0, count: Self.fftSize)
-        fftInIm = fftInRe; fftOutRe = fftInRe; fftOutIm = fftInRe; fftPower = fftInRe
+        lines = CarrierLineScanner(basebandRate: basebandRate)
     }
-
-    deinit { vDSP_DFT_DestroySetup(dft) }
 
     private static func makeDecimators(sampleRate: Double, f1: Int, f2: Int) -> (ComplexDecimator, ComplexDecimator) {
         let rate1 = sampleRate / Double(f1)
@@ -279,14 +286,7 @@ public final class PSK31SignalDecoder: SignalDecoder {
 
     private func basebandSample(_ z: SIMD2<Float>) {
         // Acquisition FFT ring.
-        fftRing[fftHead] = z
-        fftHead = (fftHead + 1) & (Self.fftSize - 1)
-        freshSamples += 1
-        sinceFFT += 1
-        if sinceFFT >= Self.fftHop {
-            sinceFFT = 0
-            if freshSamples >= Self.fftSize { analyseCarrierLine() }
-        }
+        if lines.push(z) { analyseCarrierLine() }
 
         // Matched filter.
         mfIn[mfInHead] = z
@@ -376,7 +376,10 @@ public final class PSK31SignalDecoder: SignalDecoder {
         let m2 = simd_length_squared(r2)
         let q2: Float = m2 > 1e-20 ? (r2.x * r2.x - r2.y * r2.y) / m2 : 0
         bpskFit[k & (Self.historyRing - 1)] = q2
-        bpskSquelch.update(q2, present: present, lowSymbols: lowCount, clocked: clocked)
+        let confident = r2.x * r2.x > 0.25 * p
+        bpskBalance.push(confident ? (r2.x > 0 ? 0 : 2) : nil)
+        bpskSquelch.update(q2, present: present, lowSymbols: lowCount, clocked: clocked,
+                           balanced: bpskBalance.isBalanced(), symbol: k)
 
         transferAFC()
         bpskPath(r2, k: k)
@@ -393,11 +396,39 @@ public final class PSK31SignalDecoder: SignalDecoder {
     private func recoverOnOpen(k: Int) {
         guard acquiredAt != Int.min else { return }
         let history = mode == .bpsk ? bpskHistory : qpskHistory
-        for ch in history where ch.gated && ch.fit >= Self.recoveryFit && ch.end > lastEmittedEnd
-            && ch.start >= acquiredAt + Self.recoverySettle && ch.end >= k - 3 * Self.modeWindow / 2 {
+        for ch in history where ch.gated && recoverable(ch) && ch.end > lastEmittedEnd
+            && ch.end >= k - 3 * Self.modeWindow / 2 {
             emit(ch)
         }
     }
+
+    /// A carrier was just found or re-tuned to. The balance windows restart so that only symbols of
+    /// this carrier count: noise before it has randomly signed symbols and would pass a single tone.
+    ///
+    /// `since`: where the carrier itself began, if known (the line is seen up to a second late). The
+    /// settling margin then counts from there.
+    private func markAcquired(since start: Int? = nil) {
+        acquiredAt = start.map { $0 + Self.startMargin - Self.recoverySettle } ?? symbolIndex
+        fastLeft = Self.fastSymbols
+        bpskBalance.reset(); qpskBalance.reset()
+    }
+
+    /// Walks back from now while the BPSK fit over 6 symbols stays high: the symbol where the carrier
+    /// began, when the loops had already locked on it before its line was seen. Nil when they had not.
+    private func signalStart() -> Int? {
+        let k = symbolIndex
+        var j = k
+        while j - 6 >= max(0, k - 96) && meanFit(bpskFit, from: j - 6, to: j - 1) >= 0.45 { j -= 1 }
+        return j < k - 8 ? j : nil
+    }
+
+    /// Started after the carrier was found and the loops had settled.
+    private func settled(_ ch: DecodedChar) -> Bool {
+        acquiredAt != Int.min && ch.start >= acquiredAt + Self.recoverySettle
+    }
+
+    /// Settled, and fits closely over its own symbols: safe to emit after the fact.
+    private func recoverable(_ ch: DecodedChar) -> Bool { settled(ch) && ch.fit >= Self.recoveryFit }
 
     /// Gardner alone escapes its unstable point (half a symbol off) only slowly at low SNR, and starts
     /// anywhere after the carrier is found. The feed-forward Oerder–Meyr estimate has no such point:
@@ -495,20 +526,29 @@ public final class PSK31SignalDecoder: SignalDecoder {
         let sq = cmul(cleaned, cleaned)
         let q4: Float = m > 1e-20 ? cmul(sq, sq).x / (m * m) : 0
         qpskFit[j & (Self.historyRing - 1)] = q4
-        qpskSquelch.update(q4, present: present, lowSymbols: lowCount, clocked: clocked)
+        qpskBalance.push(m > 0.25 * power ? axisIndex(cleaned) : nil)
+        qpskSquelch.update(q4, present: present, lowSymbols: lowCount, clocked: clocked,
+                           balanced: qpskBalance.isBalanced(), symbol: j)
 
         let d = cmul(cleaned, SIMD2(cleanedPrev.x, -cleanedPrev.y)) / max(power, 1e-20)
         cleanedPrev = cleaned
         updateModeStatistics(psi: atan2(d.y, d.x), k: j)
         // Mode decisions need a window of symbols the QPSK path was locked on (pre-signal noise in the
         // window looks like a mix of both).
-        validRun = qpskSquelch.isOpen && present ? validRun + 1 : 0
+        validRun = (qpskSquelch.isOpen || bpskSquelch.isOpen) && present ? validRun + 1 : 0
         qpskOdd[j & (Self.historyRing - 1)] = abs(d.y) > abs(d.x)
         if mode == .qpsk && qpskSquelch.isOpen { addPoint(cleaned / ampA4) }
 
-        guard let bit = viterbi.push(d) else { return }
+        let bit = viterbi.push(d)
+        let bitInverted = viterbiInverted.push(SIMD2(d.x, -d.y))
+        senseGain += (viterbi.lastGain - senseGain) / 32
+        invertedGain += (viterbiInverted.lastGain - invertedGain) / 32
         let b = j - QPSKViterbi.delay
-        if let ch = qpskVaricode.push(bit, symbol: b) {
+        // Both senses keep decoding; characters are taken from the one that fits better now.
+        let useInverted = invertedGain > senseGain
+        let normal = bit.flatMap { qpskVaricode.push($0, symbol: b) }
+        let inverted = bitInverted.flatMap { qpskVaricodeInverted.push($0, symbol: b) }
+        if let ch = useInverted ? inverted : normal {
             // A bit influences the five symbols from its own on.
             let fit = meanFit(qpskFit, from: ch.start, to: ch.end + 4)
             var odd = 0
@@ -517,6 +557,11 @@ public final class PSK31SignalDecoder: SignalDecoder {
             let passed = fit >= Self.charFitQPSK && Float(odd) >= 0.1 * Float(span)
             record(DecodedChar(ascii: ch.ascii, start: ch.start, end: ch.end, fit: fit, gated: passed), path: .qpsk)
         }
+    }
+
+    /// 0, 1, 2, 3 for the +1, +j, −1, −j axis nearest to `r`.
+    private func axisIndex(_ r: SIMD2<Float>) -> Int {
+        abs(r.x) >= abs(r.y) ? (r.x >= 0 ? 0 : 2) : (r.y >= 0 ? 1 : 3)
     }
 
     private func nearestAxis(_ r: SIMD2<Float>) -> SIMD2<Float> {
@@ -554,7 +599,10 @@ public final class PSK31SignalDecoder: SignalDecoder {
         let n = Float(Self.modeWindow)
         let s2 = sum2 / n, s4 = sum4 / n
         switch mode {
-        case .bpsk where s2 > 0.5 && s4 < 0.06 && s4 < s2 / 8:
+        // QPSK must also show its fourth-power line at zero offset (a BPSK signal Rs/4 off, where the
+        // fourth-power loop aliases, does not) and no z² line there (BPSK data keeps one).
+        case .bpsk where s2 > 0.5 && s4 < 0.06 && s4 < s2 / 8
+                && line4AtZero >= Self.presenceOn && line2AtZero < Self.presenceOn:
             switchMode(to: .qpsk, k: k)
         case .qpsk where s2 < 0.25 && Float(zeros) > 0.1 * n:
             switchMode(to: .bpsk, k: k)
@@ -579,8 +627,11 @@ public final class PSK31SignalDecoder: SignalDecoder {
 
     private func record(_ ch: DecodedChar, path: Path) {
         var c = ch
-        let squelchOpen = path == .bpsk ? bpskSquelch.isOpen : qpskSquelch.isOpen
-        c.passed = c.gated && squelchOpen
+        let squelch = path == .bpsk ? bpskSquelch : qpskSquelch
+        // A character that started before the squelch opened must have started after the carrier was
+        // found and settled: otherwise one begun in the noise before a transmission ends on its
+        // preamble and gets out.
+        c.passed = c.gated && squelch.isOpen && (c.start >= squelch.openedAt || settled(c))
         if path == .bpsk {
             bpskHistory.append(c)
             if bpskHistory.count > 16 { bpskHistory.removeFirst() }
@@ -646,32 +697,49 @@ public final class PSK31SignalDecoder: SignalDecoder {
     /// While locked, the carrier line must stay at zero offset: a loop mistuned by about half the
     /// symbol rate onto one idle tone of a signal looks locked, and this unlocks it.
     private func analyseCarrierLine() {
-        let n = Self.fftSize
-        var meanPower: Float = 0
-        for i in 0..<n { meanPower += simd_length_squared(fftRing[i]) }
-        meanPower /= Float(n)
+        let meanPower = lines.meanPower
         guard meanPower > 1e-24 else { line2 = 0; line4 = 0; present = false; return }
         let scale = 1 / meanPower
         let range = ModeID.psk31.lockRangeHz + 3
         let side = Self.symbolRate
 
-        let s2 = scanLines(power: 2, scale: scale, inRangeHz: 2 * range, sidelineHz: side)
-        let s4 = scanLines(power: 4, scale: scale * scale, inRangeHz: 4 * range, sidelineHz: side)
+        let s2 = lines.scan(power: 2, scale: scale, inRangeHz: 2 * range, sidelineHz: side,
+                            lineHeight: Self.sidelineParentHeight)
+        let s4 = lines.scan(power: 4, scale: scale * scale, inRangeHz: 4 * range, sidelineHz: side,
+                            lineHeight: Self.sidelineParentHeight)
         line2 = s2.height; line4 = s4.height
+        line2AtZero = s2.nearZero; line4AtZero = s4.nearZero
         let on2 = s2.height >= Self.presenceOn, on4 = s4.height >= Self.presenceOn
-        if !present && (on2 || on4) {
+        // BPSK (and any idle) squares to a clean line, and its fourth power then agrees. QPSK data has
+        // only the fourth-power line and a weak, unreliable z² peak: use z⁴ when it clearly dominates.
+        let agree = abs(s2.offsetHz / 2 - s4.offsetHz / 4) < 0.5
+        let useFourth = on4 && (!on2 || (!agree && s4.height > 4 * s2.height))
+        let offset = useFourth ? s4.offsetHz / 4 : s2.offsetHz / 2
+        // A carrier beyond the lock range, with none at our own tuning, belongs to another decoder:
+        // stay silent rather than lock onto one of its idle tones at the range edge.
+        let limit = ModeID.psk31.lockRangeHz
+        let carrierHere = s2.nearZero >= Self.presenceOn || s4.nearZero >= Self.presenceOn
+        let outOfRange = (useFourth || on2) && abs(tunedHz + offset - originHz) > limit + 1 && !carrierHere
+        let wasPresent = present
+        defer { if wasPresent && !present { absentSince = symbolIndex } }
+        if outOfRange {
+            if present { bpskSquelch.forceClose(); qpskSquelch.forceClose() }
+            present = false
+        } else if !present && (on2 || on4) {
             present = true
-            acquiredAt = symbolIndex
-            fastLeft = Self.fastSymbols
+            // The line flickers next to a strong neighbour or at low SNR: a carrier back within 2 s,
+            // or one a path is still locked on, is the same transmission, not a new one.
+            let brief = absentSince != Int.min && symbolIndex - absentSince < Self.flickerSymbols
+            if !bpskSquelch.isOpen && !qpskSquelch.isOpen && !brief { markAcquired(since: signalStart()) }
         } else if present && s2.height < Self.presenceOff && s4.height < Self.presenceOff {
             present = false
         }
         guard present else {
-            inconsistent = 0
+            inconsistent2 = 0; inconsistent4 = 0
             candidateHz = .nan
             // Long without a carrier: go back to the assigned frequency (the tracker follows the signal).
             absentEstimates += 1
-            if absentEstimates == Int(Self.returnAfterSeconds * basebandRate) / Self.fftHop && tunedHz != originHz {
+            if absentEstimates == Int(Self.returnAfterSeconds * basebandRate) / CarrierLineScanner.hop && tunedHz != originHz {
                 tunedHz = originHz
                 nco.setFrequency(-tunedHz, sampleRate: sampleRate)
                 omega2 = 0; omega4 = 0
@@ -680,23 +748,28 @@ public final class PSK31SignalDecoder: SignalDecoder {
         }
         absentEstimates = 0
 
-        let activeOpen = mode == .bpsk ? bpskSquelch.isOpen : qpskSquelch.isOpen
-        if activeOpen {
-            let check = mode == .bpsk ? s2 : s4
-            inconsistent = check.nearZero < Self.presenceOff && check.global >= Self.presenceOn ? inconsistent + 1 : 0
-            guard inconsistent >= 2 else { return }
-            inconsistent = 0
-            bpskSquelch.forceClose(); qpskSquelch.forceClose()
-            omega2 = 0; omega4 = 0
+        // Each open path must see its own line at zero offset: z² for BPSK, z⁴ for QPSK. A loop
+        // mistuned onto one idle tone, or a fourth-power loop aliased Rs/4 off, looks locked. (A lock
+        // on one idle tone is also refused by the squelch's balance test: a tone has one sign.)
+        // Only a line clearly absent at zero counts: a good lock's own line can read low there next
+        // to a strong neighbour, and closing a good lock costs text.
+        func misplaced(_ scan: CarrierLineScanner.LineScan) -> Bool {
+            scan.nearZero < Self.absentLine && scan.global >= Self.presenceOn
         }
-        // Either loop locked means the carrier is already found (the BPSK loop closes on QPSK data).
-        guard !bpskSquelch.isOpen, !qpskSquelch.isOpen else { return }
-        // BPSK (and any idle) squares to a clean line, and its fourth power then agrees. QPSK data has
-        // only the fourth-power line and a weak, unreliable z² peak: use z⁴ when it clearly dominates.
-        let agree = abs(s2.offsetHz / 2 - s4.offsetHz / 4) < 0.5
-        let useFourth = on4 && (!on2 || (!agree && s4.height > 4 * s2.height))
+        // z⁴ of a BPSK idle Rs/4 off has a sideline at zero, so also trust a strong z² line elsewhere
+        // (QPSK data has only a weak z² line; QPSK idle has its z² line at zero).
+        let quadMisplaced = misplaced(s4)
+            || (on2 && abs(s2.offsetHz / 2) >= 1.5 && s2.height >= s4.height)
+        inconsistent2 = bpskSquelch.isOpen && misplaced(s2) ? inconsistent2 + 1 : 0
+        inconsistent4 = qpskSquelch.isOpen && quadMisplaced ? inconsistent4 + 1 : 0
+        if inconsistent2 >= Self.misplacedEstimates { bpskSquelch.forceClose(); omega2 = 0; inconsistent2 = 0 }
+        if inconsistent4 >= Self.misplacedEstimates { qpskSquelch.forceClose(); omega4 = 0; inconsistent4 = 0 }
+        // A path locked with its line at zero offset means the carrier is found (the BPSK path
+        // closes on QPSK data, so either will do). A path open without its line there is not trusted.
+        let bpskHolds = bpskSquelch.isOpen && !misplaced(s2)
+        let qpskHolds = qpskSquelch.isOpen && !quadMisplaced
+        guard !bpskHolds, !qpskHolds else { return }
         guard useFourth || on2 else { return }
-        let offset = useFourth ? s4.offsetHz / 4 : s2.offsetHz / 2
         let residual = Float(offset * 2 * .pi / Self.symbolRate)
         guard abs(offset) >= Self.jumpMinHz else {
             // Close enough for the loops to pull in, but seed their frequency: on its own a loop
@@ -704,7 +777,6 @@ public final class PSK31SignalDecoder: SignalDecoder {
             omega2 = residual; omega4 = residual
             return
         }
-        let limit = ModeID.psk31.lockRangeHz
         let target = min(max(tunedHz + offset, originHz - limit), originHz + limit)
         guard target != tunedHz else { return }
         // A noise peak rarely repeats at the same frequency: re-tune on two estimates that agree.
@@ -713,91 +785,9 @@ public final class PSK31SignalDecoder: SignalDecoder {
         tunedHz = target
         nco.setFrequency(-tunedHz, sampleRate: sampleRate)
         omega2 = 0; omega4 = 0
-        fastLeft = Self.fastSymbols
-        acquiredAt = symbolIndex
+        markAcquired()
         // The window now mixes two tunings: wait for a full fresh one (plus the filters' delay).
-        freshSamples = -Int(basebandRate * 0.1)
-    }
-
-    struct LineScan {
-        /// Height (over the median bin) and frequency of the accepted in-range carrier line.
-        var height: Float
-        var offsetHz: Double
-        /// Height of the strongest line anywhere in the extended range, and of the bins at zero offset.
-        var global: Float
-        var nearZero: Float
-    }
-
-    /// Spectrum of z^power over the last FFT window, searched for carrier lines.
-    private func scanLines(power m: Int, scale: Float, inRangeHz: Double, sidelineHz: Double) -> LineScan {
-        let n = Self.fftSize
-        let binHz = basebandRate / Double(n)
-        for i in 0..<n {
-            let z = fftRing[(fftHead + i) & (n - 1)]
-            var w = z
-            for _ in 1..<m { w = cmul(w, z) }
-            fftInRe[i] = w.x * scale * fftWindow[i]
-            fftInIm[i] = w.y * scale * fftWindow[i]
-        }
-        vDSP_DFT_Execute(dft, fftInRe, fftInIm, &fftOutRe, &fftOutIm)
-        for i in 0..<n { fftPower[i] = fftOutRe[i] * fftOutRe[i] + fftOutIm[i] * fftOutIm[i] }
-        func pw(_ b: Int) -> Float { fftPower[(b % n + n) % n] }
-
-        let inRange = Int(inRangeHz / binHz)
-        let sideBins = Int((sidelineHz / binHz).rounded())
-        // z^m of an idle signal has lines at multiples of the symbol rate around its carrier line.
-        let extended = min(inRange + (m / 2) * sideBins + 3, n / 2 - 1 - Self.backgroundBins)
-
-        // Height of a bin over its local background: the mean of the bins within ±backgroundBins,
-        // leaving out its own ±3, scaled by ln 2 so pure noise reads like peak/median. A carrier
-        // line is narrow; the cross-terms of a strong neighbour are broad humps and stay low.
-        let reach = extended + Self.backgroundBins
-        prefix.removeAll(keepingCapacity: true)
-        prefix.append(0)
-        for b in -reach...reach { prefix.append(prefix[prefix.count - 1] + Double(pw(b))) }
-        func sum(_ lo: Int, _ hi: Int) -> Double { prefix[hi + reach + 1] - prefix[lo + reach] }
-        func height(_ b: Int) -> Float {
-            let w = Self.backgroundBins
-            let total = sum(b - w, b + w) - sum(b - 3, b + 3)
-            let mean = total / Double(2 * w - 6)
-            return Float(Double(pw(b)) / max(mean * 0.693, 1e-30))
-        }
-
-        var global: Float = 0
-        for b in -extended...extended { global = max(global, height(b)) }
-
-        // Highest in-range line that is not a sideline of a stronger line (up to three tries).
-        var masked: [Int] = []
-        var best = 0
-        var bestHeight: Float = 0
-        for _ in 0..<3 {
-            best = 0; bestHeight = -1
-            for b in -inRange...inRange where !masked.contains(where: { abs($0 - b) <= 3 }) {
-                let h = height(b)
-                if h > bestHeight { bestHeight = h; best = b }
-            }
-            var isSideline = false
-            for k in 1...max(1, m / 2) {
-                for sign in [-1, 1] {
-                    let c = best + sign * k * sideBins
-                    if max(pw(c - 1), pw(c), pw(c + 1)) >= 2 * pw(best) { isSideline = true }
-                }
-            }
-            if !isSideline { break }
-            masked.append(best)
-            bestHeight = 0
-        }
-
-        var nearZero: Float = 0
-        let zeroBins = max(2, Int(Double(m) * 1.5 / binHz))
-        for b in -zeroBins...zeroBins { nearZero = max(nearZero, height(b)) }
-
-        // Parabolic interpolation on magnitude.
-        let l = pw(best - 1).squareRoot(), c = pw(best).squareRoot(), r = pw(best + 1).squareRoot()
-        let denom = l - 2 * c + r
-        let delta = denom < 0 ? Double(0.5 * (l - r) / denom) : 0
-        return LineScan(height: max(bestHeight, 0), offsetHz: (Double(best) + max(min(delta, 0.5), -0.5)) * binHz,
-                        global: global, nearZero: nearZero)
+        lines.invalidate(settleSamples: Int(basebandRate * 0.1))
     }
 
     // MARK: Reset
@@ -817,15 +807,18 @@ public final class PSK31SignalDecoder: SignalDecoder {
         for i in lowRing.indices { lowRing[i] = false }
         lowCount = 0; clocked = false
         theta2 = 0; omega2 = 0; theta4 = 0; omega4 = 0
-        for i in fftRing.indices { fftRing[i] = .zero }
-        fftHead = 0; sinceFFT = 0; freshSamples = 0; line2 = 0; line4 = 0; present = false; inconsistent = 0; acquiredAt = Int.min
-        candidateHz = .nan; absentEstimates = 0
+        lines.reset()
+        line2 = 0; line4 = 0; present = false; acquiredAt = Int.min
+        line2AtZero = 0; line4AtZero = 0; inconsistent2 = 0; inconsistent4 = 0
+        bpskBalance.reset(); qpskBalance.reset()
+        viterbiInverted.reset(); qpskVaricodeInverted = VaricodeAssembler(); senseGain = 0; invertedGain = 0
+        candidateHz = .nan; absentEstimates = 0; absentSince = Int.min
         bpsk = BPSKSequenceDetector()
         ampA = 0; isiC = 0
         for i in 0..<Self.historyRing { bpskFit[i] = 0; qpskFit[i] = 0; qpskOdd[i] = false }
         for i in zRing.indices { zRing[i] = .zero }
-        bpskVaricode = VaricodeAssembler(); bpskSquelch = Squelch()
-        viterbi.reset(); qpskVaricode = VaricodeAssembler(); qpskSquelch = Squelch(); ampA4 = 0; isiC4 = 0; cleanedPrev = .zero
+        bpskVaricode = VaricodeAssembler(); bpskSquelch = PSK31Squelch()
+        viterbi.reset(); qpskVaricode = VaricodeAssembler(); qpskSquelch = PSK31Squelch(); ampA4 = 0; isiC4 = 0; cleanedPrev = .zero
         for i in r4History.indices { r4History[i] = .zero }
         mode = .bpsk
         for i in 0..<Self.modeWindow { dist2[i] = 0; dist4[i] = 0; zeroShift[i] = false }
@@ -835,118 +828,3 @@ public final class PSK31SignalDecoder: SignalDecoder {
     }
 }
 
-// MARK: - Helpers
-
-@inline(__always) private func cmul(_ a: SIMD2<Float>, _ b: SIMD2<Float>) -> SIMD2<Float> {
-    SIMD2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x)
-}
-
-@inline(__always) private func rotate(_ a: SIMD2<Float>, by angle: Float) -> SIMD2<Float> {
-    cmul(a, SIMD2(cos(angle), sin(angle)))
-}
-
-@inline(__always) private func wrap(_ a: Float) -> Float {
-    var x = a
-    while x > .pi { x -= 2 * .pi }
-    while x < -.pi { x += 2 * .pi }
-    return x
-}
-
-/// Squelch on a per-symbol fit metric in [-1, 1]: opens once the average is high and the last
-/// `goodRunToOpen` symbols each fitted, closes when the average falls or the carrier line goes.
-private struct Squelch {
-    private(set) var isOpen = false
-    private var average: Float = 0
-    var level: Float { average }
-
-    mutating func forceClose() { isOpen = false; average = min(average, 0); goodRun = 0 }
-    private var goodRun = 0
-
-    /// `lowSymbols`: how many of the last 32 symbols fell near zero amplitude (see `symbol`).
-    /// `clocked`: the envelope carries the 31.25 Hz symbol clock (see `symbol`).
-    mutating func update(_ q: Float, present: Bool, lowSymbols: Int, clocked: Bool) {
-        average += (q - average) * Self.alpha
-        goodRun = q > Self.good ? goodRun + 1 : 0
-        if isOpen {
-            if !present || !clocked || average < Self.close || lowSymbols > Self.lowToClose { isOpen = false }
-        } else if present && clocked && average > Self.open && goodRun >= Self.run && lowSymbols <= Self.lowToOpen {
-            isOpen = true
-        }
-    }
-
-    private static let alpha: Float = 1.0 / 12
-    private static let open: Float = 0.5
-    private static let close: Float = 0.3
-    private static let good: Float = 0.5
-    private static let run = 8
-    private static let lowToOpen = 4
-    private static let lowToClose = 8
-}
-
-/// Two-state maximum-likelihood sequence detector for BPSK through the PSK31 matched filter, whose
-/// output is z[k] = A·a[k] + c·(a[k-1] + a[k+1]) + noise. Ungerboeck's metric for that channel is
-/// Σ a[k]·z[k] − c·a[k]·a[k-1], so the state is the previous symbol. Register-exchange survivors.
-struct BPSKSequenceDetector {
-    static let depth = 12
-
-    private var metric: (Float, Float) = (0, 0)   // state 0: previous symbol +1, state 1: −1
-    private var survivor: (UInt32, UInt32) = (0, 0)
-    private var pushed = 0
-
-    struct Decision {
-        /// Symbols at depth + 1, depth and depth − 1 (older to newer), as ±1.
-        var previous: Float
-        var current: Float
-        var next: Float
-    }
-
-    mutating func push(_ z: Float, isi c: Float) -> Decision? {
-        // New symbol +1: from +1 costs c, from −1 gains c.
-        let plusFromPlus = metric.0 + z - c, plusFromMinus = metric.1 + z + c
-        let minusFromPlus = metric.0 - z + c, minusFromMinus = metric.1 - z - c
-        let newPlus: Float, newMinus: Float
-        let survPlus: UInt32, survMinus: UInt32
-        if plusFromPlus >= plusFromMinus { newPlus = plusFromPlus; survPlus = survivor.0 << 1 }
-        else { newPlus = plusFromMinus; survPlus = survivor.1 << 1 }
-        if minusFromPlus >= minusFromMinus { newMinus = minusFromPlus; survMinus = survivor.0 << 1 | 1 }
-        else { newMinus = minusFromMinus; survMinus = survivor.1 << 1 | 1 }
-        let top = max(newPlus, newMinus)
-        metric = (newPlus - top, newMinus - top)
-        survivor = (survPlus, survMinus)
-        pushed += 1
-        guard pushed > Self.depth + 1 else { return nil }
-        let best = newPlus >= newMinus ? survPlus : survMinus
-        func symbol(_ age: Int) -> Float { (best >> UInt32(age)) & 1 == 1 ? -1 : 1 }
-        return Decision(previous: symbol(Self.depth + 1), current: symbol(Self.depth), next: symbol(Self.depth - 1))
-    }
-}
-
-/// Collects Varicode bits into characters: a character ends at "00".
-struct VaricodeAssembler {
-    private var code: UInt32 = 0
-    private var length = 0
-    private var zeros = 0
-    private var start = 0
-
-    struct Character { var ascii: UInt8; var start: Int; var end: Int }
-
-    mutating func push(_ bit: Bool, symbol: Int) -> Character? {
-        if bit {
-            if length == 0 { start = symbol }
-            if zeros == 1 && length > 0 { appendBit(0) }
-            zeros = 0
-            appendBit(1)
-            return nil
-        }
-        zeros += 1
-        guard zeros == 2, length > 0 else { return nil }
-        defer { code = 0; length = 0 }
-        guard length <= Varicode.maxLength, let ascii = Varicode.decode(value: code) else { return nil }
-        return Character(ascii: ascii, start: start, end: symbol)
-    }
-
-    private mutating func appendBit(_ b: UInt32) {
-        length += 1
-        if length <= Varicode.maxLength { code = code << 1 | b }
-    }
-}

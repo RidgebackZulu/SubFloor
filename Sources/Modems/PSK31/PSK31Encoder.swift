@@ -19,17 +19,18 @@ public struct PSK31Encoder {
 
     public static func audio(text: String, frequencyHz: Double, qpsk: Bool = false, sampleRate: Double = 12_000,
                              leadInSeconds: Double = 1, amplitude: Float = 0.5) -> [Float] {
-        audio(text: text, frequencyHz: frequencyHz, qpsk: qpsk, sampleRate: sampleRate,
-              leadInSeconds: leadInSeconds, amplitude: amplitude, frequencyAt: { _ in frequencyHz })
+        audio(text: text, qpsk: qpsk, sampleRate: sampleRate, leadInSeconds: leadInSeconds, amplitude: amplitude,
+              frequencyAt: { _ in frequencyHz })
     }
 
-    /// As `audio(text:frequencyHz:...)`, with the carrier frequency a function of time in seconds
-    /// from the start of the buffer (for drift tests). `frequencyHz` is unused but keeps call sites
-    /// readable.
-    public static func audio(text: String, frequencyHz: Double, qpsk: Bool = false, sampleRate: Double = 12_000,
+    /// As `audio(text:frequencyHz:...)`, with the carrier frequency a function of time in seconds from
+    /// the start of the buffer (for drift tests). `invertedSense` negates every phase shift, which is
+    /// what a transmission on the opposite sideband looks like (it matters only for QPSK).
+    public static func audio(text: String, qpsk: Bool = false, sampleRate: Double = 12_000,
                              leadInSeconds: Double = 1, amplitude: Float = 0.5,
-                             frequencyAt: (Double) -> Double) -> [Float] {
-        let phases = symbolPhases(bits: bits(for: text), qpsk: qpsk)
+                             frequencyAt: (Double) -> Double, invertedSense: Bool = false) -> [Float] {
+        let sense = invertedSense ? -1.0 : 1.0
+        let phases = symbolPhases(bits: bits(for: text), qpsk: qpsk).map { $0 * sense }
         let samplesPerSymbol = sampleRate / symbolRate
         let lead = Int(leadInSeconds * sampleRate)
         // One extra symbol interval ramps the last symbol down to silence.
