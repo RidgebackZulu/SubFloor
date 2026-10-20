@@ -55,18 +55,64 @@ final class SpectrumFrameStore: @unchecked Sendable {
     }
 }
 
-/// Owns the IQ ring and the DSP thread: spectrum frames, receiver audio, modem feed.
+/// Owns the IQ ring and the DSP thread (spectrum frames, receiver audio, modem box channel) and the
+/// modem thread (`ModemWorker`).
+///
+/// **Modem box.** While the modem is on (`modemSettings.mode != nil`) and a box is present
+/// (`update(modemBoxDialOffset:)` non-nil), the DSP thread runs a `ModemChannel` on the IQ and feeds
+/// its 12 kHz audio to the worker, and does not push Receiver audio: the worker is the speakers'
+/// single producer. The switch happens only in the DSP loop's pending-config handling, through the
+/// worker's audio token (see `ModemWorker`).
+///
+/// **Box resets.** The box is reset (a new epoch, see `ModemEventQueue`) when it becomes active
+/// (modem turned on with a box, or a box appearing while on), when its dial offset has moved more
+/// than `boxResetHz` from where it was at the last reset (so a slow drag still resets once it adds
+/// up), on `modemCommand(.resetBox)`, and on `start`. A retune of the capture centre moves the
+/// offset too and is a reset: the IQ around a hardware retune is discontinuous, and audio from the
+/// old centre must not seed tracks at the new one. A smaller move only retunes the channel. The
+/// epoch is begun on the calling thread at once; the DSP thread rebuilds the channel and marks the
+/// point in the box audio where the worker resets. The channel is also rebuilt (as a gap, not a
+/// reset) when the input rate changes.
 final class DSPEngine: @unchecked Sendable {
+    /// A box dial-offset change beyond this (from the offset at the last reset) resets the box.
+    static let boxResetHz = 5.0
+
     let frames = SpectrumFrameStore()
-    let audio = AudioOutput()
+    let audio: AudioOutput
     let modems = ModemHost()
     let stats = Mutex(EngineStats())
+    let modemEvents: ModemEventQueue
+    let cursorFrames: CursorFrameStore
+
+    /// Test hook: ModemChannels built by the DSP thread.
+    let modemChannelBuilds = Atomic<Int>(0)
+    let modemWorker: ModemWorker
+
+    /// What the DSP thread should do with the box.
+    struct ModemBoxState: Equatable, Sendable {
+        var offset: Double?
+        var active: Bool
+        var epoch: UInt64
+    }
+
+    /// The caller-side modem state (any thread; the DSP thread sees it as `Pending.modemBox`).
+    private struct ModemRequest {
+        var offset: Double?
+        var settings = ModemSettings()
+        /// The offset at the last box reset.
+        var resetOffset: Double?
+        var epoch: UInt64 = 0
+
+        var isActive: Bool { settings.mode != nil && offset != nil }
+        var box: ModemBoxState { ModemBoxState(offset: offset, active: isActive, epoch: epoch) }
+    }
 
     private struct Pending {
         var receiver: Receiver.Config?
         var spectrum: SpectrumSettings?
         var volume: Float?
         var resetPeak = false
+        var modemBox: ModemBoxState?
     }
 
     private let ring = SPSCRing<DSPComplex>(capacity: 1 << 22, fill: DSPComplex(real: 0, imag: 0))
@@ -74,8 +120,35 @@ final class DSPEngine: @unchecked Sendable {
     private let running = Atomic<Bool>(false)
     private let pending = Mutex(Pending())
     private let dropped = Atomic<Int>(0)
+    /// IQ the source callback dropped (ring full): `count` samples were lost just before ring-stream
+    /// position `position` (samples written into the ring since `start`). The DSP thread marks the
+    /// gap in the box audio at exactly that point.
+    private struct IQLoss {
+        var position = 0
+        var count = 0
+    }
+    private let losses = SPSCRing<IQLoss>(capacity: 256, fill: IQLoss())
+    /// Callback thread only: samples written into the ring since `start`.
+    private let iqWritten = Atomic<Int>(0)
+    /// A loss record did not fit in `losses`; the DSP thread marks a gap where it notices.
+    private let lossesOverflowed = Atomic<Bool>(false)
     private var exited: DispatchSemaphore?
+    /// Test hook: the DSP thread while it runs (set before it starts).
+    private(set) var dspThread: Thread?
     private var source: (any IQSource)?
+    private let sink: any AudioSink
+    private let modemRequest = Mutex(ModemRequest())
+
+    /// `audioSink` replaces the `AudioOutput` as the destination of all speaker audio (tests); the
+    /// `AudioOutput` is still started and stopped. `now` is the modem's wall clock (tests).
+    init(audioSink: (any AudioSink)? = nil, now: @escaping @Sendable () -> Date = { Date() }) {
+        let output = AudioOutput()
+        audio = output
+        sink = audioSink ?? output
+        modemEvents = ModemEventQueue()
+        cursorFrames = CursorFrameStore()
+        modemWorker = ModemWorker(audioSink: sink, events: modemEvents, cursorFrames: cursorFrames, now: now)
+    }
 
     deinit { stop() }
 
@@ -84,23 +157,43 @@ final class DSPEngine: @unchecked Sendable {
         ring.drain()
         pending.withLock { $0 = Pending() }
         dropped.store(0, ordering: .relaxed)
+        losses.drain()
+        iqWritten.store(0, ordering: .relaxed)
+        lossesOverflowed.store(false, ordering: .relaxed)
         self.source = source
+        // A fresh engine: a new epoch, and the DSP thread starts from the current box request.
+        let epoch = modemRequest.withLock { r in
+            beginBoxEpoch(&r)
+            pending.withLock { $0.modemBox = r.box }
+            return r.epoch
+        }
+        modemWorker.update(volume: volume)
+        modemWorker.start(epoch: epoch)
         let done = DispatchSemaphore(value: 0)
         exited = done
         running.store(true, ordering: .releasing)
         let thread = Thread { [unowned self] in
-            run(receiver: receiver, spectrum: spectrum, volume: volume)
+            run(receiver: receiver, spectrum: spectrum, volume: volume, epoch: epoch)
             done.signal()
         }
         thread.name = "SubFloor DSP"
         thread.qualityOfService = .userInteractive
+        dspThread = thread
         thread.start()
         let ring = ring, wake = wake
         do {
             try audio.start()
             try source.start { [unowned self] block in
                 let written = ring.write(block)
-                if written < block.count { self.dropped.add(block.count - written, ordering: .relaxed) }
+                let position = self.iqWritten.load(ordering: .relaxed) + written
+                self.iqWritten.store(position, ordering: .relaxed)
+                if written < block.count {
+                    let lost = block.count - written
+                    self.dropped.add(lost, ordering: .relaxed)
+                    let loss = IQLoss(position: position, count: lost)
+                    let recorded = withUnsafePointer(to: loss) { self.losses.write(UnsafeBufferPointer(start: $0, count: 1)) }
+                    if recorded == 0 { self.lossesOverflowed.store(true, ordering: .relaxed) }
+                }
                 wake.signal()
             }
         } catch {
@@ -117,15 +210,68 @@ final class DSPEngine: @unchecked Sendable {
             exited?.wait()
         }
         exited = nil
+        dspThread = nil
+        modemWorker.stop()
         audio.stop()
     }
 
     func update(receiver: Receiver.Config) { pending.withLock { $0.receiver = receiver } }
     func update(spectrum: SpectrumSettings) { pending.withLock { $0.spectrum = spectrum } }
-    func update(volume: Float) { pending.withLock { $0.volume = volume } }
+    func update(volume: Float) {
+        pending.withLock { $0.volume = volume }
+        modemWorker.update(volume: volume)
+    }
     func resetPeak() { pending.withLock { $0.resetPeak = true } }
 
-    private func run(receiver config: Receiver.Config, spectrum initial: SpectrumSettings, volume initialVolume: Float) {
+    // MARK: Modem
+
+    /// The box's dial minus the capture centre; nil when there is no box or it is outside the span
+    /// (box audio stops). See **Box resets**.
+    func update(modemBoxDialOffset offset: Double?) {
+        let offset = offset.flatMap { $0.isFinite ? $0 : nil }
+        modemRequest.withLock { r in
+            let wasActive = r.isActive
+            r.offset = offset
+            if r.isActive, let o = offset {
+                if !wasActive || abs(o - (r.resetOffset ?? o)) > Self.boxResetHz { beginBoxEpoch(&r) }
+            }
+            pending.withLock { $0.modemBox = r.box }
+        }
+    }
+
+    func update(modemSettings settings: ModemSettings) {
+        modemRequest.withLock { r in
+            let wasActive = r.isActive
+            r.settings = settings
+            if r.isActive, !wasActive { beginBoxEpoch(&r) }
+            modemWorker.update(settings: settings)
+            pending.withLock { $0.modemBox = r.box }
+        }
+    }
+
+    func modemCommand(_ command: ModemCommand) {
+        modemRequest.withLock { r in
+            if command == .resetBox {
+                beginBoxEpoch(&r)
+                pending.withLock { $0.modemBox = r.box }
+            } else {
+                modemWorker.send(command, epoch: r.epoch)
+            }
+        }
+    }
+
+    /// Seconds to add to the system clock for UTC (from `ClockCheck`), or nil for the system clock.
+    func update(clockOffset: Double?) { modemWorker.update(clockOffset: clockOffset) }
+
+    /// Begins a new epoch for the box (caller side, under `modemRequest`).
+    private func beginBoxEpoch(_ r: inout ModemRequest) {
+        r.epoch = modemEvents.beginEpoch(at: modemWorker.utcNow())
+        cursorFrames.discard(before: r.epoch)
+        r.resetOffset = r.offset
+    }
+
+    private func run(receiver config: Receiver.Config, spectrum initial: SpectrumSettings, volume initialVolume: Float,
+                     epoch: UInt64) {
         let sampleRate = config.inputRate
         let receiver = Receiver(config: config)
         let modems = modems
@@ -146,6 +292,15 @@ final class DSPEngine: @unchecked Sendable {
         var block = [DSPComplex](repeating: DSPComplex(real: 0, imag: 0), count: 1 << 16)
         var audioOut = [Float]()
         audioOut.reserveCapacity(1 << 15)
+        let worker = modemWorker
+        var box = ModemBoxState(offset: nil, active: false, epoch: epoch)
+        var channel: ModemChannel?
+        var channelOffset = 0.0
+        var boxAudio = [Float]()
+        boxAudio.reserveCapacity(1 << 14)
+        var iqRead = 0
+        var nextLoss: IQLoss?
+        var lossScratch = IQLoss()
 
         while running.load(ordering: .acquiring) {
             let changes = pending.withLock { p -> Pending in
@@ -170,11 +325,62 @@ final class DSPEngine: @unchecked Sendable {
             }
             if changes.resetPeak { averager.resetPeak() }
 
+            // Modem box: the only place the speakers change hands.
+            if let b = changes.modemBox {
+                if b.epoch != worker.producerEpoch {
+                    worker.beginEpoch(b.epoch)
+                    channel = nil
+                }
+                if !b.active { channel = nil }
+                // Receiver audio stops here; its last push is behind us.
+                if b.active, !box.active { worker.grantAudio() }
+                box = b
+            }
+            if box.active, let offset = box.offset {
+                let rate = receiver.config.inputRate
+                if let c = channel, c.inputRate == rate {
+                    if offset != channelOffset {
+                        c.setDialOffset(offset)
+                        channelOffset = offset
+                    }
+                } else {
+                    // A rate change breaks the stream; after a reset the epoch mark already did.
+                    if channel != nil { worker.markGap(lostSamples: 1, reanchor: true) }
+                    channel = ModemChannel(inputRate: rate, dialOffsetHz: offset)
+                    channelOffset = offset
+                    modemChannelBuilds.add(1, ordering: .relaxed)
+                }
+            }
+
             let n = block.withUnsafeMutableBufferPointer { ring.read(into: $0) }
             if n == 0 {
                 _ = wake.wait(timeout: .now() + .milliseconds(20))
                 continue
             }
+
+            // Box audio, with a gap wherever the callback dropped IQ inside this block.
+            var done = 0
+            while true {
+                if nextLoss == nil, withUnsafeMutablePointer(to: &lossScratch, {
+                    losses.read(into: UnsafeMutableBufferPointer(start: $0, count: 1))
+                }) == 1 {
+                    nextLoss = lossScratch
+                }
+                guard let loss = nextLoss, loss.position <= iqRead + n else { break }
+                let cut = min(max(loss.position - iqRead, done), n)
+                if let channel {
+                    feedBox(channel, block, done..<cut, into: &boxAudio)
+                    let lost = Double(loss.count) * ModemChannel.outputRate / receiver.config.inputRate
+                    worker.markGap(lostSamples: Int(lost.rounded()), reanchor: false)
+                }
+                done = cut
+                nextLoss = nil
+            }
+            if let channel {
+                if lossesOverflowed.exchange(false, ordering: .relaxed) { worker.markGap(lostSamples: 1, reanchor: true) }
+                feedBox(channel, block, done..<n, into: &boxAudio)
+            }
+            iqRead += n
 
             // Spectrum: keep the most recent fftSize samples; emit frames at framesPerSecond.
             let size = settings.fftSize
@@ -217,10 +423,19 @@ final class DSPEngine: @unchecked Sendable {
                 var count = Int32(a.count)
                 vvtanhf(a.baseAddress!, a.baseAddress!, &count)
             }
-            audioOut.withUnsafeBufferPointer { audio.push($0) }
+            // While the box is active the worker owns the speakers; after it, wait for the token.
+            if !box.active, worker.reclaimAudio() { audioOut.withUnsafeBufferPointer { sink.push($0) } }
             let signal = receiver.signalDb
             let lost = dropped.load(ordering: .relaxed)
             stats.withLock { $0.signalDb = signal; $0.droppedSamples = lost }
         }
+    }
+
+    /// DSP thread: box audio for `block[range]` to the modem worker.
+    private func feedBox(_ channel: ModemChannel, _ block: [DSPComplex], _ range: Range<Int>, into boxAudio: inout [Float]) {
+        guard !range.isEmpty else { return }
+        boxAudio.removeAll(keepingCapacity: true)
+        block.withUnsafeBufferPointer { channel.process(UnsafeBufferPointer(rebasing: $0[range]), audio: &boxAudio) }
+        boxAudio.withUnsafeBufferPointer { modemWorker.write($0) }
     }
 }
