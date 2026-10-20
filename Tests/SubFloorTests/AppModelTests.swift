@@ -25,6 +25,27 @@ struct AppModelTests {
         #expect(!m.isRunning)
     }
 
+    @Test func failedRSPOpenFallsBackToDemoWithoutRetrying() {
+        let m = makeModel()
+        m.start()
+        defer { m.shutdown() }
+        guard m.sourceKind == .synthetic else { return }   // an RSP is actually present: nothing to assert
+        #expect(m.rspOpenFailed)
+        m.banner = nil
+        m.start()   // e.g. a sample-rate change: must not retry or re-show the banner
+        #expect(m.banner == nil)
+        m.useSource(.sdrplay)   // explicit request clears the flag and tries again
+        #expect(m.banner != nil)
+    }
+
+    @Test func switchingToDemoLeavesNoDeviceOpen() {
+        let m = makeModel()
+        m.useSource(.synthetic)
+        defer { m.shutdown() }
+        #expect(m.sourceKind == .synthetic)
+        #expect(m.preferredSource == .synthetic)
+    }
+
     @Test func overloadFlagTracksEvents() {
         let m = makeModel()
         m.handleOverload(true)

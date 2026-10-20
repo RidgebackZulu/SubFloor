@@ -87,6 +87,8 @@ final class AppModel {
     private(set) var cpuPercent: Double = 0
     private(set) var overloaded = false
     private var didAutoStart = false
+    /// Set when opening the RSP failed; later start() calls fall back to demo without retrying until retry()/useSource(.sdrplay).
+    private(set) var rspOpenFailed = false
 
     let engine = DSPEngine()
     private var sdrplay: SDRplayDevice?
@@ -191,7 +193,9 @@ final class AppModel {
     func start() {
         stop()
         var kind = preferredSource
-        if kind == .sdrplay && sdrplay == nil {
+        if kind == .sdrplay && sdrplay == nil && rspOpenFailed {
+            kind = .synthetic
+        } else if kind == .sdrplay && sdrplay == nil {
             do {
                 let device = try SDRplayDevice.open()
                 device.onEvent = { [weak self, weak device] event in
@@ -200,6 +204,7 @@ final class AppModel {
                 }
                 sdrplay = device
             } catch {
+                rspOpenFailed = true
                 show(Banner(kind: .warning, message: "No RSP found — demo signal. \(error)", action: .retry))
                 kind = .synthetic
             }
@@ -250,6 +255,7 @@ final class AppModel {
 
     func retry() {
         banner = nil
+        rspOpenFailed = false
         if preferredSource == .sdrplay, let device = sdrplay {
             stop()
             device.close()
@@ -273,6 +279,14 @@ final class AppModel {
             return
         }
         preferredSource = kind
+        if kind == .sdrplay {
+            rspOpenFailed = false
+        } else if sdrplay != nil {
+            // Free the RSP for other apps while a different source is in use.
+            stop()
+            sdrplay?.close()
+            sdrplay = nil
+        }
         if isRunning || kind != .sdrplay { start() }
     }
 
