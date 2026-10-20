@@ -11,7 +11,9 @@ let package = Package(
     platforms: [.macOS(.v15)],
     targets: [
         .systemLibrary(name: "CSDRplay", path: "Sources/CSDRplay"),
-        .target(name: "SDRplayKit", dependencies: ["CSDRplay"], linkerSettings: sdrplayLinker),
+        .target(name: "DSPCore", swiftSettings: fastMath),
+        .target(name: "SDRplayKit", dependencies: ["CSDRplay", "DSPCore"], linkerSettings: sdrplayLinker),
+        .testTarget(name: "DSPCoreTests", dependencies: ["DSPCore"]),
         .testTarget(name: "SDRplayKitTests", dependencies: ["SDRplayKit", "CSDRplay"], linkerSettings: sdrplayLinker),
     ]
 )
