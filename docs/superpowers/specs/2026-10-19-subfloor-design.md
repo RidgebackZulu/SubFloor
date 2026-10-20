@@ -13,7 +13,7 @@ frequency/mode bookmarks.
 
 ## 2. Platform & stack
 
-- macOS 26+, arm64 only. Xcode 26.2, Swift 6.2 (strict concurrency).
+- macOS 26 target machine; package deployment target macOS 15 (needed for `Synchronization`). Xcode 26.2, Swift 6.2 (strict concurrency).
 - SwiftUI app shell; Metal (`MTKView`) for spectrum/waterfall.
 - Accelerate/vDSP for FFT and DSP primitives.
 - AVAudioEngine (`AVAudioSourceNode`) for audio output.
@@ -226,3 +226,11 @@ public protocol Modem: AnyObject {
   - bookmark codec round-trip and corrupt-file handling
 - Manual hardware smoke test with the RSP1B: enumerate, stream, tune, gain, overload, unplug.
 - UI check: run the app with the synthetic source and exercise zoom, pan, click-tune and bookmarks.
+
+## 14. Planning-time decisions
+
+1. Shaders are embedded as a Swift string (`ShaderSource.swift`) and compiled with `makeLibrary(source:)`. They are not a bundled `.metal` resource.
+2. The waterfall history is a ring `MTLBuffer` of `Float16` (rows × fftSize). It is not a texture, because Apple GPUs cap 2D textures at 16384 wide and FFTs reach 65536.
+3. `SDRplayDevice` is a `final class` serialized by an `NSLock`, not an actor. The C callbacks need a stable, synchronously reachable context pointer.
+4. Low-IF mode is dropped from phase 1. Zero-IF plus hardware decimation covers the rate range.
+5. Frequency parser rule for input without a suffix: below 3000 → MHz, below 3,000,000 → kHz, otherwise Hz. Input with more than one `.` is treated as dot-grouped Hz (`14.074.000`).

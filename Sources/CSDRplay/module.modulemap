@@ -1,0 +1,5 @@
+module CSDRplay [system] {
+    header "shim.h"
+    link "sdrplay_api"
+    export *
+}
