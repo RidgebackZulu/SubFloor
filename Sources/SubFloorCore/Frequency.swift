@@ -45,11 +45,16 @@ public enum FrequencyFormatter {
     }
 
     /// Dot-grouped whole Hz: 14074000 → "14.074.000".
-    public static func grouped(_ hz: Double) -> String {
-        let digits = String(FrequencyFormatter.safeInt(hz))
+    public static func grouped(_ hz: Double) -> String { group(safeInt(hz), separator: ".") }
+
+    /// An audio frequency, comma-grouped whole Hz: 1520 → "1,520 Hz".
+    public static func audio(_ hz: Double) -> String { group(safeInt(hz), separator: ",") + " Hz" }
+
+    private static func group(_ value: Int, separator: Character) -> String {
+        let digits = String(value)
         var out = ""
         for (i, ch) in digits.enumerated() {
-            if i > 0 && (digits.count - i) % 3 == 0 { out.append(".") }
+            if i > 0 && (digits.count - i) % 3 == 0 { out.append(separator) }
             out.append(ch)
         }
         return out

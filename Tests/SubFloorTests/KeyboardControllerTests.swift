@@ -4,10 +4,10 @@ import Testing
 
 @Suite struct KeyboardControllerTests {
     private func action(_ keyCode: UInt16, _ chars: String? = nil, _ mods: NSEvent.ModifierFlags = [],
-                        editing: Bool = false, quickTune: Bool = false,
+                        editing: Bool = false, quickTune: Bool = false, modem: Bool = false,
                         main: Bool = true, rep: Bool = false) -> KeyboardController.Action? {
         KeyboardController.decide(keyCode: keyCode, characters: chars, modifiers: mods,
-                                  isEditingText: editing, quickTuneVisible: quickTune,
+                                  isEditingText: editing, quickTuneVisible: quickTune, modemActive: modem,
                                   isMainWindow: main, isRepeat: rep)
     }
 
@@ -52,5 +52,22 @@ import Testing
     @Test func optionExcluded() {
         #expect(action(124, nil, .option) == nil)
         #expect(action(33, "[", .option) == nil)
+    }
+
+    @Test func escUnlocks() {
+        #expect(action(53, "\u{1B}", modem: true) == .unlockModemCursor)
+        #expect(action(53, "\u{1B}") == nil)
+        #expect(action(53, "\u{1B}", [], quickTune: true, modem: true) == nil)
+        #expect(action(53, "\u{1B}", .command, modem: true) == nil)
+    }
+
+    @Test func arrowsNudgeWhenModemActive() {
+        #expect(action(123, nil, [], modem: true) == .nudgeModemCursor(-1))
+        #expect(action(124, nil, [], modem: true) == .nudgeModemCursor(1))
+        #expect(action(124, nil, .shift, modem: true) == .nudgeModemCursor(1))
+        #expect(action(124, nil, [], editing: true, modem: true) == nil)
+        #expect(action(124, nil, .option, modem: true) == nil)
+        #expect(action(124) == .step(1))
+        #expect(action(30, "]", [], modem: true) == .cycleMode(1))
     }
 }

@@ -48,4 +48,40 @@ import Testing
         #expect(up.hardware(fromDisplay: box.lowerHz) == box.lowerHz + 125_000_000)
         #expect(up.display(fromHardware: up.hardware(fromDisplay: box.lowerHz)) == box.lowerHz)
     }
+
+    @Test func centeredClampedToCapture() {
+        let centre = 14_000_000.0, span = 2_000_000.0
+        let free = ModemBox.centered(on: 14_250_000, clampedToCaptureCenter: centre, span: span)
+        #expect(free.centerHz == 14_250_000)
+        let high = ModemBox.centered(on: 14_999_000, clampedToCaptureCenter: centre, span: span)
+        #expect(high.upperHz == centre + 0.45 * span)
+        #expect(high.isInside(captureCenter: centre, captureSpan: span))
+        let low = ModemBox.centered(on: 12_000_000, clampedToCaptureCenter: centre, span: span)
+        #expect(low.lowerHz == centre - 0.45 * span)
+        #expect(low.isInside(captureCenter: centre, captureSpan: span))
+        // A span too narrow for the box: centred on the capture.
+        let tiny = ModemBox.centered(on: 14_100_000, clampedToCaptureCenter: centre, span: 2_000)
+        #expect(tiny.centerHz == centre)
+    }
+
+    @Test func moveKeepsAnInsideBoxInside() {
+        let centre = 14_000_000.0, span = 2_000_000.0
+        var box = ModemBox.centered(on: centre)
+        box.move(byHz: 1_000, keepingInsideCaptureCenter: centre, span: span)
+        #expect(box.centerHz == centre + 1_000)
+        box.move(byHz: 5_000_000, keepingInsideCaptureCenter: centre, span: span)
+        #expect(box.upperHz == centre + 0.45 * span)
+        box.move(byHz: -5_000_000, keepingInsideCaptureCenter: centre, span: span)
+        #expect(box.lowerHz == centre - 0.45 * span)
+
+        // Outside already (after a retune): it moves freely, and is held once it is back inside.
+        var outside = ModemBox(dialHz: 16_000_000)
+        outside.move(byHz: -100_000, keepingInsideCaptureCenter: centre, span: span)
+        #expect(outside.dialHz == 15_900_000)
+        outside.move(byHz: -1_100_000, keepingInsideCaptureCenter: centre, span: span)
+        #expect(outside.dialHz == 14_800_000)
+        #expect(outside.isInside(captureCenter: centre, captureSpan: span))
+        outside.move(byHz: 500_000, keepingInsideCaptureCenter: centre, span: span)
+        #expect(outside.upperHz == centre + 0.45 * span)
+    }
 }

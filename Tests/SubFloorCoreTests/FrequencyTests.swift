@@ -29,6 +29,14 @@ func rejectsInvalidFrequency(_ input: String) {
     #expect(FrequencyFormatter.rate(500_000) == "500.0 kSPS")
 }
 
+@Test func formatsAudioFrequencies() {
+    #expect(FrequencyFormatter.audio(1_520) == "1,520 Hz")
+    #expect(FrequencyFormatter.audio(720) == "720 Hz")
+    #expect(FrequencyFormatter.audio(1_519.6) == "1,520 Hz")
+    #expect(FrequencyFormatter.audio(3_300) == "3,300 Hz")
+    #expect(FrequencyFormatter.audio(.nan) == "0 Hz")
+}
+
 @Test func upconverterMapsDisplayAndHardware() {
     let up = Upconverter(enabled: true)
     #expect(up.hardware(fromDisplay: 7_100_000) == 132_100_000)

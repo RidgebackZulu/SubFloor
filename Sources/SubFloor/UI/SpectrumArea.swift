@@ -1,4 +1,5 @@
 import MetalKit
+import Modems
 import SubFloorCore
 import SwiftUI
 
@@ -55,11 +56,16 @@ private struct SpectrumView: NSViewRepresentable {
             reset: { model.resetView() },
             hover: { model.hover(at: $0) },
             passbandEdges: { model.passbandEdgeFractions },
-            dragEdge: { model.dragPassbandEdge(upper: $0, fraction: $1) })
+            dragEdge: { model.dragPassbandEdge(upper: $0, fraction: $1) },
+            boxGrabRect: { model.modemGrabTabFractions },
+            boxRange: { model.modemBoxFractions },
+            dragBox: { model.dragModemBox(byFraction: $0) },
+            clickInBox: { model.clickInModemBox(atFraction: $0) })
     }
 }
 
-/// dB grid, frequency grid, passband, VFO line and hover crosshair, drawn above the Metal view.
+/// dB grid, frequency grid, passband, VFO line, modem box and cursor, and hover crosshair, drawn
+/// above the Metal view.
 private struct SpectrumOverlay: View {
     @Environment(AppModel.self) private var model
 
@@ -97,6 +103,8 @@ private struct SpectrumOverlay: View {
             ctx.stroke(Path { $0.move(to: CGPoint(x: xv, y: 0)); $0.addLine(to: CGPoint(x: xv, y: size.height)) },
                        with: .color(Theme.vfo), lineWidth: 1.5)
 
+            if model.modemSettings.mode != nil { drawModemBox(ctx, size: size, specH: specH, x: x) }
+
             if let hover = model.hover {
                 let p = CGPoint(x: hover.point.x * size.width, y: hover.point.y * size.height)
                 ctx.stroke(Path { $0.move(to: CGPoint(x: p.x, y: 0)); $0.addLine(to: CGPoint(x: p.x, y: size.height)) },
@@ -114,6 +122,47 @@ private struct SpectrumOverlay: View {
                 ctx.draw(text, at: origin, anchor: .topLeading)
             }
         }
+    }
+
+    /// The modem box (green outline at 8% fill; dashed grey while outside the capture span), its
+    /// grab tab and edge labels, and the amber cursor with its audio frequency.
+    private func drawModemBox(_ ctx: GraphicsContext, size: CGSize, specH: CGFloat, x: (Double) -> CGFloat) {
+        let box = model.modemBox
+        let active = model.modemBoxActive
+        let x0 = x(box.lowerHz), x1 = x(box.upperHz)
+        // Off-screen (beyond where its tab could reach in): nothing to draw.
+        guard Double(x1) >= -SpectrumHitTest.minTabWidth,
+              Double(x0) <= Double(size.width) + SpectrumHitTest.minTabWidth else { return }
+        let color = active ? Theme.modemBox : Color.gray
+        let body = CGRect(x: x0, y: 0, width: max(x1 - x0, 1), height: size.height)
+        if active { ctx.fill(Path(body), with: .color(Theme.modemBox.opacity(0.08))) }
+        ctx.stroke(Path(body), with: .color(color),
+                   style: StrokeStyle(lineWidth: 1.5, dash: active ? [] : [5, 4]))
+
+        let tab = SpectrumHitTest.tabExtent(lower: Double(x0), upper: Double(x1))
+        let tabRect = CGRect(x: tab.lower, y: 0, width: tab.upper - tab.lower, height: SpectrumHitTest.tabHeight)
+        ctx.fill(Path(roundedRect: tabRect, cornerRadius: 3), with: .color(color.opacity(active ? 0.85 : 0.5)))
+        ctx.draw(Text(model.modemGrabTabLabel).font(.system(size: 10, weight: .semibold)).foregroundStyle(.black),
+                 at: CGPoint(x: tabRect.midX, y: tabRect.midY))
+
+        if x1 - x0 > 90 {
+            let labelY = specH - 9
+            let label = { (s: String) in Text(s).font(.system(size: 9, design: .monospaced)).foregroundStyle(color.opacity(0.9)) }
+            ctx.draw(label("\(Int(ModemBox.audioLow))"), at: CGPoint(x: x0 + 4, y: labelY), anchor: .leading)
+            ctx.draw(label("\(Int(ModemBox.audioHigh)) Hz"), at: CGPoint(x: x1 - 4, y: labelY), anchor: .trailing)
+        }
+
+        guard active, let audio = model.modemCursorAudioHz else { return }
+        let xc = x(box.rfHz(forAudio: audio))
+        ctx.stroke(Path { $0.move(to: CGPoint(x: xc, y: 0)); $0.addLine(to: CGPoint(x: xc, y: size.height)) },
+                   with: .color(Theme.modemCursor), lineWidth: 1.5)
+        let text = ctx.resolve(Text(FrequencyFormatter.audio(audio)).font(.system(size: 11, weight: .semibold, design: .monospaced))
+            .foregroundStyle(Theme.modemCursor))
+        let ts = text.measure(in: size)
+        let origin = CGPoint(x: min(xc + 6, size.width - ts.width - 8), y: SpectrumHitTest.tabHeight + 6)
+        ctx.fill(Path(roundedRect: CGRect(origin: origin, size: ts).insetBy(dx: -5, dy: -2), cornerRadius: 4),
+                 with: .color(.black.opacity(0.65)))
+        ctx.draw(text, at: origin, anchor: .topLeading)
     }
 }
 
@@ -152,6 +201,15 @@ private struct FrequencyRuler: View {
                                    with: .color(.white.opacity(0.35)), lineWidth: 1)
                         ctx.draw(Text(RulerScale.label(tick, step: step)).font(.system(size: 10, design: .monospaced)).foregroundStyle(.white.opacity(0.6)),
                                  at: CGPoint(x: x, y: size.height - 17))
+                    }
+                    // Tracked modem signals: thin blue ticks.
+                    if model.modemSettings.mode != nil && model.modemBoxActive {
+                        let box = model.modemBox
+                        for row in model.decodeLog.liveRows {
+                            let x = CGFloat(vp.fraction(ofHz: box.rfHz(forAudio: row.frequencyHz))) * size.width
+                            ctx.stroke(Path { $0.move(to: CGPoint(x: x, y: size.height - 13)); $0.addLine(to: CGPoint(x: x, y: size.height - 3)) },
+                                       with: .color(Theme.accent), lineWidth: 1)
+                        }
                     }
                     let start = vp.startFractionOfCapture * size.width
                     let width = max(vp.widthFractionOfCapture * size.width, 3)

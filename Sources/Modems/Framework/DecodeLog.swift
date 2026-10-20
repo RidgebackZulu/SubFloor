@@ -342,7 +342,7 @@ public struct DecodeLog: Sendable {
 
     /// The audio frequency of a slot decode's signal centre, where the tracker sees it: FT8 reports
     /// tone 0 of its 8 tones, WSPR (and anything else) its centre.
-    static func signalCentreHz(of d: SlotDecode) -> Double {
+    public static func signalCentreHz(of d: SlotDecode) -> Double {
         d.mode == .ft8 ? d.frequencyHz + 3.5 * FT8Encoder.toneSpacing : d.frequencyHz
     }
 

@@ -33,4 +33,27 @@ public struct ModemBox: Codable, Equatable, Sendable {
     }
 
     public mutating func move(byHz hz: Double) { dialHz += hz }
+
+    /// A box whose middle is as close to `rfCenter` as keeps it inside the capture span (see
+    /// `isInside`); centred on the capture when the span is too narrow for it.
+    public static func centered(on rfCenter: Double, clampedToCaptureCenter captureCenter: Double,
+                                span captureSpan: Double) -> ModemBox {
+        let limit = 0.45 * captureSpan
+        let half = (audioHigh - audioLow) / 2
+        let lo = captureCenter - limit + half
+        let hi = captureCenter + limit - half
+        return centered(on: lo <= hi ? min(max(rfCenter, lo), hi) : captureCenter)
+    }
+
+    /// Moves the box by `hz`; a box inside the capture span stops at its edge, one outside it
+    /// (after a retune) moves freely until it is back inside.
+    public mutating func move(byHz hz: Double, keepingInsideCaptureCenter captureCenter: Double,
+                              span captureSpan: Double) {
+        guard isInside(captureCenter: captureCenter, captureSpan: captureSpan) else {
+            dialHz += hz
+            return
+        }
+        let limit = 0.45 * captureSpan
+        dialHz = min(max(dialHz + hz, captureCenter - limit - Self.audioLow), captureCenter + limit - Self.audioHigh)
+    }
 }

@@ -49,7 +49,7 @@ public enum ModeID: String, CaseIterable, Codable, Sendable, Identifiable {
 }
 
 /// User-selected modem configuration.
-public struct ModemSettings: Sendable, Equatable {
+public struct ModemSettings: Codable, Sendable, Equatable {
     /// Selected mode; nil means the modem is off.
     public var mode: ModeID?
     public var autoDetect = false

@@ -1,5 +1,6 @@
 import AppKit
 import MetalKit
+import SubFloorCore
 
 struct SpectrumInteraction {
     var zoom: @MainActor (_ factor: Double, _ anchorFraction: Double) -> Void
@@ -9,18 +10,29 @@ struct SpectrumInteraction {
     var hover: @MainActor (_ unitPoint: CGPoint?) -> Void
     var passbandEdges: @MainActor () -> (lower: Double, upper: Double)?
     var dragEdge: @MainActor (_ upper: Bool, _ fraction: Double) -> Void
+    /// The modem box's grab tab, horizontally, in view fractions (nil: no box).
+    var boxGrabRect: @MainActor () -> (lower: Double, upper: Double)?
+    /// The modem box body in view fractions (nil: no box, or an inactive one).
+    var boxRange: @MainActor () -> (lower: Double, upper: Double)?
+    var dragBox: @MainActor (_ deltaFraction: Double) -> Void
+    var clickInBox: @MainActor (_ fraction: Double) -> Void
 }
 
 /// Mouse/trackpad: click tunes, drag pans, pinch or ⌥-scroll (or a plain mouse wheel) zooms,
 /// two-finger scroll pans, passband edges drag to set bandwidth, double-click resets the view.
+/// The modem box drags by its grab tab; a click inside the box locks the modem cursor, and a drag
+/// that starts inside it pans (see `SpectrumHitTest` for the order).
 final class SpectrumMTKView: MTKView {
     var interaction: SpectrumInteraction?
 
     private enum Drag {
         case none
         case pending(start: CGPoint)
+        /// A press inside the modem box: a click locks the cursor, a drag pans.
+        case pendingBox(start: CGPoint)
         case pan(last: CGPoint)
         case edge(upper: Bool)
+        case box(last: CGPoint)
     }
 
     private var drag: Drag = .none
@@ -46,11 +58,11 @@ final class SpectrumMTKView: MTKView {
     private func fraction(_ p: CGPoint) -> Double { Double(p.x / max(bounds.width, 1)) }
     private func unit(_ p: CGPoint) -> CGPoint { CGPoint(x: p.x / max(bounds.width, 1), y: p.y / max(bounds.height, 1)) }
 
-    private func edgeHit(_ p: CGPoint) -> Bool? {
-        guard let edges = interaction?.passbandEdges() else { return nil }
-        if abs(p.x - edges.upper * bounds.width) < 5 { return true }
-        if abs(p.x - edges.lower * bounds.width) < 5 { return false }
-        return nil
+    private func hit(_ p: CGPoint) -> SpectrumHit {
+        guard let interaction else { return .elsewhere }
+        return SpectrumHitTest.hit(x: Double(p.x), y: Double(p.y), width: Double(bounds.width),
+                                   grabTab: interaction.boxGrabRect(), box: interaction.boxRange(),
+                                   passbandEdges: interaction.passbandEdges())
     }
 
     override func scrollWheel(with event: NSEvent) {
@@ -72,17 +84,21 @@ final class SpectrumMTKView: MTKView {
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         let p = point(event)
-        if let upper = edgeHit(p) {
-            drag = .edge(upper: upper)
-        } else {
-            drag = .pending(start: p)
+        switch hit(p) {
+        case .boxGrabTab:
+            drag = .box(last: p)
+            NSCursor.closedHand.set()
+        case .passbandEdge(let upper): drag = .edge(upper: upper)
+        case .boxBody: drag = .pendingBox(start: p)
+        case .elsewhere: drag = .pending(start: p)
         }
     }
 
     override func mouseDragged(with event: NSEvent) {
         let p = point(event)
         switch drag {
-        case .pending(let start) where hypot(p.x - start.x, p.y - start.y) > 3:
+        case .pending(let start) where hypot(p.x - start.x, p.y - start.y) > 3,
+             .pendingBox(let start) where hypot(p.x - start.x, p.y - start.y) > 3:
             interaction?.pan(-Double((p.x - start.x) / max(bounds.width, 1)))
             drag = .pan(last: p)
         case .pan(let last):
@@ -90,6 +106,9 @@ final class SpectrumMTKView: MTKView {
             drag = .pan(last: p)
         case .edge(let upper):
             interaction?.dragEdge(upper, fraction(p))
+        case .box(let last):
+            interaction?.dragBox(Double((p.x - last.x) / max(bounds.width, 1)))
+            drag = .box(last: p)
         default:
             break
         }
@@ -97,20 +116,36 @@ final class SpectrumMTKView: MTKView {
     }
 
     override func mouseUp(with event: NSEvent) {
-        if case .pending = drag {
+        switch drag {
+        case .pending, .pendingBox:
             if event.clickCount == 2 {
                 interaction?.reset()
+            } else if case .pendingBox = drag {
+                interaction?.clickInBox(fraction(point(event)))
             } else {
                 interaction?.click(fraction(point(event)))
             }
+        case .box:
+            updateCursor(point(event))
+        default:
+            break
         }
         drag = .none
     }
 
     override func mouseMoved(with event: NSEvent) {
         let p = point(event)
-        (edgeHit(p) != nil ? NSCursor.resizeLeftRight : NSCursor.crosshair).set()
+        updateCursor(p)
         interaction?.hover(unit(p))
+    }
+
+    /// Open hand over the modem box's grab tab, resize over a passband edge, crosshair elsewhere.
+    private func updateCursor(_ p: CGPoint) {
+        switch hit(p) {
+        case .boxGrabTab: NSCursor.openHand.set()
+        case .passbandEdge: NSCursor.resizeLeftRight.set()
+        case .boxBody, .elsewhere: NSCursor.crosshair.set()
+        }
     }
 
     override func mouseExited(with event: NSEvent) {

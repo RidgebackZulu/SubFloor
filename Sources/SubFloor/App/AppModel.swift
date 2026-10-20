@@ -44,6 +44,9 @@ private struct SessionState: Codable {
     var agcSpeed: AGCSpeed
     var cwPitchHz: Double
     var preferredSource: SourceKind
+    /// Optional so that sessions saved before the modem box still decode.
+    var modemBox: ModemBox?
+    var modemSettings: ModemSettings?
 }
 
 @MainActor @Observable
@@ -80,6 +83,14 @@ final class AppModel {
     var showBookmarks = true
     private(set) var activeModem: (any Modem)?
     var activeModemID: String? { activeModem.map { type(of: $0).info.id } }
+    /// The multi-signal modem's box, settings and cursor (see `ModemControl`).
+    private var modem = ModemControl()
+    private(set) var decodeLog = DecodeLog()
+    /// The system clock's offset from network time (`ClockCheck`), once measured.
+    private(set) var clockOffset: Double?
+    private var clockCheckStarted = false
+    /// Test hook: every update made to the engine's modem, in order.
+    @ObservationIgnored var onModemEngineUpdate: ((ModemEngineUpdate) -> Void)?
     var banner: Banner?
     var quickTuneVisible = false
     private(set) var signalDb: Float = -200
@@ -98,6 +109,7 @@ final class AppModel {
     private let defaults: UserDefaults
     private var bookmarksSaveBlocked = false
     private var statsTimer: Timer?
+    private var statsTicks = 0
     private var cpu = CPUUsage()
     private var lastSavedSession: Data?
 
@@ -118,10 +130,12 @@ final class AppModel {
             break
         }
         restoreSession()
+        syncModem()
         engine.audio.onError = { [weak self] message in
             Task { @MainActor in self?.show(Banner(kind: .error, message: message, action: .retry)) }
         }
-        statsTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+        // 10 Hz: the modem drain every tick, the other stats every other one.
+        statsTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshStats() }
         }
     }
@@ -226,10 +240,12 @@ final class AppModel {
         }
         if abs(vfoHz - centerHz) > sampleRate * TuningPlanner.usableFraction { vfoHz = centerHz + TuningPlanner.dcOffset(sampleRate: sampleRate) }
         viewport.setCapture(centerHz: centerHz, spanHz: sampleRate)
+        syncModem()
         do {
             try engine.start(source: activeSource, receiver: receiverConfig, spectrum: spectrum, volume: volume)
             isRunning = true
             deviceName = activeSource.name
+            startClockCheckIfNeeded()
         } catch {
             show(Banner(kind: .error, message: "Could not start: \(error)", action: .retry))
         }
@@ -352,6 +368,7 @@ final class AppModel {
         viewport.setCapture(centerHz: centerHz, spanHz: sampleRate)
         viewport.reset()
         pushReceiver()
+        syncModem()
     }
 
     /// VFO move inside the spectrum (click, drag, keys). Retunes only if the VFO leaves the usable span.
@@ -364,6 +381,7 @@ final class AppModel {
             vfoHz = hz
             retuneHardware()
             viewport.setCapture(centerHz: centerHz, spanHz: sampleRate)
+            syncModem()
         }
         vfoHz = hz
         viewport.ensureVisible(hz)
@@ -418,6 +436,7 @@ final class AppModel {
         retuneHardware()
         viewport.setCapture(centerHz: centerHz, spanHz: sampleRate)
         pushReceiver()
+        syncModem()
     }
 
     private func clampedDisplay(_ hz: Double) -> Double {
@@ -459,6 +478,7 @@ final class AppModel {
             if isRunning { start() } else {
                 synthetic.setSampleRate(s.outputRate)
                 viewport.setCapture(centerHz: centerHz, spanHz: sampleRate)
+                syncModem()
             }
             return
         }
@@ -565,9 +585,140 @@ final class AppModel {
         }
     }
 
+    // MARK: Multi-signal modem
+
+    var modemBox: ModemBox { modem.box }
+    /// As sent to the engine: FT8/WSPR (`slotModesEnabled`) are off for file sources.
+    var modemSettings: ModemSettings { modem.engineSettings(isFileSource: sourceKind == .file) }
+    var modemCursorAudioHz: Double? { modem.cursorAudioHz }
+    /// False when the box is outside the capture span (the engine gets no box; decoding stops).
+    var modemBoxActive: Bool { modem.isBoxActive(captureCenter: centerHz, captureSpan: sampleRate) }
+    /// ←/→ nudge the modem cursor and Esc unlocks it (`KeyCommand`).
+    var modemKeysActive: Bool { modem.settings.mode != nil && modemBoxActive }
+    var modemGrabTabLabel: String { modem.grabTabLabel }
+
+    /// The box body in view fractions, while the modem is on and the box active (clicks inside
+    /// it lock the cursor; elsewhere they tune the VFO).
+    var modemBoxFractions: (lower: Double, upper: Double)? {
+        guard modem.settings.mode != nil, modemBoxActive else { return nil }
+        return (viewport.fraction(ofHz: modemBox.lowerHz), viewport.fraction(ofHz: modemBox.upperHz))
+    }
+
+    /// The grab tab's horizontal extent in view fractions, while the modem is on (an inactive box
+    /// can still be dragged back). The spectrum view widens it to `SpectrumHitTest.minTabWidth`.
+    var modemGrabTabFractions: (lower: Double, upper: Double)? {
+        guard modem.settings.mode != nil else { return nil }
+        return (viewport.fraction(ofHz: modemBox.lowerHz), viewport.fraction(ofHz: modemBox.upperHz))
+    }
+
+    func setModemMode(_ m: ModeID?) {
+        changeModem { $0.setMode(m) }
+        if m != nil { startClockCheckIfNeeded() }
+    }
+
+    func setAutoDetect(_ on: Bool) { changeModem { $0.setAutoDetect(on) } }
+    func setAudioWide(_ on: Bool) { changeModem { $0.setAudioWide(on) } }
+
+    /// Drags the box (never retunes); a box inside the capture span stays inside it.
+    func moveModemBox(byHz hz: Double) {
+        let center = centerHz, span = sampleRate
+        changeModem { $0.moveBox(byHz: hz, captureCenter: center, captureSpan: span) }
+    }
+
+    func dragModemBox(byFraction f: Double) { moveModemBox(byHz: f * viewport.spanHz) }
+
+    /// Centres the box on the view, clamped to the capture span.
+    func recenterModemBox() {
+        let view = viewport.centerHz, center = centerHz, span = sampleRate
+        changeModem { $0.recenter(on: view, captureCenter: center, captureSpan: span) }
+    }
+
+    func lockModemCursor(atRF rf: Double) {
+        let active = modemBoxActive
+        changeModem { $0.lock(atRF: rf, boxActive: active) }
+    }
+
+    /// A click inside the box: locks the cursor there, or unlocks it when on the cursor.
+    func clickInModemBox(atFraction f: Double) {
+        let rf = viewport.hz(atFraction: f), span = viewport.spanHz, active = modemBoxActive
+        changeModem { $0.click(atRF: rf, spanHz: span, boxActive: active) }
+    }
+
+    func unlockModemCursor() { changeModem { $0.unlock() } }
+
+    func nudgeModemCursor(_ steps: Int) {
+        let active = modemBoxActive
+        changeModem { $0.nudge(steps, boxActive: active) }
+    }
+
+    /// Clicking a row locks the cursor on its signal; clicking the cursor's row unlocks it.
+    func selectRow(_ id: Int) {
+        guard let row = decodeLog.row(forTrack: id) ?? decodeLog.slotRows.first(where: { $0.id == id }) else { return }
+        let active = modemBoxActive
+        changeModem { $0.select(row, boxActive: active) }
+    }
+
+    /// Set while the pointer is over the rows: new rows wait (`DecodeLog.holdNew`).
+    func setRowHold(_ on: Bool) {
+        guard decodeLog.holdNew != on else { return }
+        decodeLog.holdNew = on
+    }
+
+    func releaseHeldRows() { decodeLog.releaseHeld() }
+
+    /// Test seam: adopts `kind` as the running source's kind without starting anything.
+    func setSourceKindForTesting(_ kind: SourceKind) {
+        sourceKind = kind
+        syncModem()
+    }
+
+    /// Applies `change` to the modem state and brings the engine up to date. The state is written
+    /// back only when it changed, so observers are not woken for nothing.
+    private func changeModem(_ change: (inout ModemControl) -> Void) {
+        var m = modem
+        change(&m)
+        syncModem(&m)
+    }
+
+    private func syncModem() {
+        var m = modem
+        syncModem(&m)
+    }
+
+    private func syncModem(_ m: inout ModemControl) {
+        let updates = m.sync(engine, captureCenter: centerHz, captureSpan: sampleRate, isFileSource: sourceKind == .file)
+        if let hook = onModemEngineUpdate { updates.forEach(hook) }
+        if m != modem { modem = m }
+    }
+
+    /// The 10 Hz drain of the engine's modem output into the rows.
+    private func pumpModem() {
+        let batch = engine.modemEvents.drain()
+        var m = modem
+        if batch.isEmpty {
+            m.observeEpoch(batch.epoch)
+        } else {
+            m.take(batch, into: &decodeLog, now: engine.modemWorker.utcNow())
+        }
+        if m != modem { modem = m }
+    }
+
+    /// Measures the clock offset once, the first time the modem is on with the radio running.
+    private func startClockCheckIfNeeded() {
+        guard isRunning, modem.settings.mode != nil, !clockCheckStarted else { return }
+        clockCheckStarted = true
+        Task { [weak self] in
+            let offset = await ClockCheck.offsetSeconds()
+            self?.clockOffset = offset
+        }
+    }
+
     // MARK: Stats & persistence
 
     private func refreshStats() {
+        pumpModem()
+        statsTicks += 1
+        guard statsTicks % 2 == 0 else { return }
         signalDb = engine.stats.withLock { $0.signalDb }
         underruns = engine.audio.underruns.load(ordering: .relaxed)
         cpuPercent = cpu.sample()
@@ -578,7 +729,8 @@ final class AppModel {
         let state = SessionState(vfoHz: vfoHz, centerHz: centerHz, mode: mode, bandwidthHz: bandwidthHz, upconverter: upconverter,
                                  hardware: hardware, spectrum: spectrum, dbMin: dbMin, dbMax: dbMax, colormap: colormap,
                                  showBookmarks: showBookmarks, volume: volume, agcSpeed: agcSpeed, cwPitchHz: cwPitchHz,
-                                 preferredSource: preferredSource == .file ? .sdrplay : preferredSource)
+                                 preferredSource: preferredSource == .file ? .sdrplay : preferredSource,
+                                 modemBox: modem.box, modemSettings: modem.settings)
         guard let data = try? JSONEncoder().encode(state), data != lastSavedSession else { return }
         defaults.set(data, forKey: "session")
         lastSavedSession = data
@@ -591,6 +743,7 @@ final class AppModel {
         upconverter = s.upconverter; hardware = s.hardware; spectrum = s.spectrum
         dbMin = s.dbMin; dbMax = s.dbMax; colormap = s.colormap; showBookmarks = s.showBookmarks
         volume = s.volume; agcSpeed = s.agcSpeed; cwPitchHz = s.cwPitchHz; preferredSource = s.preferredSource
+        modem = ModemControl(box: s.modemBox ?? modem.box, settings: s.modemSettings ?? modem.settings)
         lastSavedSession = data
     }
 }
