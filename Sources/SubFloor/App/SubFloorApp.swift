@@ -22,8 +22,39 @@ struct SubFloorApp: App {
                 .environment(model)
                 .preferredColorScheme(scheme)
                 .tint(Theme.accent)
-                .onAppear { NSApp.activate() }
+                .onAppear {
+                    KeyboardController.shared.install(model: model)
+                    NSApp.activate()
+                }
         }
         .defaultSize(width: 1440, height: 900)
+        .commands { RadioCommands(model: model) }
+
+        Settings {
+            SettingsView()
+                .environment(model)
+                .preferredColorScheme(scheme)
+        }
+    }
+}
+
+struct RadioCommands: Commands {
+    let model: AppModel
+
+    var body: some Commands {
+        CommandMenu("Radio") {
+            Button(model.isRunning ? "Stop" : "Run") { model.toggleRun() }.keyboardShortcut("r")
+            Button("Quick Tune…") { model.quickTuneVisible = true }.keyboardShortcut("l")
+            Divider()
+            Button("Add Bookmark") { model.addBookmark() }.keyboardShortcut("d")
+            Button(model.showBookmarks ? "Hide Bookmarks on Spectrum" : "Show Bookmarks on Spectrum") {
+                model.showBookmarks.toggle()
+            }
+            .keyboardShortcut("b")
+            Divider()
+            Button("Toggle HamItUp") { model.setUpconverter(!model.upconverter.enabled) }.keyboardShortcut("u")
+            Button("Open IQ Recording…") { model.openIQFile() }.keyboardShortcut("o")
+            Button("Reset Zoom") { model.resetView() }.keyboardShortcut("0")
+        }
     }
 }
