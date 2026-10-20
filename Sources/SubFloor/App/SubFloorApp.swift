@@ -1,5 +1,6 @@
 import AppKit
 import DSPCore
+import MetalKit
 import SwiftUI
 
 @main
@@ -10,8 +11,8 @@ struct SubFloorApp: App {
 
     var body: some Scene {
         WindowGroup("SubFloor") {
-            Text("Engine smoke test — you should hear a 1 kHz USB tone (14.200 MHz demo signal).")
-                .padding(40)
+            SmokeSpectrum(frames: engine.engine.frames)
+                .frame(minWidth: 900, minHeight: 500)
                 .onAppear { engine.start() }
         }
     }
@@ -30,4 +31,19 @@ final class EngineSmokeTest {
             print("Engine start failed: \(error)")
         }
     }
+}
+
+struct SmokeSpectrum: NSViewRepresentable {
+    let frames: SpectrumFrameStore
+    final class Coordinator { var renderer: SpectrumRenderer? }
+    func makeCoordinator() -> Coordinator { Coordinator() }
+    func makeNSView(context: Context) -> SpectrumMTKView {
+        let view = SpectrumMTKView(frame: .zero, device: MTLCreateSystemDefaultDevice())
+        view.colorPixelFormat = .bgra8Unorm
+        view.preferredFramesPerSecond = 120
+        context.coordinator.renderer = SpectrumRenderer(device: view.device!, frames: frames)
+        view.delegate = context.coordinator.renderer
+        return view
+    }
+    func updateNSView(_ view: SpectrumMTKView, context: Context) {}
 }
