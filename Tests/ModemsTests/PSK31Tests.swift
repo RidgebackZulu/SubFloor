@@ -22,6 +22,33 @@ private func run(_ decoder: any SignalDecoder, _ audio: [Float], chunk: Int = 1_
     return out
 }
 
+/// Results of parallel jobs, filled under a lock.
+private final class ResultBox<T>: @unchecked Sendable {
+    var items: [T?]
+    let lock = NSLock()
+    init(_ n: Int) { items = Array(repeating: nil, count: n) }
+}
+
+/// Runs `count` independent jobs on all cores and returns their results in order.
+private func parallel<T>(_ count: Int, _ job: @Sendable (Int) -> T) -> [T] {
+    let box = ResultBox<T>(count)
+    DispatchQueue.concurrentPerform(iterations: count) { i in
+        let r = job(i)
+        box.lock.lock(); box.items[i] = r; box.lock.unlock()
+    }
+    return box.items.map { $0! }
+}
+
+/// Decodes and also reports whether the decoder ever showed QPSK31.
+private func runWatchingMode(_ decoder: any SignalDecoder, _ audio: [Float]) -> (String, Bool) {
+    var out = "", sawQPSK = false
+    for start in stride(from: 0, to: audio.count, by: 1_024) {
+        audio[start..<min(start + 1_024, audio.count)].withUnsafeBufferPointer { out += decoder.process($0) }
+        if decoder.submode == "QPSK31" { sawQPSK = true }
+    }
+    return (out, sawQPSK)
+}
+
 private func trimmed(_ s: String) -> String { s.trimmingCharacters(in: .whitespacesAndNewlines) }
 
 private func accuracy(_ received: String) -> Double {
@@ -125,13 +152,20 @@ private func accuracy(_ received: String) -> Double {
     #expect(PSK31Modem.id == .psk31)
 }
 
+/// R14: every transmission must decode exactly at +10 dB, including its first character (held-out
+/// seeds; tuned on 1...80 and 100...199).
 @Test func bpskCleanDecode() {
     let clear = PSK31Encoder.audio(text: text, frequencyHz: 1_500, leadInSeconds: leadIn)
-    let audio = ModemTestSignals.awgn(clear, snrDb: 10, seed: 3, signalPower: burstPower(clear))
-    let decoder = PSK31Modem.makeDecoder(frequencyHz: 1_500, sampleRate: 12_000)
-    let out = run(decoder, audio)
-    #expect(accuracy(out) == 1.0, "got '\(out)'")
-    #expect(decoder.submode == "BPSK31")
+    let power = burstPower(clear)
+    let results = parallel(20) { i in
+        let audio = ModemTestSignals.awgn(clear, snrDb: 10, seed: UInt64(4001 + i), signalPower: power)
+        let decoder = PSK31Modem.makeDecoder(frequencyHz: 1_500, sampleRate: 12_000)
+        return (run(decoder, audio), decoder.submode)
+    }
+    for (i, (out, submode)) in results.enumerated() {
+        #expect(accuracy(out) == 1.0, "seed \(4001 + i): '\(out)'")
+        #expect(submode == "BPSK31")
+    }
 }
 
 /// R10: the -10 dB gate is the mean over held-out seeds; parameters were tuned on seeds 1...80 only.
@@ -148,17 +182,38 @@ private func accuracy(_ received: String) -> Double {
     #expect(mean >= 0.95, "mean accuracy \(mean)")
 }
 
+/// The decoder is not told the mode; every transmission must decode exactly (held-out seeds).
 @Test func qpskCleanDecode() {
     let clear = PSK31Encoder.audio(text: text, frequencyHz: 1_200, qpsk: true, leadInSeconds: leadIn)
-    let audio = ModemTestSignals.awgn(clear, snrDb: 10, seed: 4, signalPower: burstPower(clear))
-    let decoder = PSK31Modem.makeDecoder(frequencyHz: 1_200, sampleRate: 12_000)
-    let out = run(decoder, audio)
-    #expect(accuracy(out) == 1.0, "got '\(out)'")
-    #expect(decoder.submode == "QPSK31")
+    let power = burstPower(clear)
+    let results = parallel(20) { i in
+        let audio = ModemTestSignals.awgn(clear, snrDb: 10, seed: UInt64(4101 + i), signalPower: power)
+        let decoder = PSK31Modem.makeDecoder(frequencyHz: 1_200, sampleRate: 12_000)
+        return (run(decoder, audio), decoder.submode)
+    }
+    for (i, (out, submode)) in results.enumerated() {
+        #expect(accuracy(out) == 1.0, "seed \(4101 + i): '\(out)'")
+        #expect(submode == "QPSK31")
+    }
+}
+
+/// QPSK sent with the opposite phase sense (an LSB transmission received on USB) decodes too.
+@Test func invertedSenseQPSKDecodes() {
+    let clear = PSK31Encoder.audio(text: text, qpsk: true, leadInSeconds: leadIn, frequencyAt: { _ in 1_200 },
+                                   invertedSense: true)
+    let power = burstPower(clear)
+    let results = parallel(10) { i in
+        let audio = ModemTestSignals.awgn(clear, snrDb: 10, seed: UInt64(4201 + i), signalPower: power)
+        let decoder = PSK31Modem.makeDecoder(frequencyHz: 1_200, sampleRate: 12_000)
+        return (run(decoder, audio), decoder.submode)
+    }
+    let mean = results.map { accuracy($0.0) }.reduce(0, +) / Double(results.count)
+    #expect(mean >= 0.95, "mean \(mean); first '\(results[0].0)'")
+    #expect(results.allSatisfy { $0.1 == "QPSK31" })
 }
 
 /// The carrier drifts 0.5 Hz/s for 40 s: 20 Hz in all, from 10 Hz below the decoder's frequency to
-/// 10 Hz above, so the whole drift stays inside the ±15 Hz PSK31 lock range.
+/// 10 Hz above, so the whole drift stays inside the ±15 Hz PSK31 lock range. Held-out seeds.
 @Test func afcTracksDrift() {
     let rate = 12_000.0
     var sent = ""
@@ -167,24 +222,46 @@ private func accuracy(_ received: String) -> Double {
         sent += (sent.isEmpty ? "" : " ") + text
     }
     let start = 1_490.0, drift = 0.5
-    let clear = PSK31Encoder.audio(text: sent, frequencyHz: start, leadInSeconds: leadIn,
+    let clear = PSK31Encoder.audio(text: sent, leadInSeconds: leadIn,
                                    frequencyAt: { t in start + drift * min(max(t - leadIn, 0), 40) })
     #expect(Double(clear.count) / rate >= 40 + leadIn)
-    let audio = ModemTestSignals.awgn(clear, snrDb: 5, seed: 5, signalPower: burstPower(clear))
-    let out = run(PSK31Modem.makeDecoder(frequencyHz: 1_500, sampleRate: rate), audio)
-    let acc = ModemTestSignals.characterAccuracy(sent: sent, received: trimmed(out))
-    #expect(acc >= 0.95, "accuracy \(acc), got '\(out)'")
+    let power = burstPower(clear)
+    let accs = parallel(12) { [sent] i in
+        let audio = ModemTestSignals.awgn(clear, snrDb: 5, seed: UInt64(5001 + i), signalPower: power)
+        let out = run(PSK31Modem.makeDecoder(frequencyHz: 1_500, sampleRate: rate), audio)
+        return ModemTestSignals.characterAccuracy(sent: sent, received: trimmed(out))
+    }
+    let mean = accs.reduce(0, +) / Double(accs.count)
+    #expect(mean >= 0.95, "mean \(mean), all \(accs)")
 }
 
 /// The AFC is unambiguous across the lock range: the decoder starts 12 Hz off either way.
 @Test(arguments: [-12.0, 12.0])
 func afcAcquiresAtLockRangeEdge(_ offset: Double) {
     let clear = PSK31Encoder.audio(text: text, frequencyHz: 1_000 + offset, leadInSeconds: leadIn)
-    let audio = ModemTestSignals.awgn(clear, snrDb: 10, seed: 6, signalPower: burstPower(clear))
-    let decoder = PSK31Modem.makeDecoder(frequencyHz: 1_000, sampleRate: 12_000)
-    let out = run(decoder, audio)
-    #expect(accuracy(out) >= 0.95, "got '\(out)'")
-    #expect(abs(decoder.frequencyHz - (1_000 + offset)) < 0.5, "locked at \(decoder.frequencyHz)")
+    let power = burstPower(clear)
+    let results = parallel(10) { i in
+        let audio = ModemTestSignals.awgn(clear, snrDb: 10, seed: UInt64(5201 + i), signalPower: power)
+        let decoder = PSK31Modem.makeDecoder(frequencyHz: 1_000, sampleRate: 12_000)
+        return (accuracy(run(decoder, audio)), decoder.frequencyHz)
+    }
+    let mean = results.map(\.0).reduce(0, +) / Double(results.count)
+    #expect(mean >= 0.95, "mean \(mean)")
+    for (_, f) in results { #expect(abs(f - (1_000 + offset)) < 0.5, "locked at \(f)") }
+}
+
+/// BPSK about Rs/4 off (where the fourth-power loop aliases) must never be taken for QPSK.
+@Test(arguments: [-8.0, 8.0])
+func bpskQuarterRateOffNeverQPSK(_ offset: Double) {
+    let clear = PSK31Encoder.audio(text: text, frequencyHz: 1_500 + offset, leadInSeconds: leadIn)
+    let power = burstPower(clear)
+    let results = parallel(20) { i in
+        let audio = ModemTestSignals.awgn(clear, snrDb: 5, seed: UInt64(5101 + i), signalPower: power)
+        return runWatchingMode(PSK31Modem.makeDecoder(frequencyHz: 1_500, sampleRate: 12_000), audio)
+    }
+    #expect(results.filter(\.1).count == 0, "QPSK31 reported in \(results.filter(\.1).count) of 20")
+    let mean = results.map { accuracy($0.0) }.reduce(0, +) / Double(results.count)
+    #expect(mean >= 0.95, "mean \(mean)")
 }
 
 @Test func noiseSquelch() {
@@ -196,9 +273,10 @@ func afcAcquiresAtLockRangeEdge(_ offset: Double) {
     }
 }
 
-@Test func constellationClusters() {
+@Test(arguments: [UInt64(4301), 4302, 4303])
+func constellationClusters(_ seed: UInt64) {
     let clear = PSK31Encoder.audio(text: text, frequencyHz: 1_500, leadInSeconds: leadIn)
-    let audio = ModemTestSignals.awgn(clear, snrDb: 10, seed: 7, signalPower: burstPower(clear))
+    let audio = ModemTestSignals.awgn(clear, snrDb: 10, seed: seed, signalPower: burstPower(clear))
     let decoder = PSK31Modem.makeDecoder(frequencyHz: 1_500, sampleRate: 12_000)
     _ = run(decoder, audio)
     let points = decoder.constellation()
@@ -248,13 +326,35 @@ private let otherText = "CQ CQ CQ DE G3PLX G3PLX K RRR TU 73 ES GL QRZ? 599 5NN 
 @Test func strongNeighbour80HzAway() {
     let wanted = PSK31Encoder.audio(text: text, frequencyHz: 1_500, leadInSeconds: leadIn)
     let neighbour = PSK31Encoder.audio(text: otherText, frequencyHz: 1_580, leadInSeconds: 0.3)
-    var total = 0.0
-    for seed in UInt64(1001)...1005 {
-        let audio = ModemTestSignals.awgn(mixed(wanted, neighbour, gainDb: 20), snrDb: 10, seed: seed,
-                                          signalPower: burstPower(wanted))
-        total += accuracy(run(PSK31Modem.makeDecoder(frequencyHz: 1_500, sampleRate: 12_000), audio))
+    let power = burstPower(wanted)
+    let accs = parallel(10) { i in
+        let audio = ModemTestSignals.awgn(mixed(wanted, neighbour, gainDb: 20), snrDb: 10, seed: UInt64(1001 + i),
+                                          signalPower: power)
+        return accuracy(run(PSK31Modem.makeDecoder(frequencyHz: 1_500, sampleRate: 12_000), audio))
     }
-    #expect(total / 5 >= 0.95, "mean accuracy \(total / 5)")
+    let mean = accs.reduce(0, +) / Double(accs.count)
+    #expect(mean >= 0.95, "mean accuracy \(mean)")
+}
+
+/// The user's main case: a neighbour 10 dB stronger 50 Hz away, the wanted signal at +5 dB. The
+/// wanted text decodes and none of the neighbour's leaks in (held-out seeds; tuned on 1...80).
+@Test(arguments: [-50.0, 50.0])
+func neighbour50HzAway(_ offset: Double) {
+    let wanted = PSK31Encoder.audio(text: text, frequencyHz: 1_500, leadInSeconds: leadIn)
+    let neighbour = PSK31Encoder.audio(text: otherText, frequencyHz: 1_500 + offset, leadInSeconds: 0.3)
+    let power = burstPower(wanted)
+    let outs = parallel(20) { i in
+        let audio = ModemTestSignals.awgn(mixed(wanted, neighbour, gainDb: 10), snrDb: 5, seed: UInt64(3001 + i),
+                                          signalPower: power)
+        return run(PSK31Modem.makeDecoder(frequencyHz: 1_500, sampleRate: 12_000), audio)
+    }
+    let mean = outs.map(accuracy).reduce(0, +) / Double(outs.count)
+    #expect(mean >= 0.95, "mean accuracy \(mean)")
+    for out in outs {
+        for word in ["G3PLX", "KENDAL", "PETER", "QTH", "NAME", "RRR"] {
+            #expect(!out.contains(word), "neighbour text in '\(out)'")
+        }
+    }
 }
 
 /// A decoder parked beside a signal it cannot lock (outside ±15 Hz) must stay silent, not decode a
@@ -269,26 +369,36 @@ func silentBesideSignalOutsideLockRange(_ offset: Double) {
     }
 }
 
-/// CW (a keyed carrier) on a PSK31 decoder must not spill garbage.
-@Test(arguments: [15.0, 20.0, 30.0])
-func silentOnCW(_ wpm: Double) {
+/// CW (a keyed carrier) on a PSK31 decoder must not spill garbage, at any speed or SNR: at most 2
+/// characters in total over every run (held-out seeds; tuned on 1...40).
+@Test func silentOnCW() {
     let rate = 12_000.0
-    let unit = Int(MorseCode.dotSeconds(wpm: wpm) * rate)
-    var keyed: [Bool] = []
-    for _ in 0..<4 {
-        for e in MorseCode.timeline(for: "CQ CQ DE W1AW W1AW K TEST 5NN ") { keyed += Array(repeating: e.on, count: e.units * unit) }
+    let cases: [(wpm: Double, snr: Double)] = [15.0, 20, 25, 30, 40, 50].flatMap { w in
+        [10.0, 0, -5].map { (wpm: w, snr: $0) }
     }
-    let cw = keyed.enumerated().map { i, on in on ? Float(0.5 * sin(2 * Double.pi * 1_500 * Double(i) / rate)) : 0 }
-    for seed in UInt64(1)...3 {
-        let audio = ModemTestSignals.awgn(cw, snrDb: 10, seed: seed, signalPower: 0.5 * 0.5 / 2)
-        let out = run(PSK31Modem.makeDecoder(frequencyHz: 1_500, sampleRate: rate), audio)
-        #expect(out.filter { !$0.isWhitespace }.count <= 2, "seed \(seed): '\(out)'")
+    let seeds = 6
+    let outs = parallel(cases.count * seeds) { i in
+        let (wpm, snr) = cases[i / seeds]
+        let unit = Int(MorseCode.dotSeconds(wpm: wpm) * rate)
+        var keyed = [Bool](repeating: false, count: Int(rate * 0.5))
+        while keyed.count < Int(20 * rate) {
+            for e in MorseCode.timeline(for: "CQ CQ DE W1AW W1AW K TEST 5NN ") {
+                keyed += Array(repeating: e.on, count: e.units * unit)
+            }
+        }
+        let cw = keyed.enumerated().map { j, on in on ? Float(0.5 * sin(2 * Double.pi * 1_500 * Double(j) / rate)) : 0 }
+        let audio = ModemTestSignals.awgn(cw, snrDb: snr, seed: UInt64(7001 + i % seeds), signalPower: 0.5 * 0.5 / 2)
+        return run(PSK31Modem.makeDecoder(frequencyHz: 1_500, sampleRate: rate), audio)
     }
+    let total = outs.map { $0.count }.reduce(0, +)
+    let noisy = zip(cases.flatMap { c in Array(repeating: c, count: seeds) }, outs).filter { !$0.1.isEmpty }
+    #expect(total <= 2, "\(total) characters: \(noisy.map { "\($0.0): '\($0.1)'" })")
 }
 
-@Test func chunkSizeIndependent() {
+@Test(arguments: [UInt64(4401), 4402, 4403])
+func chunkSizeIndependent(_ seed: UInt64) {
     let clear = PSK31Encoder.audio(text: text, frequencyHz: 1_500, leadInSeconds: leadIn)
-    let audio = ModemTestSignals.awgn(clear, snrDb: 0, seed: 8, signalPower: burstPower(clear))
+    let audio = ModemTestSignals.awgn(clear, snrDb: 0, seed: seed, signalPower: burstPower(clear))
     let a = run(PSK31Modem.makeDecoder(frequencyHz: 1_500, sampleRate: 12_000), audio, chunk: 37)
     let b = run(PSK31Modem.makeDecoder(frequencyHz: 1_500, sampleRate: 12_000), audio, chunk: 4_096)
     #expect(a == b)

@@ -53,3 +53,33 @@ public enum Varicode {
     /// ASCII for a code given as its bit value (MSB = first bit sent), or nil.
     static func decode(value: UInt32) -> UInt8? { byValue[value] }
 }
+
+/// Collects Varicode bits into characters: a character ends at "00".
+struct VaricodeAssembler {
+    private var code: UInt32 = 0
+    private var length = 0
+    private var zeros = 0
+    private var start = 0
+
+    struct Character { var ascii: UInt8; var start: Int; var end: Int }
+
+    mutating func push(_ bit: Bool, symbol: Int) -> Character? {
+        if bit {
+            if length == 0 { start = symbol }
+            if zeros == 1 && length > 0 { appendBit(0) }
+            zeros = 0
+            appendBit(1)
+            return nil
+        }
+        zeros += 1
+        guard zeros == 2, length > 0 else { return nil }
+        defer { code = 0; length = 0 }
+        guard length <= Varicode.maxLength, let ascii = Varicode.decode(value: code) else { return nil }
+        return Character(ascii: ascii, start: start, end: symbol)
+    }
+
+    private mutating func appendBit(_ b: UInt32) {
+        length += 1
+        if length <= Varicode.maxLength { code = code << 1 | b }
+    }
+}

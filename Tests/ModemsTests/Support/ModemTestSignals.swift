@@ -14,9 +14,11 @@ enum ModemTestSignals {
     /// variance. Deterministic for a given `seed`.
     ///
     /// SNR convention (controller ruling R7, the WSJT convention used by every decode test):
-    /// - **Signal power** is the steady in-burst power of the signal: `amplitude²/2` for a tone or
-    ///   any constant-envelope mode (PSK31 idle, RTTY, FT8, WSPR), and the key-down power for CW.
-    ///   It is never the duty-cycle-diluted mean square of a buffer that contains gaps.
+    /// - **Signal power** is the steady in-burst power of the signal: `amplitude²/2` for a tone or a
+    ///   constant-envelope mode (RTTY, FT8, WSPR), and the key-down power for CW. PSK31 is not
+    ///   constant-envelope (its amplitude dips at every phase reversal), so its reference is the mean
+    ///   burst power, the mean square while it transmits (ruling R12). It is never the
+    ///   duty-cycle-diluted mean square of a buffer that contains gaps.
     /// - **Noise** is the noise power falling in a 2.5 kHz bandwidth.
     /// - When `signalPower` is nil, Psignal is the mean square of `x`. That is only correct when `x`
     ///   is the signal alone with no silence or padding. Callers **must** pass `signalPower`
