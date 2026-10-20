@@ -55,3 +55,54 @@ import Foundation
     #expect(!s.audioWide)
     #expect(s.slotModesEnabled)
 }
+
+@Test func noiseIsPureGaussianWithRequestedSigma() {
+    let fs = 12_000.0
+    let n = ModemTestSignals.noise(seconds: 10, sigma: 0.05, seed: 3, sampleRate: fs)
+    #expect(n.count == 120_000)
+    let mean = n.reduce(0.0) { $0 + Double($1) } / Double(n.count)
+    let variance = n.reduce(0.0) { $0 + (Double($1) - mean) * (Double($1) - mean) } / Double(n.count)
+    #expect(abs(mean) < 0.001)
+    #expect(abs(variance.squareRoot() - 0.05) / 0.05 < 0.01)
+    // Roughly Gaussian: about 4.55% of samples beyond 2σ.
+    let beyond2Sigma = Double(n.filter { abs($0) > 0.1 }.count) / Double(n.count)
+    #expect(abs(beyond2Sigma - 0.0455) < 0.003)
+    // Default sigma, determinism and seed sensitivity.
+    #expect(ModemTestSignals.noise(seconds: 0.5, seed: 9) == ModemTestSignals.noise(seconds: 0.5, sigma: 0.05, seed: 9))
+    #expect(ModemTestSignals.noise(seconds: 0.5, seed: 9) != ModemTestSignals.noise(seconds: 0.5, seed: 10))
+}
+
+@Test func awgnOnSilenceWithoutSignalPowerIsSilent() {
+    // Documents the pitfall ruling R7 closes: the mean square of zeros is zero, so no noise is added.
+    let silent = ModemTestSignals.awgn([Float](repeating: 0, count: 1_000), snrDb: 0, seed: 1)
+    #expect(silent.allSatisfy { $0 == 0 })
+}
+
+@Test func awgnSignalPowerOverridesBufferMeanSquare() {
+    let fs = 12_000.0
+    let amplitude: Float = 0.5
+    // 2 s tone followed by 8 s of silence: the buffer mean square is a fifth of the in-burst power.
+    let burst = ModemTestSignals.tone(1_000, seconds: 2, amplitude: amplitude, sampleRate: fs)
+    let padded = burst + [Float](repeating: 0, count: Int(8 * fs))
+    let inBurstPower = Double(amplitude * amplitude) / 2
+    let noisy = ModemTestSignals.awgn(padded, snrDb: -10, sampleRate: fs, seed: 5, signalPower: inBurstPower)
+
+    var pNoise = 0.0
+    for i in 0..<padded.count {
+        let n = Double(noisy[i] - padded[i])
+        pNoise += n * n
+    }
+    pNoise /= Double(padded.count)
+    let measured = 10 * log10(inBurstPower / (pNoise * 2_500 / (fs / 2)))
+    #expect(abs(measured - -10) < 0.3)
+
+    // Without the override the noise would be scaled to the diluted mean square, 10·log10(5) ≈ 7 dB lower.
+    let diluted = ModemTestSignals.awgn(padded, snrDb: -10, sampleRate: fs, seed: 5)
+    var pDiluted = 0.0
+    for i in 0..<padded.count {
+        let n = Double(diluted[i] - padded[i])
+        pDiluted += n * n
+    }
+    pDiluted /= Double(padded.count)
+    #expect(abs(10 * log10(pNoise / pDiluted) - 10 * log10(5)) < 0.3)
+}

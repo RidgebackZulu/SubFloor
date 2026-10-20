@@ -10,15 +10,41 @@ enum ModemTestSignals {
 
     /// Adds white Gaussian noise so that the signal-to-noise ratio measured in a
     /// 2.5 kHz bandwidth equals `snrDb`:
-    /// `10·log10(Psignal / (σ²·2500/(fs/2))) == snrDb`, where Psignal is the mean
-    /// square of `x` and σ² the per-sample noise variance. Deterministic for a given `seed`.
-    static func awgn(_ x: [Float], snrDb: Double, sampleRate: Double = 12_000, seed: UInt64) -> [Float] {
+    /// `10·log10(Psignal / (σ²·2500/(fs/2))) == snrDb`, where σ² is the per-sample noise
+    /// variance. Deterministic for a given `seed`.
+    ///
+    /// SNR convention (controller ruling R7, the WSJT convention used by every decode test):
+    /// - **Signal power** is the steady in-burst power of the signal: `amplitude²/2` for a tone or
+    ///   any constant-envelope mode (PSK31 idle, RTTY, FT8, WSPR), and the key-down power for CW.
+    ///   It is never the duty-cycle-diluted mean square of a buffer that contains gaps.
+    /// - **Noise** is the noise power falling in a 2.5 kHz bandwidth.
+    /// - When `signalPower` is nil, Psignal is the mean square of `x`. That is only correct when `x`
+    ///   is the signal alone with no silence or padding. Callers **must** pass `signalPower`
+    ///   whenever the buffer contains silence, padding, keying gaps or several signals.
+    /// - Calling this on an all-zero buffer without `signalPower` adds no noise at all. Use
+    ///   `noise(seconds:sigma:seed:sampleRate:)` for noise-only input.
+    static func awgn(_ x: [Float], snrDb: Double, sampleRate: Double = 12_000, seed: UInt64,
+                     signalPower: Double? = nil) -> [Float] {
         guard !x.isEmpty else { return x }
-        let pSignal = x.reduce(0.0) { $0 + Double($1) * Double($1) } / Double(x.count)
+        let pSignal = signalPower ?? x.reduce(0.0) { $0 + Double($1) * Double($1) } / Double(x.count)
         let sigma2 = pSignal / pow(10, snrDb / 10) * (sampleRate / 2) / 2_500
-        let sigma = sigma2.squareRoot()
-        var rng = SplitMix64(seed: seed)
         var out = x
+        addGaussian(into: &out, sigma: sigma2.squareRoot(), seed: seed)
+        return out
+    }
+
+    /// Pure white Gaussian noise with standard deviation `sigma` per sample. Every noise-only
+    /// test must use this (ruling R7): `awgn` on zeros is silence and makes the test vacuous.
+    /// Deterministic for a given `seed`.
+    static func noise(seconds: Double, sigma: Float = 0.05, seed: UInt64, sampleRate: Double = 12_000) -> [Float] {
+        var out = [Float](repeating: 0, count: Int(seconds * sampleRate))
+        addGaussian(into: &out, sigma: Double(sigma), seed: seed)
+        return out
+    }
+
+    /// Adds N(0, sigma²) to every element, using Box-Muller pairs from a SplitMix64 stream.
+    private static func addGaussian(into out: inout [Float], sigma: Double, seed: UInt64) {
+        var rng = SplitMix64(seed: seed)
         var i = 0
         while i < out.count {
             // Box-Muller yields two independent normals per pair of uniforms.
@@ -28,7 +54,6 @@ enum ModemTestSignals {
             if i + 1 < out.count { out[i + 1] += Float(sigma * r * sin(theta)) }
             i += 2
         }
-        return out
     }
 
     /// `1 − levenshtein(sent, received) / sent.count`, clamped to ≥ 0.
