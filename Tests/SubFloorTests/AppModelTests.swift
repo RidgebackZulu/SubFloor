@@ -91,7 +91,7 @@ struct AppModelTests {
         let m = makeModel(dir: dir)
         #expect(m.bookmarks == BookmarkStore.defaults)
         #expect(m.banner?.kind == .error)
-        #expect(m.banner?.message == "The bookmarks file is unreadable and could not be backed up. Defaults are shown; saving will overwrite the file.")
+        #expect(m.banner?.message == "The bookmarks file is unreadable and could not be backed up. Changes to bookmarks will not be saved until the file is fixed or removed.")
 
         m.banner = nil
         m.addBookmark()
@@ -100,5 +100,24 @@ struct AppModelTests {
         #expect(m.banner?.message.hasPrefix("The bookmarks file is unreadable and could not be backed up") == true)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path)
         #expect(try Data(contentsOf: file) == garbage)
+    }
+
+    @Test func infoBannerDoesNotReplaceError() throws {
+        let dir = tempDir()
+        try Data("not json".utf8).write(to: dir.appendingPathComponent("bookmarks.json"))
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: dir.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dir.path) }
+        let m = makeModel(dir: dir)
+        #expect(m.banner?.kind == .error)
+        m.setVFO(20_000) // below 50 kHz: would raise an info banner via retune
+        #expect(m.banner?.kind == .error)
+    }
+
+    @Test func upconverterChangeReclampsVFOAndCenter() {
+        let m = makeModel()
+        m.setVFO(1_950_000_000)
+        m.setUpconverter(true)
+        #expect(m.vfoHz <= 1_875_000_000)
+        #expect(abs(m.vfoHz - m.centerHz) <= m.sampleRate * 0.45)
     }
 }

@@ -106,9 +106,9 @@ final class AppModel {
         bookmarks = loaded
         switch result {
         case .recoveredFromCorrupt:
-            banner = Banner(kind: .warning, message: "The bookmarks file was unreadable. It was backed up as bookmarks.corrupt-<timestamp>.json and the defaults were restored.")
+            show(Banner(kind: .warning, message: "The bookmarks file was unreadable. It was backed up as bookmarks.corrupt-<timestamp>.json and the defaults were restored."))
         case .corruptNotPreserved:
-            banner = Banner(kind: .error, message: Self.bookmarksBlockedMessage)
+            show(Banner(kind: .error, message: Self.bookmarksBlockedMessage))
             bookmarksSaveBlocked = true
         case .loaded, .createdDefaults:
             break
@@ -160,6 +160,13 @@ final class AppModel {
 
     private func pushReceiver() { engine.update(receiver: receiverConfig) }
 
+    /// Shows `new` unless it would hide a more severe banner that is already up (error > warning > info).
+    private func show(_ new: Banner) {
+        func rank(_ k: Banner.Kind) -> Int { switch k { case .info: 0; case .warning: 1; case .error: 2 } }
+        if let current = banner, rank(new.kind) < rank(current.kind) { return }
+        banner = new
+    }
+
     // MARK: Run control
 
     func toggleRun() { isRunning ? stop() : start() }
@@ -170,13 +177,13 @@ final class AppModel {
         if kind == .sdrplay && sdrplay == nil {
             do {
                 let device = try SDRplayDevice.open()
-                device.onEvent = { [weak self] event in
-                    guard let self else { return }
-                    Task { @MainActor in self.handle(event) }
+                device.onEvent = { [weak self, weak device] event in
+                    guard let self, let device else { return }
+                    Task { @MainActor in self.handle(event, from: device) }
                 }
                 sdrplay = device
             } catch {
-                banner = Banner(kind: .warning, message: "No RSP found — demo signal. \(error)", action: .retry)
+                show(Banner(kind: .warning, message: "No RSP found — demo signal. \(error)", action: .retry))
                 kind = .synthetic
             }
         }
@@ -185,7 +192,7 @@ final class AppModel {
 
         switch kind {
         case .sdrplay:
-            do { try sdrplay?.apply(hardware) } catch { banner = Banner(kind: .error, message: "\(error)") }
+            do { try sdrplay?.apply(hardware) } catch { show(Banner(kind: .error, message: "\(error)")) }
         case .synthetic:
             synthetic.setSampleRate(hardware.outputRate)
         case .file:
@@ -202,7 +209,7 @@ final class AppModel {
             isRunning = true
             deviceName = activeSource.name
         } catch {
-            banner = Banner(kind: .error, message: "Could not start: \(error)", action: .retry)
+            show(Banner(kind: .error, message: "Could not start: \(error)", action: .retry))
         }
     }
 
@@ -252,7 +259,7 @@ final class AppModel {
             vfoHz = center
             start()
         } catch {
-            banner = Banner(kind: .error, message: "Could not open \(url.lastPathComponent): \(error)")
+            show(Banner(kind: .error, message: "Could not open \(url.lastPathComponent): \(error)"))
         }
     }
 
@@ -262,11 +269,12 @@ final class AppModel {
         return Double(match.1)
     }
 
-    private func handle(_ event: SDRplayEvent) {
+    private func handle(_ event: SDRplayEvent, from device: SDRplayDevice) {
+        guard device === sdrplay else { return }
         switch event {
         case .overload(let detected):
             if detected {
-                banner = Banner(kind: .warning, message: "ADC overload — reduce gain.", action: .reduceGain)
+                show(Banner(kind: .warning, message: "ADC overload — reduce gain.", action: .reduceGain))
             } else if banner?.action == .reduceGain {
                 banner = nil
             }
@@ -274,7 +282,7 @@ final class AppModel {
             stop()
             sdrplay?.close()
             sdrplay = nil
-            banner = Banner(kind: .error, message: event == .deviceRemoved ? "RSP1B disconnected." : "RSP1B reported a failure.", action: .retry)
+            show(Banner(kind: .error, message: event == .deviceRemoved ? "RSP1B disconnected." : "RSP1B reported a failure.", action: .retry))
         case .gainChanged:
             break
         }
@@ -304,6 +312,7 @@ final class AppModel {
             hz = min(max(hz, centerHz - sampleRate * 0.45), centerHz + sampleRate * 0.45)
         } else if let newCenter = TuningPlanner.retuneIfNeeded(vfo: hz, center: centerHz, sampleRate: sampleRate) {
             centerHz = clampedCenter(newCenter)
+            vfoHz = hz
             retuneHardware()
             viewport.setCapture(centerHz: centerHz, spanHz: sampleRate)
         }
@@ -338,13 +347,28 @@ final class AppModel {
     func setUpconverter(_ enabled: Bool) {
         guard enabled != upconverter.enabled else { return }
         upconverter.enabled = enabled
-        centerHz = clampedCenter(centerHz)
-        retuneHardware()
+        resyncAfterUpconverterChange()
     }
 
     func setUpconverterLO(_ hz: Double) {
+        guard hz.isFinite, (1_000_000...1_900_000_000).contains(hz) else {
+            show(Banner(kind: .warning, message: "Upconverter LO must be between 1 MHz and 1.9 GHz."))
+            return
+        }
         upconverter.loHz = hz
+        resyncAfterUpconverterChange()
+    }
+
+    private func resyncAfterUpconverterChange() {
+        guard sourceKind != .file else { return }
+        centerHz = clampedCenter(centerHz)
+        vfoHz = clampedDisplay(vfoHz)
+        if let newCenter = TuningPlanner.retuneIfNeeded(vfo: vfoHz, center: centerHz, sampleRate: sampleRate) {
+            centerHz = clampedCenter(newCenter)
+        }
         retuneHardware()
+        viewport.setCapture(centerHz: centerHz, spanHz: sampleRate)
+        pushReceiver()
     }
 
     private func clampedDisplay(_ hz: Double) -> Double {
@@ -363,10 +387,10 @@ final class AppModel {
         do {
             try activeSource.setCenterFrequency(upconverter.hardware(fromDisplay: centerHz))
         } catch {
-            banner = Banner(kind: .error, message: "Tune failed: \(error)")
+            show(Banner(kind: .error, message: "Tune failed: \(error)"))
         }
         if !upconverter.enabled && vfoHz < 50_000 {
-            banner = Banner(kind: .info, message: "Below 50 kHz the RSP1B is weak — enable HamItUp if it is connected.")
+            show(Banner(kind: .info, message: "Below 50 kHz the RSP1B is weak — enable HamItUp if it is connected."))
         }
         let maxLNA = lnaStateCount - 1
         if hardware.lnaState > maxLNA { updateHardware { $0.lnaState = maxLNA } }
@@ -389,7 +413,7 @@ final class AppModel {
             }
             return
         }
-        do { try sdrplay?.apply(s) } catch { banner = Banner(kind: .error, message: "\(error)") }
+        do { try sdrplay?.apply(s) } catch { show(Banner(kind: .error, message: "\(error)")) }
     }
 
     // MARK: Spectrum interaction (never retunes except through setVFO)
@@ -449,7 +473,7 @@ final class AppModel {
             bookmarks += incoming.filter { !existing.contains($0.id) }
             saveBookmarks()
         } catch {
-            banner = Banner(kind: .error, message: "Import failed: \(error.localizedDescription)")
+            show(Banner(kind: .error, message: "Import failed: \(error.localizedDescription)"))
         }
     }
 
@@ -459,19 +483,19 @@ final class AppModel {
         panel.nameFieldStringValue = "SubFloor Bookmarks.json"
         guard panel.runModal() == .OK, let url = panel.url else { return }
         do { try BookmarkStore.write(bookmarks, to: url) } catch {
-            banner = Banner(kind: .error, message: "Export failed: \(error.localizedDescription)")
+            show(Banner(kind: .error, message: "Export failed: \(error.localizedDescription)"))
         }
     }
 
-    private static let bookmarksBlockedMessage = "The bookmarks file is unreadable and could not be backed up. Defaults are shown; saving will overwrite the file."
+    private static let bookmarksBlockedMessage = "The bookmarks file is unreadable and could not be backed up. Changes to bookmarks will not be saved until the file is fixed or removed."
 
     private func saveBookmarks() {
         if bookmarksSaveBlocked {
-            banner = Banner(kind: .error, message: Self.bookmarksBlockedMessage)
+            show(Banner(kind: .error, message: Self.bookmarksBlockedMessage))
             return
         }
         do { try bookmarkStore.save(bookmarks) } catch {
-            banner = Banner(kind: .error, message: "Could not save bookmarks: \(error.localizedDescription)")
+            show(Banner(kind: .error, message: "Could not save bookmarks: \(error.localizedDescription)"))
         }
     }
 
