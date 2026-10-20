@@ -43,8 +43,11 @@ public final class CWSignalDecoder: SignalDecoder {
     private static let settleSamples = 100
     private static let afcStepLimitHz = 2.0
     private static let afcGain = 0.3
-    /// Baseband samples between the two smoothed values whose phase difference measures frequency.
+    /// Baseband samples between the two smoothed values whose phase difference measures frequency:
+    /// the long lag is precise but ambiguous beyond +/- 1000/(2*30) = 16.7 Hz, so a short lag
+    /// (unambiguous to +/- 62 Hz, much noisier) picks which whole turn of phase the long lag means.
     private static let afcLag = 30
+    private static let afcShortLag = 8
 
     private var scratch: [DSPComplex] = []
     private var baseband: [DSPComplex] = []
@@ -69,6 +72,9 @@ public final class CWSignalDecoder: SignalDecoder {
     private var lagRe: Double = 0
     private var lagIm: Double = 0
     private var lagCount = 0
+    private var shortRe: Double = 0
+    private var shortIm: Double = 0
+    private var shortCount = 0
     private var windowSamples = 0
 
     public init(frequencyHz: Double, sampleRate: Double = 12_000) {
@@ -175,32 +181,47 @@ public final class CWSignalDecoder: SignalDecoder {
         return (coarse.magnitude, fine.magnitude)
     }
 
-    /// Gathers the phase advance of the smoothed baseband over `afcLag` samples, during strong key-down,
-    /// and once per second nudges the NCO. Longer lags on the smoothed signal measure frequency far more
-    /// precisely than sample-to-sample phase when the SNR is low.
+    /// Gathers the phase advance of the smoothed baseband over a short and a long lag, during strong
+    /// key-down, and once per second nudges the NCO. The long lag on the smoothed signal measures
+    /// frequency far more precisely than sample-to-sample phase when the SNR is low; the short lag
+    /// resolves its ambiguity, so the estimate is right over the whole CW lock range.
     private func accumulateAFC(coarseMean c: (re: Double, im: Double)) {
         let slot = afcHead
         afcHistory[slot] = c
         afcHead = (afcHead + 1) % afcHistory.count
-        let old = afcHistory[(slot + afcHistory.count - Self.afcLag) % afcHistory.count]
-        let cmag2 = c.re * c.re + c.im * c.im, omag2 = old.re * old.re + old.im * old.im
+        let size = afcHistory.count
         let strong = 0.36 * decoder.peakLevel * decoder.peakLevel
-        if decoder.signalPresent && cmag2 > strong && omag2 > strong {
-            // c[n] · conj(c[n-lag])
-            lagRe += c.re * old.re + c.im * old.im
-            lagIm += c.im * old.re - c.re * old.im
-            lagCount += 1
+        if decoder.signalPresent, c.re * c.re + c.im * c.im > strong {
+            let far = afcHistory[(slot + size - Self.afcLag) % size]
+            if far.re * far.re + far.im * far.im > strong {
+                // c[n] · conj(c[n-lag])
+                lagRe += c.re * far.re + c.im * far.im
+                lagIm += c.im * far.re - c.re * far.im
+                lagCount += 1
+            }
+            let near = afcHistory[(slot + size - Self.afcShortLag) % size]
+            if near.re * near.re + near.im * near.im > strong {
+                shortRe += c.re * near.re + c.im * near.im
+                shortIm += c.im * near.re - c.re * near.im
+                shortCount += 1
+            }
         }
         windowSamples += 1
         guard windowSamples >= Int(Self.basebandRate) else { return }
         if lagCount >= 40 {
-            let offsetHz = atan2(lagIm, lagRe) / (2 * .pi) * Self.basebandRate / Double(Self.afcLag)
+            let rate = Self.basebandRate
+            var offsetHz = atan2(lagIm, lagRe) / (2 * .pi) * rate / Double(Self.afcLag)
+            if shortCount >= 40 {
+                let coarseHz = atan2(shortIm, shortRe) / (2 * .pi) * rate / Double(Self.afcShortLag)
+                let ambiguity = rate / Double(Self.afcLag)
+                offsetHz += ((coarseHz - offsetHz) / ambiguity).rounded() * ambiguity
+            }
             let step = min(max(offsetHz * Self.afcGain, -Self.afcStepLimitHz), Self.afcStepLimitHz)
             let limit = ModeID.cw.lockRangeHz
             tunedHz = min(max(tunedHz + step, originHz - limit), originHz + limit)
             nco.setFrequency(-tunedHz, sampleRate: sampleRate)
         }
-        lagRe = 0; lagIm = 0; lagCount = 0; windowSamples = 0
+        lagRe = 0; lagIm = 0; lagCount = 0; shortRe = 0; shortIm = 0; shortCount = 0; windowSamples = 0
     }
 
     public func constellation() -> [SIMD2<Float>] { [] }
@@ -215,6 +236,6 @@ public final class CWSignalDecoder: SignalDecoder {
         settle = Self.settleSamples
         coarseSum = 0; fineSum = 0; blockCount = 0
         afcHistory = [(re: Double, im: Double)](repeating: (0, 0), count: 128); afcHead = 0
-        lagRe = 0; lagIm = 0; lagCount = 0; windowSamples = 0
+        lagRe = 0; lagIm = 0; lagCount = 0; shortRe = 0; shortIm = 0; shortCount = 0; windowSamples = 0
     }
 }

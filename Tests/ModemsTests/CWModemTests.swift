@@ -177,3 +177,15 @@ func shortElementsAfterLeadInKeepTheSpeed(_ leadIn: Double) {
     }
     #expect(total / 5 >= 0.95)
 }
+
+/// The AFC must be unambiguous over the whole CW lock range (25 Hz), not only the first 16.7 Hz.
+@Test(arguments: [(20.0, 20.0), (-20.0, 20.0), (25.0, 20.0), (-25.0, 20.0), (20.0, 30.0)])
+func afcPullsInFromTheEdgeOfTheLockRange(_ offsetHz: Double, _ wpm: Double) {
+    let sent = "CQ CQ CQ DE W1AW W1AW K CQ CQ CQ DE W1AW W1AW K"
+    let signal = 800 + offsetHz
+    let audio = ModemTestSignals.awgn(cwAudio(sent, wpm: wpm, hz: signal), snrDb: 10, seed: 31, signalPower: 0.5 * 0.5 / 2)
+    let decoder = CWModem.makeDecoder(frequencyHz: 800, sampleRate: 12_000)
+    let text = clean(run(decoder, audio))
+    #expect(ModemTestSignals.characterAccuracy(sent: sent, received: text) >= 0.95, "got '\(text)'")
+    #expect(abs(decoder.frequencyHz - signal) <= 2, "tuned to \(decoder.frequencyHz), signal at \(signal)")
+}
