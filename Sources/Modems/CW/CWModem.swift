@@ -13,52 +13,53 @@ public enum CWModem: StreamingModem {
 }
 
 /// One CW signal: NCO mix to baseband, complex low-pass decimation to 1 kHz, 5 ms envelope blocks,
-/// then `CWDecoderCore`. A slow AFC follows the carrier from the baseband phase slope during key-down.
+/// then `CWEnvelopeDecoder` (floor/peak statistics, Viterbi keying segmentation, speed clustering).
+/// A slow AFC follows the carrier from the baseband phase slope during key-down.
+///
+/// Speed range: 5 to about 40 WPM at +10 dB (see the tests); at -8 dB, 20 WPM.
 ///
 /// Not thread-safe; owned by one thread at a time (see `SignalDecoder`).
 public final class CWSignalDecoder: SignalDecoder {
     public var frequencyHz: Double { tunedHz }
-    public var submode: String { "CW \(Int(core.wpm.rounded()))WPM" }
+    public var submode: String { "CW \(Int(decoder.wpm.rounded()))WPM" }
 
     private let sampleRate: Double
     private let originHz: Double
     private var tunedHz: Double
     private var nco: NCO
     private var decimator: ComplexDecimator
-    private let core: CWDecoderCore
+    private let decoder: CWEnvelopeDecoder
 
     private static let basebandRate = 1_000.0
-    /// Baseband low-pass cutoff. Narrow enough to cost the noise very little, wide enough for
-    /// keying up to about 35 WPM.
+    /// Baseband low-pass cutoff, Hz.
     private static let cutoffHz = 40.0
-    /// Moving-average length of the detection envelope, as a fraction of the current dot.
+    /// Moving-average length of the detection envelope, in dots of the current speed estimate,
+    /// bounded so a wrong estimate cannot run the smoothing away.
     private static let smoothDots = 1.0
-    /// Blocks the keying state machine runs behind the level tracker (120 ms).
-    private static let lookahead = 24
-    /// A key-down run must be at least this long, in dots, to count as a mark.
-    private static let minMark = 0.55
-    private static let minPeakToFloor = 4.0
-    private static let minDwellDots = 0.85
-    private static let switchPenalty = 2.0
-    private static let evidenceScale = 0.5
-    private static let dotAdaptation = 0.1
-    private static let minMarkPeak: Float = 0.5
+    private static let smoothBoundsMs = 24.0...150.0
+    /// Moving-average length of the segmentation envelope, in dots.
+    private static let fineDots = 0.4
     private static let blockSamples = 5
+    private static let settleSamples = 100
     private static let afcStepLimitHz = 2.0
     private static let afcGain = 0.5
 
     private var scratch: [DSPComplex] = []
     private var baseband: [DSPComplex] = []
-    private var blockSum: Float = 0
-    private var blockCount = 0
-    private var envelope: [Float] = []
+    private var coarseEnvelope: [Float] = []
     private var fineEnvelope: [Float] = []
+    private var coarseSum: Float = 0
     private var fineSum: Float = 0
-    private var ring = [DSPComplex](repeating: DSPComplex(real: 0, imag: 0), count: 256)
-    private var ringHead = 0
-    private var magRing = [Float](repeating: 0, count: 256)
-    private static let settleSamples = 100
+    private var blockCount = 0
     private var settle = settleSamples
+
+    // Smoothing: running sum of the last `smoothLength` baseband samples.
+    private static let ringSize = 256
+    private var ring = [DSPComplex](repeating: DSPComplex(real: 0, imag: 0), count: ringSize)
+    private var ringHead = 0
+    private var coarse = Window()
+    private var fine = Window()
+    private var sinceRecompute = 0
 
     // AFC state: Σ z[n]·conj(z[n-1]) over key-down samples, in the current 1 s window.
     private var previous = DSPComplex(real: 0, imag: 0)
@@ -74,22 +75,12 @@ public final class CWSignalDecoder: SignalDecoder {
         tunedHz = frequencyHz
         nco = NCO(frequency: -frequencyHz, sampleRate: sampleRate)
         decimator = Self.makeDecimator(sampleRate: sampleRate)
-        core = CWDecoderCore(sampleRate: Self.basebandRate, pitchHz: frequencyHz)
-        core.noisyEnvelope = true
-        core.minPeakToFloor = Self.minPeakToFloor
-        core.lookaheadBlocks = Self.lookahead
-        core.minMarkFraction = Self.minMark
-        core.minMarkPeak = Self.minMarkPeak
-        core.dotAdaptation = Self.dotAdaptation
-        core.minDwellDots = Self.minDwellDots
-        core.switchPenalty = Self.switchPenalty
-        core.evidenceScale = Self.evidenceScale
+        decoder = CWEnvelopeDecoder(blockMs: Double(Self.blockSamples) / Self.basebandRate * 1_000)
     }
 
     private static func makeDecimator(sampleRate: Double) -> ComplexDecimator {
         let factor = max(1, Int((sampleRate / basebandRate).rounded()))
-        // Blackman-Harris transition ≈ 6/N cycles/sample: here twice the cutoff, so the pass-band edge
-        // and the stop band are 3 × cutoff apart at most.
+        // Blackman-Harris transition ≈ 6/N cycles/sample, so a transition band of twice the cutoff.
         let taps = FIRDesign.tapCount(transition: 2 * cutoffHz / sampleRate)
         return ComplexDecimator(taps: FIRDesign.lowpass(taps: taps, cutoff: cutoffHz / sampleRate), factor: factor)
     }
@@ -106,55 +97,82 @@ public final class CWSignalDecoder: SignalDecoder {
             decimator.process(UnsafeBufferPointer(rebasing: s[0..<audio.count]), into: &baseband)
         }
 
-        envelope.removeAll(keepingCapacity: true)
+        coarseEnvelope.removeAll(keepingCapacity: true)
         fineEnvelope.removeAll(keepingCapacity: true)
         for z in baseband {
-            // The FIR and the smoothing ring start empty; their ramp would corrupt the noise floor.
-            if settle > 0 { settle -= 1; _ = smooth(z); previous = z; continue }
-            let mag = (z.real * z.real + z.imag * z.imag).squareRoot()
             let sm = smooth(z)
-            blockSum += sm.coarse
+            // The FIR and the smoothing ring start empty; their ramp would corrupt the noise floor.
+            if settle > 0 { settle -= 1; previous = z; continue }
+            coarseSum += sm.coarse
             fineSum += sm.fine
             blockCount += 1
             if blockCount == Self.blockSamples {
-                envelope.append(blockSum / Float(Self.blockSamples))
+                coarseEnvelope.append(coarseSum / Float(Self.blockSamples))
                 fineEnvelope.append(fineSum / Float(Self.blockSamples))
-                blockSum = 0; fineSum = 0
-                blockCount = 0
+                coarseSum = 0; fineSum = 0; blockCount = 0
             }
-            accumulateAFC(z, mag: mag)
+            accumulateAFC(z)
         }
-        let blockMs = Double(Self.blockSamples) / Self.basebandRate * 1_000
-        let text = envelope.withUnsafeBufferPointer { coarse in
+        return coarseEnvelope.withUnsafeBufferPointer { coarse in
             fineEnvelope.withUnsafeBufferPointer { fine in
-                core.process(envelope: coarse, fine: fine, blockMs: blockMs)
+                decoder.process(coarse: coarse, fine: fine)
             }
         }
-        return text
     }
 
-    /// Smooths the complex baseband with a moving average about as long as a dot, which narrows the
-    /// noise bandwidth to roughly the keying bandwidth. Returns the smoothed magnitude and the
-    /// unsmoothed magnitude from the middle of that window, so the two line up in time.
-    private func smooth(_ z: DSPComplex) -> (coarse: Float, fine: Float) {
-        ring[ringHead] = z
-        magRing[ringHead] = (z.real * z.real + z.imag * z.imag).squareRoot()
-        ringHead = (ringHead + 1) % ring.count
-        let length = min(max(Int(core.dotMs * Self.smoothDots * Self.basebandRate / 1_000), 4), ring.count)
-        var re: Float = 0, im: Float = 0
-        var idx = ringHead
-        for _ in 0..<length {
-            idx = (idx + ring.count - 1) % ring.count
-            re += ring[idx].real
-            im += ring[idx].imag
+    /// Moving average of the complex baseband over `length` samples ending `delay` samples before the
+    /// newest, kept as a running sum. Rebuilt from the ring whenever its shape changes.
+    private struct Window {
+        var length = 0, delay = 0
+        var re = 0.0, im = 0.0
+
+        mutating func advance(ring: [DSPComplex], newest: Int, length wanted: Int, delay wantedDelay: Int, rebuild: Bool) {
+            let size = ring.count
+            if rebuild || wanted != length || wantedDelay != delay {
+                length = wanted; delay = wantedDelay
+                re = 0; im = 0
+                for back in 0..<length {
+                    let v = ring[(newest + size - delay - back) % size]
+                    re += Double(v.real); im += Double(v.imag)
+                }
+                return
+            }
+            let entering = ring[(newest + size - delay) % size]
+            let leaving = ring[(newest + size - delay - length) % size]
+            re += Double(entering.real) - Double(leaving.real)
+            im += Double(entering.imag) - Double(leaving.imag)
         }
-        let inv = 1 / Float(length)
-        let mid = (ringHead + ring.count - 1 - (length - 1) / 2) % ring.count
-        return (((re * inv) * (re * inv) + (im * inv) * (im * inv)).squareRoot(), magRing[mid])
+
+        var magnitude: Float { Float((re * re + im * im).squareRoot() / Double(max(length, 1))) }
+    }
+
+    /// Smooths the complex baseband before taking the magnitude, which narrows the noise bandwidth.
+    /// `coarse` averages about a dot and drives detection. `fine` averages a fraction of a dot and
+    /// drives the keying segmentation. Both windows are centred on the same instant.
+    private func smooth(_ z: DSPComplex) -> (coarse: Float, fine: Float) {
+        let size = Self.ringSize
+        let dot = min(max(decoder.dotMs * Self.smoothDots, Self.smoothBoundsMs.lowerBound), Self.smoothBoundsMs.upperBound)
+        var coarseLength = Int(dot * Self.basebandRate / 1_000)
+        var fineLength = max(1, Int(dot * Self.fineDots * Self.basebandRate / 1_000))
+        // Hysteresis: only change a window's shape when the target has moved by 2 samples.
+        if abs(coarseLength - coarse.length) < 2 && coarse.length > 0 { coarseLength = coarse.length }
+        if abs(fineLength - fine.length) < 2 && fine.length > 0 { fineLength = fine.length }
+        let newest = ringHead
+        ring[newest] = z
+        ringHead = (ringHead + 1) % size
+        sinceRecompute += 1
+        let rebuild = sinceRecompute >= 4_096
+        if rebuild { sinceRecompute = 0 }
+        coarse.advance(ring: ring, newest: newest, length: coarseLength, delay: 0, rebuild: rebuild)
+        // The fine window ends later in time than the coarse one starts: centre it on the coarse centre.
+        fine.advance(ring: ring, newest: newest, length: fineLength,
+                     delay: max(0, (coarseLength - fineLength) / 2), rebuild: rebuild)
+        return (coarse.magnitude, fine.magnitude)
     }
 
     /// Gathers the lag-1 product during key-down and, once per second, nudges the NCO.
-    private func accumulateAFC(_ z: DSPComplex, mag: Float) {
+    private func accumulateAFC(_ z: DSPComplex) {
+        let mag = (z.real * z.real + z.imag * z.imag).squareRoot()
         if mag > envPeak { envPeak = mag } else { envPeak *= 0.9995 }
         if mag > envPeak * 0.6 && previous.real * previous.real + previous.imag * previous.imag > 0 {
             // z[n] · conj(z[n-1])
@@ -165,7 +183,7 @@ public final class CWSignalDecoder: SignalDecoder {
         previous = z
         windowSamples += 1
         guard windowSamples >= Int(Self.basebandRate) else { return }
-        if lagCount >= 100 && core.signalPresent {
+        if lagCount >= 100 && decoder.signalPresent {
             let offsetHz = atan2(lagIm, lagRe) / (2 * .pi) * Self.basebandRate
             let step = min(max(offsetHz * Self.afcGain, -Self.afcStepLimitHz), Self.afcStepLimitHz)
             let limit = ModeID.cw.lockRangeHz
@@ -181,10 +199,11 @@ public final class CWSignalDecoder: SignalDecoder {
         tunedHz = originHz
         nco = NCO(frequency: -originHz, sampleRate: sampleRate)
         decimator = Self.makeDecimator(sampleRate: sampleRate)
-        core.reset()
-        ring = [DSPComplex](repeating: DSPComplex(real: 0, imag: 0), count: ring.count); ringHead = 0; settle = Self.settleSamples
-        magRing = [Float](repeating: 0, count: magRing.count)
-        blockSum = 0; fineSum = 0; blockCount = 0
+        decoder.reset()
+        ring = [DSPComplex](repeating: DSPComplex(real: 0, imag: 0), count: Self.ringSize)
+        ringHead = 0; coarse = Window(); fine = Window(); sinceRecompute = 0
+        settle = Self.settleSamples
+        coarseSum = 0; fineSum = 0; blockCount = 0
         previous = DSPComplex(real: 0, imag: 0)
         lagRe = 0; lagIm = 0; lagCount = 0; windowSamples = 0; envPeak = 0
     }

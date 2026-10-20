@@ -28,13 +28,45 @@ private func clean(_ s: String) -> String {
     s.split(separator: " ").joined(separator: " ")
 }
 
+/// R9: -8 dB is at the detection limit, so the target is a mean over seeds, not one lucky seed.
 @Test func decodesAtMinus8dB() {
     let sent = "CQ TEST DE W1AW K"
     let clear = cwAudio(sent, wpm: 20, hz: 800)
-    let audio = ModemTestSignals.awgn(clear, snrDb: -8, seed: 1, signalPower: 0.5 * 0.5 / 2)
+    var total = 0.0
+    for seed in 1...20 {
+        let audio = ModemTestSignals.awgn(clear, snrDb: -8, seed: UInt64(seed), signalPower: 0.5 * 0.5 / 2)
+        let text = clean(run(CWModem.makeDecoder(frequencyHz: 800, sampleRate: 12_000), audio))
+        total += ModemTestSignals.characterAccuracy(sent: sent, received: text)
+    }
+    #expect(total / 20 >= 0.95)
+}
+
+@Test(arguments: [8.0, 12.0, 35.0, 40.0])
+func decodesAcrossSpeedsAtPlus10dB(_ wpm: Double) {
+    let sent = "CQ TEST DE W1AW K"
+    let audio = ModemTestSignals.awgn(cwAudio(sent, wpm: wpm, hz: 800), snrDb: 10, seed: 11, signalPower: 0.5 * 0.5 / 2)
     let text = clean(run(CWModem.makeDecoder(frequencyHz: 800, sampleRate: 12_000), audio))
-    let accuracy = ModemTestSignals.characterAccuracy(sent: sent, received: text)
-    #expect(accuracy >= 0.95)
+    #expect(ModemTestSignals.characterAccuracy(sent: sent, received: text) >= 0.95, "got '\(text)'")
+}
+
+@Test func recoversAfterLongCarrier() {
+    let sent = "CQ TEST DE W1AW K"
+    let carrier = [Float](repeating: 0, count: 12_000) + ModemTestSignals.tone(800, seconds: 3, amplitude: 0.5)
+    let audio = ModemTestSignals.awgn(carrier + cwAudio(sent, wpm: 20, hz: 800, leadIn: 0.5), snrDb: 10, seed: 12,
+                                      signalPower: 0.5 * 0.5 / 2)
+    let text = clean(run(CWModem.makeDecoder(frequencyHz: 800, sampleRate: 12_000), audio))
+    #expect(ModemTestSignals.characterAccuracy(sent: sent, received: text) >= 0.95, "got '\(text)'")
+}
+
+@Test func followsSpeedChange() {
+    let first = "CQ TEST DE W1AW K", second = "PARIS PARIS 73"
+    let a = ModemTestSignals.awgn(cwAudio(first, wpm: 20, hz: 800), snrDb: 10, seed: 13, signalPower: 0.5 * 0.5 / 2)
+    let b = ModemTestSignals.awgn(cwAudio(second, wpm: 30, hz: 800, leadIn: 0.3), snrDb: 10, seed: 14, signalPower: 0.5 * 0.5 / 2)
+    let decoder = CWModem.makeDecoder(frequencyHz: 800, sampleRate: 12_000)
+    let textA = clean(run(decoder, a))
+    let textB = clean(run(decoder, b))
+    #expect(ModemTestSignals.characterAccuracy(sent: first, received: textA) >= 0.95, "got '\(textA)'")
+    #expect(ModemTestSignals.characterAccuracy(sent: second, received: textB) >= 0.95, "got '\(textB)'")
 }
 
 @Test func twoSignals150HzApartDecodeIndependently() {
@@ -104,4 +136,14 @@ private func clean(_ s: String) -> String {
     let b = clean(run(CWModem.makeDecoder(frequencyHz: 800, sampleRate: 12_000), audio, chunk: 333))
     #expect(a == sent)
     #expect(b == sent)
+}
+
+@Test func speedClusterFindsTheDot() {
+    // "C" then a word gap, in ms at 20 WPM, with jitter and one carrier-length outlier.
+    let runs: [Double] = [185, 55, 62, 58, 181, 66, 59, 175, 420, 64, 57, 190, 60, 1_200]
+    let dot = CWEnvelopeDecoder.shortCluster(of: runs)
+    #expect(dot != nil)
+    #expect(abs((dot ?? 0) - 60) < 8)
+    // All runs alike: no short/long structure, so no estimate.
+    #expect(CWEnvelopeDecoder.shortCluster(of: [60, 62, 58, 61, 59, 63, 60, 62]) == nil)
 }
