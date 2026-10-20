@@ -102,3 +102,26 @@ final class BlockCounter: @unchecked Sendable {
     try await Task.sleep(for: .milliseconds(50))
     #expect(counter.count == atStop)
 }
+
+@Test func floatWavNonFiniteSamplesBecomeZero() throws {
+    var data = Data()
+    func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+    func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+    func f32(_ v: Float) { u32(v.bitPattern) }
+    let frames = 4
+    data.append(contentsOf: Array("RIFF".utf8)); u32(UInt32(36 + frames * 8))
+    data.append(contentsOf: Array("WAVE".utf8))
+    data.append(contentsOf: Array("fmt ".utf8)); u32(16); u16(3); u16(2); u32(250_000); u32(250_000 * 8); u16(8); u16(32)
+    data.append(contentsOf: Array("data".utf8)); u32(UInt32(frames * 8))
+    f32(0.5); f32(-0.25)
+    f32(.nan); f32(.infinity)
+    f32(-.infinity); f32(0.125)
+    f32(0.75); f32(.nan)
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("subfloor-test-\(UUID()).wav")
+    try data.write(to: url)
+    defer { try? FileManager.default.removeItem(at: url) }
+    let source = try IQFileSource(url: url, centerFrequency: 7_100_000)
+    let block = source.readFrames(at: 0, count: 4)
+    #expect(block.allSatisfy { $0.real.isFinite && $0.imag.isFinite })
+    #expect(block[0].real == 0.5 && block[1].real == 0 && block[1].imag == 0 && block[2].imag == 0.125 && block[3].imag == 0)
+}

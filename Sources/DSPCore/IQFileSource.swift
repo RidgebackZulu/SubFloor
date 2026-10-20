@@ -89,6 +89,8 @@ public final class IQFileSource: IQSource, @unchecked Sendable {
                 o.withMemoryRebound(to: Float.self) { floats in
                     if layout.isFloat {
                         floats.baseAddress!.update(from: base.assumingMemoryBound(to: Float.self), count: count * 2)
+                        // Float WAVs may contain NaN/Inf; those would poison the filters and AGC.
+                        for k in 0..<(count * 2) where !floats[k].isFinite { floats[k] = 0 }
                     } else {
                         vDSP_vflt16(base.assumingMemoryBound(to: Int16.self), 1, floats.baseAddress!, 1, vDSP_Length(count * 2))
                         var scale: Float = 1 / 32_768
