@@ -4,9 +4,11 @@ import Testing
 
 @Suite struct KeyboardControllerTests {
     private func action(_ keyCode: UInt16, _ chars: String? = nil, _ mods: NSEvent.ModifierFlags = [],
-                        editing: Bool = false, quickTune: Bool = false) -> KeyboardController.Action? {
+                        editing: Bool = false, quickTune: Bool = false,
+                        main: Bool = true, rep: Bool = false) -> KeyboardController.Action? {
         KeyboardController.decide(keyCode: keyCode, characters: chars, modifiers: mods,
-                                  isEditingText: editing, quickTuneVisible: quickTune)
+                                  isEditingText: editing, quickTuneVisible: quickTune,
+                                  isMainWindow: main, isRepeat: rep)
     }
 
     @Test func arrowsStep() {
@@ -35,5 +37,20 @@ import Testing
         #expect(action(124, nil, [], quickTune: true) == nil)
         #expect(action(44, "/", [], quickTune: true) == nil)
         #expect(action(0, "a") == nil)
+    }
+
+    @Test func nonMainWindowReturnsNil() {
+        #expect(action(124, nil, [], main: false) == nil)
+        #expect(action(49, " ", [], main: false) == nil)
+    }
+
+    @Test func repeatIgnoredForSpaceOnly() {
+        #expect(action(49, " ", [], rep: true) == nil)
+        #expect(action(124, nil, [], rep: true) == .step(1))
+    }
+
+    @Test func optionExcluded() {
+        #expect(action(124, nil, .option) == nil)
+        #expect(action(33, "[", .option) == nil)
     }
 }
