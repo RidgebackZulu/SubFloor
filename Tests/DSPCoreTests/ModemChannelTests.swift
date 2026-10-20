@@ -79,5 +79,49 @@ import Foundation
         #expect(abs(first.count + second.count - 12_000) <= 6)
         #expect(TestSignals.dominates(first.dropFirst(1_000), at: 1_000, sampleRate: 12_000, over: [1_500]))
         #expect(TestSignals.dominates(second.dropFirst(1_000), at: 1_500, sampleRate: 12_000, over: [1_000]))
+
+        // Phase continuity: the retune seam must not show a step bigger than the steady-state signal does.
+        let combined = first + second
+        let seam = first.count
+        func maxStep(_ range: Range<Int>) -> Float {
+            range.map { abs(combined[$0 + 1] - combined[$0]) }.max() ?? 0
+        }
+        let steady = max(maxStep(1_000..<(seam - 100)), maxStep((seam + 100)..<(combined.count - 1)))
+        let atSeam = maxStep((seam - 20)..<(seam + 20))
+        #expect(steady > 0.4)
+        #expect(atSeam <= 1.5 * steady, "seam step \(atSeam) vs steady \(steady)")
+    }
+
+    @Test func resamplerChunkInvariance() {
+        let n = 20_003   // not a multiple of 31250/12000 steps: avoids an exact-boundary output whose inclusion is rounding-dependent
+        let input: [Float] = (0..<n).map { i in
+            let t = Double(i) / 31_250
+            return Float(sin(2 * Double.pi * 1_000 * t) + 0.5 * sin(2 * Double.pi * 3_700 * t + 1) + 0.1 * sin(2 * Double.pi * 11_000 * t))
+        }
+        var whole = FractionalResampler(inputRate: 31_250, outputRate: 12_000)
+        var reference: [Float] = []
+        input.withUnsafeBufferPointer { whole.process($0, into: &reference) }
+
+        var chunked = FractionalResampler(inputRate: 31_250, outputRate: 12_000)
+        var result: [Float] = []
+        let sizes = [1, 7, 333, 1_000]
+        var i = 0, k = 0
+        while i < n {
+            let m = min(sizes[k % sizes.count], n - i)
+            input.withUnsafeBufferPointer { chunked.process(UnsafeBufferPointer(rebasing: $0[i..<(i + m)]), into: &result) }
+            i += m
+            k += 1
+        }
+        #expect(result.count == reference.count)
+        let diff = zip(result, reference).map { abs($0 - $1) }.max() ?? 0
+        #expect(diff < 1e-6, "max chunking difference \(diff)")
+    }
+
+    @Test func unityGain() {
+        let audio = run(ModemChannel(inputRate: inputRate, dialOffsetHz: 50_000), offset: 51_500, seconds: 0.5)
+        let body = audio.dropFirst(1_000)
+        let rms = (body.reduce(0.0) { $0 + Double($1) * Double($1) } / Double(body.count)).squareRoot()
+        let amplitude = rms * 2.0.squareRoot()
+        #expect(abs(amplitude - 1.0) <= 0.05, "amplitude \(amplitude)")
     }
 }

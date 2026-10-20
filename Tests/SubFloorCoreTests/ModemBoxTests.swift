@@ -27,6 +27,19 @@ import Testing
         var moved = box
         moved.move(byHz: 0.46 * span)
         #expect(!moved.isInside(captureCenter: centre, captureSpan: span))
+
+        // Boundaries at +-0.45 x span: the box edge on the limit is inside, 1 Hz further out is not.
+        let limit = 0.45 * span
+        let upperLimit = ModemBox(dialHz: centre + limit - ModemBox.audioHigh)
+        #expect(upperLimit.isInside(captureCenter: centre, captureSpan: span))
+        var justOutsideHigh = upperLimit
+        justOutsideHigh.move(byHz: 1)
+        #expect(!justOutsideHigh.isInside(captureCenter: centre, captureSpan: span))
+        let lowerLimit = ModemBox(dialHz: centre - limit - ModemBox.audioLow)
+        #expect(lowerLimit.isInside(captureCenter: centre, captureSpan: span))
+        var justOutsideLow = lowerLimit
+        justOutsideLow.move(byHz: -1)
+        #expect(!justOutsideLow.isInside(captureCenter: centre, captureSpan: span))
     }
 
     @Test func upconverterLeavesDisplayMathsUnchanged() {
