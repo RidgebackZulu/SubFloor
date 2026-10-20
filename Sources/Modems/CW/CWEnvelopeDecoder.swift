@@ -52,6 +52,11 @@ final class CWEnvelopeDecoder {
     // Segmentation.
     private var viterbi: KeyingViterbi
     private var decided: [Bool] = []
+    private static let durationWeight = 1.0
+    private static let durationSigma = 0.25
+    private static let durationMax = 8.0
+    private var exitCost = [[Double]](repeating: [Double](repeating: 0, count: KeyingViterbi.cap), count: 2)
+    private var exitCostDot = 0.0
 
     // Keying state machine.
     private var keyDown = false
@@ -61,6 +66,7 @@ final class CWEnvelopeDecoder {
     /// Durations of the marks of the character in progress; dit/dah is decided when it ends, with
     /// the speed estimate as it stands then.
     private var marks: [Double] = []
+    private var markGaps: [Double] = []
     private var charPending = false
     private var wordPending = false
 
@@ -71,9 +77,14 @@ final class CWEnvelopeDecoder {
     /// a mark too long to be Morse at the current speed). Text is held back, not guessed, meanwhile.
     private var speedKnown = false
     private var held: [(gap: Double, mark: Double)] = []
+    /// False until a mark has been accepted since the start (or since a carrier / speed restart): the
+    /// gap before that mark is lead-in, not keying, and says nothing about speed.
+    private var hadMark = false
     private static let minRunsForSpeed = 6
 
     var wpm: Double { 1_200 / dotMs }
+    /// The tracked key-down level of the smoothed envelope.
+    var peakLevel: Double { peak }
     /// True once the tracked peak stands clear of the key-up floor.
     var signalPresent: Bool { warmupCount >= Self.warmupBlocks && peak > noiseFloor * minPeakToFloor }
 
@@ -90,8 +101,8 @@ final class CWEnvelopeDecoder {
         fineWarm = 0; fineVariance = 0; level = 0
         viterbi = KeyingViterbi(lag: lookahead)
         keyDown = false; runBlocks = 0; gapBefore = 0; markPeak = 0
-        marks.removeAll(); charPending = false; wordPending = false
-        speedKnown = false; held.removeAll()
+        marks.removeAll(); markGaps.removeAll(); charPending = false; wordPending = false
+        speedKnown = false; held.removeAll(); hadMark = false
         dotMs = 60
     }
 
@@ -128,8 +139,28 @@ final class CWEnvelopeDecoder {
         // mark whose strength is not yet visible, and the mark's start would drift early.
         let amplitude = max(peak, (signalPresent ? 1.8 : 3.0) * sigma2.squareRoot())
         let llr = Self.evidenceScale * (Self.logI0(f * amplitude / sigma2) - amplitude * amplitude / (2 * sigma2))
-        if let state = viterbi.push(llr: llr, minDwell: minDwellBlocks(), switchPenalty: Self.switchPenalty) {
+        updateExitCosts()
+        if let state = viterbi.push(llr: llr, minDwell: minDwellBlocks(), switchPenalty: Self.switchPenalty, exitCost: speedKnown && Self.durationWeight > 0 ? exitCost : nil) {
             decided.append(state)
+        }
+    }
+
+    /// Duration prior: ending a mark after about 1 or 3 dots, or a gap after about 1, 3 or 7 dots, is
+    /// cheap; any other length costs up to `durationMax` nats (scaled by `durationWeight`).
+    private func updateExitCosts() {
+        guard Self.durationWeight > 0, speedKnown else { return }
+        let dot = dotMs / blockMs
+        guard abs(dot - exitCostDot) > 0.5 else { return }
+        exitCostDot = dot
+        let sigma = max(Self.durationSigma * dot, 1)
+        for k in 1...KeyingViterbi.cap {
+            func cost(_ units: [Double]) -> Double {
+                let best = units.map { u -> Double in let d = (Double(k) - u * dot) / sigma; return d * d / 2 }.min() ?? 0
+                return min(best, Self.durationMax) * Self.durationWeight
+            }
+            exitCost[1][k - 1] = cost([1, 3])
+            // Beyond a word gap the length means idle time, not timing.
+            exitCost[0][k - 1] = Double(k) >= 6 * dot ? 0 : cost([1, 3, 7])
         }
     }
 
@@ -138,7 +169,9 @@ final class CWEnvelopeDecoder {
     /// it keeps noise from fragmenting marks. In between it is interpolated on the peak-to-floor ratio.
     private func minDwellBlocks() -> Int {
         let fixed = fixedDwellMs / blockMs
-        let lowSNR = Self.lowSNRDwellDots * min(max(dotMs, 20), 150) / blockMs
+        // Before the speed is known, assume it may be fast: a minimum run longer than a dot would merge elements.
+        let dot = speedKnown ? min(max(dotMs, 20), 150) : min(dotMs, 30)
+        let lowSNR = Self.lowSNRDwellDots * dot / blockMs
         return max(2, Int((lowSNR + (fixed - lowSNR) * strength()).rounded()))
     }
 
@@ -206,20 +239,25 @@ final class CWEnvelopeDecoder {
             let ms = Double(runBlocks) * blockMs
             if ms > maxElementMs {
                 // A carrier, not Morse: drop whatever character was in progress.
-                marks.removeAll(); charPending = false; wordPending = false
+                marks.removeAll(); markGaps.removeAll(); charPending = false; wordPending = false
+                hadMark = false
                 runBlocks = 1
             } else if markPeak >= Self.minMarkPeak && ms >= minMarkMs() {
                 let gapMs = Double(gapBefore) * blockMs
                 if speedKnown && ms > dotMs * 5 {
                     // Too long for a dah at this speed: the speed dropped, or this is a carrier.
-                    // Finish what was in progress and learn the speed again.
-                    if charPending { endCharacter(out: &out) }
+                    // Take back the character in progress (it was cut at the old speed) and learn
+                    // the speed again; it is re-read once the new speed is known.
+                    for (gap, mark) in zip(markGaps, marks) { held.append((gap, mark)) }
+                    marks.removeAll(); markGaps.removeAll(); charPending = false; wordPending = false
                     speedKnown = false
+                    hadMark = false
                     runs.removeAll()
                 }
                 let wasKnown = speedKnown
-                noteRun(gapMs)
-                noteRun(ms)
+                if hadMark { noteRun(gapMs, isGap: true) }
+                noteRun(ms, isGap: false)
+                hadMark = true
                 if !wasKnown && speedKnown { flushHeld(out: &out) }
                 place(gap: gapMs, mark: ms, out: &out)
                 runBlocks = 1
@@ -245,7 +283,11 @@ final class CWEnvelopeDecoder {
         let ms = Double(runBlocks) * blockMs
         guard speedKnown else {
             // Never learned the speed and the line has gone quiet: use the guess rather than hold forever.
-            if ms > maxElementMs { flushHeld(out: &out); endCharacter(out: &out); endWord(out: &out) }
+            if ms > maxElementMs {
+                if !held.isEmpty { flushHeld(out: &out) }
+                if charPending { endCharacter(out: &out) }
+                if wordPending { endWord(out: &out) }
+            }
             return
         }
         if charPending && ms > dotMs * 2 { endCharacter(out: &out) }
@@ -256,12 +298,13 @@ final class CWEnvelopeDecoder {
     private func place(gap: Double, mark: Double, out: inout String) {
         guard speedKnown else { held.append((gap, mark)); return }
         if mark > dotMs * 5 {
-            marks.removeAll(); charPending = false; wordPending = false
+            marks.removeAll(); markGaps.removeAll(); charPending = false; wordPending = false
             return
         }
         if charPending && gap > dotMs * 2 { endCharacter(out: &out) }
         if wordPending && gap > dotMs * 5 { endWord(out: &out) }
         marks.append(mark)
+        markGaps.append(gap)
         charPending = true
         wordPending = true
     }
@@ -278,11 +321,12 @@ final class CWEnvelopeDecoder {
     private func endCharacter(out: inout String) {
         let symbol = String(marks.map { $0 < dotMs * 2 ? "." : "-" })
         if !symbol.isEmpty { out.append(MorseCode.reverse[symbol] ?? "*") }
-        marks.removeAll()
+        marks.removeAll(); markGaps.removeAll()
         charPending = false
     }
 
     private func endWord(out: inout String) {
+        guard wordPending else { return }
         out.append(" ")
         wordPending = false
     }
@@ -290,8 +334,10 @@ final class CWEnvelopeDecoder {
     // MARK: Speed
 
     /// Records a completed run (mark or gap) and re-estimates the dot from the recent ones.
-    private func noteRun(_ ms: Double) {
+    private func noteRun(_ ms: Double, isGap: Bool) {
         guard ms >= blockMs, ms <= maxElementMs else { return }
+        // A gap much longer than a word gap is idle time; it would pull the "long" cluster away.
+        if isGap && ms > dotMs * 9 { return }
         runs.append(ms)
         if runs.count > Self.runWindow { runs.removeFirst() }
         guard runs.count >= Self.minRunsForSpeed, let estimate = Self.shortCluster(of: runs) else { return }
@@ -306,6 +352,7 @@ final class CWEnvelopeDecoder {
     /// Morse runs are 1, 3 and 7 dots) and returns the median of the short one: the dot. Returns nil
     /// when there is no clear short/long structure (all runs alike, or the clusters are less than 2x apart).
     static func shortCluster(of runs: [Double]) -> Double? {
+        guard runs.count >= 4 else { return nil }
         let sorted = runs.sorted()
         let logs = sorted.map { log($0) }
         var best: (split: Int, cost: Double)?
@@ -315,7 +362,7 @@ final class CWEnvelopeDecoder {
         }
         guard let split = best?.split else { return nil }
         let low = Array(sorted[..<split]), high = Array(sorted[split...])
-        let lowMedian = low[low.count / 2], highMedian = high[high.count / 2]
+        let lowMedian = low[(low.count - 1) / 2], highMedian = high[high.count / 2]
         guard highMedian / lowMedian >= 2 else { return nil }
         return lowMedian
     }
@@ -333,7 +380,7 @@ final class CWEnvelopeDecoder {
 /// penalty. The "on" state earns each block's log-likelihood ratio; "off" earns nothing.
 /// `push` returns the decided state of the block `lag` blocks ago. Storage is allocated once.
 struct KeyingViterbi {
-    static let cap = 30
+    static let cap = 80
     private let lag: Int
     private var score: [Double]
     private var next: [Double]
@@ -350,7 +397,8 @@ struct KeyingViterbi {
         back = [UInt8](repeating: 0, count: (lag + 1) * 2 * Self.cap)
     }
 
-    mutating func push(llr: Double, minDwell: Int, switchPenalty: Double) -> Bool? {
+    /// `exitCost[v][k-1]` is added when a run of state `v` ends after `k` blocks (a duration prior).
+    mutating func push(llr: Double, minDwell: Int, switchPenalty: Double, exitCost: [[Double]]? = nil) -> Bool? {
         let cap = Self.cap
         let width = 2 * cap
         let dwell = min(max(minDwell, 1), cap)
@@ -363,7 +411,7 @@ struct KeyingViterbi {
                 var source = s
                 if k == 1 {
                     for kk in dwell...cap {
-                        let c = score[(1 - v) * cap + kk - 1] - switchPenalty
+                        let c = score[(1 - v) * cap + kk - 1] - switchPenalty - (exitCost?[1 - v][kk - 1] ?? 0)
                         if c > best { best = c; source = (1 - v) * cap + kk - 1 }
                     }
                 } else {

@@ -28,17 +28,18 @@ private func clean(_ s: String) -> String {
     s.split(separator: " ").joined(separator: " ")
 }
 
-/// R9: -8 dB is at the detection limit, so the target is a mean over seeds, not one lucky seed.
+/// R9/R10: -8 dB is at the detection limit, so the target is a mean over seeds, and the seeds are
+/// held out: parameters were tuned on seeds 1...80 only, never on 1001...1040.
 @Test func decodesAtMinus8dB() {
     let sent = "CQ TEST DE W1AW K"
     let clear = cwAudio(sent, wpm: 20, hz: 800)
     var total = 0.0
-    for seed in 1...20 {
+    for seed in 1001...1040 {
         let audio = ModemTestSignals.awgn(clear, snrDb: -8, seed: UInt64(seed), signalPower: 0.5 * 0.5 / 2)
         let text = clean(run(CWModem.makeDecoder(frequencyHz: 800, sampleRate: 12_000), audio))
         total += ModemTestSignals.characterAccuracy(sent: sent, received: text)
     }
-    #expect(total / 20 >= 0.95)
+    #expect(total / 40 >= 0.95)
 }
 
 @Test(arguments: [8.0, 12.0, 35.0, 40.0])
@@ -85,9 +86,13 @@ func decodesAcrossSpeedsAtPlus10dB(_ wpm: Double) {
 }
 
 @Test func noiseOnlyNoText() {
+    // Spaces count too: an idle decoder must stay silent, not stream word gaps.
     let audio = ModemTestSignals.noise(seconds: 60, seed: 3)
     let text = run(CWModem.makeDecoder(frequencyHz: 800, sampleRate: 12_000), audio)
-    #expect(text.filter { $0 != " " }.count == 0)
+    #expect(text.isEmpty, "got \(text.count) characters")
+    // Strong noise (sigma 0.5) may rarely let a blip through, but never a stream.
+    let loud = run(CWModem.makeDecoder(frequencyHz: 800, sampleRate: 12_000), ModemTestSignals.noise(seconds: 60, sigma: 0.5, seed: 105))
+    #expect(loud.count <= 4, "got \(loud.count) characters")
 }
 
 @Test func reportsSubmodeAndRegisters() {
@@ -146,4 +151,29 @@ func decodesAcrossSpeedsAtPlus10dB(_ wpm: Double) {
     #expect(abs((dot ?? 0) - 60) < 8)
     // All runs alike: no short/long structure, so no estimate.
     #expect(CWEnvelopeDecoder.shortCluster(of: [60, 62, 58, 61, 59, 63, 60, 62]) == nil)
+    // Too few runs to cluster: no estimate, and no crash.
+    #expect(CWEnvelopeDecoder.shortCluster(of: []) == nil)
+    #expect(CWEnvelopeDecoder.shortCluster(of: [60, 180, 60]) == nil)
+}
+
+/// Words made of 1 and 3 unit elements only: a speed estimate that takes the 3-unit runs for dots
+/// reads this as "IIIITTEE...". The lead-in gap must not count as a keying gap.
+@Test(arguments: [1.0, 1.2])
+func shortElementsAfterLeadInKeepTheSpeed(_ leadIn: Double) {
+    let sent = "EE TT EE EE TT EE TEST TEST"
+    let audio = ModemTestSignals.awgn(cwAudio(sent, wpm: 20, hz: 800, leadIn: leadIn), snrDb: 10, seed: 21,
+                                      signalPower: 0.5 * 0.5 / 2)
+    let text = clean(run(CWModem.makeDecoder(frequencyHz: 800, sampleRate: 12_000), audio))
+    #expect(ModemTestSignals.characterAccuracy(sent: sent, received: text) >= 0.95, "got '\(text)'")
+}
+
+@Test func fastKeyingAtLowSNRDecodesFromTheFirstCharacter() {
+    var total = 0.0
+    for seed in 1...5 {
+        let audio = ModemTestSignals.awgn(cwAudio("CQ TEST DE W1AW K", wpm: 35, hz: 800), snrDb: 0, seed: UInt64(seed),
+                                          signalPower: 0.5 * 0.5 / 2)
+        total += ModemTestSignals.characterAccuracy(sent: "CQ TEST DE W1AW K",
+                                                    received: clean(run(CWModem.makeDecoder(frequencyHz: 800, sampleRate: 12_000), audio)))
+    }
+    #expect(total / 5 >= 0.95)
 }

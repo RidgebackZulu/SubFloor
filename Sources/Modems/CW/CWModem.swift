@@ -42,7 +42,9 @@ public final class CWSignalDecoder: SignalDecoder {
     private static let blockSamples = 5
     private static let settleSamples = 100
     private static let afcStepLimitHz = 2.0
-    private static let afcGain = 0.5
+    private static let afcGain = 0.3
+    /// Baseband samples between the two smoothed values whose phase difference measures frequency.
+    private static let afcLag = 30
 
     private var scratch: [DSPComplex] = []
     private var baseband: [DSPComplex] = []
@@ -62,12 +64,12 @@ public final class CWSignalDecoder: SignalDecoder {
     private var sinceRecompute = 0
 
     // AFC state: Σ z[n]·conj(z[n-1]) over key-down samples, in the current 1 s window.
-    private var previous = DSPComplex(real: 0, imag: 0)
+    private var afcHistory = [(re: Double, im: Double)](repeating: (0, 0), count: 128)
+    private var afcHead = 0
     private var lagRe: Double = 0
     private var lagIm: Double = 0
     private var lagCount = 0
     private var windowSamples = 0
-    private var envPeak: Float = 0
 
     public init(frequencyHz: Double, sampleRate: Double = 12_000) {
         self.sampleRate = sampleRate
@@ -102,7 +104,7 @@ public final class CWSignalDecoder: SignalDecoder {
         for z in baseband {
             let sm = smooth(z)
             // The FIR and the smoothing ring start empty; their ramp would corrupt the noise floor.
-            if settle > 0 { settle -= 1; previous = z; continue }
+            if settle > 0 { settle -= 1; continue }
             coarseSum += sm.coarse
             fineSum += sm.fine
             blockCount += 1
@@ -111,7 +113,8 @@ public final class CWSignalDecoder: SignalDecoder {
                 fineEnvelope.append(fineSum / Float(Self.blockSamples))
                 coarseSum = 0; fineSum = 0; blockCount = 0
             }
-            accumulateAFC(z)
+            let cm = coarse.mean
+            accumulateAFC(coarseMean: cm)
         }
         return coarseEnvelope.withUnsafeBufferPointer { coarse in
             fineEnvelope.withUnsafeBufferPointer { fine in
@@ -125,6 +128,8 @@ public final class CWSignalDecoder: SignalDecoder {
     private struct Window {
         var length = 0, delay = 0
         var re = 0.0, im = 0.0
+
+        var mean: (re: Double, im: Double) { (re / Double(max(length, 1)), im / Double(max(length, 1))) }
 
         mutating func advance(ring: [DSPComplex], newest: Int, length wanted: Int, delay wantedDelay: Int, rebuild: Bool) {
             let size = ring.count
@@ -170,21 +175,26 @@ public final class CWSignalDecoder: SignalDecoder {
         return (coarse.magnitude, fine.magnitude)
     }
 
-    /// Gathers the lag-1 product during key-down and, once per second, nudges the NCO.
-    private func accumulateAFC(_ z: DSPComplex) {
-        let mag = (z.real * z.real + z.imag * z.imag).squareRoot()
-        if mag > envPeak { envPeak = mag } else { envPeak *= 0.9995 }
-        if mag > envPeak * 0.6 && previous.real * previous.real + previous.imag * previous.imag > 0 {
-            // z[n] · conj(z[n-1])
-            lagRe += Double(z.real * previous.real + z.imag * previous.imag)
-            lagIm += Double(z.imag * previous.real - z.real * previous.imag)
+    /// Gathers the phase advance of the smoothed baseband over `afcLag` samples, during strong key-down,
+    /// and once per second nudges the NCO. Longer lags on the smoothed signal measure frequency far more
+    /// precisely than sample-to-sample phase when the SNR is low.
+    private func accumulateAFC(coarseMean c: (re: Double, im: Double)) {
+        let slot = afcHead
+        afcHistory[slot] = c
+        afcHead = (afcHead + 1) % afcHistory.count
+        let old = afcHistory[(slot + afcHistory.count - Self.afcLag) % afcHistory.count]
+        let cmag2 = c.re * c.re + c.im * c.im, omag2 = old.re * old.re + old.im * old.im
+        let strong = 0.36 * decoder.peakLevel * decoder.peakLevel
+        if decoder.signalPresent && cmag2 > strong && omag2 > strong {
+            // c[n] · conj(c[n-lag])
+            lagRe += c.re * old.re + c.im * old.im
+            lagIm += c.im * old.re - c.re * old.im
             lagCount += 1
         }
-        previous = z
         windowSamples += 1
         guard windowSamples >= Int(Self.basebandRate) else { return }
-        if lagCount >= 100 && decoder.signalPresent {
-            let offsetHz = atan2(lagIm, lagRe) / (2 * .pi) * Self.basebandRate
+        if lagCount >= 40 {
+            let offsetHz = atan2(lagIm, lagRe) / (2 * .pi) * Self.basebandRate / Double(Self.afcLag)
             let step = min(max(offsetHz * Self.afcGain, -Self.afcStepLimitHz), Self.afcStepLimitHz)
             let limit = ModeID.cw.lockRangeHz
             tunedHz = min(max(tunedHz + step, originHz - limit), originHz + limit)
@@ -204,7 +214,7 @@ public final class CWSignalDecoder: SignalDecoder {
         ringHead = 0; coarse = Window(); fine = Window(); sinceRecompute = 0
         settle = Self.settleSamples
         coarseSum = 0; fineSum = 0; blockCount = 0
-        previous = DSPComplex(real: 0, imag: 0)
-        lagRe = 0; lagIm = 0; lagCount = 0; windowSamples = 0; envPeak = 0
+        afcHistory = [(re: Double, im: Double)](repeating: (0, 0), count: 128); afcHead = 0
+        lagRe = 0; lagIm = 0; lagCount = 0; windowSamples = 0
     }
 }
