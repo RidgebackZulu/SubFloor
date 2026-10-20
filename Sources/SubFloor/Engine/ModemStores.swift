@@ -146,6 +146,9 @@ final class CursorFrameStore: Sendable {
         }
     }
 
+    /// Whether a frame is stored (false after `discard(before:)` until the next one).
+    var hasFrame: Bool { state.withLock { $0.frame != nil } }
+
     /// Drops the stored frame and every later frame from an epoch before `epoch`.
     func discard(before epoch: UInt64) {
         state.withLock { s in

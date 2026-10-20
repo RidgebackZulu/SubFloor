@@ -1,6 +1,5 @@
 import Testing
 import Foundation
-import SwiftUI
 import DSPCore
 @testable import Modems
 
@@ -76,31 +75,4 @@ private func decode(_ audio: [Float]) -> String {
     var g = Gaussian(seed: 99)
     let audio = (0..<(5 * 48_000)).map { _ in g.next(0.05) }
     #expect(decode(audio).filter { $0 != " " }.isEmpty)
-}
-
-@Test func registryFindsCWModem() {
-    #expect(ModemRegistry.type(withID: "cw") != nil)
-    #expect(ModemRegistry.infos.map(\.id).contains("cw"))
-    #expect(CWDecoderModem.info.preferredMode == .cw)
-}
-
-@Test func hostForwardsAudioToActiveModem() {
-    let host = ModemHost()
-    let probe = ProbeModem()
-    host.set(probe)
-    let context = ModemContext(sampleRate: 48_000, mode: .cw, bandwidthHz: 500, cwPitchHz: 700)
-    [Float](repeating: 0, count: 128).withUnsafeBufferPointer { host.process(audio: $0, context: context) }
-    #expect(probe.received == 128)
-    host.set(nil)
-    [Float](repeating: 0, count: 128).withUnsafeBufferPointer { host.process(audio: $0, context: context) }
-    #expect(probe.received == 128)
-}
-
-private final class ProbeModem: Modem, @unchecked Sendable {
-    static let info = ModemInfo(id: "probe", name: "Probe", input: .audio, preferredMode: nil, preferredBandwidth: nil)
-    var received = 0
-    init() {}
-    func reset() {}
-    func process(audio: UnsafeBufferPointer<Float>, context: ModemContext) { received += audio.count }
-    @MainActor func makeOutputView() -> AnyView { AnyView(EmptyView()) }
 }

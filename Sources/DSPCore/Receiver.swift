@@ -29,7 +29,6 @@ public final class Receiver: @unchecked Sendable {
     public private(set) var config: Config
     public private(set) var channelRate: Double = 0
     public private(set) var signalDb: Float = -200
-    public var channelTap: ((UnsafeBufferPointer<DSPComplex>, Double) -> Void)?
 
     private var nco = NCO()
     private var stages: [ComplexDecimator] = []
@@ -135,7 +134,6 @@ public final class Receiver: @unchecked Sendable {
                 vDSP_measqv(floats.baseAddress!, 1, &meanSquare, vDSP_Length(floats.count))
             }
             signalDb = 10 * log10(max(2 * meanSquare, 1e-20))
-            channelTap?(channel, channelRate)
         }
         if let threshold = config.squelchDb {
             squelchOpen = squelchOpen ? signalDb > threshold - 2 : signalDb > threshold

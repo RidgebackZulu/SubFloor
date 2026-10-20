@@ -469,8 +469,8 @@ public struct DecodeLog: Sendable {
         return (lines.reversed().joined(separator: "\n"), near.last!.mode)
     }
 
-    /// `HHMMSS` of a UTC time.
-    static func utcHHMMSS(_ d: Date) -> String {
+    /// `HHMMSS` of a UTC time (whatever the local time zone).
+    public static func utcHHMMSS(_ d: Date) -> String {
         var s = Int(d.timeIntervalSince1970.rounded(.down)) % 86_400
         if s < 0 { s += 86_400 }
         func two(_ n: Int) -> String { n < 10 ? "0\(n)" : "\(n)" }

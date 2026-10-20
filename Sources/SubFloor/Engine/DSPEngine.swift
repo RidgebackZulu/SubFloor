@@ -79,7 +79,6 @@ final class DSPEngine: @unchecked Sendable {
 
     let frames = SpectrumFrameStore()
     let audio: AudioOutput
-    let modems = ModemHost()
     let stats = Mutex(EngineStats())
     let modemEvents: ModemEventQueue
     let cursorFrames: CursorFrameStore
@@ -274,12 +273,6 @@ final class DSPEngine: @unchecked Sendable {
                      epoch: UInt64) {
         let sampleRate = config.inputRate
         let receiver = Receiver(config: config)
-        let modems = modems
-        // Context is the start-time config; refresh when IQ modems arrive.
-        receiver.channelTap = { iq, rate in
-            modems.process(iq: iq, context: ModemContext(sampleRate: rate, mode: config.mode,
-                                                         bandwidthHz: config.bandwidthHz, cwPitchHz: config.cwPitchHz))
-        }
         var settings = initial
         var volume = initialVolume
         var analyzer = SpectrumAnalyzer(size: settings.fftSize, window: settings.window)
@@ -414,9 +407,6 @@ final class DSPEngine: @unchecked Sendable {
             audioOut.removeAll(keepingCapacity: true)
             block.withUnsafeBufferPointer { receiver.process(UnsafeBufferPointer(rebasing: $0[0..<n]), audio: &audioOut) }
             guard !audioOut.isEmpty else { continue }
-            let rx = receiver.config
-            let context = ModemContext(sampleRate: Receiver.audioRate, mode: rx.mode, bandwidthHz: rx.bandwidthHz, cwPitchHz: rx.cwPitchHz)
-            audioOut.withUnsafeBufferPointer { modems.process(audio: $0, context: context) }
             audioOut.withUnsafeMutableBufferPointer { a in
                 var gain = volume
                 vDSP_vsmul(a.baseAddress!, 1, &gain, a.baseAddress!, 1, vDSP_Length(a.count))

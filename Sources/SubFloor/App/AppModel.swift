@@ -81,8 +81,6 @@ final class AppModel {
     // MARK: Bookmarks, modems, UI
     private(set) var bookmarks: [Bookmark] = []
     var showBookmarks = true
-    private(set) var activeModem: (any Modem)?
-    var activeModemID: String? { activeModem.map { type(of: $0).info.id } }
     /// The multi-signal modem's box, settings and cursor (see `ModemControl`).
     private var modem = ModemControl()
     private(set) var decodeLog = DecodeLog()
@@ -568,23 +566,6 @@ final class AppModel {
         }
     }
 
-    // MARK: Modems
-
-    func activateModem(id: String?) {
-        guard let id, let type = ModemRegistry.type(withID: id) else {
-            activeModem = nil
-            engine.modems.set(nil)
-            return
-        }
-        let modem = type.init()
-        activeModem = modem
-        engine.modems.set(modem)
-        if let preferred = type.info.preferredMode {
-            setMode(preferred)
-            if let bw = type.info.preferredBandwidth { setBandwidth(bw) }
-        }
-    }
-
     // MARK: Multi-signal modem
 
     var modemBox: ModemBox { modem.box }
@@ -596,6 +577,13 @@ final class AppModel {
     /// ←/→ nudge the modem cursor and Esc unlocks it (`KeyCommand`).
     var modemKeysActive: Bool { modem.settings.mode != nil && modemBoxActive }
     var modemGrabTabLabel: String { modem.grabTabLabel }
+
+    /// The modem panel's control-strip state (`ModemPanelStatus`).
+    var modemPanelStatus: ModemPanelStatus {
+        ModemPanelStatus(mode: modem.settings.mode, autoDetect: modem.settings.autoDetect,
+                         isFileSource: sourceKind == .file, boxActive: modemBoxActive, clockOffset: clockOffset,
+                         signalCount: decodeLog.liveRows.count, heldNewCount: decodeLog.heldNewCount, box: modem.box)
+    }
 
     /// The box body in view fractions, while the modem is on and the box active (clicks inside
     /// it lock the cursor; elsewhere they tune the VFO).
