@@ -13,6 +13,9 @@ import Foundation
 ///   alone: at high SNR the minimum run length is a fixed 10 ms, so a wrong speed estimate cannot
 ///   merge elements and keep itself wrong. Only when the SNR is low does the minimum grow towards a
 ///   fraction of a dot, to suppress noise glitches.
+/// - The gate opens while the tracked peak stands 4x above the floor. The peak restarts at the floor
+///   once nothing has reached it for 2.5 s, so the gate shuts when a transmission ends rather than
+///   staying open while the peak decays through the noise.
 ///
 /// Not thread-safe; owned by one thread at a time.
 final class CWEnvelopeDecoder {
@@ -25,6 +28,21 @@ final class CWEnvelopeDecoder {
     // Tuning.
     private let minPeakToFloor = 4.0
     private static let peakAttack = 0.15
+    /// When nothing in the last 2.25 to 2.5 s (the window moves in tenths) reached the peak, the signal
+    /// has gone: the peak restarts at the floor, as after the warm-up, so only a new signal can open
+    /// the gate. Otherwise the peak of a strong signal decays through the noise for several seconds
+    /// after the transmission, with the gate open while it stands only just above the noise peaks, and
+    /// noise is read as marks. The window is longer than any key-up within a transmission (a word gap
+    /// is 1.7 s at 5 WPM) and the peak only rises towards the marks' levels, so it does not fire while
+    /// a signal is keyed at a steady level; a deep fade restarts the peak, which then re-acquires the
+    /// faded level from the next mark (the gate sees it `lookahead` blocks early, as at the start).
+    private static let releaseMs = 2_500.0
+    private static let releaseSlots = 10
+    /// Slowest learning rate of the floor and the fine-envelope noise power (per clear key-up block,
+    /// after a running mean over the first ones). The smoothed envelope holds only a few independent
+    /// values per second, so a faster floor wanders by tens of percent in plain noise, and a floor
+    /// that has wandered low lets noise peaks through the 4x gate.
+    private static let floorRate = 0.005
     private static let minMarkFraction = 0.55
     private static let minMarkPeak: Float = 0.5
     private static let switchPenalty = 2.5
@@ -48,6 +66,12 @@ final class CWEnvelopeDecoder {
     private var fineWarm = 0.0
     /// Noise power per quadrature component of the fine envelope.
     private var fineVariance = 0.0
+    /// Highest coarse envelope in each tenth of the release window, ring-indexed; `releaseHead` is
+    /// the slot being filled, `releaseFill` its block count.
+    private var releaseMax = [Double](repeating: 0, count: releaseSlots)
+    private var releaseHead = 0
+    private var releaseFill = 0
+    private let releaseSlotBlocks: Int
 
     // Segmentation.
     private var viterbi: KeyingViterbi
@@ -93,12 +117,15 @@ final class CWEnvelopeDecoder {
         self.blockMs = blockMs
         self.lookahead = lookahead
         viterbi = KeyingViterbi(lag: lookahead)
+        releaseSlotBlocks = max(1, Int((Self.releaseMs / Double(Self.releaseSlots) / blockMs).rounded()))
     }
 
     func reset() {
         pending.removeAll(); decided.removeAll(); warmupValues.removeAll(); runs.removeAll()
         warmupCount = 0; noiseFloor = 0; peak = 0; floorUpdates = 0; inputCount = 0
         fineWarm = 0; fineVariance = 0; level = 0
+        for i in releaseMax.indices { releaseMax[i] = 0 }
+        releaseHead = 0; releaseFill = 0
         viterbi = KeyingViterbi(lag: lookahead)
         keyDown = false; runBlocks = 0; gapBefore = 0; markPeak = 0
         marks.removeAll(); markGaps.removeAll(); charPending = false; wordPending = false
@@ -116,6 +143,7 @@ final class CWEnvelopeDecoder {
             // The level tracker and the segmentation see the newest block now; the keying state
             // machine sees it `lookahead` blocks later.
             if warmupCount >= Self.warmupBlocks, m > peak { peak += (m - peak) * Self.peakAttack }
+            releasePeak(m)
             pushSegmentation(fine: f)
             if pending.count > lookahead {
                 let s = pending.removeFirst()
@@ -123,6 +151,20 @@ final class CWEnvelopeDecoder {
             }
         }
         return out
+    }
+
+    /// Adds the newest coarse envelope to the release window; restarts the peak at the floor when
+    /// nothing in the window reached it.
+    private func releasePeak(_ m: Double) {
+        if releaseFill == releaseSlotBlocks {
+            releaseHead = (releaseHead + 1) % Self.releaseSlots
+            releaseMax[releaseHead] = 0
+            releaseFill = 0
+        }
+        releaseMax[releaseHead] = max(releaseMax[releaseHead], m)
+        releaseFill += 1
+        guard warmupCount >= Self.warmupBlocks, peak > noiseFloor else { return }
+        if (releaseMax.max() ?? 0) < peak { peak = noiseFloor }
     }
 
     // MARK: Segmentation
@@ -221,7 +263,7 @@ final class CWEnvelopeDecoder {
             let clear = Double(runBlocks) * blockMs >= dotMs && !pending.contains { $0.coarse > noiseFloor * 2.5 }
             if clear {
                 floorUpdates += 1
-                let rate = max(0.02, 1 / Double(floorUpdates + 10))
+                let rate = max(Self.floorRate, 1 / Double(floorUpdates + 10))
                 noiseFloor += (min(m, noiseFloor * 2.5) - noiseFloor) * rate
                 fineVariance += (min(fine * fine / 2, fineVariance * 6) - fineVariance) * rate
             }

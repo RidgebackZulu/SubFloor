@@ -95,6 +95,40 @@ func decodesAcrossSpeedsAtPlus10dB(_ wpm: Double) {
     #expect(loud.count <= 4, "got \(loud.count) characters")
 }
 
+/// Results of parallel jobs, filled under a lock.
+private final class ResultBox<T>: @unchecked Sendable {
+    var items: [T?]
+    let lock = NSLock()
+    init(_ n: Int) { items = Array(repeating: nil, count: n) }
+}
+
+/// Runs `count` independent jobs on all cores and returns their results in order.
+private func parallel<T>(_ count: Int, _ job: @Sendable (Int) -> T) -> [T] {
+    let box = ResultBox<T>(count)
+    DispatchQueue.concurrentPerform(iterations: count) { i in
+        let r = job(i)
+        box.lock.lock(); box.items[i] = r; box.lock.unlock()
+    }
+    return box.items.map { $0! }
+}
+
+/// The end of a strong transmission is not followed by a stray dot (or dash) read from the noise:
+/// the engine's parallel-decode CW signal (+15 dB, 3000 Hz) with 12 s of noise after it, on held-out
+/// seeds. The tracked peak used to decay from the signal's level through the noise for about 10 s
+/// with the gate open, and about one run in ten ended "... DX E".
+@Test func noStrayElementAfterTransmission() {
+    let sent = "TEST DE OH2XX OH2XX PSE K 73 GL ES DX"
+    let clear = cwAudio(sent, wpm: 20, hz: 3_000) + [Float](repeating: 0, count: 12 * 12_000)
+    let texts = parallel(40) { i in
+        let audio = ModemTestSignals.awgn(clear, snrDb: 15, seed: UInt64(3001 + i), signalPower: 0.5 * 0.5 / 2)
+        return clean(run(CWModem.makeDecoder(frequencyHz: 3_000, sampleRate: 12_000), audio))
+    }
+    for (i, text) in texts.enumerated() {
+        #expect(text.hasSuffix("ES DX"), "seed \(3001 + i): '\(text)'")
+        #expect(ModemTestSignals.characterAccuracy(sent: sent, received: text) >= 0.95, "seed \(3001 + i): '\(text)'")
+    }
+}
+
 @Test func reportsSubmodeAndRegisters() {
     let decoder = CWModem.makeDecoder(frequencyHz: 800, sampleRate: 12_000)
     let audio = cwAudio("CQ TEST DE W1AW K", wpm: 25, hz: 800)
