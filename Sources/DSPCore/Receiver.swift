@@ -111,7 +111,7 @@ public final class Receiver: @unchecked Sendable {
             cutoff: audioCutoff / rate)
         audioFilter = FIRDecimator(taps: audioTaps, factor: audioFactor)
         resampler = LinearResampler(inputRate: rate / Double(audioFactor), outputRate: Self.audioRate)
-        agc = AGC(speed: config.agc, sampleRate: Self.audioRate)
+        agc.reconfigure(speed: config.agc, sampleRate: Self.audioRate)   // keeps the envelope: no pop on rebuild
         squelchOpen = true
         retune()
     }

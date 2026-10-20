@@ -91,3 +91,30 @@ private func config(_ mode: DemodMode, offset: Double = 50_000) -> Receiver.Conf
     rx.update(c)
     #expect(rx.channelRate == rate && rx.config.offsetHz == 10_000)
 }
+
+@Test func agcEnvelopeSurvivesReceiverRebuild() {
+    let rx = Receiver(config: config(.usb))
+    let iq = TestSignals.tone(frequency: 51_000, sampleRate: fs, count: Int(fs / 2), amplitude: 0.1)
+    var audio = [Float]()
+    var i = 0
+    func feed(_ end: Int) {
+        while i < end {
+            let e = min(end, i + 20_000)
+            iq[i..<e].withUnsafeBufferPointer { rx.process($0, audio: &audio) }
+            i = e
+        }
+    }
+    feed(iq.count - 200_000)
+    let steadyPeak = audio.suffix(2_400).map(abs).max() ?? 0
+    #expect(steadyPeak > 0.05)
+    audio.removeAll()
+    var changed = config(.usb)
+    changed.bandwidthHz = 2_400
+    rx.update(changed)
+    feed(iq.count)
+    // Filter group delay swallows the first few ms, so look at the first 100 ms (which includes the first 10 ms).
+    let firstTen = audio.prefix(480).map(abs).max() ?? 0
+    let firstHundred = audio.prefix(4_800).map(abs).max() ?? 0
+    #expect(firstTen <= 2 * steadyPeak)
+    #expect(firstHundred <= 2 * steadyPeak)
+}

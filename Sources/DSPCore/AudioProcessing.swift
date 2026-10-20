@@ -22,7 +22,7 @@ public struct AGC: Sendable {
     }
     public var target: Float = 0.25
     public var maxGain: Float = 10_000
-    private let sampleRate: Double
+    private var sampleRate: Double
     private var envelope: Float = 1e-4
     private var attack: Float = 0
     private var decay: Float = 0
@@ -30,6 +30,13 @@ public struct AGC: Sendable {
     public init(speed: AGCSpeed, sampleRate: Double) {
         self.speed = speed
         self.sampleRate = sampleRate
+        configure()
+    }
+
+    /// Re-targets the AGC at a new speed/rate while keeping the current envelope, so a rebuild causes no gain jump.
+    public mutating func reconfigure(speed newSpeed: AGCSpeed, sampleRate newRate: Double) {
+        sampleRate = newRate
+        speed = newSpeed   // didSet recomputes attack/decay
         configure()
     }
 
