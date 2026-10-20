@@ -44,9 +44,9 @@ skipped with the message "timing test: runs only in an optimised build (swift te
 
 | Command | Result |
 |---|---|
-| `swift test` (debug, all targets) | TO-DO |
-| `swift test -c release -Xswiftc -enable-testing` (runs the performance tests) | TO-DO |
-| `ModemEnginePerformanceTests` figures with real vDSP (fill in §2's Mac column) | TO-DO |
+| `swift test` (debug, all targets) | 2026-10-20, `507026e`: 399 tests, 6 issues. Seen: `ClockCheckTests.queryTimesOut` (async wrapper's queue started > 1.5 s late under the parallel run; test fixed in `c789515`). The other issues were not in the pasted output: TO-DO, re-run on `c789515` or later |
+| `swift test -c release -Xswiftc -enable-testing` (runs the performance tests) | 2026-10-20, `507026e`: 399 tests, 2 issues, both test-timing assumptions fixed in `c789515`: `queryTimesOut` (as above) and `iqOverflowMarksGapWhereLost` (a second, genuine IQ loss on the Mac; the test assumed exactly one). Re-run on `c789515` or later: TO-DO |
+| `ModemEnginePerformanceTests` figures with real vDSP (fill in §2's Mac column) | done, see §2 |
 
 ---
 
@@ -63,10 +63,10 @@ times (so the slot recorder runs too). Only the feeding is timed.
 
 | Test | Measured (harness) | Mac (real vDSP) | Gate |
 |---|---|---|---|
-| `thirtyPSKDecodersRealtimeHeadroom`: 60 s through the engine | 1.52–1.71 s, **35–39× real time** (RTF 0.025–0.028) | TO-DO | < 6 s (≥ 10×) |
-| — decoders running at once | 30 | TO-DO | ≥ 30 |
-| — signals decoded at ≥ 0.9 character accuracy | **30 / 30** (every signal 1.00) | TO-DO | ≥ 28 / 30 |
-| `thirtyPSKDecodersPlusFT8`: same engine run with four busy FT8 slots decoded concurrently on another thread (as the app's slot queue does) | engine 1.48–1.84 s; total wall **2.0–2.2 s** (≥ 27× real time) | TO-DO | total < 6 s |
+| `thirtyPSKDecodersRealtimeHeadroom`: 60 s through the engine | 1.52–1.71 s, **35–39× real time** (RTF 0.025–0.028) | **0.613 s, 97.8× real time** (RTF 0.0102) | < 6 s (≥ 10×) |
+| — decoders running at once | 30 | 30 | ≥ 30 |
+| — signals decoded at ≥ 0.9 character accuracy | **30 / 30** (every signal 1.00) | **30 / 30** (every signal 1.00) | ≥ 28 / 30 |
+| `thirtyPSKDecodersPlusFT8`: same engine run with four busy FT8 slots decoded concurrently on another thread (as the app's slot queue does) | engine 1.48–1.84 s; total wall **2.0–2.2 s** (≥ 27× real time) | engine **0.586 s, 102× real time**; 30 / 30 PSK31 at 1.00 (total wall not in the pasted output) | total < 6 s |
 | — one busy FT8 slot alone (20 signals, −16…+10 dB, 140 Hz apart) | **0.46–0.55 s**, 20 / 20 decoded | TO-DO | < 3 s |
 | — FT8 decodes per slot while concurrent | 20, 20, 20, 20 of 20 | TO-DO | ≥ 18 each |
 
@@ -75,7 +75,7 @@ suites running in parallel). Other speed figures printed by the existing tests i
 
 | Figure | Harness |
 |---|---|
-| `ModemEngineTests.parallelDecode` (5 PSK31 + 2 CW, auto-detect, 40 s) | 0.47 s, 85× real time |
+| `ModemEngineTests.parallelDecode` (5 PSK31 + 2 CW, auto-detect, 40 s) | 0.47 s, 85× real time (Mac: 0.194 s, 206×) |
 | FT8 slot decode, 8 signals at −15 dB / noise only | 0.35 s / 0.28 s |
 | WSPR slot decode, 4 signals at −24 dB / noise only (120 s slot) | 0.12 s / 0.04 s |
 | Classifier, one call on a 2 s / 16 s capture | 0.30 ms / 2.36 ms |
@@ -100,7 +100,7 @@ held in the 2026-10-20 run; where the test prints its figure, the figure is give
 | RTTY | — (extra) | `weakToneDecodes` (upper tone −6 dB, 0 dB), `slowSelectiveFadeDecodes` (+5 dB, tone to −20 dB) | pass |
 | CW 20 WPM | −8 dB, ≥ 95 % | `CWModemTests.decodesAtMinus8dB` (mean over held-out seeds 1001–1040) | pass (mean ≥ 0.95) |
 | CW | — (extra) | 8 / 12 / 35 / 40 WPM at +10 dB, ≥ 0.95 each | pass |
-| FT8 | −20 dB, ≥ 80 % | `FT8Tests.minus20dB` (20 trials, gate ≥ 16, no wrong decodes) | **20 / 20, 0 wrong** |
+| FT8 | −20 dB, ≥ 80 % | `FT8Tests.minus20dB` (20 trials, gate ≥ 16, no wrong decodes) | **20 / 20, 0 wrong** (also on the Mac) |
 | FT8 | — (extra) | six signals at −10 dB in one slot; 0 dB with −10/−15/−20 dB neighbours 60 Hz away | all decoded; reported SNR within 0.6 dB (−18 dB read −17.5 dB) |
 | FT8 | no garbage | 30 noise-only slots | 0 decodes |
 | WSPR | −28 dB, ≥ 80 % (gate −26 dB) | `WSPRDecoderTests.minus26dBGate` (gate ≥ 16 / 20, no wrong) | **20 / 20, 0 wrong** |
@@ -138,7 +138,7 @@ Procedure:
 
 | Date / build (commit) | Rate | FFT | Mode | Signals tracked / decoding | `top` samples 2–5 (% CPU) | Mean | Target | Pass? |
 |---|---|---|---|---|---|---|---|---|
-| TO-DO | 2 MSPS | 8192 | PSK31 + auto | TO-DO | TO-DO | TO-DO | < 30 % | TO-DO |
+| 2026-10-20, `507026e` | 2 MSPS | 8192 | PSK31 + auto, Demo source | TO-DO | 26.4, 65.5, 60.9, 63.1 | **54 %** | < 30 % | **No**: under investigation (modem-off baseline and a per-thread profile needed). The machine was under memory pressure (≈ 300 MB free, 11 GB compressed). For scale, on the x86 harness the 2 MSPS modem channel costs ≈ 6 % of a core and the 12 kHz engine ≈ 1 % |
 | TO-DO | 10 MSPS | 8192 | PSK31 + auto | TO-DO | TO-DO | TO-DO | info only | — |
 
 Mac model / macOS version: TO-DO.
