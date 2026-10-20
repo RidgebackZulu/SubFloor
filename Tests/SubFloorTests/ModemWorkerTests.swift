@@ -693,11 +693,15 @@ private let rx = Receiver.Config(inputRate: 250_000, offsetHz: 0, mode: .usb, ba
         let worker = engine.modemWorker
         #expect(waitUntil(10) { !worker.gapLog.withLock { $0.isEmpty } })
         let gaps = worker.gapLog.withLock { $0 }
-        #expect(gaps.count == 1, "\(gaps)")
         let ratio = ModemChannel.outputRate / rx.inputRate
         if let g = gaps.first {
             #expect(abs(Double(g.atSample) - Double(capacity) * ratio) < 4, "gap at box sample \(g.atSample)")
             #expect(g.lost == Int((Double(burst - capacity) * ratio).rounded()))
+        }
+        // The small blocks that follow the burst are lost too if they arrive while the ring is still
+        // full (a slow or loaded machine): each such loss is a real gap of its own, after the first.
+        for (previous, next) in zip(gaps, gaps.dropFirst()) {
+            #expect(next.atSample >= previous.atSample && next.lost > 0, "\(gaps)")
         }
     }
 

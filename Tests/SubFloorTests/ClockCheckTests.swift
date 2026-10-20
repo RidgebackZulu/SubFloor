@@ -178,12 +178,15 @@ private func transmitTime(_ request: [UInt8]) -> Double? {
         #expect(server.requests.load(ordering: .relaxed) == 1)
     }
 
-    /// No reply, or only invalid replies: nil once the timeout has passed, not much later.
-    @Test func queryTimesOut() async throws {
+    /// No reply, or only invalid replies: nil once the timeout has passed, not much later. Times the
+    /// blocking query itself: the async wrapper's utility queue can start late on a loaded machine (a
+    /// full parallel test run), which says nothing about the timeout (`queryAgainstLocalResponder`
+    /// covers the wrapper).
+    @Test func queryTimesOut() throws {
         let silent = try #require(Responder { _, _ in nil })
         defer { silent.stop() }
         var start = Date()
-        #expect(await ClockCheck.offsetSeconds(server: "127.0.0.1", port: silent.port, timeout: 0.3) == nil)
+        #expect(ClockCheck.query(server: "127.0.0.1", port: silent.port, timeout: 0.3) == nil)
         var elapsed = Date().timeIntervalSince(start)
         #expect(elapsed >= 0.25 && elapsed < 1.5, "elapsed \(elapsed)")
         #expect(silent.requests.load(ordering: .relaxed) == 1)
@@ -194,7 +197,7 @@ private func transmitTime(_ request: [UInt8]) -> Double? {
         })
         defer { wrong.stop() }
         start = Date()
-        #expect(await ClockCheck.offsetSeconds(server: "127.0.0.1", port: wrong.port, timeout: 0.3) == nil)
+        #expect(ClockCheck.query(server: "127.0.0.1", port: wrong.port, timeout: 0.3) == nil)
         elapsed = Date().timeIntervalSince(start)
         #expect(elapsed >= 0.25 && elapsed < 1.5, "elapsed \(elapsed)")
         #expect(wrong.requests.load(ordering: .relaxed) == 1)
