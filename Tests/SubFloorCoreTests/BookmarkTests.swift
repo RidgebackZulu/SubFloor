@@ -76,3 +76,21 @@ private func backupFiles(in dir: URL) throws -> [URL] {
     #expect(BookmarkSearch.filter(BookmarkStore.defaults, query: "").count == BookmarkStore.defaults.count)
     #expect(BookmarkSearch.filter(BookmarkStore.defaults, query: "hamitup").allSatisfy { $0.upconverter })
 }
+
+@Test func searchOverHugeFrequencyBookmarkDoesNotCrash() {
+    let b = Bookmark(name: "Huge", frequencyHz: 1e30, mode: .am, bandwidthHz: 1000)
+    let n = Bookmark(name: "Nan", frequencyHz: .nan, mode: .am, bandwidthHz: 1000)
+    #expect(BookmarkSearch.filter([b, n], query: "huge").count == 1)
+}
+
+@Test func readDropsInvalidBookmarks() throws {
+    let url = tempURL()
+    let good = Bookmark(name: "Good", frequencyHz: 7e6, mode: .usb, bandwidthHz: 2700)
+    let bad = [Bookmark(name: "Big", frequencyHz: 1e30, mode: .usb, bandwidthHz: 2700),
+               Bookmark(name: "Zero", frequencyHz: 0, mode: .usb, bandwidthHz: 2700),
+               Bookmark(name: "Neg", frequencyHz: -5, mode: .usb, bandwidthHz: 2700),
+               Bookmark(name: "BW", frequencyHz: 7e6, mode: .usb, bandwidthHz: 0),
+               Bookmark(name: "BWBig", frequencyHz: 7e6, mode: .usb, bandwidthHz: 1e12)]
+    try BookmarkStore.write([good] + bad, to: url)
+    #expect(try BookmarkStore.read(from: url) == [good])
+}

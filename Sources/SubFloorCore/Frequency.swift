@@ -29,14 +29,24 @@ public enum FrequencyParser {
         else if v < 3_000 { hz = v * 1e6 }
         else if v < 3_000_000 { hz = v * 1e3 }
         else { hz = v }
+        guard hz.isFinite, hz <= maxHz else { return nil }
         return hz.rounded()
     }
+
+    /// Upper bound accepted by `parse` (100 GHz).
+    public static let maxHz = 1e11
 }
 
 public enum FrequencyFormatter {
+    /// Whole Hz clamped to 0…9_999_999_999; non-finite values become 0.
+    public static func safeInt(_ hz: Double) -> Int {
+        guard hz.isFinite else { return 0 }
+        return Int(max(0, min(hz, 9_999_999_999)).rounded())
+    }
+
     /// Dot-grouped whole Hz: 14074000 → "14.074.000".
     public static func grouped(_ hz: Double) -> String {
-        let digits = String(Int(max(0, hz).rounded()))
+        let digits = String(FrequencyFormatter.safeInt(hz))
         var out = ""
         for (i, ch) in digits.enumerated() {
             if i > 0 && (digits.count - i) % 3 == 0 { out.append(".") }
@@ -47,7 +57,7 @@ public enum FrequencyFormatter {
 
     /// Ten zero-padded digits (GHz … Hz) for the big readout.
     public static func readoutDigits(_ hz: Double) -> [Int] {
-        var v = Int(max(0, min(hz, 9_999_999_999)).rounded())
+        var v = safeInt(hz)
         var out = [Int](repeating: 0, count: 10)
         for i in stride(from: 9, through: 0, by: -1) {
             out[i] = v % 10

@@ -96,7 +96,9 @@ public final class BookmarkStore {
     }
 
     public static func read(from url: URL) throws -> [Bookmark] {
-        try JSONDecoder().decode(BookmarkFile.self, from: Data(contentsOf: url)).bookmarks
+        let all = try JSONDecoder().decode(BookmarkFile.self, from: Data(contentsOf: url)).bookmarks
+        func valid(_ v: Double) -> Bool { v.isFinite && v > 0 && v <= FrequencyParser.maxHz }
+        return all.filter { valid($0.frequencyHz) && valid($0.bandwidthHz) }
     }
 
     public static let defaults: [Bookmark] = [
@@ -117,7 +119,7 @@ public enum BookmarkSearch {
         guard !tokens.isEmpty else { return bookmarks }
         return bookmarks.filter { b in
             let haystack = [b.name, b.group ?? "", b.mode.rawValue, FrequencyFormatter.short(b.frequencyHz),
-                            String(Int(b.frequencyHz)), b.upconverter ? "hamitup upconverter" : ""]
+                            String(FrequencyFormatter.safeInt(b.frequencyHz)), b.upconverter ? "hamitup upconverter" : ""]
                 .joined(separator: " ").lowercased()
             return tokens.allSatisfy { haystack.contains($0) }
         }

@@ -54,3 +54,12 @@ func rejectsInvalidFrequency(_ input: String) {
     #expect(RSP1B.clampHardware(3_000_000_000) == 2_000_000_000)
     #expect(RSP1B.clampHardware(10) == 1_000)
 }
+
+@Test func hugeAndNonFiniteFrequenciesDoNotCrash() {
+    #expect(FrequencyParser.parse("99999999999g") == nil)
+    #expect(FrequencyParser.parse(String(repeating: "9", count: 25)) == nil)
+    #expect(FrequencyParser.parse("1.2g") == 1_200_000_000)
+    _ = FrequencyFormatter.grouped(1e30)
+    #expect(FrequencyFormatter.grouped(.nan) == "0")
+    #expect(FrequencyFormatter.readoutDigits(.infinity) == [Int](repeating: 0, count: 10))
+}
