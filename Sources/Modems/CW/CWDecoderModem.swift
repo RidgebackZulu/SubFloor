@@ -2,6 +2,7 @@ import DSPCore
 import Foundation
 import Observation
 import SwiftUI
+import Synchronization
 
 /// Main-thread state for the CW output view. Mutated only on the main queue.
 @Observable
@@ -26,15 +27,27 @@ public final class CWDecoderModem: Modem, @unchecked Sendable {
     public static let info = ModemInfo(id: "cw", name: "CW Decoder", input: .audio, preferredMode: .cw, preferredBandwidth: 500)
 
     public let model = CWDecoderModel()
-    private let core = CWDecoderCore()
+    private var core = CWDecoderCore()
+    private let resetRequested = Atomic<Bool>(false)
     private var pending = ""
     private var samplesSinceFlush = 0
 
     public init() {}
 
-    public func reset() { core.reset() }
+    /// Safe from any thread: the DSP thread performs the reset at the start of its next `process`.
+    public func reset() { resetRequested.store(true, ordering: .releasing) }
 
     public func process(audio: UnsafeBufferPointer<Float>, context: ModemContext) {
+        if resetRequested.exchange(false, ordering: .acquiring) {
+            core.reset()
+            pending = ""
+            samplesSinceFlush = 0
+        }
+        if core.sampleRate != context.sampleRate {
+            core = CWDecoderCore(sampleRate: context.sampleRate, pitchHz: context.cwPitchHz)
+            pending = ""
+            samplesSinceFlush = 0
+        }
         if core.pitchHz != context.cwPitchHz { core.pitchHz = context.cwPitchHz }
         pending += core.process(audio)
         samplesSinceFlush += audio.count

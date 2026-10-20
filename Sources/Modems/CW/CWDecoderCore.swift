@@ -12,8 +12,12 @@ public final class CWDecoderCore {
     private let blockSize: Int
     private var coefficient = 0.0
     private var s1 = 0.0, s2 = 0.0, filled = 0
-    private var noiseFloor = 1e-3
-    private var peak = 1e-3
+    private static let warmupBlocks = 20
+    private var warmupCount = 0
+    private var warmupSum = 0.0
+    private var warmupMax = 0.0
+    private var noiseFloor = 0.0
+    private var peak = 0.0
     private var keyDown = false
     private var runBlocks = 0
     private var dotMs = 60.0
@@ -34,7 +38,8 @@ public final class CWDecoderCore {
 
     public func reset() {
         s1 = 0; s2 = 0; filled = 0
-        noiseFloor = 1e-3; peak = 1e-3
+        warmupCount = 0; warmupSum = 0; warmupMax = 0
+        noiseFloor = 0; peak = 0; level = 0
         keyDown = false; runBlocks = 0; dotMs = 60; wpm = 20
         symbol = ""; charPending = false; wordPending = false
     }
@@ -57,8 +62,18 @@ public final class CWDecoderCore {
     }
 
     private func step(magnitude m: Double, out: inout String) {
-        if m > peak { peak = m } else { peak += (m - peak) * 0.002 }
-        if m < noiseFloor { noiseFloor = m } else { noiseFloor += (m - noiseFloor) * 0.002 }
+        if warmupCount < Self.warmupBlocks {
+            warmupCount += 1
+            warmupSum += m
+            warmupMax = max(warmupMax, m)
+            if warmupCount == Self.warmupBlocks {
+                noiseFloor = warmupSum / Double(Self.warmupBlocks)
+                peak = warmupMax
+            }
+            return
+        }
+        if m > peak { peak = m } else { peak += (max(noiseFloor, 0) - peak) * 0.002 }
+        if !keyDown { noiseFloor += (m - noiseFloor) * (m < noiseFloor ? 0.1 : 0.01) }
         let span = peak - noiseFloor
         let threshold = noiseFloor + span * (keyDown ? 0.4 : 0.6)
         let down = m > threshold && peak > noiseFloor * 4
