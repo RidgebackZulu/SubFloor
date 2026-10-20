@@ -123,10 +123,10 @@ private struct SplitHandle: View {
     let height: CGFloat
 
     var body: some View {
-        Rectangle()
-            .fill(.clear)
+        Color.clear
             .frame(height: 8)
             .frame(maxWidth: .infinity)
+            .overlay(RoundedRectangle(cornerRadius: 1.5).fill(.white.opacity(0.25)).frame(width: 36, height: 3))
             .contentShape(Rectangle())
             .offset(y: height * model.spectrumFraction - 4)
             .onHover { inside in (inside ? NSCursor.resizeUpDown : NSCursor.arrow).set() }

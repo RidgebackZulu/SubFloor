@@ -15,7 +15,7 @@ struct TopBarView: View {
             .controlSize(.large)
             .help("Run / Stop (Space)")
 
-            FrequencyReadout(hz: model.vfoHz, onCommit: { model.tune(to: $0) }, onStep: { model.setVFO($0) })
+            FrequencyReadout(hz: model.vfoHz, onCommit: { model.tune(to: $0) }, onDigitStep: model.stepDigit)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text("CENTER").font(.system(size: 9, weight: .semibold)).foregroundStyle(.tertiary)
@@ -29,7 +29,7 @@ struct TopBarView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(width: 300)
+            .frame(width: 250)
 
             BandwidthControl()
 

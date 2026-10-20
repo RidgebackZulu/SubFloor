@@ -18,6 +18,24 @@ struct AppModelTests {
                         defaults: UserDefaults(suiteName: UUID().uuidString)!)
     }
 
+    @Test func overloadFlagTracksEvents() {
+        let m = makeModel()
+        m.handleOverload(true)
+        #expect(m.overloaded)
+        #expect(m.banner?.action == .reduceGain)
+        m.handleOverload(false)
+        #expect(!m.overloaded)
+        #expect(m.banner == nil)
+    }
+
+    @Test func consecutiveDigitStepsAccumulate() {
+        let m = makeModel()
+        let start = m.vfoHz
+        m.stepDigit(power: 3, ticks: 1)
+        m.stepDigit(power: 3, ticks: 1)
+        #expect(m.vfoHz == start + 2_000)
+    }
+
     @Test func setVFOInsideUsableSpanKeepsCenter() {
         let m = makeModel()
         let center = m.centerHz

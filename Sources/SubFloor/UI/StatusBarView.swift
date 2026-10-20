@@ -12,6 +12,9 @@ struct StatusBarView: View {
             Text("RBW \(FrequencyFormatter.short(model.sampleRate / Double(model.spectrum.fftSize)))")
             Text(String(format: "Signal %.0f dBFS", model.signalDb))
             Spacer()
+            if model.overloaded {
+                Label("OVERLOAD", systemImage: "exclamationmark.triangle.fill").foregroundStyle(.red)
+            }
             if model.upconverter.enabled {
                 Label("HamItUp \(FrequencyFormatter.short(model.upconverter.loHz))", systemImage: "arrow.up.arrow.down").foregroundStyle(.orange)
             }

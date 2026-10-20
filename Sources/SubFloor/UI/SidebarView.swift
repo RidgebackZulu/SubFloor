@@ -46,7 +46,7 @@ private struct RadioSection: View {
                 }
                 .labelsHidden().frame(width: 110)
             }
-            LabeledContent("Bandwidth") {
+            LabeledContent("Output rate") {
                 Text(FrequencyFormatter.rate(model.sampleRate)).monospacedDigit().foregroundStyle(.secondary)
             }
             LabeledContent("LNA state") {
@@ -103,7 +103,7 @@ private struct DisplaySection: View {
             HStack {
                 Toggle("Peak hold", isOn: $model.showPeak)
                 Spacer()
-                Button("Reset") { model.engine.resetPeak() }.controlSize(.small)
+                Button("Reset") { model.resetPeak() }.controlSize(.small)
             }
             LabeledContent("Resolution") {
                 Text(FrequencyFormatter.short(model.sampleRate / Double(model.spectrum.fftSize)) + " / bin")

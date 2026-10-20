@@ -5,7 +5,7 @@ import SwiftUI
 struct FrequencyReadout: View {
     let hz: Double
     var onCommit: (Double) -> Void
-    var onStep: (Double) -> Void
+    var onDigitStep: (Int, Int) -> Void
 
     @State private var editing = false
     @State private var text = ""
@@ -38,13 +38,15 @@ struct FrequencyReadout: View {
                     }
                     Text("\(digits[i])")
                         .foregroundStyle(i < firstSignificant ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.primary))
-                        .overlay(ScrollCatcher(onScroll: { onStep(hz + Double($0) * pow(10, Double(9 - i))) },
+                        .overlay(ScrollCatcher(onScroll: { onDigitStep(9 - i, $0) },
                                                onClick: { editing = true }))
                 }
                 Text(" Hz").font(.system(size: 13, weight: .medium)).foregroundStyle(.secondary).padding(.leading, 4)
             }
             .font(Theme.readout)
             .monospacedDigit()
+            .lineLimit(1)
+            .fixedSize()
             .help("Scroll a digit to step it · click to type (14.074, 7074k, 144.39m)")
         }
     }

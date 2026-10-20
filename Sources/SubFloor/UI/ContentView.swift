@@ -33,7 +33,7 @@ struct ContentView: View {
         }
         .animation(.snappy(duration: 0.2), value: model.banner)
         .animation(.snappy(duration: 0.15), value: model.quickTuneVisible)
-        .frame(minWidth: 1180, minHeight: 720)
-        .onAppear { model.start() }
+        .frame(minWidth: 1280, minHeight: 720)
+        .onAppear { model.startIfNeeded() }
     }
 }

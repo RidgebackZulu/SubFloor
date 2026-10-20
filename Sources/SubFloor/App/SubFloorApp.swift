@@ -17,7 +17,7 @@ struct SubFloorApp: App {
     }
 
     var body: some Scene {
-        WindowGroup("SubFloor") {
+        Window("SubFloor", id: "main") {
             ContentView()
                 .environment(model)
                 .preferredColorScheme(scheme)

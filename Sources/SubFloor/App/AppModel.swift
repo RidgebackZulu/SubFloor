@@ -85,6 +85,8 @@ final class AppModel {
     private(set) var signalDb: Float = -200
     private(set) var underruns = 0
     private(set) var cpuPercent: Double = 0
+    private(set) var overloaded = false
+    private var didAutoStart = false
 
     let engine = DSPEngine()
     private var sdrplay: SDRplayDevice?
@@ -169,6 +171,18 @@ final class AppModel {
 
     // MARK: Run control
 
+    func startIfNeeded() {
+        guard !didAutoStart else { return }
+        didAutoStart = true
+        start()
+    }
+
+    func resetPeak() { engine.resetPeak() }
+
+    func stepDigit(power: Int, ticks: Int) {
+        setVFO(vfoHz + Double(ticks) * pow(10, Double(power)))
+    }
+
     func toggleRun() { isRunning ? stop() : start() }
 
     func start() {
@@ -217,6 +231,7 @@ final class AppModel {
         guard isRunning else { return }
         engine.stop()
         isRunning = false
+        overloaded = false
     }
 
     func retry() {
@@ -269,17 +284,23 @@ final class AppModel {
         return Double(match.1)
     }
 
+    func handleOverload(_ detected: Bool) {
+        overloaded = detected
+        if detected {
+            show(Banner(kind: .warning, message: "ADC overload — reduce gain.", action: .reduceGain))
+        } else if banner?.action == .reduceGain {
+            banner = nil
+        }
+    }
+
     private func handle(_ event: SDRplayEvent, from device: SDRplayDevice) {
         guard device === sdrplay else { return }
         switch event {
         case .overload(let detected):
-            if detected {
-                show(Banner(kind: .warning, message: "ADC overload — reduce gain.", action: .reduceGain))
-            } else if banner?.action == .reduceGain {
-                banner = nil
-            }
+            handleOverload(detected)
         case .deviceRemoved, .deviceFailure:
             stop()
+            overloaded = false
             sdrplay?.close()
             sdrplay = nil
             show(Banner(kind: .error, message: event == .deviceRemoved ? "RSP1B disconnected." : "RSP1B reported a failure.", action: .retry))
