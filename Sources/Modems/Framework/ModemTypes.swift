@@ -143,7 +143,7 @@ public protocol SlotModem {
 /// Registry of the available modems. Each modem task appends its type here.
 public enum ModemCatalog {
     public static var streaming: [any StreamingModem.Type] { [CWModem.self, PSK31Modem.self, RTTYModem.self] }
-    public static var slot: [any SlotModem.Type] { [WSPRModem.self] }
+    public static var slot: [any SlotModem.Type] { [FT8Modem.self, WSPRModem.self] }
 
     public static func streaming(_ id: ModeID) -> (any StreamingModem.Type)? {
         streaming.first { $0.id == id }

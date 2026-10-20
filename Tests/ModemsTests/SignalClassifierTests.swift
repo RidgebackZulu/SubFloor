@@ -288,12 +288,10 @@ private func confusionMatrix(_ trials: [TrialResult]) -> String {
         }
     }
 
-    // TODO(Task 10): enable `classifiesFT8` by replacing `nil` with
-    // `{ FT8Encoder.audio(message: $0, audioHz: $1) }` on the next line; nothing else changes.
-    private static let ft8Encoder: (@Sendable (String, Double) -> [Float]?)? = nil
+    private static let ft8Encoder: (@Sendable (String, Double) -> [Float]?)? = { FT8Encoder.audio(message: $0, audioHz: $1) }
 
-    /// Plan: an FT8 signal at +5 dB aligned to a slot, ≥ 90% of 20 trials. Pending until Task 10
-    /// provides `FT8Encoder` (15 s of audio, signal from 0.5 s, `audioHz` = tone 0).
+    /// Plan: an FT8 signal at +5 dB aligned to a slot, ≥ 90% of 20 trials, from Task 10's
+    /// `FT8Encoder` (15 s of audio, signal from 0.5 s, `audioHz` = tone 0).
     @Test func classifiesFT8() {
         withKnownIssue("FT8Encoder arrives in Task 10") {
             guard let encoder = Self.ft8Encoder else {

@@ -646,20 +646,20 @@ private let cwTexts = ["CQ CQ DE W1AW W1AW K TU 599 NAME JOHN QTH CT BK", "TEST 
         #expect(late.classification(ofTrack: l?.id ?? 0)?.mode != .ft8)
     }
 
-    @Test func slotSinkReceivesTimedBlocks() {
+    @Test func processRecordsTimedBlocksForSlots() {
         let engine = ModemEngine()
         engine.settings = ModemSettings(mode: .ft8)
-        var received: [(Int, Date)] = []
-        engine.slotSink = { audio, time in received.append((audio.count, time)) }
         let audio = ModemTestSignals.noise(seconds: 1, seed: 916)
         let t0 = Date(timeIntervalSince1970: 1_800_000_000)
         for start in stride(from: 0, to: audio.count, by: 3_000) {
             let time = t0.addingTimeInterval(Double(start) / fs)
             _ = audio[start..<(start + 3_000)].withUnsafeBufferPointer { engine.process($0, sampleIndex: start, firstSampleTime: time) }
         }
+        // Four timed blocks make one continuous run; an untimed block is not recorded.
+        #expect(engine.slotRecorder.retainedSampleCount == 12_000)
+        #expect(engine.slotRecorder.anchorCount == 1)
         _ = audio[0..<100].withUnsafeBufferPointer { engine.process($0, sampleIndex: 12_000) }
-        #expect(received.map(\.0) == [3_000, 3_000, 3_000, 3_000])
-        #expect(received.map(\.1) == (0..<4).map { t0.addingTimeInterval(Double($0) * 0.25) })
+        #expect(engine.slotRecorder.retainedSampleCount == 12_000)
         #expect(engine.decoderKeys.isEmpty, "a slot mode runs no streaming decoders")
     }
 }

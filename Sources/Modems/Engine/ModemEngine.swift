@@ -66,7 +66,15 @@ public struct ModemOutput: Sendable {
 /// cross-fades over 20 ms.
 ///
 /// **Time.** `process` takes the UTC time of each block's first sample when the caller knows it;
-/// the classifier's FT8 slot check uses it, and `slotSink` receives the block with it.
+/// the classifier's FT8 slot check uses it.
+///
+/// **Slots.** Every timed block also goes to a `SlotRecorder` (150 s of audio). A block without a
+/// time, a jump in `sampleIndex` and `resetForBoxMove()` are gaps to it, so a slot spanning one is
+/// skipped, never decoded partially. `dueSlotJobs(now:)` returns the slots that are complete, for
+/// the slot modes wanted: none unless `slotModesEnabled` and a mode is selected; with auto-detect
+/// on, every slot mode (FT8 and WSPR decode every slot regardless); with it off, the selected mode if
+/// it is a slot mode. A mode not wanted at the previous call starts with the slot in progress, so
+/// switching to it never returns a backlog of old slots.
 ///
 /// **Chunk size.** The engine splits its input at the tracker's 2048-sample frame boundaries and
 /// makes every decision there, so the decoders, the tracks and the text do not depend on how the
@@ -78,6 +86,8 @@ public final class ModemEngine {
 
     /// Box audio kept for classification and decoder priming.
     public static let historySeconds = 16.0
+    /// Box audio kept for slot decoding: a WSPR slot plus margin.
+    public static let slotRetainSeconds = 150.0
     /// Decisions are made every `stepSamples` (the tracker's hop).
     static let stepSamples = 2_048
     static let signalsIntervalSeconds = 0.5
@@ -119,10 +129,6 @@ public final class ModemEngine {
         }
     }
 
-    /// Receives every block with the UTC time of its first sample, when `process` is given one.
-    /// Task 10's `SlotRecorder` attaches here (through `appendSlotAudio`); nil until then.
-    public var slotSink: ((UnsafeBufferPointer<Float>, Date) -> Void)?
-
     /// The key the cursor's signal is reported under: its track id, or a provisional (negative) key
     /// while no track is at the cursor. Nil when unlocked.
     public var cursorTrackID: Int? { cursor?.key }
@@ -132,6 +138,7 @@ public final class ModemEngine {
     private let tracker: SignalTracker
     private let analyzer: CursorAnalyzer
     private let listen: ListenFilter
+    let slotRecorder: SlotRecorder
 
     private struct Cursor {
         var key: Int
@@ -214,6 +221,7 @@ public final class ModemEngine {
         tracker = SignalTracker(sampleRate: sampleRate)
         analyzer = CursorAnalyzer(sampleRate: sampleRate)
         listen = ListenFilter(sampleRate: sampleRate)
+        slotRecorder = SlotRecorder(sampleRate: sampleRate, retainSeconds: Self.slotRetainSeconds)
         history = .init(repeating: 0, count: Int(Self.historySeconds * sampleRate) + Self.stepSamples)
         narrowScratch = .init(repeating: 0, count: Self.stepSamples)
     }
@@ -267,11 +275,13 @@ public final class ModemEngine {
         dirty = true
     }
 
-    /// Clears tracks, decoders, classifications, the cursor and all audio history (the box moved).
-    /// Keys keep increasing, so nothing decoded before can be reported under a later signal; the next
-    /// output's `signals` is empty.
+    /// Clears tracks, decoders, classifications, the cursor and all audio history (the box moved),
+    /// slot audio included: no slot that started before the move is ever returned. Keys keep
+    /// increasing, so nothing decoded before can be reported under a later signal; the next output's
+    /// `signals` is empty.
     public func resetForBoxMove() {
         tracker.reset()
+        slotRecorder.reset()
         slots.removeAll()
         covered.removeAll()
         classes.removeAll()
@@ -295,13 +305,19 @@ public final class ModemEngine {
 
     /// Consumes box audio. `sampleIndex` is the index of `audio[0]` in the caller's box-audio stream
     /// (a jump marks lost audio; the streaming decoders simply carry on). `firstSampleTime` is the UTC
-    /// time of `audio[0]`, when known.
+    /// time of `audio[0]`, when known; the block goes to the slot recorder with it (without it, it is
+    /// a gap there).
     public func process(_ audio: UnsafeBufferPointer<Float>, sampleIndex: Int, firstSampleTime: Date? = nil) -> ModemOutput {
-        if let expected = nextSampleIndex, sampleIndex != expected { gaps += 1 }
+        if let expected = nextSampleIndex, sampleIndex != expected {
+            gaps += 1
+            slotRecorder.markGap()
+        }
         nextSampleIndex = sampleIndex + audio.count
         if let t = firstSampleTime {
             timeAnchor = (position, t)
-            if !audio.isEmpty { slotSink?(audio, t) }
+            appendSlotAudio(audio, firstSampleTime: t)
+        } else if !audio.isEmpty {
+            slotRecorder.markGap()
         }
         textOut.removeAll(keepingCapacity: true)
         var listenAudio = [Float](repeating: 0, count: audio.count)
@@ -328,6 +344,26 @@ public final class ModemEngine {
             lastCursorFrameAt = position
         }
         return out
+    }
+
+    // MARK: Slots
+
+    /// Records box audio for the slot modes; `process` calls it for every timed block, so call it
+    /// directly only for audio that does not go through `process`.
+    public func appendSlotAudio(_ audio: UnsafeBufferPointer<Float>, firstSampleTime: Date) {
+        slotRecorder.append(audio, firstSampleTime: firstSampleTime)
+    }
+
+    /// The complete slots due at `now` for the slot modes the settings want (see **Slots** above),
+    /// each returned once. Decode them off the modem thread (`SlotJob.decode`).
+    public func dueSlotJobs(now: Date) -> [SlotJob] {
+        slotRecorder.dueSlots(modes: wantedSlotModes(), now: now)
+    }
+
+    func wantedSlotModes() -> [any SlotModem.Type] {
+        guard settings.slotModesEnabled, let mode = settings.mode else { return [] }
+        if settings.autoDetect { return ModemCatalog.slot }
+        return mode.isSlotMode ? ModemCatalog.slot.filter { $0.id == mode } : []
     }
 
     private func processBlock(_ block: UnsafeBufferPointer<Float>, listenInto listenAudio: inout [Float], at offset: Int) {
