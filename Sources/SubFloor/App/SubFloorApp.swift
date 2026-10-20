@@ -1,8 +1,19 @@
 import AppKit
 import SwiftUI
 
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    weak var model: AppModel?
+
+    func applicationWillTerminate(_ notification: Notification) {
+        MainActor.assumeIsolated { model?.shutdown() }
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
+}
+
 @main
 struct SubFloorApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var model = AppModel()
     @AppStorage("appearance") private var appearance = "dark"
 
@@ -23,6 +34,7 @@ struct SubFloorApp: App {
                 .preferredColorScheme(scheme)
                 .tint(Theme.accent)
                 .onAppear {
+                    appDelegate.model = model
                     KeyboardController.shared.install(model: model)
                     NSApp.activate()
                 }

@@ -18,6 +18,13 @@ struct AppModelTests {
                         defaults: UserDefaults(suiteName: UUID().uuidString)!)
     }
 
+    @Test func shutdownOnUnstartedModelIsSafeAndIdempotent() {
+        let m = makeModel()
+        m.shutdown()
+        m.shutdown()
+        #expect(!m.isRunning)
+    }
+
     @Test func overloadFlagTracksEvents() {
         let m = makeModel()
         m.handleOverload(true)

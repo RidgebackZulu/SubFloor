@@ -234,6 +234,17 @@ final class AppModel {
         overloaded = false
     }
 
+    /// Orderly shutdown (app quit): stop the engine, release the RSP, persist the session. Idempotent.
+    func shutdown() {
+        engine.stop()
+        isRunning = false
+        sdrplay?.close()
+        sdrplay = nil
+        saveSessionIfChanged()
+        statsTimer?.invalidate()
+        statsTimer = nil
+    }
+
     func retry() {
         banner = nil
         if preferredSource == .sdrplay, let device = sdrplay {
