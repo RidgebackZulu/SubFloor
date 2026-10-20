@@ -404,3 +404,142 @@ func snrIsCalibratedTo2500HzBandwidth(_ snrDb: Double) {
     #expect(abs(10 * log10(mean)) < 0.1, "floor bias \(10 * log10(mean)) dB")
     #expect(ratios.allSatisfy { abs(10 * log10($0)) < 0.5 }, "per-frame floor range \(ratios.min()!)...\(ratios.max()!)")
 }
+
+// MARK: - Busy band (review fix round 1)
+
+/// BPSK31 at `hz`: cosine-shaped reversals at 31.25 Bd. `reversalProbability` 1 is idle (two lines
+/// at ±15.625 Hz); 0.5 is random data. `timingOffset` shifts the symbol clock, in symbols.
+private func bpsk31(_ hz: Double, seconds: Double, amplitude: Float = 0.5, seed: UInt64,
+                    reversalProbability: Double = 0.5, timingOffset: Double = 0, phase: Double = 0) -> [Float] {
+    let n = Int(seconds * fs)
+    let symbol = fs / 31.25
+    var out = [Float](repeating: 0, count: n)
+    var state = seed
+    var sign: Float = 1
+    var reversing = false
+    var currentSymbol = Int.min
+    for i in 0..<n {
+        let t = Double(i) / symbol + timingOffset
+        let s = Int(t.rounded(.down))
+        if s != currentSymbol {
+            if reversing { sign = -sign }
+            currentSymbol = s
+            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            reversing = Double(state >> 11) / Double(1 << 53) < reversalProbability
+        }
+        let envelope: Float = reversing ? sign * Float(cos(Double.pi * (t - Double(s)))) : sign
+        out[i] = amplitude * envelope * Float(cos(2 * Double.pi * hz * Double(i) / fs + phase))
+    }
+    return out
+}
+
+private func meanSquare(_ x: [Float]) -> Double { x.reduce(0.0) { $0 + Double($1) * Double($1) } / Double(x.count) }
+
+/// Mixes signals and adds noise for `snrDb` per signal, relative to the first signal's power.
+private func scene(_ signals: [[Float]], snrDb: Double, seed: UInt64, referencePower: Double? = nil) -> [Float] {
+    var x = signals[0]
+    for s in signals.dropFirst() { for i in x.indices { x[i] += s[i] } }
+    return ModemTestSignals.awgn(x, snrDb: snrDb, seed: seed, signalPower: referencePower ?? meanSquare(signals[0]))
+}
+
+private func expectTracks(_ tracker: SignalTracker, at expected: [Double], tolerance: Double = 3,
+                          _ label: String, sourceLocation: SourceLocation = #_sourceLocation) {
+    let tracks = tracker.tracks
+    #expect(tracks.count == expected.count, "\(label): \(tracks.map { ($0.frequencyHz, $0.isFSKPair) })",
+            sourceLocation: sourceLocation)
+    guard tracks.count == expected.count else { return }
+    for (t, hz) in zip(tracks, expected) {
+        #expect(abs(t.frequencyHz - hz) < tolerance, "\(label): \(t.frequencyHz) Hz, expected \(hz)",
+                sourceLocation: sourceLocation)
+    }
+}
+
+@Test(arguments: [(1.0, 10.0), (0.5, 10.0), (0.5, 0.0)])
+func busyPSKBandStaysSeparate(_ reversalProbability: Double, _ snrDb: Double) {
+    let centres = (0..<7).map { 800 + 55 * Double($0) }
+    let signals = centres.enumerated().map { i, hz in
+        bpsk31(hz, seconds: 6, seed: UInt64(i) + 1, reversalProbability: reversalProbability,
+               timingOffset: Double(i) * 0.37, phase: Double(i))
+    }
+    let tracker = SignalTracker()
+    feed(tracker, scene(signals, snrDb: snrDb, seed: 151))
+    expectTracks(tracker, at: centres, "p=\(reversalProbability) snr=\(snrDb)")
+    #expect(!tracker.tracks.contains { $0.isFSKPair })
+}
+
+@Test(arguments: [160.0, 170, 180])
+func twoPSKSignalsNear170HzAreNotRTTY(_ spacing: Double) {
+    for (p, offset) in [(1.0, 0.0), (1.0, 0.5), (0.5, 0.0)] {
+        for snr in [10.0, 0.0] {
+            let a = bpsk31(1_200, seconds: 5, seed: 3, reversalProbability: p)
+            let b = bpsk31(1_200 + spacing, seconds: 5, seed: 4, reversalProbability: p, timingOffset: offset, phase: 1)
+            let tracker = SignalTracker()
+            feed(tracker, scene([a, b], snrDb: snr, seed: 161))
+            expectTracks(tracker, at: [1_200, 1_200 + spacing], "spacing \(spacing) p=\(p) offset \(offset) snr \(snr)")
+            #expect(!tracker.tracks.contains { $0.isFSKPair })
+        }
+    }
+}
+
+@Test func weakNeighboursBesideRTTYSurvive() {
+    let rttyA: Float = 0.5
+    let rttyPower = Double(rttyA * rttyA) / 2
+    let rtty = fsk(low: 1_415, high: 1_585, bitSeconds: 0.022, seconds: 5, amplitude: rttyA, randomBitsSeed: 9)
+    // Neighbours 20 dB below a +20 dB RTTY signal, i.e. at 0 dB.
+    let weak = rttyA * Float(pow(10, -20.0 / 20))
+    let cases: [(String, [Float], Double)] = [
+        ("PSK31 mark+80", bpsk31(1_665, seconds: 5, amplitude: weak * 1.414, seed: 5), 1_665),
+        ("PSK31 mark+120", bpsk31(1_705, seconds: 5, amplitude: weak * 1.414, seed: 6), 1_705),
+        ("PSK31 mark+170", bpsk31(1_755, seconds: 5, amplitude: weak * 1.414, seed: 7), 1_755),
+        ("PSK31 space-120", bpsk31(1_295, seconds: 5, amplitude: weak * 1.414, seed: 8), 1_295),
+        ("CW mark+80", ModemTestSignals.tone(1_665, seconds: 5, amplitude: weak), 1_665),
+    ]
+    for (label, neighbour, hz) in cases {
+        let tracker = SignalTracker()
+        feed(tracker, scene([rtty, neighbour], snrDb: 20, seed: 171, referencePower: rttyPower))
+        let expected = [1_500.0, hz].sorted()
+        expectTracks(tracker, at: expected, label)
+        #expect(tracker.tracks.first { abs($0.frequencyHz - 1_500) < 3 }?.isFSKPair == true, "\(label): RTTY not paired")
+        #expect(tracker.tracks.filter(\.isFSKPair).count == 1, "\(label)")
+    }
+    // RTTY at +10 dB with a −10 dB PSK31 120-170 Hz beyond the mark.
+    for hz in [1_705.0, 1_735, 1_755] {
+        let neighbour = bpsk31(hz, seconds: 5, amplitude: weak * 1.414, seed: 10)
+        let tracker = SignalTracker()
+        feed(tracker, scene([rtty, neighbour], snrDb: 10, seed: 172, referencePower: rttyPower))
+        expectTracks(tracker, at: [1_500, hz], "+10 dB RTTY, −10 dB PSK31 at \(hz)")
+    }
+}
+
+@Test(arguments: [40.0, 50.0])
+func closePSKPairsStaySeparate(_ spacing: Double) {
+    for p in [1.0, 0.5] {
+        let a = bpsk31(1_500, seconds: 5, seed: 21, reversalProbability: p)
+        let b = bpsk31(1_500 + spacing, seconds: 5, seed: 22, reversalProbability: p, timingOffset: 0.3, phase: 2)
+        let tracker = SignalTracker()
+        feed(tracker, scene([a, b], snrDb: 10, seed: 181))
+        expectTracks(tracker, at: [1_500, 1_500 + spacing], "spacing \(spacing) p=\(p)")
+    }
+}
+
+/// Ruling R8: the cursor can snap to a signal younger than the 6-frame confirmation.
+@Test func strongestPeakFindsYoungSignals() {
+    let tracker = SignalTracker()
+    #expect(tracker.strongestPeak(near: 1_000, within: 50) == nil)
+    let audio = scene([ModemTestSignals.tone(1_000, seconds: 2, amplitude: 0.5),
+                       ModemTestSignals.tone(1_030, seconds: 2, amplitude: 0.05),
+                       bpsk31(2_000, seconds: 2, seed: 1, reversalProbability: 1)],
+                      snrDb: 10, seed: 191)
+    // 4 warm-up frames plus one: peaks exist, but no track is confirmed yet.
+    feed(tracker, audio[0..<(4_096 + 4 * 2_048)])
+    #expect(tracker.tracks.isEmpty)
+    let carrier = tracker.strongestPeak(near: 1_020, within: 40)
+    #expect(carrier.map { abs($0 - 1_000) < 1 } == true, "carrier snap \(String(describing: carrier))")
+    #expect(tracker.strongestPeak(near: 1_030, within: 5).map { abs($0 - 1_030) < 1 } == true)
+    // An idle PSK31 snaps to its centre, not to a sideband line.
+    let psk = tracker.strongestPeak(near: 2_010, within: 30)
+    #expect(psk.map { abs($0 - 2_000) < 3 } == true, "PSK snap \(String(describing: psk))")
+    #expect(tracker.strongestPeak(near: 1_500, within: 100) == nil)
+    tracker.reset()
+    #expect(tracker.strongestPeak(near: 1_000, within: 50) == nil)
+}

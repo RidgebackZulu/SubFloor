@@ -48,11 +48,17 @@ public struct Track: Sendable, Equatable, Identifiable {
 /// 2. Noise floor: a 64-bin running median over the band's bins, excluding the bins the previous
 ///    frame attributed to signals, scaled from median to mean noise power per bin.
 /// 3. Peaks: ≥ 6 dB over the floor and a local maximum within ±5 bins, refined by parabolic
-///    interpolation.
-/// 4. Grouping into signals: FSK pairs (lumps 170 ± 15 Hz apart within 6 dB) absorb their keying
-///    lines; then remaining peaks within ±20 Hz of a stronger signal's line, or joined to it with no
-///    3 dB valley, are its sidebands; a PSK31 idle twin (two lines 31.25 ± 4 Hz apart within 6 dB) is one
-///    signal centred between them.
+///    interpolation. Sharper ±2-bin maxima are also kept as lines for PSK31 twins and FSK keying
+///    lines, where neighbouring signals' lines sit closer than 5 bins.
+/// 4. Grouping into signals, in this order:
+///    - FSK pairs: lumps of a smoothed spectrum 170 ± 15 Hz apart within 6 dB, with nothing
+///      independent between them and with anticorrelated mark/space energies. A pair absorbs its
+///      tones within 1 baud, its skirt to 4 baud (stopping at any neighbour with its own lump), and
+///      mirrored keying lines to 8 baud.
+///    - PSK31 idle twins: two sharp lines 31.25 ± 1.5 Hz apart within 3 dB with a deep dip between,
+///      paired across the band before any sideband merge.
+///    - Sidebands: peaks within ±20 Hz of a stronger signal's main line, or a similar-level top up to
+///      35 Hz away with only a shallow dip (a PSK31 data hump), then the no-valley merge.
 /// 5. Association: nearest track within ±10 Hz, frequency EMA α = 0.3. A new signal must be seen
 ///    in 6 consecutive frames (about 1 s) before it becomes a track, which keeps noise from spawning
 ///    tracks; an idle track revives only on the same evidence.
@@ -76,16 +82,45 @@ public final class SignalTracker {
     static let floorMeanPerMedian: Float = 1.078
     static let peakThreshold: Float = 3.981_071_7          // 6 dB
     static let localMaxBins = 5
+    /// Hann main-lobe half-width: lines this sharp are kept for twin pairing even when a neighbour
+    /// within ±5 bins is stronger.
+    static let lineLocalMaxBins = 2
     static let sidebandHz = 20.0
     static let twinSpacingHz = 31.25                        // BPSK31 idle: ±15.625 Hz
+    /// Tight pass: real idle lines sit within 0.1 Hz of 31.25 Hz apart and about 1 dB of each other.
+    static let twinTightToleranceHz = 1.5
+    static let twinLevelDb: Float = 3
+    /// Loose fallback for leftover lines (noisy low-SNR frames).
     static let twinToleranceHz = 4.0
+    static let lineSteepDb: Float = 10
+    /// Depth the suppressed-carrier gap of an idle twin must reach below the weaker line.
+    static let twinDipDb: Float = 6
     static let pairLevelDb: Float = 6
     static let fskShiftHz = 170.0
     static let fskShiftToleranceHz = 15.0
     static let rttyBaud = 45.45
-    /// Keying lines beyond shift/2 + 1 baud are absorbed only when this far below the weaker tone.
-    static let fskSplatterDb: Float = 12
+    /// Reach (beyond shift/2) of an FSK pair's skirt and of its mirrored keying lines.
     static let fskSplatterBauds = 4.0
+    static let fskMirrorBauds = 8.0
+    static let mirrorToleranceHz = 3.0
+    static let mirrorLevelDb: Float = 6
+    static let fskMirrorBelowToneDb: Float = 6
+    /// Independent content between two tones this close to the weaker tone vetoes an FSK pair.
+    static let fskMiddleDb: Float = 6
+    /// Mark/space energy correlation at or below this marks a real FSK signal (with a full 2 s history).
+    /// Measured over 80 PSK31 pairs and 20 carrier pairs 155-185 Hz apart: −0.17…+0.31; random
+    /// RTTY at −10 dB: −0.54…−0.35, at −5 dB and up ≤ −0.73.
+    static let fskMaxEnvelopeCorrelation: Float = -0.3
+    static let fskStrictestCorrelation: Float = -0.6
+    static let fskHistorySamples = 24_576                   // ≈ 2 s
+    static let minFSKHistorySamples = 8_192
+    static let envelopeDecimation = 8                       // 1.5 kHz
+    static let envelopeBandpassSamples = 24                 // 16 ms boxcar at 1.5 kHz
+    static let envelopeAverageSamples = 12                  // 8 ms
+    static let envelopeSettleSamples = 300                  // 200 ms notch settling
+    static let envelopeNotchRadius = 0.985                  // ≈ 7 Hz wide
+    static let pskSymbolRateHz = 31.25
+    static let envelopeHop = 6                              // 4 ms
     /// Gaussian smoothing (in bins) used to find FSK tone lumps, so keying lines merge into one lump.
     static let lumpSigmaBins = 5.0
     static let lumpRadiusBins = 15
@@ -123,6 +158,14 @@ public final class SignalTracker {
         avg.map { 10 * log10(max($0, 1e-20)) }
     }
 
+    /// The centre of the strongest signal detected in the latest frame within ±`within` Hz of `hz`,
+    /// confirmed or not (ruling R8: cursor click-snap for signals younger than the confirmation).
+    /// A line's centre is its interpolated peak; an idle PSK31 twin or FSK pair snaps to its centre,
+    /// not to a sideband line. Nil when nothing qualifies.
+    public func strongestPeak(near hz: Double, within: Double) -> Double? {
+        latestDetections.filter { abs($0.hz - hz) <= within }.max { $0.snrDb < $1.snrDb }?.hz
+    }
+
     /// Noise floor per bin (mean noise power, same units as the averaged spectrum). For tests.
     var noiseFloor: [Float] { floor }
 
@@ -137,6 +180,10 @@ public final class SignalTracker {
     private let gaussian: [Float]
 
     private var buffer: [Float]
+    private var history: [Float]
+    private var historyWrite = 0
+    private var historyCount = 0
+    private var latestDetections: [(hz: Double, snrDb: Float)] = []
     private var windowed: [Float]
     private var filled = 0
     private var frames = 0
@@ -168,6 +215,9 @@ public final class SignalTracker {
         var hz: Double
         var power: Float
         var db: Float
+        /// A local maximum within ±5 bins (the brief's peak). Lines that are only ±2-bin maxima are
+        /// kept for PSK31 twin pairing and FSK keying lines, where two signals' lines sit close together.
+        var isPeak: Bool
     }
 
     private struct Lump {
@@ -219,6 +269,7 @@ public final class SignalTracker {
         g = g.map { $0 / gs }
         gaussian = g
         buffer = .init(repeating: 0, count: n)
+        history = .init(repeating: 0, count: Self.fskHistorySamples)
         windowed = .init(repeating: 0, count: n)
         re = .init(repeating: 0, count: n / 2)
         im = .init(repeating: 0, count: n / 2)
@@ -237,6 +288,9 @@ public final class SignalTracker {
         filled = 0
         frames = 0
         samplesSeen = 0
+        historyWrite = 0
+        historyCount = 0
+        latestDetections.removeAll()
         for i in avg.indices { avg[i] = 0; raw[i] = 0; floor[i] = 0; excluded[i] = false }
         confirmed.removeAll()
         streaks.removeAll()
@@ -253,6 +307,12 @@ public final class SignalTracker {
             buffer.withUnsafeMutableBufferPointer { b in
                 (b.baseAddress! + filled).update(from: audio.baseAddress! + i, count: take)
             }
+            for j in 0..<take {
+                history[historyWrite] = audio[i + j]
+                historyWrite += 1
+                if historyWrite == history.count { historyWrite = 0 }
+            }
+            historyCount = min(history.count, historyCount + take)
             filled += take
             i += take
             samplesSeen += take
@@ -279,6 +339,7 @@ public final class SignalTracker {
         let peaks = findPeaks()
         let groups = groupPeaks(peaks)
         let detections = measure(groups, peaks)
+        latestDetections = detections.map { ($0.centreHz, $0.snrDb) }
         associate(detections)
     }
 
@@ -388,74 +449,120 @@ public final class SignalTracker {
     }
 
     private func findPeaks() -> [Peak] {
-        var peaks: [Peak] = []
+        var lines: [Peak] = []
         for k in lowBin...highBin where avg[k] > Self.peakThreshold * floor[k] {
-            guard isLocalMax(avg, k, radius: Self.localMaxBins) else { continue }
+            guard isLocalMax(avg, k, radius: Self.lineLocalMaxBins) else { continue }
             let (delta, level) = interpolate(avg, k)
-            peaks.append(Peak(bin: k, hz: (Double(k) + delta) * binHz, power: pow(10, level / 10), db: level))
+            lines.append(Peak(bin: k, hz: (Double(k) + delta) * binHz, power: pow(10, level / 10), db: level,
+                              isPeak: isLocalMax(avg, k, radius: Self.localMaxBins)))
         }
-        return peaks
+        return lines
     }
 
     // MARK: - Grouping
 
-    private func groupPeaks(_ peaks: [Peak]) -> [Group] {
+    /// Groups the frame's lines into signals. Order matters: FSK pairs (validated), then PSK31 idle
+    /// twins paired globally with a tight tolerance, then sidebands, then the no-valley merge.
+    private func groupPeaks(_ lines: [Peak]) -> [Group] {
         var groups: [Group] = []
-        var assigned = [Bool](repeating: false, count: peaks.count)
+        var assigned = [Bool](repeating: false, count: lines.count)
 
         // 1. FSK pairs, found on a Gaussian-smoothed spectrum so each tone's keying lines form one lump.
-        let lumps = findLumps(peaks)
+        let lumps = findLumps(lines)
         var lumpUsed = [Bool](repeating: false, count: lumps.count)
         let order = lumps.indices.sorted { lumps[$0].db > lumps[$1].db }
         func insideFSK(_ hz: Double) -> Bool {
             groups.contains { $0.kind == .fsk && abs(hz - $0.fskCentreHz) <= $0.fskHalfShiftHz + Self.rttyBaud }
         }
         for li in order where !lumpUsed[li] && !insideFSK(lumps[li].hz) {
-            var best: Int?
             for mi in order where mi != li && !lumpUsed[mi] && !insideFSK(lumps[mi].hz) {
                 let spacing = abs(lumps[mi].hz - lumps[li].hz)
                 guard abs(spacing - Self.fskShiftHz) <= Self.fskShiftToleranceHz,
                       abs(lumps[mi].db - lumps[li].db) <= Self.pairLevelDb else { continue }
-                if best == nil || lumps[mi].db > lumps[best!].db { best = mi }
+                let (low, high) = lumps[li].hz < lumps[mi].hz ? (lumps[li], lumps[mi]) : (lumps[mi], lumps[li])
+                guard isFSK(low: low, high: high, lines: lines, lumps: lumps) else { continue }
+                lumpUsed[li] = true
+                lumpUsed[mi] = true
+                groups.append(Group(kind: .fsk, members: [], twin: nil, fskCentreHz: (low.hz + high.hz) / 2,
+                                    fskHalfShiftHz: (high.hz - low.hz) / 2, lumpBins: [low.bin, high.bin]))
+                break
             }
-            guard let mi = best else { continue }
-            lumpUsed[li] = true
-            lumpUsed[mi] = true
-            let lo = min(lumps[li].hz, lumps[mi].hz), hi = max(lumps[li].hz, lumps[mi].hz)
-            groups.append(Group(kind: .fsk, members: [], twin: nil, fskCentreHz: (lo + hi) / 2,
-                                fskHalfShiftHz: (hi - lo) / 2, lumpBins: [lumps[li].bin, lumps[mi].bin]))
         }
-        // Absorb each FSK pair's tone and keying lines.
+        // Absorb each FSK pair's tones and keying lines. Within 1 baud outside a tone everything is
+        // taken; beyond that only lines that are evidently the pair's own (see below), so weak
+        // neighbours beside an RTTY signal stay separate.
         for gi in groups.indices {
             let g = groups[gi]
-            let toneDb = g.lumpBins.map { lb -> Float in
-                let hz = Double(lb) * binHz
-                return peaks.filter { abs($0.hz - hz) <= Self.lumpSupportHz }.map(\.db).max() ?? -300
+            let weakerTone = toneLevels(g.lumpBins.map { Double($0) * binHz }, lines).min() ?? -300
+            let inner = g.fskHalfShiftHz + Self.rttyBaud
+            let outer = g.fskHalfShiftHz + Self.fskSplatterBauds * Self.rttyBaud
+            let toneHz = g.lumpBins.map { Double($0) * binHz }
+            let mirrorReach = g.fskHalfShiftHz + Self.fskMirrorBauds * Self.rttyBaud
+            // Independent neighbours: smoothed-spectrum lumps outside the inner zone that are not the
+            // pair's tones. The pair never reaches past the nearest one on either side.
+            let neighbours = lumps.filter { lump in
+                abs(lump.hz - g.fskCentreHz) > inner && !toneHz.contains { abs($0 - lump.hz) <= Self.lumpSupportHz }
             }
-            let weakerTone = toneDb.min() ?? -300
-            for pi in peaks.indices where !assigned[pi] {
-                let off = abs(peaks[pi].hz - g.fskCentreHz)
-                let inner = off <= g.fskHalfShiftHz + Self.rttyBaud
-                let splatter = off <= g.fskHalfShiftHz + Self.fskSplatterBauds * Self.rttyBaud
-                    && peaks[pi].db <= weakerTone - Self.fskSplatterDb
-                if inner || splatter {
-                    groups[gi].members.append(pi)
-                    assigned[pi] = true
+            let upperStop = neighbours.filter { $0.hz > g.fskCentreHz }.map { $0.hz - Self.lumpSupportHz }.min() ?? .infinity
+            let lowerStop = neighbours.filter { $0.hz < g.fskCentreHz }.map { $0.hz + Self.lumpSupportHz }.max() ?? -.infinity
+            for li in lines.indices where !assigned[li] {
+                let line = lines[li]
+                let off = abs(line.hz - g.fskCentreHz)
+                var take = off <= inner
+                if !take && off <= mirrorReach {
+                    // Mirrored keying lines: periodic keying and the CPFSK skirt are symmetric about
+                    // the centre, a neighbour is not.
+                    let mirror = 2 * g.fskCentreHz - line.hz
+                    take = line.db <= weakerTone - Self.fskMirrorBelowToneDb && lines.contains {
+                        abs($0.hz - mirror) <= Self.mirrorToleranceHz && abs($0.db - line.db) <= Self.mirrorLevelDb
+                    }
+                    // Skirt within 4 baud, short of any neighbour: keying skirt bumps vanish in the
+                    // smoothed spectrum, while a neighbour keeps a lump of its own (and stops the reach).
+                    if !take && off <= outer { take = line.hz < upperStop && line.hz > lowerStop }
+                }
+                if take {
+                    groups[gi].members.append(li)
+                    assigned[li] = true
                 }
             }
         }
 
-        // 2. Remaining peaks, strongest first.
-        let byPower = peaks.indices.filter { !assigned[$0] }.sorted { peaks[$0].power > peaks[$1].power }
+        // 2. PSK31 idle twins, paired across the whole band before any sideband merge: two lines
+        //    31.25 ± 1.5 Hz apart, within 3 dB, with a deep dip between them. Left to right, so a chain
+        //    of lines from neighbouring signals pairs signal by signal.
+        let byFrequency = lines.indices.filter { !assigned[$0] }.sorted { lines[$0].hz < lines[$1].hz }
+        for (n, i) in byFrequency.enumerated() where !assigned[i] {
+            var best: Int?
+            var bestError = Double.infinity
+            for j in byFrequency[(n + 1)...] where !assigned[j] {
+                let d = lines[j].hz - lines[i].hz
+                if d > Self.twinSpacingHz + Self.twinTightToleranceHz { break }
+                let error = abs(d - Self.twinSpacingHz)
+                guard error <= Self.twinTightToleranceHz, abs(lines[i].db - lines[j].db) <= Self.twinLevelDb,
+                      error < bestError, isLineLike(lines[i]), isLineLike(lines[j]),
+                      hasCentreDip(lines[i], lines[j]) else { continue }
+                best = j
+                bestError = error
+            }
+            guard let j = best else { continue }
+            let (anchor, partner) = lines[i].power >= lines[j].power ? (i, j) : (j, i)
+            groups.append(Group(kind: .twin, members: [anchor, partner], twin: partner))
+            assigned[i] = true
+            assigned[j] = true
+        }
+
+        // 3. Remaining brief peaks (±5-bin maxima), strongest first.
+        let byPower = lines.indices.filter { !assigned[$0] && lines[$0].isPeak }
+            .sorted { lines[$0].power > lines[$1].power }
         for pi in byPower {
-            let p = peaks[pi]
+            let p = lines[pi]
             // a. Sideband: within ±20 Hz of a stronger signal's main line.
             var bestGroup: Int?
             var bestDistance = Double.infinity
             for (gi, g) in groups.enumerated() where g.kind != .fsk {
-                let lines = [g.members[0]] + (g.twin.map { [$0] } ?? [])
-                for l in lines {
-                    let d = abs(peaks[l].hz - p.hz)
+                let mains = [g.members[0]] + (g.twin.map { [$0] } ?? [])
+                for l in mains {
+                    let d = abs(lines[l].hz - p.hz)
                     if d <= Self.sidebandHz && d < bestDistance { bestDistance = d; bestGroup = gi }
                 }
             }
@@ -463,13 +570,30 @@ public final class SignalTracker {
                 groups[gi].members.append(pi)
                 continue
             }
-            // b. PSK31 idle twin: a line 31.25 ± 4 Hz from a similar-level anchor.
+            // a2. Hump structure: a similar-level peak up to 31.25 + 4 Hz from a stronger single's
+            //     anchor with only a shallow dip between belongs to it (a PSK31 data spectrum often
+            //     shows two tops ±10-16 Hz from its carrier). Two signals 40 Hz apart are not affected.
             bestDistance = .infinity
             for (gi, g) in groups.enumerated() where g.kind == .single {
-                let a = peaks[g.members[0]]
+                let a = lines[g.members[0]]
+                let d = abs(a.hz - p.hz)
+                if d <= Self.twinSpacingHz + Self.twinToleranceHz && a.db - p.db <= Self.twinLevelDb
+                    && !hasCentreDip(a, p) && d < bestDistance {
+                    bestDistance = d
+                    bestGroup = gi
+                }
+            }
+            if let gi = bestGroup {
+                groups[gi].members.append(pi)
+                continue
+            }
+            // b. Looser twin for a line the tight pass missed (noise at low SNR), still with a dip.
+            bestDistance = .infinity
+            for (gi, g) in groups.enumerated() where g.kind == .single {
+                let a = lines[g.members[0]]
                 let d = abs(a.hz - p.hz)
                 if abs(d - Self.twinSpacingHz) <= Self.twinToleranceHz && a.db - p.db <= Self.pairLevelDb
-                    && d < bestDistance {
+                    && d < bestDistance && isLineLike(a) && isLineLike(p) && hasCentreDip(a, p) {
                     bestDistance = d
                     bestGroup = gi
                 }
@@ -480,17 +604,17 @@ public final class SignalTracker {
                 groups[gi].members.append(pi)
                 continue
             }
-            // c. No valley: joined to the nearest stronger peak without dipping 3 dB below this one.
-            var nearest: (group: Int, peak: Int)?
+            // c. No valley: joined to the nearest stronger line without dipping 3 dB below this one.
+            var nearest: (group: Int, line: Int)?
             var nearestDistance = Int.max
             for (gi, g) in groups.enumerated() {
-                for m in g.members where abs(peaks[m].bin - p.bin) < nearestDistance {
-                    nearestDistance = abs(peaks[m].bin - p.bin)
+                for m in g.members where abs(lines[m].bin - p.bin) < nearestDistance {
+                    nearestDistance = abs(lines[m].bin - p.bin)
                     nearest = (gi, m)
                 }
             }
             if let (gi, m) = nearest {
-                let lo = min(peaks[m].bin, p.bin), hi = max(peaks[m].bin, p.bin)
+                let lo = min(lines[m].bin, p.bin), hi = max(lines[m].bin, p.bin)
                 var dip = Float.infinity
                 if hi - lo > 1 { for k in (lo + 1)..<hi { dip = min(dip, avg[k]) } }
                 if dip >= p.power * pow(10, -Self.valleyDb / 10) {
@@ -503,7 +627,134 @@ public final class SignalTracker {
         return groups
     }
 
-    private func findLumps(_ peaks: [Peak]) -> [Lump] {
+    /// A pure tone through the Hann window: the bin two away falls at least 10 dB on one side or the
+    /// other (the near side may hold a neighbouring line 3 bins away). A PSK31 data hump's top is flat.
+    private func isLineLike(_ line: Peak) -> Bool {
+        let k = line.bin
+        let left = db(avg[k]) - db(avg[k - 2]), right = db(avg[k]) - db(avg[k + 2])
+        return max(left, right) >= Self.lineSteepDb
+    }
+
+    /// True when the spectrum between two lines dips at least `twinDipDb` below the weaker one, as it
+    /// does at the suppressed carrier of a PSK31 idle (and not on a data hump).
+    private func hasCentreDip(_ a: Peak, _ b: Peak) -> Bool {
+        let lo = min(a.bin, b.bin), hi = max(a.bin, b.bin)
+        guard hi - lo > 1 else { return false }
+        var dip = Float.infinity
+        for k in (lo + 1)..<hi { dip = min(dip, avg[k]) }
+        return dip <= min(a.power, b.power) * pow(10, -Self.twinDipDb / 10)
+    }
+
+    /// Level (dB) of the strongest brief peak within `lumpSupportHz` of each frequency.
+    private func toneLevels(_ hz: [Double], _ lines: [Peak]) -> [Float] {
+        hz.map { f in lines.filter { $0.isPeak && abs($0.hz - f) <= Self.lumpSupportHz }.map(\.db).max() ?? -300 }
+    }
+
+    /// Validates a lump pair as one FSK signal rather than two independent signals ~170 Hz apart.
+    /// 1. Nothing independent between the tones: no peak or lump in the middle (more than
+    ///    `lumpSupportHz` from both tones) within `fskMiddleDb` of the weaker tone.
+    /// 2. Mark and space are mutually exclusive in time: their short-time energies over the last
+    ///    2 s of audio must be anticorrelated. A 31.25 Hz notch on the energies stops two PSK31
+    ///    signals' symbol-rate ripples from faking the anticorrelation.
+    private func isFSK(low: Lump, high: Lump, lines: [Peak], lumps: [Lump]) -> Bool {
+        let tones = toneLevels([low.hz, high.hz], lines)
+        let weakerTone = tones.min() ?? -300
+        let middle = (low.hz + Self.lumpSupportHz)...(high.hz - Self.lumpSupportHz)
+        guard !middle.isEmpty else { return false }
+        if lines.contains(where: { $0.isPeak && middle.contains($0.hz) && $0.db > weakerTone - Self.fskMiddleDb }) {
+            return false
+        }
+        let weakerLump = min(low.db, high.db)
+        if lumps.contains(where: { middle.contains($0.hz) && $0.db > weakerLump - Self.fskMiddleDb }) { return false }
+        guard let correlation = envelopeCorrelation(low.hz, high.hz) else { return false }
+        // Stricter while the history is short and the estimate noisier (sd ∝ 1/√length).
+        let threshold = max(Self.fskStrictestCorrelation,
+                            Self.fskMaxEnvelopeCorrelation
+                                * Float((Double(Self.fskHistorySamples) / Double(historyCount)).squareRoot()))
+        return correlation <= threshold
+    }
+
+    /// Pearson correlation of the short-time energies at two audio frequencies over the audio history.
+    func envelopeCorrelation(_ hz1: Double, _ hz2: Double) -> Float? {
+        let cap = history.count
+        let n = historyCount
+        guard n >= Self.minFSKHistorySamples else { return nil }
+        let d = Self.envelopeDecimation
+        let m = n / d
+        let start = (historyWrite - n + cap) % cap
+        // Per tone: mix to baseband, decimate by block sums, a 16 ms boxcar band-pass (−21 dB at the
+        // other tone), band power, a narrow notch at 31.25 Hz that removes PSK31's symbol-rate power
+        // ripple (the only periodic component two independent PSK31 signals can share), then an
+        // 8 ms average. RTTY keying (≤ 22.7 Hz) passes almost untouched.
+        let bandpass = Self.envelopeBandpassSamples, average = Self.envelopeAverageSamples
+        func energies(_ hz: Double) -> [Double] {
+            var zr = [Double](repeating: 0, count: m), zi = [Double](repeating: 0, count: m)
+            let w = 2 * Double.pi * hz / sampleRate
+            let cw = cos(w), sw = sin(w)
+            var c = 1.0, s = 0.0
+            var idx = start
+            for k in 0..<(m * d) {
+                let x = Double(history[idx])
+                idx += 1
+                if idx == cap { idx = 0 }
+                zr[k / d] += x * c
+                zi[k / d] -= x * s
+                let nc = c * cw - s * sw
+                s = s * cw + c * sw
+                c = nc
+                if k & 1_023 == 1_023 {
+                    let r = (c * c + s * s).squareRoot()
+                    c /= r
+                    s /= r
+                }
+            }
+            guard m > bandpass + Self.envelopeSettleSamples + average else { return [] }
+            // Band power after a 16 ms boxcar band-pass, then a notch at 31.25 Hz on the power.
+            var power = [Double](repeating: 0, count: m - bandpass + 1)
+            var ar = zr[0..<bandpass].reduce(0, +), ai = zi[0..<bandpass].reduce(0, +)
+            for j in power.indices {
+                if j > 0 {
+                    ar += zr[j + bandpass - 1] - zr[j - 1]
+                    ai += zi[j + bandpass - 1] - zi[j - 1]
+                }
+                power[j] = ar * ar + ai * ai
+            }
+            let w0 = 2 * Double.pi * Self.pskSymbolRateHz / (sampleRate / Double(d))
+            let r = Self.envelopeNotchRadius
+            let b1 = -2 * cos(w0), a1 = -2 * r * cos(w0), a2 = r * r
+            var x1 = power[0], x2 = power[0], y1 = 0.0, y2 = 0.0
+            var notched = [Double](repeating: 0, count: power.count)
+            for j in power.indices {
+                let y = power[j] + b1 * x1 + x2 - a1 * y1 - a2 * y2
+                x2 = x1; x1 = power[j]; y2 = y1; y1 = y
+                notched[j] = y
+            }
+            var out: [Double] = []
+            var sum = notched[Self.envelopeSettleSamples..<(Self.envelopeSettleSamples + average)].reduce(0, +)
+            var j = Self.envelopeSettleSamples
+            while j + average <= notched.count {
+                if (j - Self.envelopeSettleSamples) % Self.envelopeHop == 0 { out.append(sum) }
+                if j + average < notched.count { sum += notched[j + average] - notched[j] }
+                j += 1
+            }
+            return out
+        }
+        let e1 = energies(hz1), e2 = energies(hz2)
+        let count = Double(e1.count)
+        guard e1.count >= 8 else { return nil }
+        let m1 = e1.reduce(0, +) / count, m2 = e2.reduce(0, +) / count
+        var cov = 0.0, v1 = 0.0, v2 = 0.0
+        for i in e1.indices {
+            let a = e1[i] - m1, b = e2[i] - m2
+            cov += a * b
+            v1 += a * a
+            v2 += b * b
+        }
+        guard v1 > 0, v2 > 0 else { return nil }
+        return Float(cov / (v1 * v2).squareRoot())
+    }
+
+    private func findLumps(_ lines: [Peak]) -> [Lump] {
         let r = Self.lumpRadiusBins
         let lo = lowBin - Self.lumpLocalMaxBins, hi = highBin + Self.lumpLocalMaxBins
         for k in lo...hi {
@@ -516,7 +767,7 @@ public final class SignalTracker {
             guard isLocalMax(smooth, k, radius: Self.lumpLocalMaxBins) else { continue }
             let (delta, level) = interpolate(smooth, k)
             let hz = (Double(k) + delta) * binHz
-            guard peaks.contains(where: { abs($0.hz - hz) <= Self.lumpSupportHz }) else { continue }
+            guard lines.contains(where: { $0.isPeak && abs($0.hz - hz) <= Self.lumpSupportHz }) else { continue }
             lumps.append(Lump(bin: k, hz: hz, db: level))
         }
         return lumps
