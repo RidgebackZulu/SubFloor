@@ -28,7 +28,7 @@ final class AudioOutput: @unchecked Sendable {
 
     private func render(_ out: UnsafeMutableBufferPointer<Float>) {
         if !primed.load(ordering: .acquiring) {
-            guard ring.availableToRead >= Self.targetLatency else {
+            guard ring.availableToRead >= max(Self.targetLatency, out.count) else {
                 out.update(repeating: 0)
                 return
             }

@@ -73,13 +73,17 @@ final class DSPEngine: @unchecked Sendable {
     private let wake = DispatchSemaphore(value: 0)
     private let running = Atomic<Bool>(false)
     private let pending = Mutex(Pending())
+    private let dropped = Atomic<Int>(0)
     private var exited: DispatchSemaphore?
     private var source: (any IQSource)?
+
+    deinit { stop() }
 
     func start(source: any IQSource, receiver: Receiver.Config, spectrum: SpectrumSettings, volume: Float) throws {
         stop()
         ring.drain()
         pending.withLock { $0 = Pending() }
+        dropped.store(0, ordering: .relaxed)
         self.source = source
         let done = DispatchSemaphore(value: 0)
         exited = done
@@ -91,12 +95,12 @@ final class DSPEngine: @unchecked Sendable {
         thread.name = "SubFloor DSP"
         thread.qualityOfService = .userInteractive
         thread.start()
-        try audio.start()
         let ring = ring, wake = wake
         do {
+            try audio.start()
             try source.start { [unowned self] block in
                 let written = ring.write(block)
-                if written < block.count { self.stats.withLock { $0.droppedSamples += block.count - written } }
+                if written < block.count { self.dropped.add(block.count - written, ordering: .relaxed) }
                 wake.signal()
             }
         } catch {
@@ -159,6 +163,7 @@ final class DSPEngine: @unchecked Sendable {
                     linear = history
                     db = .init(repeating: -200, count: s.fftSize)
                     historyPos = 0
+                    sinceFrame = 0
                 }
                 averager.alpha = s.averaging
                 settings = s
@@ -185,7 +190,7 @@ final class DSPEngine: @unchecked Sendable {
                 }
             }
             sinceFrame += n
-            if sinceFrame >= max(size, Int(sampleRate / settings.framesPerSecond)) {
+            if sinceFrame >= max(size, Int(sampleRate / max(1, settings.framesPerSecond.isFinite ? settings.framesPerSecond : 1))) {
                 sinceFrame = 0
                 linear.withUnsafeMutableBufferPointer { l in
                     history.withUnsafeBufferPointer { h in
@@ -214,7 +219,8 @@ final class DSPEngine: @unchecked Sendable {
             }
             audioOut.withUnsafeBufferPointer { audio.push($0) }
             let signal = receiver.signalDb
-            stats.withLock { $0.signalDb = signal }
+            let lost = dropped.load(ordering: .relaxed)
+            stats.withLock { $0.signalDb = signal; $0.droppedSamples = lost }
         }
     }
 }

@@ -24,6 +24,10 @@ final class EngineSmokeTest {
 
     func start() {
         let rx = Receiver.Config(inputRate: source.sampleRate, offsetHz: 100_000, mode: .usb, bandwidthHz: 2_700)
-        try? engine.start(source: source, receiver: rx, spectrum: SpectrumSettings(), volume: 0.4)
+        do {
+            try engine.start(source: source, receiver: rx, spectrum: SpectrumSettings(), volume: 0.4)
+        } catch {
+            print("Engine start failed: \(error)")
+        }
     }
 }
