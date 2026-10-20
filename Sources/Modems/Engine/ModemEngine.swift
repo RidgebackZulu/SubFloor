@@ -875,7 +875,13 @@ final class ListenFilter {
         upScratch.withUnsafeMutableBufferPointer { up.mix(UnsafeMutableBufferPointer(rebasing: $0[0..<used])) }
         for i in 0..<used { out[i] = 2 * upScratch[i].real }
         for i in used..<n { out[i] = 0 }
-        fifoCount = produced - used
-        for k in 0..<fifoCount { fifo[k] = SIMD2(upScratch[used + k].real, upScratch[used + k].imag) }
+        // A rebuilt decimator (`configure`) restarts its output phase, so it can emit one baseband
+        // sample more than the input so far accounts for. Output is capped at the input count, so
+        // that surplus would stay in the FIFO for good and pile up with every width change: drop it,
+        // keeping the FIFO under `factor` samples (a skip of under 1 ms, during a filter change).
+        let keep = min(produced - used, factor - 1)
+        let skip = produced - used - keep
+        fifoCount = keep
+        for k in 0..<keep { fifo[k] = SIMD2(upScratch[used + skip + k].real, upScratch[used + skip + k].imag) }
     }
 }

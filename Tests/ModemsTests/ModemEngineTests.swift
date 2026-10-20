@@ -663,3 +663,51 @@ private let cwTexts = ["CQ CQ DE W1AW W1AW K TU 599 NAME JOHN QTH CT BK", "TEST 
         #expect(engine.decoderKeys.isEmpty, "a slot mode runs no streaming decoders")
     }
 }
+
+// MARK: - Listen filter width changes (regression: crash switching PSK31 → FT8 with a cursor)
+
+@Suite struct ListenFilterWidthChangeTests {
+    /// Rebuilding the decimator for a new width restarts its output phase, so it can emit one
+    /// baseband sample more than the input so far accounts for. Repeated changes between blocks of
+    /// every size must not overflow the interpolator's FIFO (one output sample per input sample is
+    /// the function's contract: `out` has the input's count).
+    @Test func widthChangesBetweenBlocksKeepCounts() {
+        let filter = ListenFilter(sampleRate: fs)
+        let widths: [Double] = ModeID.allCases.map(\.listenWidthHz) + [250, 100, 400, 50, 150]
+        let tone = (0..<ModemEngine.stepSamples).map { Float(0.5 * sin(2 * Double.pi * 1_500 * Double($0) / fs)) }
+        var out = [Float](repeating: 0, count: ModemEngine.stepSamples)
+        for round in 0..<200 {
+            filter.configure(widthHz: widths[round % widths.count])
+            let n = [1, 7, 11, 12, 13, 500, 2_047, 2_048][round % 8]
+            tone.withUnsafeBufferPointer { x in
+                out.withUnsafeMutableBufferPointer { o in
+                    filter.process(UnsafeBufferPointer(rebasing: x[0..<n]), centerHz: 1_500,
+                                   into: UnsafeMutableBufferPointer(rebasing: o[0..<n]))
+                }
+            }
+            #expect(out[0..<n].allSatisfy { $0.isFinite })
+        }
+    }
+
+    /// The app path that crashed: a cursor locked on a PSK31 signal, then the mode switched to
+    /// each other mode (each has its own listen width), with audio between every switch.
+    @Test func modeSwitchesWithLockedCursorDoNotCrash() {
+        let engine = ModemEngine()
+        engine.settings = ModemSettings(mode: .psk31)
+        let audio = noisy(psk("CQ CQ DE K1ABC K1ABC PSE K", 1_500, leadIn: 0.5), snrDb: 10, seed: 41)
+        var run = Run()
+        feed(engine, audio, 0..<samples(3), into: &run)
+        engine.lockCursor(atAudioHz: 1_500)
+        var position = samples(3)
+        let order: [ModeID?] = [.ft8, .psk31, .wspr, .cw, .rtty, .ft8, nil, .psk31, .ft8]
+        for (i, mode) in order.enumerated() {
+            engine.settings = ModemSettings(mode: mode, autoDetect: i % 2 == 1, audioWide: i % 3 == 2)
+            if mode != nil { engine.lockCursor(atAudioHz: 1_500) }
+            let end = min(position + 3_001, audio.count)
+            feed(engine, audio, position..<end, chunk: 700 + 97 * i, into: &run)
+            position = end
+        }
+        #expect(run.listen.count == position, "one listen sample per box sample")
+        #expect(run.listen.allSatisfy { $0.isFinite })
+    }
+}
