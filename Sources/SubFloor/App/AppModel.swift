@@ -108,7 +108,7 @@ final class AppModel {
         bookmarks = loaded
         switch result {
         case .recoveredFromCorrupt:
-            show(Banner(kind: .warning, message: "The bookmarks file was unreadable. It was backed up as bookmarks.corrupt-<timestamp>.json and the defaults were restored."))
+            show(Banner(kind: .warning, message: "The bookmarks file was unreadable. It was backed up as \(bookmarkStore.lastBackupURL?.lastPathComponent ?? "bookmarks.corrupt-<timestamp>.json") and the defaults were restored."))
         case .corruptNotPreserved:
             show(Banner(kind: .error, message: Self.bookmarksBlockedMessage))
             bookmarksSaveBlocked = true

@@ -104,6 +104,15 @@ struct AppModelTests {
         #expect(m.bandwidthHz == DemodMode.usb.bandwidthRange.lowerBound)
     }
 
+    @Test func corruptBookmarksBannerNamesRealBackupFile() throws {
+        let dir = tempDir()
+        try Data("{ nope".utf8).write(to: dir.appendingPathComponent("bookmarks.json"))
+        let m = makeModel(dir: dir)
+        let message = try #require(m.banner?.message)
+        #expect(!message.contains("<timestamp>"))
+        #expect(message.contains("bookmarks.corrupt-"))
+    }
+
     @Test func corruptNotPreservedBlocksSaving() throws {
         let dir = tempDir()
         let file = dir.appendingPathComponent("bookmarks.json")

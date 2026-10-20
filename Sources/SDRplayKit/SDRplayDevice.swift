@@ -53,8 +53,17 @@ public final class SDRplayDevice: IQSource, @unchecked Sendable {
             }
             try check(sdrplay_api_SelectDevice(&chosen), "Select device (in use by another app?)")
             var params: UnsafeMutablePointer<sdrplay_api_DeviceParamsT>?
-            try check(sdrplay_api_GetDeviceParams(chosen.dev, &params), "Read device parameters")
-            guard let params else { throw SDRplayError(message: "Device returned no parameters") }
+            // The device API lock is still held here (see the defer above); release the selected device on failure.
+            do {
+                try check(sdrplay_api_GetDeviceParams(chosen.dev, &params), "Read device parameters")
+            } catch {
+                _ = sdrplay_api_ReleaseDevice(&chosen)
+                throw error
+            }
+            guard let params else {
+                _ = sdrplay_api_ReleaseDevice(&chosen)
+                throw SDRplayError(message: "Device returned no parameters")
+            }
             return SDRplayDevice(device: chosen, params: params)
         } catch {
             _ = sdrplay_api_Close()

@@ -35,11 +35,13 @@ private func backupFiles(in dir: URL) throws -> [URL] {
     let url = tempURL()
     try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
     try Data("{ nope".utf8).write(to: url)
-    let (loaded, result) = BookmarkStore(url: url).load()
+    let store = BookmarkStore(url: url)
+    let (loaded, result) = store.load()
     #expect(result == .recoveredFromCorrupt)
     #expect(loaded == BookmarkStore.defaults)
     let backups = try backupFiles(in: url.deletingLastPathComponent())
     #expect(backups.count == 1)
+    #expect(store.lastBackupURL?.lastPathComponent == backups.first?.lastPathComponent)
     #expect(try backups.map { try Data(contentsOf: $0) } == [Data("{ nope".utf8)])
 }
 

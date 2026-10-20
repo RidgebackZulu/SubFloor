@@ -37,6 +37,8 @@ public final class BookmarkStore {
     }
 
     public let url: URL
+    /// Where the unreadable file was preserved by the last `load()` that returned `.recoveredFromCorrupt`.
+    public private(set) var lastBackupURL: URL?
 
     public init(url: URL) { self.url = url }
 
@@ -58,12 +60,15 @@ public final class BookmarkStore {
     /// Existing backups are never overwritten or deleted.
     private func preserveCorrupt() -> LoadResult {
         let backup = uniqueBackupURL()
+        lastBackupURL = nil
         do {
             try FileManager.default.moveItem(at: url, to: backup)
+            lastBackupURL = backup
             return .recoveredFromCorrupt
         } catch {
             do {
                 try FileManager.default.copyItem(at: url, to: backup)
+                lastBackupURL = backup
                 return .recoveredFromCorrupt
             } catch {
                 return .corruptNotPreserved
