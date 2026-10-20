@@ -63,10 +63,14 @@ public enum RTTYModem: StreamingModem {
 /// in use is healthy (at most 30% failed frames over 2 s), and its current run of consecutive good
 /// frames is at least 3 long. Each character's frame must also be firm, judged against the signal's
 /// current level: decisions 0.6 of a clean bit on average, the start bit 0.3, and every bit's winning
-/// tone at least half that tone's level if it was read with no signal present for over 3 s (a frame
-/// begun in the noise just before a transmission fails this; frames within a transmission are spared
-/// it, since a faded tone would fail it too). When those hold, the run's earlier characters are
-/// emitted too.
+/// tone at least 0.4 of that tone's level at the bit decisions of the run's frames read with the
+/// signal on (half its high level while there are none), if it was read with no signal present and
+/// in range for over 3 s (a frame begun in the noise just before a transmission fails this; frames
+/// within a transmission are spared it, since a faded tone would fail it too). The run's own frames
+/// carry the signal's level at once, where the high levels take a few tenths of a second to rise to
+/// it after the transmission starts. When those hold, the run's earlier characters are emitted too.
+/// The squelch stays shut for the first 32 bits, while the levels (which start at zero) settle: a
+/// spurious opening then would count the noise before a transmission as part of one.
 ///
 /// `constellation()`: mark and space envelope pairs `(upper tone, lower tone)` at the bit decisions of
 /// recent firm frames, each normalised by its tone's level at its own bits, so a mark bit sits near
@@ -102,6 +106,9 @@ public final class RTTYSignalDecoder: SignalDecoder {
     private static let imbalanceFullDb: Float = 6
     /// Envelope levels average over this many bits.
     private static let levelBits: Float = 16
+    /// The squelch stays shut for this many bits after the start (or a reset), while the levels,
+    /// which start at zero, settle.
+    private static let levelWarmupBits: Float = 32
     /// A run must be this many consecutive good frames before it is emitted.
     private static let minRun = 3
     /// Minimum mean decision firmness of a character's frame, and of its start bit, against the
@@ -110,6 +117,9 @@ public final class RTTYSignalDecoder: SignalDecoder {
     private static let startFit: Float = 0.3
     /// Each bit's winning tone must reach this fraction of that tone's current high level.
     private static let bitLevel: Float = 0.5
+    /// The same against the tone's level in the run's frames read with the signal on (taken at the
+    /// bit decisions, where the envelope is highest, so about 1.25 times the high level).
+    private static let runBitLevel: Float = 0.4
     /// A frame counts as clean (for polarity and health) when its start and stop bits are this firm.
     private static let framingFirmness: Float = 0.3
     /// Timing search around the edge, in baseband samples.
@@ -176,12 +186,16 @@ public final class RTTYSignalDecoder: SignalDecoder {
     private let attack: Float, peakDecay: Float, floorDecay: Float
     private var markHigh: Float = 0, markLow: Float = 0, spaceHigh: Float = 0, spaceLow: Float = 0
     private let levelAlpha: Float
+    /// Samples before the squelch may first open.
+    private let levelWarmup: Int
     private var imbalanceWeight: Float = 0
 
     // Squelch.
     private var present = false
-    private var everPresent = false
     private var absentSince = 0
+    /// A signal has been present and in range, and when it last was.
+    private var heardSignal = false
+    private var lastSignal = 0
     /// Envelope levels at bit decisions, for the constellation.
     private var markBitLevel: Float = 0, spaceBitLevel: Float = 0
 
@@ -214,8 +228,8 @@ public final class RTTYSignalDecoder: SignalDecoder {
         /// Envelope of the winning tone at each bit decision, and which bits the upper tone won.
         var envelopes: SIMD8<Float>
         var upper: UInt8
-        /// Read while no signal was present (none yet, or none for a while): its bits must carry the
-        /// signal's level when it is emitted.
+        /// Read while no signal was present (none present and in range yet, or none for a while): its
+        /// bits must carry the signal's level when it is emitted.
         var checkLevels: Bool
         var run: Int
     }
@@ -278,6 +292,7 @@ public final class RTTYSignalDecoder: SignalDecoder {
         peakDecay = 1 / (16 * bit)
         floorDecay = 1 / (48 * bit)
         levelAlpha = 1 / (Self.levelBits * bit)
+        levelWarmup = Int(Self.levelWarmupBits * bit)
         baseband.reserveCapacity(Self.blockOutputs + 1)
     }
 
@@ -364,6 +379,10 @@ public final class RTTYSignalDecoder: SignalDecoder {
         }
 
         updatePresence(n: n)
+        if present && inRangeConfirmed {
+            heardSignal = true
+            lastSignal = n
+        }
         advance(framer: 0, upTo: n)
         advance(framer: 1, upTo: n)
     }
@@ -401,9 +420,8 @@ public final class RTTYSignalDecoder: SignalDecoder {
             }
             return
         }
-        if contrast > Self.contrastOpen {
+        if contrast > Self.contrastOpen && n >= levelWarmup {
             present = true
-            everPresent = true
             return
         }
         let absent = n - absentSince
@@ -526,14 +544,15 @@ public final class RTTYSignalDecoder: SignalDecoder {
         return true
     }
 
-    /// No signal is present, and none was for a while (a short gap is a fade, not the noise before a
-    /// transmission).
+    /// No signal is present, and none was present and in range for a while (a short gap is a fade, not
+    /// the noise before a transmission; a squelch opening that the AFC never confirmed was noise).
     private var beforeSignal: Bool {
-        !present && (!everPresent || sampleIndex - absentSince > Int(Self.gapSeconds * basebandRate))
+        !present && (!heardSignal || sampleIndex - lastSignal > Int(Self.gapSeconds * basebandRate))
     }
 
-    /// Mean firmness of a frame's decisions against the signal's current level, 0…1.
-    private func fit(_ frame: Frame) -> Float {
+    /// Mean firmness of a frame's decisions against the signal's current level, 0…1. `levels`, when
+    /// known, is each tone's level at the bit decisions of the frames read with the signal on.
+    private func fit(_ frame: Frame, levels: SIMD2<Float>? = nil) -> Float {
         let scale = max(decisionScale, 1e-30)
         // The start bit must be firm. A frame begun in the noise just before a signal is partly noise:
         // every bit must carry the signal (a faded tone during a transmission would fail this, so
@@ -541,8 +560,10 @@ public final class RTTYSignalDecoder: SignalDecoder {
         guard frame.firmness[0] >= Self.startFit * scale else { return 0 }
         if frame.checkLevels {
             for k in 0...6 {
-                let high = frame.upper & (1 << UInt8(k)) != 0 ? markHigh : spaceHigh
-                if frame.envelopes[k] < Self.bitLevel * high { return 0 }
+                let isUpper = frame.upper & (1 << UInt8(k)) != 0
+                let least = levels.map { Self.runBitLevel * (isUpper ? $0.x : $0.y) }
+                    ?? Self.bitLevel * (isUpper ? markHigh : spaceHigh)
+                if frame.envelopes[k] < least { return 0 }
             }
         }
         var sum: Float = 0
@@ -581,10 +602,28 @@ public final class RTTYSignalDecoder: SignalDecoder {
         let otherClean = other.attempts >= Self.minCompareAttempts && otherRate <= Self.cleanFailures
         guard !(otherClean && rate >= otherRate + Self.polarityMargin) else { return }
         let oldest = sampleIndex - Int(Self.recoverSeconds * basebandRate)
+        let levels = runLevels(framer)
         for frame in framer.history where frame.run == framer.runID && frame.end > lastEmittedEnd
-            && frame.end >= oldest && fit(frame) >= Self.charFit {
+            && frame.end >= oldest && fit(frame, levels: levels) >= Self.charFit {
             emit(frame)
         }
+    }
+
+    /// Each tone's mean envelope (upper, lower) at the bit decisions of the current run's frames that
+    /// were read with the signal on; nil when there are none. The tones' high levels average over
+    /// 16 bits, so for a few tenths of a second after a transmission starts they still sit well
+    /// below it; these frames carry its level at once.
+    private func runLevels(_ framer: Framer) -> SIMD2<Float>? {
+        var sum = SIMD2<Float>.zero, count = SIMD2<Float>.zero
+        for frame in framer.history where frame.run == framer.runID && !frame.checkLevels {
+            for k in 0...6 {
+                let lane = frame.upper & (1 << UInt8(k)) != 0 ? 0 : 1
+                sum[lane] += frame.envelopes[k]
+                count[lane] += 1
+            }
+        }
+        guard count.x > 0, count.y > 0 else { return nil }
+        return sum / count
     }
 
     private func emit(_ frame: Frame) {
@@ -706,7 +745,7 @@ public final class RTTYSignalDecoder: SignalDecoder {
         halfM = .zero; halfS = .zero
         markPeak = 0; markFloor = 0; spacePeak = 0; spaceFloor = 0
         markHigh = 0; markLow = 0; spaceHigh = 0; spaceLow = 0; imbalanceWeight = 0
-        present = false; everPresent = false; absentSince = 0
+        present = false; absentSince = 0; heardSignal = false; lastSignal = 0
         markBitLevel = 0; spaceBitLevel = 0
         framers = [Framer(sign: 1), Framer(sign: -1)]
         active = 0

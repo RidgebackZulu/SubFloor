@@ -217,6 +217,28 @@ private func makeDecoder(_ hz: Double = 1_500) -> any SignalDecoder {
         #expect(flips.filter { $0 }.isEmpty, "flipped in \(flips.filter { $0 }.count) of 10")
     }
 
+    /// A decoder listening to the noise before a short burst does not prefix its text with a character
+    /// framed from the noise and the burst's idle mark: the engine's fallback-mode scenario (−3 dB, 3 s
+    /// lead-in), the decoder started 0, 1, 2 or 2.5 s into it, on held-out seeds. Two causes used to
+    /// let one through in about 0.7% of runs: the squelch opened on the zero-started levels at the
+    /// start, which exempted the frames before the burst from the level check, and that check compared
+    /// them with the tones' high levels, still rising a few tenths of a second into the burst.
+    @Test(arguments: [0.0, 1.0, 2.0, 2.5])
+    func noStrayCharacterBeforeBurst(_ startSeconds: Double) {
+        let sent = "CQ W1AW K"
+        let burst = RTTYEncoder.audio(text: sent, centerHz: 1_500, leadInSeconds: 3)
+        let clear = burst + [Float](repeating: 0, count: 12 * 12_000 - burst.count)
+        let outs = parallel(200) { i in
+            let audio = ModemTestSignals.awgn(clear, snrDb: -3, seed: UInt64(40_001 + i), signalPower: rttyPower)
+            return trimmed(run(makeDecoder(), Array(audio[Int(startSeconds * 12_000)...])))
+        }
+        for (i, out) in outs.enumerated() {
+            // A bit error may change a character; nothing may be added.
+            #expect(out.count <= sent.count, "seed \(40_001 + i): '\(out)'")
+            #expect(accuracy(out, sent: sent) >= 0.85, "seed \(40_001 + i): '\(out)'")
+        }
+    }
+
     @Test func noiseOnly() {
         let outs = parallel(5) { i in
             run(makeDecoder(), ModemTestSignals.noise(seconds: 60, seed: UInt64(1 + i)))
