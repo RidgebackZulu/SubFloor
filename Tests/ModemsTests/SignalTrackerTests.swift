@@ -508,6 +508,9 @@ func twoPSKSignalsNear170HzAreNotRTTY(_ spacing: Double) {
         let tracker = SignalTracker()
         feed(tracker, scene([rtty, neighbour], snrDb: 10, seed: 172, referencePower: rttyPower))
         expectTracks(tracker, at: [1_500, hz], "+10 dB RTTY, −10 dB PSK31 at \(hz)")
+        #expect(tracker.tracks.first { abs($0.frequencyHz - 1_500) < 3 }?.isFSKPair == true,
+                "+10 dB RTTY with −10 dB PSK31 at \(hz): RTTY not paired")
+        #expect(tracker.tracks.filter(\.isFSKPair).count == 1)
     }
 }
 
@@ -542,4 +545,65 @@ func closePSKPairsStaySeparate(_ spacing: Double) {
     #expect(tracker.strongestPeak(near: 1_500, within: 100) == nil)
     tracker.reset()
     #expect(tracker.strongestPeak(near: 1_000, within: 50) == nil)
+}
+
+/// Two independent carriers placed symmetrically about an RTTY centre must not pass as its mirrored
+/// keying lines.
+@Test func symmetricCarriersBesideRTTYStaySeparate() {
+    let rttyA: Float = 0.5
+    let rtty = fsk(low: 1_415, high: 1_585, bitSeconds: 0.022, seconds: 5, amplitude: rttyA, randomBitsSeed: 9)
+    let weak = rttyA * Float(pow(10, -20.0 / 20))
+    for offset in [120.0, 200.0, 300.0] {
+        let upper = ModemTestSignals.tone(1_585 + offset, seconds: 5, amplitude: weak)
+        let lower = ModemTestSignals.tone(1_415 - offset, seconds: 5, amplitude: weak)
+        let tracker = SignalTracker()
+        feed(tracker, scene([rtty, upper, lower], snrDb: 20, seed: 201, referencePower: Double(rttyA * rttyA) / 2))
+        expectTracks(tracker, at: [1_415 - offset, 1_500, 1_585 + offset], "carriers at ±\(offset) beyond the tones")
+        #expect(tracker.tracks.filter(\.isFSKPair).map { $0.frequencyHz.rounded() } == [1_500])
+    }
+}
+
+/// Slow fading (QSB) multiplies mark and space by a common gain; FSK pairing must survive it.
+@Test(arguments: [(0.8, 0.3), (0.9, 0.5)])
+func fadedRTTYStaysOnePair(_ depth: Double, _ rateHz: Double) {
+    let a: Float = 0.5
+    for (snr, seed) in [(10.0, UInt64(11)), (-5.0, UInt64(12))] {
+        var x = fsk(low: 1_915, high: 2_085, bitSeconds: 0.022, seconds: 6, amplitude: a, randomBitsSeed: seed)
+        for i in x.indices {
+            let t = Double(i) / fs
+            x[i] *= Float(1 - depth * (1 - cos(2 * Double.pi * rateHz * t)) / 2)
+        }
+        // In-burst power is the unfaded power (R7).
+        let audio = ModemTestSignals.awgn(x, snrDb: snr, seed: seed + 100, signalPower: Double(a * a) / 2)
+        let tracker = SignalTracker()
+        var start = 0
+        var paired = false
+        while start < audio.count {
+            let end = min(start + Int(fs), audio.count)
+            feed(tracker, audio[start..<end])
+            start = end
+            paired = paired || tracker.tracks.contains(where: \.isFSKPair)
+            // Once paired, never a separate mark or space track at any point of the fade cycle. (Before
+            // the partner is first visible, a lone tone is all the band shows.)
+            guard paired else { continue }
+            #expect(tracker.tracks.allSatisfy { $0.isFSKPair && abs($0.frequencyHz - 2_000) < 3 },
+                    "depth \(depth) at \(rateHz) Hz, \(snr) dB, \(Double(end) / fs) s: \(tracker.tracks.map { ($0.frequencyHz, $0.isFSKPair) })")
+        }
+        expectTracks(tracker, at: [2_000], "depth \(depth) at \(rateHz) Hz, \(snr) dB")
+        #expect(tracker.tracks.first?.isFSKPair == true)
+    }
+}
+
+/// PSK31 text mixed with idle (60-90% reversals) shows two broad tops about ±12 Hz from the carrier
+/// with a dip between; it is still one signal.
+@Test(arguments: [0.6, 0.75, 0.9])
+func mixedIdleDataPSK31IsOneTrack(_ reversalProbability: Double) {
+    for (k, snr) in [10.0, 0.0, -5.0].enumerated() {
+        for c in [700.0, 1_580, 2_450] {
+            let signal = bpsk31(c, seconds: 4, seed: UInt64(k) + 7, reversalProbability: reversalProbability, timingOffset: 0.2)
+            let tracker = SignalTracker()
+            feed(tracker, scene([signal], snrDb: snr, seed: UInt64(k) + 70))
+            expectTracks(tracker, at: [c], "p=\(reversalProbability) at \(c) Hz, \(snr) dB")
+        }
+    }
 }
