@@ -66,7 +66,7 @@ public final class FIRDecimator {
         let consumed = outCount * factor
         let remaining = filled - consumed
         buffer.withUnsafeMutableBufferPointer { b in
-            memmove(b.baseAddress!, b.baseAddress! + consumed, remaining * MemoryLayout<Float>.stride)
+            _ = memmove(b.baseAddress!, b.baseAddress! + consumed, remaining * MemoryLayout<Float>.stride)
         }
         filled = remaining
     }
