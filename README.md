@@ -52,7 +52,10 @@ panel shows the band being decoded. Changing mode starts afresh: nothing of the 
 The decode list is always shown: the cursor's row first, then FT8/WSPR messages (newest slot first),
 then the other CW/PSK31 signals. FT8 and WSPR need a live radio (RSP1B or Demo): they are off for IQ
 files. Slot timing is UTC from the system clock, and the panel warns when the clock is more than 1 s
-off. If the passband can't be decoded (narrower than 50 Hz above 300 Hz), the panel says so.
+off. After each slot the strip shows its outcome: "WSPR 14:32 · 2 decodes", "· no decodes", or
+"· skipped (audio gap)" when some of the slot's audio was lost. FT8 and WSPR search the whole decode
+band, so a HamItUp oscillator a few hundred hertz off (2 ppm at 125 MHz is 250 Hz) still decodes; the
+decoded audio frequencies then show the error, which Settings' HamItUp LO corrects. If the passband can't be decoded (narrower than 50 Hz above 300 Hz), the panel says so.
 
 RTTY and auto-detect are disabled for now; their code is kept (`RTTYModem`, `SignalClassifier`, and the
 engine's support for both) and covered by the tests.

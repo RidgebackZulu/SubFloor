@@ -45,8 +45,11 @@ struct WSPRDetection: Sendable, Equatable {
 /// The WSPR demodulator, written from the public protocol description (`WSPRCodec`) and general
 /// non-coherent FSK practice; no WSJT-X or wsprd source was read.
 ///
-/// Pipeline, per decoding pass:
-/// 1. **Downconvert** (once per slot): mix the slot audio down by 1500 Hz and decimate 12 kHz → 375 Hz
+/// The slot is searched in windows at most 300 Hz wide across the whole `audioBand`
+/// (`searchWindows`), each decoded on its own as below; a message found in two is kept once.
+///
+/// Pipeline, per window and decoding pass:
+/// 1. **Downconvert** (once per window): mix the slot audio down by the window's centre and decimate 12 kHz → 375 Hz
 ///    complex in two stages (×8 then ×4, Blackman-Harris low-passes, flat to ±160 Hz, nothing aliased
 ///    into ±220 Hz). One symbol is then 256 samples and the tone spacing 375/256 Hz is one bin of a
 ///    256-point DFT. Other input rates are first resampled to 12 kHz.
@@ -55,7 +58,7 @@ struct WSPRDetection: Sendable, Equatable {
 ///    symbol is that symbol's matched filter. The noise floor is the median of the slot-averaged
 ///    spectrum over the searched band.
 /// 3. **Candidates:** in the slot-averaged spectrum, the summed power of a centre's four tone bins
-///    (±0.73 and ±2.2 Hz), at local maxima within ±150 Hz of 1500 Hz and inside `audioBand`, whose
+///    (±0.73 and ±2.2 Hz), at local maxima within the window, whose
 ///    estimated SNR is above −33 dB. At most 40, strongest first.
 /// 4. **Coarse sync** on the spectrogram: start time −1…+3 s after the nominal 1 s (quarter-symbol
 ///    steps), centre ±1.5 Hz (half-tone steps) and drift −2…+2 Hz over the transmission (0.5 Hz
@@ -85,7 +88,7 @@ struct WSPRDetection: Sendable, Equatable {
 enum WSPRDecoder {
     static let inputRate = 12_000.0
     static let basebandRate = 375.0
-    static let centreHz = 1_500.0
+    /// Half the width of each searched window (`searchWindows`).
     static let searchHalfWidthHz = 150.0
     /// Samples per symbol at the baseband rate.
     static let symbolLength = 256
@@ -136,7 +139,7 @@ enum WSPRDecoder {
         var count: Int { re.count }
     }
 
-    /// One sync hypothesis: start sample at 375 Hz, centre offset from 1500 Hz at mid-transmission,
+    /// One sync hypothesis: start sample at 375 Hz, centre offset from the window's centre at mid-transmission,
     /// and drift over the transmission.
     struct Alignment: Equatable {
         var start: Int
@@ -148,25 +151,51 @@ enum WSPRDecoder {
 
     static func decode(samples: [Float], sampleRate: Double, audioBand: ClosedRange<Double>) -> [WSPRDetection] {
         guard sampleRate > 0, sampleRate.isFinite, !samples.isEmpty else { return [] }
-        let lo = max(audioBand.lowerBound, centreHz - searchHalfWidthHz)
-        let hi = min(audioBand.upperBound, centreHz + searchHalfWidthHz)
-        // The band must hold a signal (≈ 6 Hz) and enough bins for a noise floor.
-        guard hi - lo >= 12 else { return [] }
+        let windows = searchWindows(audioBand)
+        guard !windows.isEmpty else { return [] }
         let audio = sampleRate == inputRate ? samples : resample(samples, from: sampleRate)
-        var baseband = downconvert(audio)
         guard let setup = vDSP_create_fftsetup(log2FFT, FFTRadix(kFFTRadix2)) else { return [] }
         defer { vDSP_destroy_fftsetup(setup) }
+        var found: [WSPRDetection] = []
+        for window in windows {
+            for d in decode(audio, centreHz: window.centreHz, halfWidthHz: window.halfWidthHz, setup: setup)
+            where !found.contains(where: { $0.message == d.message }) {
+                found.append(d)
+            }
+        }
+        return found.sorted { $0.frequencyHz < $1.frequencyHz }
+    }
 
-        let band = (lo - centreHz)...(hi - centreHz)
+    /// The windows searched, each one downconversion: `audioBand` split into equal parts at most
+    /// `2·searchHalfWidthHz` wide (the baseband is flat to ±160 Hz). The whole band, not only the
+    /// 200 Hz WSPR sub-band around 1500 Hz: a receiver or converter whose oscillator is a few ppm off
+    /// (a 125 MHz up-converter at 2 ppm moves signals 250 Hz) puts them elsewhere. Empty when the band
+    /// cannot hold a signal (≈ 6 Hz) and enough bins for a noise floor.
+    static func searchWindows(_ audioBand: ClosedRange<Double>) -> [(centreHz: Double, halfWidthHz: Double)] {
+        let lo = max(audioBand.lowerBound, 0), hi = min(audioBand.upperBound, inputRate / 2 - 2 * searchHalfWidthHz)
+        guard hi - lo >= 12 else { return [] }
+        let count = Int(((hi - lo) / (2 * searchHalfWidthHz)).rounded(.up))
+        let width = (hi - lo) / Double(count)
+        return (0..<count).map { (lo + width * (Double($0) + 0.5), width / 2) }
+    }
+
+    /// The decoding passes over one window: `centreHz ± halfWidthHz` of 12 kHz `audio`.
+    static func decode(_ audio: [Float], centreHz: Double, halfWidthHz: Double, setup: FFTSetup) -> [WSPRDetection] {
+        var baseband = downconvert(audio, centreHz: centreHz)
+        let band = -halfWidthHz...halfWidthHz
+        // Candidates a tone spacing past the edges, so that a signal on the edge between two windows
+        // peaks inside one of them (a message found in both is kept once).
+        let search = (-halfWidthHz - toneSpacing)...(halfWidthHz + toneSpacing)
         var found: [WSPRDetection] = []
         for pass in 0..<maxPasses {
             let spectrogram = Spectrogram(baseband, setup: setup)
             guard let floor = spectrogram.noiseFloor(band: band) else { break }
             var fresh: [(WSPRDetection, Alignment)] = []
-            for bin in spectrogram.candidates(band: band, floor: floor) {
+            for bin in spectrogram.candidates(band: search, floor: floor) {
                 let fine = fineSync(baseband, from: coarseSync(spectrogram, bin: bin))
-                guard band.contains(fine.frequency),
-                      let (detection, alignment) = decode(baseband, near: fine, floor: floor, pass: pass),
+                guard abs(fine.frequency) <= search.upperBound + toneSpacing,
+                      let (detection, alignment) = decode(baseband, near: fine, floor: floor, pass: pass,
+                                                          centreHz: centreHz),
                       !found.contains(where: { $0.message == detection.message }),
                       !fresh.contains(where: { $0.0.message == detection.message })
                 else { continue }
@@ -178,13 +207,14 @@ enum WSPRDecoder {
                 found.append(detection)
             }
         }
-        return found.sorted { $0.frequencyHz < $1.frequencyHz }
+        return found
     }
 
     /// Demodulates and decodes at `fine`. If that fails and the sync is clearly a signal's, it retries
     /// 8 samples (21 ms) earlier and later and 0.08 Hz lower and higher: near the threshold the sync
     /// estimate's own noise (some ±10 samples and ±0.05 Hz) costs decodes.
-    static func decode(_ z: Baseband, near fine: Alignment, floor: Float, pass: Int) -> (WSPRDetection, Alignment)? {
+    static func decode(_ z: Baseband, near fine: Alignment, floor: Float, pass: Int,
+                       centreHz: Double) -> (WSPRDetection, Alignment)? {
         let p = tonePowers(z, at: fine)
         var attempts = [fine]
         if syncScore(p) >= retrySync {
@@ -196,6 +226,7 @@ enum WSPRDecoder {
         for a in attempts {
             if var d = demodulate(z, at: a, floor: floor) {
                 d.pass = pass
+                d.frequencyHz += centreHz
                 return (d, a)
             }
         }
@@ -223,7 +254,7 @@ enum WSPRDecoder {
     /// Mixes 12 kHz audio down by `centreHz` and decimates to one slot of 375 Hz complex baseband
     /// (zero-padded or truncated to 120 s). Baseband sample m is centred on audio sample 32m. A real
     /// tone of amplitude A reads A/2.
-    static func downconvert(_ audio: [Float]) -> Baseband {
+    static func downconvert(_ audio: [Float], centreHz: Double) -> Baseband {
         let t1 = stage1Taps.count, t2 = stage2Taps.count
         // Front padding that centres both filters, so output m sits on input sample 32m.
         let delay = (t1 - 1) / 2 + (t2 - 1) / 2 * stage1Factor
@@ -275,7 +306,7 @@ enum WSPRDecoder {
     // MARK: - Spectrogram and candidates
 
     /// Power spectra of one-symbol frames at a quarter-symbol hop, 512 bins each, centred: bin b is
-    /// (b − 256)·0.73 Hz from 1500 Hz. Unnormalised, so a frame on a symbol has that symbol's DFT
+    /// (b − 256)·0.73 Hz from the window's centre. Unnormalised, so a frame on a symbol has that symbol's DFT
     /// power, the same scale as `toneSpectra`.
     struct Spectrogram {
         var power: [Float]
@@ -323,7 +354,7 @@ enum WSPRDecoder {
             return avg.map { $0 * k }
         }
 
-        /// Bin indices covered by `band` (offsets from 1500 Hz).
+        /// Bin indices covered by `band` (offsets from the window's centre).
         static func bins(in band: ClosedRange<Double>) -> ClosedRange<Int> {
             Int((band.lowerBound / WSPRDecoder.binHz).rounded(.up)) + centre
                 ... Int((band.upperBound / WSPRDecoder.binHz).rounded(.down)) + centre
@@ -571,7 +602,7 @@ enum WSPRDecoder {
         let excess = max(signal / Float(symbolCount) - floor, floor * 1e-4)
         let snr = 10 * log10(Double(excess / floor)) - snrBandwidthDb
         return WSPRDetection(call: message.call, grid: message.grid, powerDbm: message.powerDbm,
-                             frequencyHz: centreHz + a.frequency, driftHz: a.drift,
+                             frequencyHz: a.frequency, driftHz: a.drift,
                              timeOffset: Double(a.start) / basebandRate - nominalStart,
                              snrDb: Float(snr), sync: sync, bitErrors: errors, pass: 0)
     }

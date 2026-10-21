@@ -77,7 +77,7 @@ suites running in parallel). Other speed figures printed by the existing tests i
 |---|---|
 | `ModemEngineTests.parallelDecode` (5 PSK31 + 2 CW, auto-detect, 40 s) | 0.47 s, 85× real time (Mac: 0.194 s, 206×) |
 | FT8 slot decode, 8 signals at −15 dB / noise only | 0.35 s / 0.28 s |
-| WSPR slot decode, 4 signals at −24 dB / noise only (120 s slot) | 0.12 s / 0.04 s |
+| WSPR slot decode, 4 signals at −24 dB / noise only (120 s slot) | 0.12 s / 0.04 s searching 1350–1650 Hz; 0.41–0.45 s / 0.37–0.41 s searching the whole 300–3300 Hz band (since the search follows the decode band, so an up-converter's LO error cannot move signals out of it) |
 | Classifier, one call on a 2 s / 16 s capture | 0.30 ms / 2.36 ms |
 
 The FT8 slots of the concurrent test are separate synthetic audio, not the PSK31 band itself; the point
@@ -178,7 +178,7 @@ Session date, antenna, time of day, band conditions: TO-DO.
 | Mode | Frequency | Start / end (UTC) | Signals seen in the box | What decoded (examples, with UTC timestamps) | Empty band? | Notes |
 |---|---|---|---|---|---|---|
 | FT8 | 14.074 MHz USB | TO-DO | TO-DO | TO-DO | TO-DO | TO-DO |
-| WSPR | 14.0956 MHz dial | TO-DO | TO-DO | TO-DO | TO-DO | WSPR slots are 2 min: stay ≥ 4 min |
+| WSPR | 14.0956 MHz dial | TO-DO | TO-DO | TO-DO | TO-DO | WSPR slots are 2 min: stay ≥ 4 min. The strip shows each slot's outcome ("WSPR 14:32 · 2 decodes", "· no decodes", "· skipped (audio gap)"); decodes far from 1400–1600 Hz audio mean the HamItUp LO setting is off by that much |
 | PSK31 | 14.070 MHz | TO-DO | TO-DO | TO-DO | TO-DO | TO-DO |
 | CW | 14.030 MHz | TO-DO | TO-DO | TO-DO | TO-DO | TO-DO |
 | RTTY | 14.085 MHz | TO-DO | TO-DO | TO-DO | TO-DO | TO-DO |

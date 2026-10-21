@@ -201,6 +201,29 @@ private func weakTrial(_ i: Int, snrDb: Double, seedBase: UInt64) -> Int {
         #expect(decode(audio, band: 2_000...3_000).isEmpty)
     }
 
+    /// Off the 200 Hz sub-band, as an up-converter a few ppm off puts signals: anywhere in the band
+    /// decodes, including on the edge between two searched windows.
+    @Test(arguments: [600.0, 1_411.1, 1_850.0, 2_600.0])
+    func offsetSignal(hz: Double) throws {
+        let audio = ModemTestSignals.awgn(wspr(g4jnt, hz: hz), snrDb: -20, seed: 14, signalPower: signalPower)
+        let decodes = decode(audio, band: 300...2_800)
+        let d = try #require(decodes.first)
+        #expect(decodes.count == 1)
+        #expect(d.message == g4jnt.text)
+        #expect(abs(d.frequencyHz - hz) <= 2, "\(d.frequencyHz) Hz")
+    }
+
+    @Test func searchWindowsTileTheBand() {
+        let w = WSPRDecoder.searchWindows(300...2_800)
+        #expect(w.count == 9)
+        #expect(abs(w.first!.centreHz - w.first!.halfWidthHz - 300) < 1e-9)
+        #expect(abs(w.last!.centreHz + w.last!.halfWidthHz - 2_800) < 1e-9)
+        #expect(w.allSatisfy { $0.halfWidthHz <= WSPRDecoder.searchHalfWidthHz })
+        for (a, b) in zip(w, w.dropFirst()) { #expect(abs(a.centreHz + a.halfWidthHz - (b.centreHz - b.halfWidthHz)) < 1e-9) }
+        #expect(WSPRDecoder.searchWindows(1_400...1_600).map(\.centreHz) == [1_500])
+        #expect(WSPRDecoder.searchWindows(1_500...1_505).isEmpty)
+    }
+
     @Test(arguments: [-20.0, -15.0, -10.0, -5.0, 0.0])
     func reportedSNR(snrDb: Double) throws {
         let audio = ModemTestSignals.awgn(wspr(lz0dls, hz: 1_510), snrDb: snrDb, seed: 7, signalPower: signalPower)
