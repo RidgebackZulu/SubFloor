@@ -582,8 +582,12 @@ final class AppModel {
     var modemPanelStatus: ModemPanelStatus {
         ModemPanelStatus(mode: modem.settings.mode, autoDetect: modem.settings.autoDetect,
                          isFileSource: sourceKind == .file, boxActive: modemBoxActive, clockOffset: clockOffset,
-                         signalCount: decodeLog.liveRows.count, heldNewCount: decodeLog.heldNewCount, box: modem.box)
+                         box: modem.box)
     }
+
+    /// "3 signals": the live rows (read by its own small view, so the log's 10 Hz changes don't
+    /// re-render the control strip).
+    var modemSignalCountText: String { ModemPanelFormat.signalCount(decodeLog.liveRows.count) }
 
     /// The box body in view fractions, while the modem is on and the box active (clicks inside
     /// it lock the cursor; elsewhere they tune the VFO).

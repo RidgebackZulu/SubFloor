@@ -118,7 +118,10 @@ enum ModemPanelMessage: Equatable, Hashable {
     var isWarning: Bool { self != .needsLiveRadio }
 }
 
-/// The control strip's state, from `AppModel`'s modem state (`AppModel.modemPanelStatus`).
+/// The control strip's state, from `AppModel`'s modem state (`AppModel.modemPanelStatus`). It holds
+/// only state that changes when the user changes something (not the decode log, which changes at
+/// 10 Hz): the views whose bodies read it hold segmented pickers, which SwiftUI re-measures (slowly)
+/// whenever such a body runs. The log's counts are read by the small views that show them.
 struct ModemPanelStatus: Equatable {
     /// `|clockOffset|` beyond this warns.
     static let clockTolerance = 1.0
@@ -128,8 +131,6 @@ struct ModemPanelStatus: Equatable {
     var isFileSource: Bool
     var boxActive: Bool
     var clockOffset: Double?
-    var signalCount: Int
-    var heldNewCount: Int
     var box: ModemBox
 
     var isOn: Bool { mode != nil }
@@ -158,9 +159,7 @@ struct ModemPanelStatus: Equatable {
         return out
     }
 
-    var signalCountText: String { ModemPanelFormat.signalCount(signalCount) }
     var dialText: String { ModemPanelFormat.dial(box) }
-    var newRowsPillText: String? { ModemPanelFormat.newRowsPill(heldNewCount) }
 }
 
 /// The bench panes' amber readouts.

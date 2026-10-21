@@ -134,7 +134,7 @@ private struct AudioSection: View {
             Slider(value: Binding(get: { Double(model.squelchDb) }, set: { model.squelchDb = Float($0) }), in: -140...0)
                 .controlSize(.small)
                 .disabled(!model.squelchEnabled)
-            SignalMeter(db: model.signalDb, threshold: model.squelchEnabled ? model.squelchDb : nil)
+            SignalMeter()
             if model.mode == .cw {
                 SliderRow(title: "CW pitch", value: $model.cwPitchHz, range: 300...1200, text: "\(Int(model.cwPitchHz)) Hz")
             }
@@ -142,11 +142,14 @@ private struct AudioSection: View {
     }
 }
 
+/// Reads the channel power itself, so its 10 Hz updates re-render only the meter, not the section
+/// around it (whose segmented picker SwiftUI re-measures, slowly, whenever that section re-renders).
 private struct SignalMeter: View {
-    let db: Float
-    let threshold: Float?
+    @Environment(AppModel.self) private var model
 
     var body: some View {
+        let db = model.signalDb
+        let threshold: Float? = model.squelchEnabled ? model.squelchDb : nil
         GeometryReader { geo in
             let f = { (v: Float) in CGFloat(min(max((v + 140) / 140, 0), 1)) * geo.size.width }
             ZStack(alignment: .leading) {

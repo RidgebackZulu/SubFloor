@@ -19,7 +19,7 @@ import Testing
     private func status(mode: ModeID? = .psk31, autoDetect: Bool = false, file: Bool = false, boxActive: Bool = true,
                         clockOffset: Double? = nil) -> ModemPanelStatus {
         ModemPanelStatus(mode: mode, autoDetect: autoDetect, isFileSource: file, boxActive: boxActive,
-                         clockOffset: clockOffset, signalCount: 3, heldNewCount: 0, box: ModemBox(dialHz: 14_074_000))
+                         clockOffset: clockOffset, box: ModemBox(dialHz: 14_074_000))
     }
 
     // MARK: Formatting
@@ -132,12 +132,7 @@ import Testing
 
     @Test func statusTexts() {
         let s = status()
-        #expect(s.signalCountText == "3 signals")
         #expect(s.dialText == "14.074.000 USB")
-        #expect(s.newRowsPillText == nil)
-        var held = s
-        held.heldNewCount = 2
-        #expect(held.newRowsPillText == "2 new ↓")
         #expect(s.isOn)
         #expect(!status(mode: nil).isOn)
     }

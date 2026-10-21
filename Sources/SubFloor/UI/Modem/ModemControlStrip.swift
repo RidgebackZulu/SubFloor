@@ -56,9 +56,7 @@ struct ModemControlStrip: View {
                 if !status.slotModes.isEmpty {
                     SlotProgressView(modes: status.slotModes)
                 }
-                Text(status.signalCountText)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                ModemSignalCount()
                 Text(status.dialText)
                     .foregroundStyle(status.boxActive ? Theme.modemBox : Color.secondary)
                     .lineLimit(1)
@@ -69,6 +67,18 @@ struct ModemControlStrip: View {
         .controlSize(.small)
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+    }
+}
+
+/// "3 signals". Its own view so that only it re-renders when the decode log changes (10 Hz), not
+/// the strip and its segmented pickers.
+private struct ModemSignalCount: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        Text(model.modemSignalCountText)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
     }
 }
 
