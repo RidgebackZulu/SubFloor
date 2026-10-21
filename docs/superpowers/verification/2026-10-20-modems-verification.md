@@ -138,10 +138,29 @@ Procedure:
 
 | Date / build (commit) | Rate | FFT | Mode | Signals tracked / decoding | `top` samples 2–5 (% CPU) | Mean | Target | Pass? |
 |---|---|---|---|---|---|---|---|---|
-| 2026-10-20, `507026e` | 2 MSPS | 8192 | PSK31 + auto, Demo source | TO-DO | 26.4, 65.5, 60.9, 63.1 | **54 %** | < 30 % | **No**: under investigation (modem-off baseline and a per-thread profile needed). The machine was under memory pressure (≈ 300 MB free, 11 GB compressed). For scale, on the x86 harness the 2 MSPS modem channel costs ≈ 6 % of a core and the 12 kHz engine ≈ 1 % |
+| 2026-10-20, `507026e` | 2 MSPS | 8192 | PSK31 + auto, Demo source | TO-DO | 26.4, 65.5, 60.9, 63.1 | **54 %** | < 30 % | **No** (see §4.1 for the per-thread figures and fixes; ≈ 51 % after them) (modem-off baseline and a per-thread profile needed). The machine was under memory pressure (≈ 300 MB free, 11 GB compressed). For scale, on the x86 harness the 2 MSPS modem channel costs ≈ 6 % of a core and the 12 kHz engine ≈ 1 % |
 | TO-DO | 10 MSPS | 8192 | PSK31 + auto | TO-DO | TO-DO | TO-DO | info only | — |
 
-Mac model / macOS version: TO-DO.
+Mac model / macOS version: M2 Pro; macOS version TO-DO.
+
+### 4.1 Per-thread CPU on the Mac (Instruments Time Profiler) and the fixes it led to
+
+`top` swung ±10 points between identical runs on this Mac (memory pressure, efficiency vs performance
+cores), so the figures below are Instruments Time Profiler totals: real CPU per thread over 10 s, as a
+percentage of one core. Demo source, 2 MSPS, FFT 8192, modem PSK31 with auto-detect.
+
+| Thread | Before (`507026e`) | After (`c74a485`) | What changed |
+|---|---|---|---|
+| Main thread (SwiftUI/AppKit) | 36 % | **15.4 %** | `6f0b606` meter no longer animates for good; `587063a`, `0ed1078` fast-changing values read only by the small views that show them (segmented pickers were re-measured on every update); `d5cc708` window minimum size without measuring the whole window; `7e8a145` everything shown updates together at 5 Hz; `c74a485` slot countdown drawn in a Canvas once a second; `97dfdcf` spectrum presented only when there is something new |
+| Worker threads (Demo generator; FT8/WSPR slot decoding) | ≈ 19 % (generator most of it) | 18.6 % (generator ≈ 14 %) | `43e18ce` generator uses phasors instead of per-sample `cos`/`sin` |
+| `SubFloor DSP` (spectrum, receiver, 2 MSPS modem channel) | 6–10 % | 10.4 % | — |
+| `SubFloor Modem` (all decoders, tracker, classifier) | 3–5 % | 6.2 % | — |
+| **Process** | **≈ 70 %** | **≈ 51 %** | |
+
+Against the target (< 30 % for the whole process): **not met on the Demo source (≈ 51 %)**. The Demo
+generator only runs for the Demo source, so on the RSP1B the process should be about 35–37 %, still over
+the target. Remaining candidates: vectorising the Demo generator, and fusing the full-rate NCO mix with
+the first decimation stage (done twice per block, for the receiver and for the modem channel).
 
 ---
 
