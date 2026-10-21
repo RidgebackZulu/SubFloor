@@ -81,8 +81,16 @@ final class AppModel {
     // MARK: Bookmarks, modems, UI
     private(set) var bookmarks: [Bookmark] = []
     var showBookmarks = true
-    /// The multi-signal modem's box, settings and cursor (see `ModemControl`).
-    private var modem = ModemControl()
+    /// The multi-signal modem's box, settings and cursor (see `ModemControl`). Not observed: it also
+    /// changes with the cursor's tracking and the engine bookkeeping several times a second, which
+    /// would re-render every view reading any part of it (the modem strip's segmented pickers among
+    /// them, which SwiftUI re-measures slowly). Views read the parts below instead, which `setModem`
+    /// assigns only when they change.
+    @ObservationIgnored private var modem = ModemControl()
+    private(set) var modemBox = ModemBox(dialHz: ModemControl.defaultDialHz)
+    /// The user's modem settings, as persisted (`modemSettings` is what the engine gets).
+    private var modemUserSettings = ModemSettings()
+    private(set) var modemCursorAudioHz: Double?
     private(set) var decodeLog = DecodeLog()
     /// The system clock's offset from network time (`ClockCheck`), once measured.
     private(set) var clockOffset: Double?
@@ -568,21 +576,21 @@ final class AppModel {
 
     // MARK: Multi-signal modem
 
-    var modemBox: ModemBox { modem.box }
     /// As sent to the engine: FT8/WSPR (`slotModesEnabled`) are off for file sources.
-    var modemSettings: ModemSettings { modem.engineSettings(isFileSource: sourceKind == .file) }
-    var modemCursorAudioHz: Double? { modem.cursorAudioHz }
+    var modemSettings: ModemSettings {
+        ModemControl(settings: modemUserSettings).engineSettings(isFileSource: sourceKind == .file)
+    }
     /// False when the box is outside the capture span (the engine gets no box; decoding stops).
-    var modemBoxActive: Bool { modem.isBoxActive(captureCenter: centerHz, captureSpan: sampleRate) }
+    var modemBoxActive: Bool { modemBox.isInside(captureCenter: centerHz, captureSpan: sampleRate) }
     /// ←/→ nudge the modem cursor and Esc unlocks it (`KeyCommand`).
-    var modemKeysActive: Bool { modem.settings.mode != nil && modemBoxActive }
-    var modemGrabTabLabel: String { modem.grabTabLabel }
+    var modemKeysActive: Bool { modemUserSettings.mode != nil && modemBoxActive }
+    var modemGrabTabLabel: String { ModemControl(settings: modemUserSettings).grabTabLabel }
 
     /// The modem panel's control-strip state (`ModemPanelStatus`).
     var modemPanelStatus: ModemPanelStatus {
-        ModemPanelStatus(mode: modem.settings.mode, autoDetect: modem.settings.autoDetect,
+        ModemPanelStatus(mode: modemUserSettings.mode, autoDetect: modemUserSettings.autoDetect,
                          isFileSource: sourceKind == .file, boxActive: modemBoxActive, clockOffset: clockOffset,
-                         box: modem.box)
+                         box: modemBox)
     }
 
     /// "3 signals": the live rows (read by its own small view, so the log's 10 Hz changes don't
@@ -592,14 +600,14 @@ final class AppModel {
     /// The box body in view fractions, while the modem is on and the box active (clicks inside
     /// it lock the cursor; elsewhere they tune the VFO).
     var modemBoxFractions: (lower: Double, upper: Double)? {
-        guard modem.settings.mode != nil, modemBoxActive else { return nil }
+        guard modemUserSettings.mode != nil, modemBoxActive else { return nil }
         return (viewport.fraction(ofHz: modemBox.lowerHz), viewport.fraction(ofHz: modemBox.upperHz))
     }
 
     /// The grab tab's horizontal extent in view fractions, while the modem is on (an inactive box
     /// can still be dragged back). The spectrum view widens it to `SpectrumHitTest.minTabWidth`.
     var modemGrabTabFractions: (lower: Double, upper: Double)? {
-        guard modem.settings.mode != nil else { return nil }
+        guard modemUserSettings.mode != nil else { return nil }
         return (viewport.fraction(ofHz: modemBox.lowerHz), viewport.fraction(ofHz: modemBox.upperHz))
     }
 
@@ -680,7 +688,15 @@ final class AppModel {
     private func syncModem(_ m: inout ModemControl) {
         let updates = m.sync(engine, captureCenter: centerHz, captureSpan: sampleRate, isFileSource: sourceKind == .file)
         if let hook = onModemEngineUpdate { updates.forEach(hook) }
+        setModem(m)
+    }
+
+    /// Stores the modem state and publishes the parts views read, each only when it changed.
+    private func setModem(_ m: ModemControl) {
         if m != modem { modem = m }
+        if m.box != modemBox { modemBox = m.box }
+        if m.settings != modemUserSettings { modemUserSettings = m.settings }
+        if m.cursorAudioHz != modemCursorAudioHz { modemCursorAudioHz = m.cursorAudioHz }
     }
 
     /// The 10 Hz drain of the engine's modem output into the rows.
@@ -692,7 +708,7 @@ final class AppModel {
         } else {
             m.take(batch, into: &decodeLog, now: engine.modemWorker.utcNow())
         }
-        if m != modem { modem = m }
+        setModem(m)
     }
 
     /// Measures the clock offset once, the first time the modem is on with the radio running.
@@ -741,7 +757,7 @@ final class AppModel {
         upconverter = s.upconverter; hardware = s.hardware; spectrum = s.spectrum
         dbMin = s.dbMin; dbMax = s.dbMax; colormap = s.colormap; showBookmarks = s.showBookmarks
         volume = s.volume; agcSpeed = s.agcSpeed; cwPitchHz = s.cwPitchHz; preferredSource = s.preferredSource
-        modem = ModemControl(box: s.modemBox ?? modem.box, settings: s.modemSettings ?? modem.settings)
+        setModem(ModemControl(box: s.modemBox ?? modem.box, settings: s.modemSettings ?? modem.settings))
         lastSavedSession = data
     }
 }

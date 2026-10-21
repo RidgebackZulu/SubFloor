@@ -100,9 +100,12 @@ private struct SlotProgressView: View {
                                     .frame(width: max(2, 54 * p.fraction))
                             }
                             .frame(width: 54, height: 4)
+                            // Fixed width: "FT8 12 s" → "FT8 9 s" must not re-lay out the strip (and
+                            // re-measure its segmented pickers) twice a second.
                             Text(p.text)
                                 .font(.caption.monospacedDigit())
                                 .foregroundStyle(.secondary)
+                                .frame(width: 72, alignment: .leading)
                         }
                         .help("\(mode.label): seconds until the next UTC slot")
                     }
