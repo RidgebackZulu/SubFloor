@@ -48,6 +48,8 @@ final class SpectrumRenderer: NSObject, MTKViewDelegate {
     private var sequence: UInt64 = 0
     private var latestAverage: [Float] = []
     private var latestPeak: [Float] = []
+    /// What the last presented frame showed (nil before the first).
+    private var drawn: (sequence: UInt64, state: DisplayState, size: CGSize, scale: CGFloat)?
 
     init?(device: MTLDevice, frames: SpectrumFrameStore) {
         guard let queue = device.makeCommandQueue(),
@@ -102,6 +104,15 @@ final class SpectrumRenderer: NSObject, MTKViewDelegate {
             for i in 0..<fftSize { row[i] = Float16(latestAverage[i]) }
         }
 
+        // Nothing new to show (no spectrum frame since, same view, same size): keep the last frame
+        // on screen. Spectra arrive at the waterfall rate (30/s by default) but the view ticks at
+        // 120 Hz, and every present commits a Core Animation transaction, which runs AppKit's and
+        // SwiftUI's layout and render pass for the whole window.
+        let scale = view.window?.backingScaleFactor ?? 2
+        if let d = drawn, d.sequence == sequence, d.state == state, d.size == view.drawableSize, d.scale == scale {
+            return
+        }
+
         guard let pass = view.currentRenderPassDescriptor, let drawable = view.currentDrawable,
               let commands = queue.makeCommandBuffer() else { return }
         inFlight.wait()
@@ -118,7 +129,7 @@ final class SpectrumRenderer: NSObject, MTKViewDelegate {
             spectrumFraction: state.spectrumFraction,
             viewSize: SIMD2(Float(size.width), Float(size.height)),
             showPeak: state.showPeak ? 1 : 0,
-            rowHeightPx: Float(view.window?.backingScaleFactor ?? 2))
+            rowHeightPx: Float(scale))
 
         let encoder = commands.makeRenderCommandEncoder(descriptor: pass)!
         encoder.setRenderPipelineState(pipeline)
@@ -133,5 +144,6 @@ final class SpectrumRenderer: NSObject, MTKViewDelegate {
         commands.addCompletedHandler { _ in semaphore.signal() }
         commands.present(drawable)
         commands.commit()
+        drawn = (sequence, state, size, scale)
     }
 }
