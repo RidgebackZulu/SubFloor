@@ -19,7 +19,7 @@ import Testing
     private func status(mode: ModeID? = .psk31, autoDetect: Bool = false, file: Bool = false, boxActive: Bool = true,
                         clockOffset: Double? = nil) -> ModemPanelStatus {
         ModemPanelStatus(mode: mode, autoDetect: autoDetect, isFileSource: file, boxActive: boxActive,
-                         clockOffset: clockOffset, box: ModemBox(dialHz: 14_074_000))
+                         clockOffset: clockOffset, audioBand: 300...2_800)
     }
 
     // MARK: Formatting
@@ -59,7 +59,7 @@ import Testing
         #expect(ModemPanelFormat.modeLabel(row) == "PSK31")
         row.mode = nil
         #expect(ModemPanelFormat.modeLabel(row) == "?")
-        #expect(ModemPanelFormat.modeChoices.map(ModemPanelFormat.label(of:)) == ["Off", "CW", "PSK31", "RTTY", "FT8", "WSPR"])
+        #expect(ModemPanelFormat.modeChoices.map(ModemPanelFormat.label(of:)) == ["Off", "CW", "PSK31", "FT8", "WSPR"])
         #expect(ModemPanelFormat.signalCount(1) == "1 signal")
         #expect(ModemPanelFormat.signalCount(0) == "0 signals")
         #expect(ModemPanelFormat.newRowsPill(0) == nil)
@@ -112,9 +112,7 @@ import Testing
 
         let outside = status(boxActive: false).messages
         #expect(outside == [.boxOutsideSpan])
-        #expect(ModemPanelMessage.boxOutsideSpan.text == "Modem box is outside the captured band")
-        #expect(ModemPanelMessage.boxOutsideSpan.offersRecenter)
-        #expect(!ModemPanelMessage.needsLiveRadio.offersRecenter)
+        #expect(ModemPanelMessage.boxOutsideSpan.text == "Nothing to decode: widen the passband, or tune inside the captured band")
 
         // The clock matters only to running slot modes, and only beyond ±1 s.
         #expect(status(mode: .ft8, clockOffset: 1.0).messages.isEmpty)
@@ -132,9 +130,25 @@ import Testing
 
     @Test func statusTexts() {
         let s = status()
-        #expect(s.dialText == "14.074.000 USB")
+        #expect(s.bandText == "300–2,800 Hz")
+        #expect(ModemPanelFormat.band(nil) == "—")
+        #expect(ModemPanelFormat.band(1_000...3_300) == "1,000–3,300 Hz")
         #expect(s.isOn)
         #expect(!status(mode: nil).isOn)
+    }
+
+    /// A slot row is the cursor's when the cursor is on its signal's centre (FT8 reports tone 0).
+    @Test func slotRowAtTheCursor() {
+        let ft8 = DecodeRow(id: Int.min, frequencyHz: 1_200, mode: .ft8, submode: "", snrDb: -10, recentText: "CQ",
+                            history: "CQ", isQuiet: false, isCursor: false, utcTime: Date(timeIntervalSince1970: 0))
+        let centre = 1_200 + 3.5 * FT8Encoder.toneSpacing
+        #expect(ModemPanelFormat.slotRowIsAtCursor(ft8, cursorAudioHz: centre))
+        #expect(ModemPanelFormat.slotRowIsAtCursor(ft8, cursorAudioHz: centre + 9))
+        #expect(!ModemPanelFormat.slotRowIsAtCursor(ft8, cursorAudioHz: centre + 11))
+        #expect(!ModemPanelFormat.slotRowIsAtCursor(ft8, cursorAudioHz: nil))
+        var live = ft8
+        live.utcTime = nil
+        #expect(!ModemPanelFormat.slotRowIsAtCursor(live, cursorAudioHz: centre), "a live row is not a slot row")
     }
 
     // MARK: Bench
@@ -152,7 +166,7 @@ import Testing
         let wspr = CursorFrame(waveform: [], spectrumDb: [], spectrumCenterHz: 1_500, iq: [], frequencyHz: 1_500,
                                snrDb: -20, submode: "WSPR", symbolRate: 12_000.0 / 8_192)
         #expect(BenchReadouts(wspr).iq == "WSPR · 1.465 Bd")
-        #expect(ModemPanelFormat.benchPlaceholder == "Click a signal inside the box to analyse it")
+        #expect(ModemPanelFormat.benchPlaceholder == "Click a signal in the passband, or a decode, to analyse it")
     }
 
     @Test func benchFeedFollowsTheStoreAndTheLock() {

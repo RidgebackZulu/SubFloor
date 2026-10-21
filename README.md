@@ -2,7 +2,7 @@
 
 A fast, native macOS (Apple Silicon) receiver for the SDRplay RSP1B: Metal spectrum + waterfall,
 AM/NFM/WFM/USB/LSB/CW audio, HamItUp upconverter mode, bookmarks, and a multi-signal modem panel that
-decodes every CW, PSK31, RTTY, FT8 and WSPR signal inside a 3 kHz box at once.
+decodes every CW, PSK31, FT8 and WSPR signal in the receiver's passband at once.
 
 ## Requirements
 - macOS on Apple Silicon, Xcode 26 / Swift 6.2
@@ -30,28 +30,32 @@ Without an RSP connected, SubFloor runs on a built-in demo signal around 14.1 MH
 | Zoom / pan | Pinch or ⌥-scroll / two-finger scroll or drag — never retunes the radio |
 | Bandwidth | Drag the passband edges |
 | Bookmarks | ⌘D add · ⌘B show on spectrum · sidebar list |
-| HamItUp | Top-bar toggle or ⌘U (LO set in Settings, default 125 MHz) |
+| HamItUp | Top-bar button (green when on) or ⌘U (LO set in Settings, default 125 MHz) |
+| Edit a bookmark | Click its flag above the spectrum: name, frequency, mode, group, HamItUp; Tune or Delete |
 
 ## Modem panel
-Pick a mode (CW, PSK31, RTTY, FT8, WSPR) in the panel under the spectrum. A green 3 kHz box appears on
-the spectrum: it covers RF dial + 300 … 3300 Hz, and each signal's audio frequency is its RF minus the
-dial (the box's dial frequency is shown in the panel, "USB"). Every signal in the box gets a row.
+Pick a mode (CW, PSK31, FT8, WSPR) in the panel under the spectrum. The modem decodes what the receiver
+is tuned to: its window is the receiver's passband (on USB, 300 Hz up to the passband's top edge, at
+most 3300 Hz above the dial, which is the VFO), so you hear what is decoded, and the receiver's audio
+keeps playing. Tune with the VFO as usual and widen or narrow the passband by dragging its edges; the
+panel shows the band being decoded. Changing mode starts afresh: nothing of the old mode carries over.
 
 | Action | How |
 | --- | --- |
-| Move the box | Drag its grab tab on the top edge ("≡ PSK31 · 3 kHz"). It never retunes the radio; clicking outside the box still tunes the VFO |
-| Re-center the box | "⌖ Re-center box": the middle of the current view, kept inside the captured span |
-| Analyse a signal | Click it inside the box: the amber cursor snaps to the nearest tracked signal and follows it; the bench shows its waveform, ±100 Hz spectrum and IQ |
+| Analyse a signal | Click it inside the passband: the amber cursor snaps to the nearest tracked signal and follows it; the bench shows its waveform, ±100 Hz spectrum and IQ. Clicking outside the passband still tunes the VFO |
+| Analyse a decode | Click a row in the decode list (FT8/WSPR messages included): the cursor goes to that signal and the bench shows it; the row turns amber |
 | Unlock the cursor | Esc, click the cursor again, or click its (amber) row |
 | Next / previous signal | ← / → while a mode is on (instead of stepping the VFO) |
-| Lock on a row's signal | Click the row; its chevron shows the full history |
-| Audio | Narrow: the cursor's signal through its mode's filter (wide box audio while no cursor is locked) · Wide: the whole box |
-| Auto-detect | Classifies every signal and decodes it in its own mode, FT8/WSPR on every slot; the picked mode is the cursor's fallback |
+| Signal history | A CW/PSK31 row's chevron shows its full history |
 | Pause new rows | Hover the list; "N new ↓" shows them |
 
-FT8 and WSPR need a live radio (RSP1B or Demo): they are off for IQ files. Slot timing is UTC from the
-system clock, and the panel warns when the clock is more than 1 s off. If a retune leaves the box outside
-the captured span, decoding stops until the box is re-centered or the radio is tuned back.
+The decode list is always shown: the cursor's row first, then FT8/WSPR messages (newest slot first),
+then the other CW/PSK31 signals. FT8 and WSPR need a live radio (RSP1B or Demo): they are off for IQ
+files. Slot timing is UTC from the system clock, and the panel warns when the clock is more than 1 s
+off. If the passband can't be decoded (narrower than 50 Hz above 300 Hz), the panel says so.
+
+RTTY and auto-detect are disabled for now; their code is kept (`RTTYModem`, `SignalClassifier`, and the
+engine's support for both) and covered by the tests.
 
 ## Manual hardware checklist
 Run through this with an RSP1B attached before a release:
@@ -64,8 +68,7 @@ Run through this with an RSP1B attached before a release:
 - [ ] Switch the audio output device while running; audio continues
 
 ## Adding a modem
-Modems decode the box's 12 kHz real USB audio on the modem thread (`ModemEngine`); the panel picks up
-new modes by itself.
+Modems decode the box's 12 kHz real USB audio on the modem thread (`ModemEngine`).
 1. Add a case to `ModeID` (`Sources/Modems/Framework/ModemTypes.swift`) with its label, listen filter
    width and lock range (the compiler points to the other switches over modes).
 2. Create `Sources/Modems/<Name>/` with either
@@ -75,5 +78,6 @@ new modes by itself.
    - a `SlotModem` (fixed UTC slots): `id`, `slotSeconds` and
      `decode(samples:sampleRate:slotStart:audioBand:)` returning `[SlotDecode]`, run off the modem
      thread on each complete slot.
-3. Add one line: the type to `ModemCatalog.streaming` or `ModemCatalog.slot` in the same file.
+3. Add one line: the type to `ModemCatalog.streaming` or `ModemCatalog.slot` in the same file, and
+   the mode to `ModemControl.offeredModes` (`Sources/SubFloor/App/ModemControl.swift`) for the panel.
 4. Add tests in `Tests/ModemsTests` (see `Tests/ModemsTests/Support/ModemTestSignals.swift`).

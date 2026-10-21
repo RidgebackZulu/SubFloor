@@ -33,12 +33,21 @@ struct TopBarView: View {
 
             BandwidthControl()
 
-            Toggle(isOn: Binding(get: { model.upconverter.enabled }, set: { model.setUpconverter($0) })) {
+            // Green when on, dimmed when off: a tinted toggle button reads much the same either way.
+            let hamItUp = model.upconverter.enabled
+            Button { model.setUpconverter(!hamItUp) } label: {
                 Label("HamItUp", systemImage: "arrow.up.arrow.down")
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .foregroundStyle(hamItUp ? Color.black : Color.secondary)
+                    .background { RoundedRectangle(cornerRadius: 5).fill(hamItUp ? Color.green : Color.white.opacity(0.06)) }
+                    .overlay { RoundedRectangle(cornerRadius: 5).stroke(hamItUp ? Color.green : Color.white.opacity(0.15)) }
+                    .opacity(hamItUp ? 1 : 0.6)
             }
-            .toggleStyle(.button)
-            .tint(.orange)
-            .help("Upconverter mode: radio tuned \(FrequencyFormatter.short(model.upconverter.loHz)) above the display frequency")
+            .buttonStyle(.plain)
+            .help(hamItUp
+                  ? "HamItUp on: radio tuned \(FrequencyFormatter.short(model.upconverter.loHz)) above the display frequency (⌘U)"
+                  : "HamItUp off: direct sampling (⌘U turns it on)")
 
             Button { model.addBookmark() } label: { Image(systemName: "star") }
                 .help("Bookmark this frequency (⌘D)")

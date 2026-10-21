@@ -1,8 +1,8 @@
 import Modems
 import SwiftUI
 
-/// The modem panel's top strip: mode, auto-detect, re-center, audio width, then the signal count,
-/// the box's dial frequency and, while FT8/WSPR decode, their slot progress.
+/// The modem panel's top strip: the mode, then the signal count, the decode band (the receiver's
+/// passband) and, while FT8/WSPR decode, their slot progress.
 struct ModemControlStrip: View {
     @Environment(AppModel.self) private var model
     let status: ModemPanelStatus
@@ -24,31 +24,7 @@ struct ModemControlStrip: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(width: 300)
-
-            Toggle(isOn: Binding(get: { model.modemSettings.autoDetect }, set: { model.setAutoDetect($0) })) {
-                Label("Auto-detect", systemImage: "wand.and.stars")
-            }
-            .toggleStyle(.button)
-            .tint(Theme.modemBox)
-            .help("Classify every signal in the box and decode it in its own mode; the mode above is the cursor's fallback")
-
-            Button { model.recenterModemBox() } label: { Text("⌖ Re-center box") }
-                .help("Move the modem box to the middle of the spectrum view")
-                .disabled(!status.isOn)
-
-            HStack(spacing: 4) {
-                Text("AUDIO").font(.caption.weight(.semibold)).foregroundStyle(.secondary)
-                Picker("Audio", selection: Binding(get: { model.modemSettings.audioWide }, set: { model.setAudioWide($0) })) {
-                    Text("Narrow").tag(false)
-                    Text("Wide").tag(true)
-                }
-                .pickerStyle(.segmented)
-                .labelsHidden()
-                .frame(width: 120)
-            }
-            .help("Narrow: the cursor's signal through its mode's filter · Wide: the whole box, 300–3300 Hz")
-            .disabled(!status.isOn)
+            .frame(width: 260)
 
             Spacer(minLength: 8)
 
@@ -57,10 +33,10 @@ struct ModemControlStrip: View {
                     SlotProgressView(modes: status.slotModes)
                 }
                 ModemSignalCount()
-                Text(status.dialText)
+                Text(status.bandText)
                     .foregroundStyle(status.boxActive ? Theme.modemBox : Color.secondary)
                     .lineLimit(1)
-                    .help("The modem box's dial (USB carrier) frequency")
+                    .help("The audio band decoded: the receiver's passband, above the dial")
             }
         }
         .font(.callout.monospacedDigit())

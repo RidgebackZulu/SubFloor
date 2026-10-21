@@ -741,6 +741,23 @@ private let cwTexts = ["CQ CQ DE W1AW W1AW K TU 599 NAME JOHN QTH CT BK", "TEST 
         #expect(engine.decoderKeys.count == 2)
     }
 
+    /// Clicking a slot decode puts the cursor on its signal: in FT8 there is no streaming decoder,
+    /// but the bench still gets frames (waveform, ±100 Hz spectrum, an IQ trail).
+    @Test func benchRunsForASlotModeCursor() throws {
+        let slot = try #require(FT8Encoder.audio(message: "CQ K1ABC FN42", audioHz: 1_200))
+        let audio = noisy(slot, snrDb: 10, seed: 63)
+        let engine = ModemEngine()
+        engine.settings = ModemSettings(mode: .ft8)
+        engine.lockCursor(atAudioHz: 1_200 + 3.5 * FT8Encoder.toneSpacing)
+        var run = Run()
+        feed(engine, audio, 0..<samples(6), into: &run)
+        #expect(engine.decoderKeys.isEmpty, "no streaming decoder in a slot mode")
+        let frame = try #require(run.cursor)
+        #expect(frame.waveform.count == 480)
+        #expect(frame.spectrumDb.count == 401)
+        #expect(frame.iq.count >= 64)
+    }
+
     /// A mode with no modem among the engine's (RTTY, disabled in the catalog) decodes nothing and is
     /// safe: no decoder, no text, no crash, with or without a cursor.
     @Test func disabledModeGetsNoDecoder() {

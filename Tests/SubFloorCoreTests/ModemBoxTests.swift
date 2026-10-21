@@ -85,3 +85,37 @@ import Testing
         #expect(outside.upperHz == centre + 0.45 * span)
     }
 }
+
+// MARK: - Following the receiver's passband
+
+@Test func upperSidebandDialIsTheVFOAndTheBandIsThePassbandAboveIt() throws {
+    // USB, 2.7 kHz: the passband is VFO+100 … VFO+2800.
+    let f = try #require(ModemBox.following(passband: 14_074_100...14_076_800, vfoHz: 14_074_000, upperSideband: true))
+    #expect(f.box.dialHz == 14_074_000)
+    #expect(f.audioBand == 300...2_800, "the box carries 300 Hz and up")
+    // Wider than the box: clipped to it.
+    let wide = try #require(ModemBox.following(passband: 14_074_100...14_078_100, vfoHz: 14_074_000, upperSideband: true))
+    #expect(wide.audioBand == 300...3_300)
+}
+
+@Test func otherModesCoverThePassbandFromItsLowerEdge() throws {
+    // LSB 2.4 kHz below the VFO, CW 500 Hz around it: the band starts at 300 Hz.
+    let lsb = try #require(ModemBox.following(passband: 7_071_500...7_073_900, vfoHz: 7_074_000, upperSideband: false))
+    #expect(lsb.box.dialHz == 7_071_200)
+    #expect(lsb.audioBand == 300...2_700)
+    #expect(lsb.box.rfHz(forAudio: lsb.audioBand.lowerBound) == 7_071_500)
+    let cw = try #require(ModemBox.following(passband: 14_029_750...14_030_250, vfoHz: 14_030_000, upperSideband: false))
+    #expect(cw.audioBand == 300...800)
+    // AM 10 kHz: its middle 3 kHz.
+    let am = try #require(ModemBox.following(passband: 9_995_000...10_005_000, vfoHz: 10_000_000, upperSideband: false))
+    #expect(am.audioBand == 300...3_300)
+    #expect(am.box.centerHz == 10_000_000)
+}
+
+@Test func nothingToDecodeIsNil() {
+    // USB with the passband below 300 Hz above the dial (narrow, 100…250 Hz).
+    #expect(ModemBox.following(passband: 14_074_100...14_074_250, vfoHz: 14_074_000, upperSideband: true) == nil)
+    // Just under the minimum band.
+    #expect(ModemBox.following(passband: 14_074_100...14_074_349, vfoHz: 14_074_000, upperSideband: true) == nil)
+    #expect(ModemBox.following(passband: 14_074_100...14_074_350, vfoHz: 14_074_000, upperSideband: true) != nil)
+}

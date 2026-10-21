@@ -1,47 +1,47 @@
 import Modems
 import SwiftUI
 
-/// The decoded signals: "Live" (the cursor's row pinned first in amber, then every tracked signal
-/// in `DecodeLog`'s frozen frequency order) and "Slot decodes" (FT8/WSPR messages, newest slot
-/// first), each under a collapsible header.
+/// The decodes, in one always-visible list under one header: the cursor's row pinned first in
+/// amber, then FT8/WSPR messages (newest slot first; the one at the cursor in amber), then the other
+/// tracked CW/PSK31 signals in `DecodeLog`'s frozen frequency order. A mode change clears the log,
+/// so in practice the list holds one mode's rows. In a slot mode the other tracked signals are left
+/// out: their decodes are the slot rows.
 ///
-/// Clicking a row locks the cursor on its signal (the cursor's row unlocks it); a row's disclosure
-/// shows its full history. While the pointer is over the list new rows are held (`setRowHold`), and
-/// a floating "N new ↓" pill shows them.
+/// Clicking a row locks the cursor on its signal, and the bench shows it (the cursor's row unlocks
+/// it); a live row's disclosure shows its full history. While the pointer is over the list new rows
+/// are held (`setRowHold`), and a floating "N new ↓" pill shows them.
 struct SignalRowsView: View {
     @Environment(AppModel.self) private var model
-    /// Whether FT8/WSPR are decoding (the section also shows while it has rows).
-    let showsSlotSection: Bool
-    @State private var liveExpanded = true
-    @State private var slotExpanded = true
+    /// Whether FT8/WSPR are decoding.
+    let showsSlotDecodes: Bool
     @State private var expandedRows: Set<Int> = []
 
     var body: some View {
         let log = model.decodeLog
         let live = log.liveRows
+        let cursorRows = live.filter(\.isCursor)
+        let otherLive = showsSlotDecodes ? [] : live.filter { !$0.isCursor }
         let slots = log.slotRows
+        let cursorHz = model.modemCursorAudioHz
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 2) {
-                SectionToggle(title: "Live", count: live.count, expanded: $liveExpanded)
-                if liveExpanded {
-                    if live.isEmpty {
-                        EmptyRow(text: "No signals in the box yet")
-                    }
-                    ForEach(live) { row in
-                        LiveRow(row: row, expanded: expansion(of: row.id))
-                    }
+                HStack(spacing: 6) {
+                    SectionHeader("Decodes")
+                    Text("\(slots.count + live.count)").font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
+                    Spacer()
                 }
-                if showsSlotSection || !slots.isEmpty {
-                    SectionToggle(title: "Slot decodes", count: slots.count, expanded: $slotExpanded)
-                        .padding(.top, 6)
-                    if slotExpanded {
-                        if slots.isEmpty {
-                            EmptyRow(text: "Decodes appear at the end of each slot")
-                        }
-                        ForEach(slots) { row in
-                            SlotRow(row: row)
-                        }
-                    }
+                .padding(.vertical, 3)
+                if cursorRows.isEmpty && slots.isEmpty && otherLive.isEmpty {
+                    EmptyRow(text: showsSlotDecodes ? "Decodes appear at the end of each slot" : "No signals in the passband yet")
+                }
+                ForEach(cursorRows) { row in
+                    LiveRow(row: row, expanded: expansion(of: row.id))
+                }
+                ForEach(slots) { row in
+                    SlotRow(row: row, isAtCursor: ModemPanelFormat.slotRowIsAtCursor(row, cursorAudioHz: cursorHz))
+                }
+                ForEach(otherLive) { row in
+                    LiveRow(row: row, expanded: expansion(of: row.id))
                 }
             }
             .padding(.horizontal, 12)
@@ -73,29 +73,6 @@ struct SignalRowsView: View {
                 set: { on in
                     if on { expandedRows.insert(id) } else { expandedRows.remove(id) }
                 })
-    }
-}
-
-/// A section header with its row count and a disclosure chevron.
-private struct SectionToggle: View {
-    let title: String
-    let count: Int
-    @Binding var expanded: Bool
-
-    var body: some View {
-        Button { withAnimation(.snappy) { expanded.toggle() } } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "chevron.right")
-                    .font(.caption2.weight(.semibold))
-                    .rotationEffect(.degrees(expanded ? 90 : 0))
-                SectionHeader(title)
-                Text("\(count)").font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
-                Spacer()
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .padding(.vertical, 3)
     }
 }
 
@@ -199,10 +176,11 @@ private struct LiveRow: View {
     }
 }
 
-/// One FT8/WSPR message: "HHMMSS  SNR  freq  message".
+/// One FT8/WSPR message: "HHMMSS  SNR  freq  message"; amber when the cursor is on its signal.
 private struct SlotRow: View {
     @Environment(AppModel.self) private var model
     let row: DecodeRow
+    let isAtCursor: Bool
     @State private var hovering = false
 
     var body: some View {
@@ -219,10 +197,16 @@ private struct SlotRow: View {
         }
         .padding(.vertical, 2)
         .padding(.horizontal, 8)
-        .background(RoundedRectangle(cornerRadius: 5).fill(hovering ? Color.white.opacity(0.06) : Color.clear))
+        .background(RoundedRectangle(cornerRadius: 5).fill(
+            isAtCursor ? Theme.modemCursor.opacity(0.18) : (hovering ? Color.white.opacity(0.06) : Color.clear)))
+        .overlay(alignment: .leading) {
+            if isAtCursor {
+                Rectangle().fill(Theme.modemCursor).frame(width: 3)
+            }
+        }
         .contentShape(Rectangle())
         .onTapGesture { model.selectRow(row.id) }
         .onHover { hovering = $0 }
-        .help("Click to lock the cursor on this signal")
+        .help("Click to analyse this signal on the bench")
     }
 }

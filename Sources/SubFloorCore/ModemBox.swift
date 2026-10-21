@@ -34,6 +34,35 @@ public struct ModemBox: Codable, Equatable, Sendable {
 
     public mutating func move(byHz hz: Double) { dialHz += hz }
 
+    /// The narrowest decode band worth running the modem for.
+    public static let minimumBandHz = 50.0
+
+    /// The box, and the audio band it decodes, for a receiver passband: the modem decodes what the
+    /// receiver is tuned to.
+    /// - Upper sideband: the dial is the VFO, so audio frequencies are the usual USB offsets (FT8 at
+    ///   "1500 Hz" is 1500 Hz above the dial), and the band is the passband above it, within the
+    ///   box's 300…3300 Hz.
+    /// - Any other mode: the box covers the passband from its lower edge (its middle 3 kHz when the
+    ///   passband is wider).
+    ///
+    /// Nil when less than `minimumBandHz` of the passband fits the box.
+    public static func following(passband: ClosedRange<Double>, vfoHz: Double,
+                                 upperSideband: Bool) -> (box: ModemBox, audioBand: ClosedRange<Double>)? {
+        let width = audioHigh - audioLow
+        let dial: Double
+        if upperSideband {
+            dial = vfoHz
+        } else if passband.upperBound - passband.lowerBound <= width {
+            dial = passband.lowerBound - audioLow
+        } else {
+            dial = (passband.lowerBound + passband.upperBound) / 2 - (audioLow + audioHigh) / 2
+        }
+        let low = max(passband.lowerBound - dial, audioLow)
+        let high = min(passband.upperBound - dial, audioHigh)
+        guard high - low >= minimumBandHz else { return nil }
+        return (ModemBox(dialHz: dial), low...high)
+    }
+
     /// A box whose middle is as close to `rfCenter` as keeps it inside the capture span (see
     /// `isInside`); centred on the capture when the span is too narrow for it.
     public static func centered(on rfCenter: Double, clampedToCaptureCenter captureCenter: Double,

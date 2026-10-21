@@ -15,24 +15,34 @@ struct AppModelModemTests {
                         defaults: defaults ?? UserDefaults(suiteName: UUID().uuidString)!)
     }
 
-    @Test func recenterPlacesBoxAtViewCenter() {
+    /// The receiver's default: USB, 2.7 kHz. Its decode band: 300…2800 Hz above the VFO.
+    private let usbBand = 300.0...2_800.0
+
+    @Test func boxFollowsThePassband() {
         let m = makeModel()
-        m.zoom(by: 0.1, anchor: 0.3)
-        m.recenterModemBox()
-        #expect(abs(m.modemBox.centerHz - m.viewport.centerHz) < 1e-6)
+        m.setModemMode(.ft8)
+        #expect(m.modemBox.dialHz == m.vfoHz, "USB: the dial is the VFO")
+        #expect(m.modemAudioBand == usbBand)
         #expect(m.modemBoxActive)
+        m.setVFO(14_074_000)
+        #expect(m.modemBox.dialHz == 14_074_000)
+        m.setBandwidth(1_500)
+        #expect(m.modemAudioBand == 300...1_600)
+        // The decode band in view fractions is the passband's part of the box.
+        let f = m.modemBoxFractions
+        #expect(f.map { abs(m.viewport.hz(atFraction: $0.lower) - 14_074_300) < 1 } == true)
+        #expect(f.map { abs(m.viewport.hz(atFraction: $0.upper) - 14_075_600) < 1 } == true)
     }
 
-    @Test func boxStaysPutOnVFOClick() {
+    @Test func clickOutsideThePassbandTunesAndTheBoxFollows() {
         let m = makeModel()
         m.setModemMode(.psk31)
-        let box = m.modemBox
         let vfo = m.vfoHz
         let f = 0.9
-        #expect(!box.contains(rf: m.viewport.hz(atFraction: f)))
+        #expect(!m.modemBox.contains(rf: m.viewport.hz(atFraction: f)))
         m.click(atFraction: f)
         #expect(m.vfoHz != vfo)
-        #expect(m.modemBox == box)
+        #expect(m.modemBox.dialHz == m.vfoHz)
     }
 
     @Test func lockCursorConvertsToAudio() {
@@ -46,21 +56,19 @@ struct AppModelModemTests {
         m.unlockModemCursor()
         #expect(m.modemCursorAudioHz == nil)
         #expect(updates.last == .command(.unlock))
+        // Outside the decode band (above the 2.8 kHz passband): no lock.
+        m.lockModemCursor(atRF: m.modemBox.dialHz + 3_000)
+        #expect(m.modemCursorAudioHz == nil)
     }
 
-    @Test func boxOutsideSpanInactive() {
+    @Test func retuningFarAwayKeepsTheBoxOnTheVFO() {
         let m = makeModel()
         var updates: [ModemEngineUpdate] = []
         m.onModemEngineUpdate = { updates.append($0) }
         m.setModemMode(.psk31)
-        #expect(m.modemBoxActive)
         let center = m.centerHz
         m.setVFO(m.vfoHz + 1_000_000)
         #expect(m.centerHz != center)
-        #expect(!m.modemBoxActive)
-        #expect(updates.last == .boxDialOffset(nil))
-        #expect(m.modemBoxFractions == nil)
-        m.recenterModemBox()
         #expect(m.modemBoxActive)
         #expect(updates.last == .boxDialOffset(m.modemBox.dialHz - m.centerHz))
     }
@@ -74,43 +82,38 @@ struct AppModelModemTests {
         m.setSourceKindForTesting(.file)
         #expect(m.sourceKind == .file)
         #expect(m.modemSettings.slotModesEnabled == false)
-        #expect(updates.last == .settings(ModemSettings(mode: .ft8, slotModesEnabled: false)))
+        #expect(updates.last == .settings(ModemSettings(mode: .ft8, slotModesEnabled: false, audioBand: usbBand)))
     }
 
-    @Test func modeOffRestoresVFOAudio() {
+    @Test func modeOffSendsNilMode() {
         let m = makeModel()
         var updates: [ModemEngineUpdate] = []
         m.onModemEngineUpdate = { updates.append($0) }
-        m.setModemMode(.rtty)
+        m.setModemMode(.psk31)
         m.lockModemCursor(atRF: m.modemBox.dialHz + 1_000)
         m.setModemMode(nil)
         #expect(m.modemSettings.mode == nil)
         #expect(m.modemCursorAudioHz == nil)
-        #expect(updates.last == .settings(ModemSettings(mode: nil)))
+        #expect(updates.last == .settings(ModemSettings(mode: nil, audioBand: usbBand)))
     }
 
-    @Test func boxDragMovesTheBoxNotTheVFO() {
+    @Test func disabledModesAreNotOffered() {
         let m = makeModel()
-        m.setModemMode(.psk31)
-        let dial = m.modemBox.dialHz
-        let vfo = m.vfoHz
-        m.dragModemBox(byFraction: 0.001)
-        #expect(abs(m.modemBox.dialHz - (dial + 0.001 * m.viewport.spanHz)) < 1e-6)
-        #expect(m.vfoHz == vfo)
+        m.setModemMode(.rtty)
+        #expect(m.modemSettings.mode == nil)
+        #expect(!m.modemSettings.autoDetect)
     }
 
-    @Test func sessionPersistsBoxAndSettings() {
+    @Test func sessionPersistsTheModeAndTheBoxFollowsTheVFO() {
         let defaults = UserDefaults(suiteName: UUID().uuidString)!
         let m = makeModel(defaults: defaults)
         m.setModemMode(.psk31)
-        m.setAutoDetect(true)
-        m.setAudioWide(true)
-        m.moveModemBox(byHz: 2_345)
-        let box = m.modemBox
+        m.setVFO(14_070_000)
         m.shutdown()
 
         let restored = makeModel(defaults: defaults)
-        #expect(restored.modemBox == box)
-        #expect(restored.modemSettings == ModemSettings(mode: .psk31, autoDetect: true, audioWide: true))
+        #expect(restored.modemSettings.mode == .psk31)
+        #expect(restored.vfoHz == 14_070_000)
+        #expect(restored.modemBox.dialHz == 14_070_000)
     }
 }

@@ -5,10 +5,10 @@ import SubFloorCore
 /// The modem panel's text: everything the views show, as pure functions (`ModemPanelTests`).
 enum ModemPanelFormat {
     /// The mode segment's choices: Off, then every mode.
-    static let modeChoices: [ModeID?] = [nil] + ModeID.allCases.map { $0 }
+    static let modeChoices: [ModeID?] = [nil] + ModemControl.offeredModes.map { $0 }
 
-    static let benchPlaceholder = "Click a signal inside the box to analyse it"
-    static let offHint = "Pick a mode to decode every signal inside the modem box"
+    static let benchPlaceholder = "Click a signal in the passband, or a decode, to analyse it"
+    static let offHint = "Pick a mode to decode every signal in the receiver's passband"
 
     /// A mode segment's label: "Off" or the mode's name.
     static func label(of mode: ModeID?) -> String { mode?.label ?? "Off" }
@@ -24,6 +24,12 @@ enum ModemPanelFormat {
 
     /// The box's dial frequency: "14.074.000 USB".
     static func dial(_ box: ModemBox) -> String { FrequencyFormatter.grouped(box.dialHz) + " USB" }
+
+    /// The decode band: "300–2,800 Hz", or "—" when nothing can be decoded.
+    static func band(_ band: ClosedRange<Double>?) -> String {
+        guard let band else { return "—" }
+        return "\(FrequencyFormatter.audio(band.lowerBound).dropLast(3))–\(FrequencyFormatter.audio(band.upperBound))"
+    }
 
     /// A signed whole-dB SNR: "+12 dB", "-4 dB".
     static func snr(_ db: Float) -> String {
@@ -56,6 +62,18 @@ enum ModemPanelFormat {
     }
 
     static func signalCount(_ n: Int) -> String { n == 1 ? "1 signal" : "\(n) signals" }
+
+    /// How close (Hz) the cursor must be to a slot decode's signal for its row to show as the cursor's.
+    static let slotCursorToleranceHz = 10.0
+
+    /// Whether a slot row is the cursor's signal: its centre (FT8 reports tone 0) within
+    /// `slotCursorToleranceHz` of the cursor.
+    static func slotRowIsAtCursor(_ row: DecodeRow, cursorAudioHz: Double?) -> Bool {
+        guard let cursor = cursorAudioHz, let mode = row.mode, let slotStart = row.utcTime else { return false }
+        let centre = DecodeLog.signalCentreHz(of: SlotDecode(mode: mode, slotStart: slotStart, frequencyHz: row.frequencyHz,
+                                                             snrDb: row.snrDb, timeOffset: 0, message: ""))
+        return abs(centre - cursor) <= slotCursorToleranceHz
+    }
 
     /// The floating pill over held rows: "4 new ↓", or nil when none are held.
     static func newRowsPill(_ held: Int) -> String? { held > 0 ? "\(held) new ↓" : nil }
@@ -96,7 +114,7 @@ struct SlotProgress: Equatable {
 enum ModemPanelMessage: Equatable, Hashable {
     /// FT8/WSPR are wanted but the source is an IQ file.
     case needsLiveRadio
-    /// The box is outside the captured span: decoding has stopped.
+    /// None of the passband can be decoded, or it is outside the captured span: decoding has stopped.
     case boxOutsideSpan
     /// Slot modes are running and the system clock is this far from network time (seconds to add
     /// to it; positive: it is behind).
@@ -105,7 +123,7 @@ enum ModemPanelMessage: Equatable, Hashable {
     var text: String {
         switch self {
         case .needsLiveRadio: "FT8/WSPR need a live radio"
-        case .boxOutsideSpan: "Modem box is outside the captured band"
+        case .boxOutsideSpan: "Nothing to decode: widen the passband, or tune inside the captured band"
         case .clock(let offset):
             "System clock is \(String(format: "%.1f", abs(offset))) s \(offset > 0 ? "slow" : "fast")"
                 + " — FT8/WSPR need it within 1 s of UTC"
@@ -113,7 +131,6 @@ enum ModemPanelMessage: Equatable, Hashable {
     }
 
     /// Whether the message carries a Re-center button.
-    var offersRecenter: Bool { self == .boxOutsideSpan }
 
     var isWarning: Bool { self != .needsLiveRadio }
 }
@@ -131,7 +148,8 @@ struct ModemPanelStatus: Equatable {
     var isFileSource: Bool
     var boxActive: Bool
     var clockOffset: Double?
-    var box: ModemBox
+    /// The decode band (`ModemControl.audioBand`).
+    var audioBand: ClosedRange<Double>?
 
     var isOn: Bool { mode != nil }
 
@@ -159,7 +177,7 @@ struct ModemPanelStatus: Equatable {
         return out
     }
 
-    var dialText: String { ModemPanelFormat.dial(box) }
+    var bandText: String { ModemPanelFormat.band(audioBand) }
 }
 
 /// The bench panes' amber readouts.

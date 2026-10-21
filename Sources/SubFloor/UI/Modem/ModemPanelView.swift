@@ -2,7 +2,7 @@ import Modems
 import SwiftUI
 
 /// The multi-signal modem panel, under the spectrum: the control strip, its messages, the cursor
-/// bench (collapsible), then the signal rows. With the mode Off only the strip shows.
+/// bench (collapsible), then the decode list, always shown. With the mode Off only the strip shows.
 struct ModemPanelView: View {
     @Environment(AppModel.self) private var model
     @State private var expanded = true
@@ -19,7 +19,7 @@ struct ModemPanelView: View {
                     Divider()
                     CursorBenchView(expanded: $benchExpanded)
                     Divider()
-                    SignalRowsView(showsSlotSection: !status.slotModes.isEmpty)
+                    SignalRowsView(showsSlotDecodes: !status.slotModes.isEmpty)
                         .frame(height: 200)
                 } else {
                     Text(ModemPanelFormat.offHint)
@@ -35,9 +35,8 @@ struct ModemPanelView: View {
     }
 }
 
-/// One message under the strip; the box-outside-span one carries a Re-center button.
+/// One message under the strip.
 private struct MessageRow: View {
-    @Environment(AppModel.self) private var model
     let message: ModemPanelMessage
 
     var body: some View {
@@ -45,11 +44,6 @@ private struct MessageRow: View {
             Image(systemName: message.isWarning ? "exclamationmark.triangle.fill" : "info.circle.fill")
                 .foregroundStyle(message.isWarning ? Color.orange : Theme.accent)
             Text(message.text).lineLimit(1)
-            if message.offersRecenter {
-                Text("—").foregroundStyle(.secondary)
-                Button("Re-center") { model.recenterModemBox() }
-                    .controlSize(.small)
-            }
             Spacer()
         }
         .font(.callout)

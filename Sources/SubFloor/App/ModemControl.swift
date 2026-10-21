@@ -11,7 +11,9 @@ enum ModemEngineUpdate: Equatable, Sendable {
 }
 
 /// The modem state `AppModel` keeps, as a pure value: the box, the user's settings and the
-/// cursor, and the engine updates they imply. `AppModel` is a thin wrapper that supplies the
+/// cursor, and the engine updates they imply. The box follows the receiver's passband
+/// (`follow(passband:vfoHz:upperSideband:)`, `ModemBox.following`): the modem decodes what the
+/// receiver is tuned to, and the decode band is the passband's part of the box. `AppModel` is a thin wrapper that supplies the
 /// capture span and source, applies `takeEngineUpdates` to the `DSPEngine`, and feeds back epochs
 /// and snapshots.
 ///
@@ -32,6 +34,9 @@ enum ModemEngineUpdate: Equatable, Sendable {
 struct ModemControl: Equatable, Sendable {
     /// The box's first dial: 20 m FT8.
     static let defaultDialHz = 14_074_000.0
+    /// The modes the panel offers. RTTY is disabled for now (its modem is kept; see `ModemCatalog`),
+    /// and auto-detect is off (`engineSettings`); a saved setting for either is dropped.
+    static let offeredModes: [ModeID] = [.cw, .psk31, .ft8, .wspr]
     /// See **The cursor**: the widest lock range (RTTY's 30 Hz).
     static let lockAcceptHz = 30.0
     /// A click in the box this close to the locked cursor unlocks it: this fraction of the view's
@@ -40,8 +45,11 @@ struct ModemControl: Equatable, Sendable {
     static let cursorClickMaxHz = 10.0
 
     var box = ModemBox(dialHz: ModemControl.defaultDialHz)
-    /// The user's settings, as persisted (`engineSettings` sets `slotModesEnabled`).
+    /// The user's settings, as persisted (`engineSettings` sets `slotModesEnabled` and the band).
     var settings = ModemSettings()
+    /// The audio band decoded: the passband's part of the box; nil when none of it can be decoded
+    /// (then the box is inactive).
+    private(set) var audioBand: ClosedRange<Double>? = ModemSettings.fullBand
     /// The locked cursor's audio frequency; nil when unlocked.
     private(set) var cursorAudioHz: Double?
 
@@ -67,12 +75,15 @@ struct ModemControl: Equatable, Sendable {
     init(box: ModemBox = ModemBox(dialHz: ModemControl.defaultDialHz), settings: ModemSettings = ModemSettings()) {
         self.box = box
         self.settings = settings
+        if let mode = settings.mode, !Self.offeredModes.contains(mode) { self.settings.mode = nil }
+        self.settings.autoDetect = false
     }
 
     // MARK: Derived
 
+    /// True while part of the passband can be decoded and the box lies in the capture span.
     func isBoxActive(captureCenter: Double, captureSpan: Double) -> Bool {
-        box.isInside(captureCenter: captureCenter, captureSpan: captureSpan)
+        audioBand != nil && box.isInside(captureCenter: captureCenter, captureSpan: captureSpan)
     }
 
     /// The box dial minus the capture centre, or nil while the box is outside the span.
@@ -80,46 +91,48 @@ struct ModemControl: Equatable, Sendable {
         isBoxActive(captureCenter: captureCenter, captureSpan: captureSpan) ? box.dialHz - captureCenter : nil
     }
 
+    /// What the engine gets: the user's settings with `slotModesEnabled` off for file sources, the
+    /// decode band, and auto-detect off (disabled for now; the engine's support is kept).
     func engineSettings(isFileSource: Bool) -> ModemSettings {
         var s = settings
         s.slotModesEnabled = !isFileSource
+        s.autoDetect = false
+        s.audioBand = audioBand ?? ModemSettings.fullBand
         return s
     }
 
-    /// The grab tab's label: "≡ PSK31 · 3 kHz", or "AUTO · 3 kHz" with auto-detect on.
-    var grabTabLabel: String {
-        if settings.autoDetect { return "AUTO · 3 kHz" }
-        return "≡ \(settings.mode?.label ?? "MODEM") · 3 kHz"
+    /// True when `rf` lies in the decode band.
+    func bandContains(rf: Double) -> Bool {
+        guard let band = audioBand, rf.isFinite else { return false }
+        return band.contains(box.audioHz(forRF: rf))
     }
 
     // MARK: Settings
 
     mutating func setMode(_ mode: ModeID?) {
-        settings.mode = mode
-        if mode == nil { dropCursor() }
+        settings.mode = mode.flatMap { Self.offeredModes.contains($0) ? $0 : nil }
+        dropCursor()   // a new mode starts from nothing (the engine resets too)
     }
-
-    mutating func setAutoDetect(_ on: Bool) { settings.autoDetect = on }
-    mutating func setAudioWide(_ on: Bool) { settings.audioWide = on }
 
     // MARK: Box
 
-    /// Drags the box by `hz` (see `ModemBox.move(byHz:keepingInsideCaptureCenter:span:)`).
-    mutating func moveBox(byHz hz: Double, captureCenter: Double, captureSpan: Double) {
-        guard hz.isFinite else { return }
-        box.move(byHz: hz, keepingInsideCaptureCenter: captureCenter, span: captureSpan)
-    }
-
-    /// Centres the box on `rf` (the view's centre), clamped to the capture span.
-    mutating func recenter(on rf: Double, captureCenter: Double, captureSpan: Double) {
-        box = ModemBox.centered(on: rf, clampedToCaptureCenter: captureCenter, span: captureSpan)
+    /// Places the box and decode band on the receiver's passband (see `ModemBox.following`). A dial
+    /// that moves more than `DSPEngine.boxResetHz` resets the modem, as tuning to a new frequency
+    /// should; a new passband width on upper sideband only changes the band.
+    mutating func follow(passband: ClosedRange<Double>, vfoHz: Double, upperSideband: Bool) {
+        if let f = ModemBox.following(passband: passband, vfoHz: vfoHz, upperSideband: upperSideband) {
+            box = f.box
+            audioBand = f.audioBand
+        } else {
+            audioBand = nil
+        }
     }
 
     // MARK: Cursor
 
-    /// Locks the cursor at RF `rf` inside the box, while the modem is on and the box active.
+    /// Locks the cursor at RF `rf` inside the decode band, while the modem is on and the box active.
     mutating func lock(atRF rf: Double, boxActive: Bool) {
-        guard settings.mode != nil, boxActive, rf.isFinite, box.contains(rf: rf) else { return }
+        guard settings.mode != nil, boxActive, bandContains(rf: rf) else { return }
         let audio = box.audioHz(forRF: rf)
         cursorAudioHz = audio
         cursorExpected = true

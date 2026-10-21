@@ -1,3 +1,4 @@
+import DSPCore
 import MetalKit
 import Modems
 import SubFloorCore
@@ -57,9 +58,10 @@ private struct SpectrumView: NSViewRepresentable {
             hover: { model.hover(at: $0) },
             passbandEdges: { model.passbandEdgeFractions },
             dragEdge: { model.dragPassbandEdge(upper: $0, fraction: $1) },
-            boxGrabRect: { model.modemGrabTabFractions },
+            // No grab tab: the modem decodes the receiver's passband, which follows the VFO.
+            boxGrabRect: { nil },
             boxRange: { model.modemBoxFractions },
-            dragBox: { model.dragModemBox(byFraction: $0) },
+            dragBox: { _ in },
             clickInBox: { model.clickInModemBox(atFraction: $0) })
     }
 }
@@ -103,7 +105,7 @@ private struct SpectrumOverlay: View {
             ctx.stroke(Path { $0.move(to: CGPoint(x: xv, y: 0)); $0.addLine(to: CGPoint(x: xv, y: size.height)) },
                        with: .color(Theme.vfo), lineWidth: 1.5)
 
-            if model.modemSettings.mode != nil { drawModemBox(ctx, size: size, specH: specH, x: x) }
+            if model.modemSettings.mode != nil { drawModemCursor(ctx, size: size, x: x) }
 
             if let hover = model.hover {
                 let p = CGPoint(x: hover.point.x * size.width, y: hover.point.y * size.height)
@@ -124,34 +126,11 @@ private struct SpectrumOverlay: View {
         }
     }
 
-    /// The modem box (green outline at 8% fill; dashed grey while outside the capture span), its
-    /// grab tab and edge labels, and the amber cursor with its audio frequency.
-    private func drawModemBox(_ ctx: GraphicsContext, size: CGSize, specH: CGFloat, x: (Double) -> CGFloat) {
+    /// The amber modem cursor with its audio frequency (the decode window is the passband, drawn
+    /// above).
+    private func drawModemCursor(_ ctx: GraphicsContext, size: CGSize, x: (Double) -> CGFloat) {
         let box = model.modemBox
         let active = model.modemBoxActive
-        let x0 = x(box.lowerHz), x1 = x(box.upperHz)
-        // Off-screen (beyond where its tab could reach in): nothing to draw.
-        guard Double(x1) >= -SpectrumHitTest.minTabWidth,
-              Double(x0) <= Double(size.width) + SpectrumHitTest.minTabWidth else { return }
-        let color = active ? Theme.modemBox : Color.gray
-        let body = CGRect(x: x0, y: 0, width: max(x1 - x0, 1), height: size.height)
-        if active { ctx.fill(Path(body), with: .color(Theme.modemBox.opacity(0.08))) }
-        ctx.stroke(Path(body), with: .color(color),
-                   style: StrokeStyle(lineWidth: 1.5, dash: active ? [] : [5, 4]))
-
-        let tab = SpectrumHitTest.tabExtent(lower: Double(x0), upper: Double(x1))
-        let tabRect = CGRect(x: tab.lower, y: 0, width: tab.upper - tab.lower, height: SpectrumHitTest.tabHeight)
-        ctx.fill(Path(roundedRect: tabRect, cornerRadius: 3), with: .color(color.opacity(active ? 0.85 : 0.5)))
-        ctx.draw(Text(model.modemGrabTabLabel).font(.system(size: 10, weight: .semibold)).foregroundStyle(.black),
-                 at: CGPoint(x: tabRect.midX, y: tabRect.midY))
-
-        if x1 - x0 > 90 {
-            let labelY = specH - 9
-            let label = { (s: String) in Text(s).font(.system(size: 9, design: .monospaced)).foregroundStyle(color.opacity(0.9)) }
-            ctx.draw(label("\(Int(ModemBox.audioLow))"), at: CGPoint(x: x0 + 4, y: labelY), anchor: .leading)
-            ctx.draw(label("\(Int(ModemBox.audioHigh)) Hz"), at: CGPoint(x: x1 - 4, y: labelY), anchor: .trailing)
-        }
-
         guard active, let audio = model.modemCursorAudioHz else { return }
         let xc = x(box.rfHz(forAudio: audio))
         ctx.stroke(Path { $0.move(to: CGPoint(x: xc, y: 0)); $0.addLine(to: CGPoint(x: xc, y: size.height)) },
@@ -159,7 +138,7 @@ private struct SpectrumOverlay: View {
         let text = ctx.resolve(Text(FrequencyFormatter.audio(audio)).font(.system(size: 11, weight: .semibold, design: .monospaced))
             .foregroundStyle(Theme.modemCursor))
         let ts = text.measure(in: size)
-        let origin = CGPoint(x: min(xc + 6, size.width - ts.width - 8), y: SpectrumHitTest.tabHeight + 6)
+        let origin = CGPoint(x: min(xc + 6, size.width - ts.width - 8), y: 8)
         ctx.fill(Path(roundedRect: CGRect(origin: origin, size: ts).insetBy(dx: -5, dy: -2), cornerRadius: 4),
                  with: .color(.black.opacity(0.65)))
         ctx.draw(text, at: origin, anchor: .topLeading)
@@ -226,13 +205,15 @@ private struct FrequencyRuler: View {
     }
 }
 
+/// A bookmark above the spectrum; a click opens its editor (with Tune and Delete).
 private struct BookmarkFlag: View {
     @Environment(AppModel.self) private var model
     let bookmark: Bookmark
+    @State private var editing = false
 
     var body: some View {
         let color = Color(hex: bookmark.colorHex) ?? Theme.accent
-        Button { model.select(bookmark) } label: {
+        Button { editing = true } label: {
             HStack(spacing: 3) {
                 Image(systemName: bookmark.upconverter ? "arrow.up.arrow.down" : "flag.fill").font(.system(size: 8, weight: .bold))
                 Text(bookmark.name).font(.system(size: 10, weight: .medium)).lineLimit(1)
@@ -243,7 +224,65 @@ private struct BookmarkFlag: View {
             .background(Capsule().fill(color.opacity(0.9)))
         }
         .buttonStyle(.plain)
-        .help("\(bookmark.name) — \(FrequencyFormatter.short(bookmark.frequencyHz)) \(bookmark.mode.label)\(bookmark.upconverter ? " via HamItUp" : "")")
+        .help("\(bookmark.name) — \(FrequencyFormatter.short(bookmark.frequencyHz)) \(bookmark.mode.label)\(bookmark.upconverter ? " via HamItUp" : ""). Click to edit or tune")
+        .popover(isPresented: $editing, arrowEdge: .bottom) {
+            BookmarkEditor(bookmark: bookmark) { editing = false }
+        }
+    }
+}
+
+/// Edits one bookmark in place: each change is saved as it is made (the frequency when entered).
+private struct BookmarkEditor: View {
+    @Environment(AppModel.self) private var model
+    @State private var draft: Bookmark
+    @State private var frequencyText: String
+    let close: () -> Void
+
+    init(bookmark: Bookmark, close: @escaping () -> Void) {
+        _draft = State(initialValue: bookmark)
+        _frequencyText = State(initialValue: FrequencyFormatter.grouped(bookmark.frequencyHz))
+        self.close = close
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Form {
+                TextField("Name", text: $draft.name)
+                TextField("Frequency", text: $frequencyText)
+                    .onSubmit { commitFrequency() }
+                    .help("e.g. 14.074, 7074k, 144.39m")
+                Picker("Mode", selection: $draft.mode) {
+                    ForEach(DemodMode.allCases) { Text($0.label).tag($0) }
+                }
+                TextField("Group", text: Binding(get: { draft.group ?? "" },
+                                                  set: { draft.group = $0.isEmpty ? nil : $0 }))
+                Toggle("Via HamItUp", isOn: $draft.upconverter)
+            }
+            HStack {
+                Button("Delete", role: .destructive) {
+                    model.deleteBookmark(draft.id)
+                    close()
+                }
+                Spacer()
+                Button("Tune") {
+                    commitFrequency()
+                    model.select(draft)
+                    close()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(14)
+        .frame(width: 300)
+        .onChange(of: draft) { _, edited in model.updateBookmark(edited) }
+        .onDisappear { commitFrequency() }
+    }
+
+    /// Takes the typed frequency if it parses (else restores the field) and saves.
+    private func commitFrequency() {
+        if let hz = FrequencyParser.parse(frequencyText) { draft.frequencyHz = hz }
+        frequencyText = FrequencyFormatter.grouped(draft.frequencyHz)
+        model.updateBookmark(draft)
     }
 }
 
