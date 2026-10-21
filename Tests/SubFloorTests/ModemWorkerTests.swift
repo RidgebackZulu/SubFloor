@@ -135,6 +135,11 @@ private func waitUntil(_ timeout: Double, _ condition: () -> Bool) -> Bool {
     return condition()
 }
 
+/// How long to wait for a slot job's FT8 decode. A release build decodes a slot in well under a
+/// second, but an unoptimised (debug) decode during a full parallel `swift test` run on the Mac took
+/// over 10 s; the waits return as soon as the decode arrives.
+private let slotDecodeTimeout = 120.0
+
 /// A UTC slot boundary (a multiple of 120 s, so both FT8 and WSPR slots start there).
 private let t0 = 1_800_000_000.0
 
@@ -256,7 +261,7 @@ private let t0 = 1_800_000_000.0
         #expect(w.slotJobsDecoded.load(ordering: .relaxed) == 0)
         w.slotQueue.resume()
         var c = Collected()
-        collect(w.events, into: &c, timeout: 10) { !$0.slotDecodes.isEmpty }
+        collect(w.events, into: &c, timeout: slotDecodeTimeout) { !$0.slotDecodes.isEmpty }
         let d = try #require(c.slotDecodes.first)
         #expect(d.message == message)
         #expect(d.mode == .ft8)
@@ -282,7 +287,7 @@ private let t0 = 1_800_000_000.0
         let epoch = w.events.beginEpoch(at: clock.now())
         w.beginEpoch(epoch)
         w.slotQueue.resume()
-        #expect(waitUntil(10) { w.slotJobsDecoded.load(ordering: .relaxed) >= 1 })
+        #expect(waitUntil(slotDecodeTimeout) { w.slotJobsDecoded.load(ordering: .relaxed) >= 1 })
         Thread.sleep(forTimeInterval: 0.05)
         let b = w.events.drain()
         #expect(b.slotDecodes.isEmpty, "\(b.slotDecodes)")
@@ -312,7 +317,7 @@ private let t0 = 1_800_000_000.0
         #expect(waitUntil(5) { w.queuedSamples == 0 })
         feed(w, Array(audio[s(11)...]), clock: clock, chunk: 1_200, wait: true)
         var c = Collected()
-        collect(w.events, into: &c, timeout: 10) { !$0.slotDecodes.isEmpty }
+        collect(w.events, into: &c, timeout: slotDecodeTimeout) { !$0.slotDecodes.isEmpty }
         Thread.sleep(forTimeInterval: 0.5)
         c.batches.append(w.events.drain())
         #expect(c.slotDecodes.map(\.message) == ["CQ W9XYZ EN37"], "\(c.slotDecodes)")
