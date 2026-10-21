@@ -153,7 +153,6 @@ private struct SignalMeter: View {
                 Capsule().fill(.white.opacity(0.08))
                 Capsule().fill(LinearGradient(colors: [.green, .yellow, .red], startPoint: .leading, endPoint: .trailing))
                     .frame(width: f(db))
-                    .animation(.linear(duration: 0.2), value: db)
                 if let threshold {
                     Rectangle().fill(.white).frame(width: 2).offset(x: f(threshold) - 1)
                 }

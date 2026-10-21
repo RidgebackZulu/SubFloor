@@ -703,13 +703,19 @@ final class AppModel {
 
     // MARK: Stats & persistence
 
+    /// 10 Hz. Observed properties are assigned only when their shown value changes: every
+    /// assignment re-renders the views that read them, even with the same value. (The meter used to
+    /// animate each 0.2 s update over 0.2 s, so it animated for good, at the display's frame rate.)
     private func refreshStats() {
         pumpModem()
+        let db = engine.stats.withLock { $0.signalDb }
+        if (db * 2).rounded() != (signalDb * 2).rounded() { signalDb = db }
         statsTicks += 1
         guard statsTicks % 2 == 0 else { return }
-        signalDb = engine.stats.withLock { $0.signalDb }
-        underruns = engine.audio.underruns.load(ordering: .relaxed)
-        cpuPercent = cpu.sample()
+        let lostBlocks = engine.audio.underruns.load(ordering: .relaxed)
+        if lostBlocks != underruns { underruns = lostBlocks }
+        let cpuNow = cpu.sample()
+        if cpuNow.rounded() != cpuPercent.rounded() { cpuPercent = cpuNow }
         saveSessionIfChanged()
     }
 
