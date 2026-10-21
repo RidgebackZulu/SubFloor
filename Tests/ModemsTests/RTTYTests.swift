@@ -98,8 +98,9 @@ private func makeDecoder(_ hz: Double = 1_500) -> any SignalDecoder {
 
     // MARK: - Decoding
 
-    @Test func catalogHasRTTY() {
-        #expect(ModemCatalog.streaming(.rtty) != nil)
+    /// RTTY is out of the catalog for now; its modem still works (and the engine takes it when given).
+    @Test func rttyIsDisabledInTheCatalog() {
+        #expect(!ModemCatalog.streaming.contains { $0.id == .rtty })
         #expect(RTTYModem.id == .rtty)
         let decoder = makeDecoder()
         #expect(decoder.submode == "RTTY 45")

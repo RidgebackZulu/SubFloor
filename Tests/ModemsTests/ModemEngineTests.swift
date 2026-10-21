@@ -98,6 +98,10 @@ private func feed(_ engine: ModemEngine, _ audio: [Float], _ range: Range<Int>? 
 
 private func samples(_ seconds: Double) -> Int { Int(seconds * fs) }
 
+/// The catalog's streaming modems plus RTTY, which the catalog leaves out for now (its code and the
+/// engine's handling of it are kept, and tested through this).
+private let withRTTY: [any StreamingModem.Type] = ModemCatalog.streaming + [RTTYModem.self]
+
 private func trimmed(_ s: String) -> String { s.trimmingCharacters(in: .whitespacesAndNewlines) }
 
 /// CW text with runs of spaces collapsed (word gaps vary).
@@ -246,7 +250,7 @@ private let cwTexts = ["CQ CQ DE W1AW W1AW K TU 599 NAME JOHN QTH CT BK", "TEST 
         let counts = parallel(configs.count) { i in
             let (settings, withCursor) = configs[i]
             let audio = ModemTestSignals.noise(seconds: 60, sigma: 0.05, seed: UInt64(950 + i / 2))
-            let engine = ModemEngine()
+            let engine = ModemEngine(streamingModems: withRTTY)
             engine.settings = settings
             if withCursor { engine.lockCursor(atAudioHz: 1_500) }
             var run = Run()
@@ -293,7 +297,7 @@ private let cwTexts = ["CQ CQ DE W1AW W1AW K TU 599 NAME JOHN QTH CT BK", "TEST 
         let sent = "CQ W1AW K"
         let rtty = RTTYEncoder.audio(text: sent, centerHz: 1_500, leadInSeconds: 3)
         let audio = ModemTestSignals.awgn(mix(seconds: 12, rtty), snrDb: -3, seed: 904, signalPower: 0.5 * 0.5 / 2)
-        let engine = ModemEngine()
+        let engine = ModemEngine(streamingModems: withRTTY)
         engine.settings = ModemSettings(mode: .rtty, autoDetect: true)
         var run = Run()
         feed(engine, audio, 0..<samples(1), into: &run)
@@ -711,3 +715,46 @@ private let cwTexts = ["CQ CQ DE W1AW W1AW K TU 599 NAME JOHN QTH CT BK", "TEST 
         #expect(run.listen.allSatisfy { $0.isFinite })
     }
 }
+
+// MARK: - Decode band and disabled modes
+
+@Suite struct ModemEngineBandTests {
+    /// Only signals inside `audioBand` (the receiver's passband) get a decoder, a snapshot and a row;
+    /// widening the band brings the other one in.
+    @Test func decodesOnlyInsideTheAudioBand() {
+        let audio = noisy(mix(seconds: 16, psk("CQ CQ DE K1ABC K", 900), psk("CQ CQ DE W9XYZ K", 2_000)), snrDb: 10, seed: 61)
+        let engine = ModemEngine()
+        engine.settings = ModemSettings(mode: .psk31, audioBand: 1_500...2_800)
+        var run = Run()
+        feed(engine, audio, 0..<samples(8), into: &run)
+        let listed = run.signals ?? []
+        #expect(listed.contains { abs($0.frequencyHz - 2_000) < 3 }, "\(listed)")
+        #expect(!listed.contains { abs($0.frequencyHz - 900) < 20 }, "\(listed)")
+        #expect(engine.decoderKeys.count == 1)
+        #expect(trimmed(run.text.values.joined()).contains("W9XYZ"))
+        #expect(!run.text.values.joined().contains("K1ABC"))
+
+        engine.settings = ModemSettings(mode: .psk31, audioBand: ModemSettings.fullBand)
+        var wide = Run()
+        feed(engine, audio, samples(8)..<audio.count, into: &wide)
+        #expect((wide.signals ?? []).contains { abs($0.frequencyHz - 900) < 3 })
+        #expect(engine.decoderKeys.count == 2)
+    }
+
+    /// A mode with no modem among the engine's (RTTY, disabled in the catalog) decodes nothing and is
+    /// safe: no decoder, no text, no crash, with or without a cursor.
+    @Test func disabledModeGetsNoDecoder() {
+        let rtty = RTTYEncoder.audio(text: "RYRYRY CQ TEST DE OH2XX K", centerHz: 1_500, leadInSeconds: 1)
+        let audio = ModemTestSignals.awgn(mix(seconds: 10, rtty), snrDb: 10, seed: 62, signalPower: 0.5 * 0.5 / 2)
+        let engine = ModemEngine()
+        #expect(!engine.streamingModems.contains { $0.id == .rtty })
+        engine.settings = ModemSettings(mode: .rtty)
+        var run = Run()
+        feed(engine, audio, 0..<samples(4), into: &run)
+        engine.lockCursor(atAudioHz: 1_500)
+        feed(engine, audio, samples(4)..<audio.count, into: &run)
+        #expect(engine.decoderKeys.isEmpty)
+        #expect(run.text.values.joined().isEmpty)
+    }
+}
+

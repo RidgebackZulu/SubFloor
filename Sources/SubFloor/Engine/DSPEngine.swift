@@ -60,14 +60,14 @@ final class SpectrumFrameStore: @unchecked Sendable {
 ///
 /// **Modem box.** While the modem is on (`modemSettings.mode != nil`) and a box is present
 /// (`update(modemBoxDialOffset:)` non-nil), the DSP thread runs a `ModemChannel` on the IQ and feeds
-/// its 12 kHz audio to the worker, and does not push Receiver audio: the worker is the speakers'
-/// single producer. The switch happens only in the DSP loop's pending-config handling, through the
-/// worker's audio token (see `ModemWorker`).
+/// its 12 kHz audio to the worker. The Receiver's audio keeps playing (`modemPlaysListenAudio` is
+/// off); with it on, the worker would become the speakers' single producer, switched only in the DSP
+/// loop's pending-config handling, through the worker's audio token (see `ModemWorker`).
 ///
 /// **Box resets.** The box is reset (a new epoch, see `ModemEventQueue`) when it becomes active
-/// (modem turned on with a box, or a box appearing while on), when its dial offset has moved more
-/// than `boxResetHz` from where it was at the last reset (so a slow drag still resets once it adds
-/// up), on `modemCommand(.resetBox)`, and on `start`. A retune of the capture centre moves the
+/// (modem turned on with a box, or a box appearing while on), when the mode changes (so nothing of
+/// the old mode carries over), when its dial offset has moved more than `boxResetHz` from where it was
+/// at the last reset (so a slow drag still resets once it adds up), on `modemCommand(.resetBox)`, and on `start`. A retune of the capture centre moves the
 /// offset too and is a reset: the IQ around a hardware retune is discontinuous, and audio from the
 /// old centre must not seed tracks at the new one. A smaller move only retunes the channel. The
 /// epoch is begun on the calling thread at once; the DSP thread rebuilds the channel and marks the
@@ -76,6 +76,11 @@ final class SpectrumFrameStore: @unchecked Sendable {
 final class DSPEngine: @unchecked Sendable {
     /// A box dial-offset change beyond this (from the offset at the last reset) resets the box.
     static let boxResetHz = 5.0
+    /// Whether the modem's listen audio (the cursor's signal through its mode's filter, or the whole
+    /// box) replaces the Receiver's while the modem is on. Off: the Receiver's audio always plays,
+    /// and the box follows the receiver's passband, so you hear what is decoded. The hand-over code
+    /// (`ModemWorker`'s audio token) is kept for a listen mode later.
+    static let modemPlaysListenAudio = false
 
     let frames = SpectrumFrameStore()
     let audio: AudioOutput
@@ -240,9 +245,11 @@ final class DSPEngine: @unchecked Sendable {
 
     func update(modemSettings settings: ModemSettings) {
         modemRequest.withLock { r in
-            let wasActive = r.isActive
+            let wasActive = r.isActive, oldMode = r.settings.mode
             r.settings = settings
-            if r.isActive, !wasActive { beginBoxEpoch(&r) }
+            // A new mode starts from nothing: the old mode's tracks, decoders, rows, cursor, partly
+            // recorded slots and in-flight slot results all go (an epoch). Turning on is a new mode.
+            if settings.mode != oldMode || (r.isActive && !wasActive) { beginBoxEpoch(&r) }
             modemWorker.update(settings: settings)
             pending.withLock { $0.modemBox = r.box }
         }
@@ -325,8 +332,9 @@ final class DSPEngine: @unchecked Sendable {
                     channel = nil
                 }
                 if !b.active { channel = nil }
-                // Receiver audio stops here; its last push is behind us.
-                if b.active, !box.active { worker.grantAudio() }
+                // Receiver audio stops here; its last push is behind us (only while the modem plays its
+                // own listen audio, which it does not: see `modemPlaysListenAudio`).
+                if Self.modemPlaysListenAudio, b.active, !box.active { worker.grantAudio() }
                 box = b
             }
             if box.active, let offset = box.offset {
@@ -413,8 +421,11 @@ final class DSPEngine: @unchecked Sendable {
                 var count = Int32(a.count)
                 vvtanhf(a.baseAddress!, a.baseAddress!, &count)
             }
-            // While the box is active the worker owns the speakers; after it, wait for the token.
-            if !box.active, worker.reclaimAudio() { audioOut.withUnsafeBufferPointer { sink.push($0) } }
+            // While the worker owns the speakers (only with `modemPlaysListenAudio`), it pushes instead;
+            // after it, wait for the token.
+            if !(Self.modemPlaysListenAudio && box.active), worker.reclaimAudio() {
+                audioOut.withUnsafeBufferPointer { sink.push($0) }
+            }
             let signal = receiver.signalDb
             let lost = dropped.load(ordering: .relaxed)
             stats.withLock { $0.signalDb = signal; $0.droppedSamples = lost }

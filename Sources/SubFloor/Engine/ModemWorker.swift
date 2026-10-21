@@ -422,7 +422,6 @@ final class ModemWorker: @unchecked Sendable {
         speaker.reserveCapacity(Self.maxChunk * 4 + 64)
         var lastSlotCheck = -Double.infinity
         var lastSlotCheckAudio = 0
-        let band = ModemBox.audioLow...ModemBox.audioHigh
 
         while running.load(ordering: .acquiring) {
             let newSettings = control.withLock { c -> ModemSettings? in
@@ -494,9 +493,11 @@ final class ModemWorker: @unchecked Sendable {
                         events.append(text: out.text, signals: out.signals, epoch: epoch)
                     }
                     if let c = out.cursor { cursorFrames.publish(c, epoch: epoch) }
-                    speaker.removeAll(keepingCapacity: true)
-                    out.listenAudio.withUnsafeBufferPointer { resampler.process($0, into: &speaker) }
-                    play(&speaker)
+                    if holdsSpeakers {
+                        speaker.removeAll(keepingCapacity: true)
+                        out.listenAudio.withUnsafeBufferPointer { resampler.process($0, into: &speaker) }
+                        play(&speaker)
+                    }
                 }
                 consumed += n
                 streamIndex += n
@@ -508,12 +509,19 @@ final class ModemWorker: @unchecked Sendable {
                 || consumed - lastSlotCheckAudio >= Int(Self.slotCheckSeconds * rate) {
                 lastSlotCheck = t
                 lastSlotCheckAudio = consumed
-                for job in engine.dueSlotJobs(now: Date(timeIntervalSince1970: t)) { dispatch(job, epoch: epoch, band: band) }
+                for job in engine.dueSlotJobs(now: Date(timeIntervalSince1970: t)) {
+                    dispatch(job, epoch: epoch, band: engine.settings.audioBand)   // the passband, from the app
+                }
             }
 
             if count == 0 { _ = wake.wait(timeout: .now() + .milliseconds(20)) }
         }
     }
+
+    /// Whether the speakers are (or may become, mid-hand-over) the worker's: with the Receiver's audio
+    /// always playing (`DSPEngine.modemPlaysListenAudio` off) they never are, and the listen audio is
+    /// not resampled for nothing.
+    private var holdsSpeakers: Bool { audioToken.load(ordering: .relaxed) != Self.tokenReceiver }
 
     /// Volume, soft clip, and push if the worker holds the speakers.
     private func play(_ audio: inout [Float]) {

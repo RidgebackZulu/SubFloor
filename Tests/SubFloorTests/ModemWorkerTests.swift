@@ -271,6 +271,27 @@ private let t0 = 1_800_000_000.0
         #expect(w.slotJobsDispatched.load(ordering: .relaxed) == 1)
     }
 
+    /// Slot decodes stay inside the decode band (the receiver's passband): a signal below it is not
+    /// reported, one inside it is.
+    @Test func slotDecodesStayInTheAudioBand() throws {
+        let sink = RecordingSink()
+        let clock = TestClock(t0 - 1)
+        let w = worker(sink, clock: clock, settings: ModemSettings(mode: .ft8, audioBand: 1_500...3_000))
+        defer { w.stop() }
+        let outside = try #require(FT8Encoder.audio(message: "CQ K1ABC FN42", audioHz: 1_000))
+        let inside = try #require(FT8Encoder.audio(message: "CQ W9XYZ EN37", audioHz: 2_000))
+        let lead = [Float](repeating: 0, count: Int(fs))
+        let both = zip(outside, inside).map { $0 + $1 }
+        let audio = plus(lead + both + lead, noise(both.count + 2 * lead.count, sigma: quietSigma, seed: 33))
+        Thread.sleep(forTimeInterval: 0.1)
+        feed(w, audio, clock: clock)
+        var c = Collected()
+        collect(w.events, into: &c, timeout: slotDecodeTimeout) { !$0.slotDecodes.isEmpty }
+        Thread.sleep(forTimeInterval: 0.3)
+        c.batches.append(w.events.drain())
+        #expect(c.slotDecodes.map(\.message) == ["CQ W9XYZ EN37"], "\(c.slotDecodes)")
+    }
+
     /// A slot job started before a reset finishes afterwards; its decodes are dropped.
     @Test func staleSlotResultsDropped() throws {
         let sink = RecordingSink()
@@ -557,30 +578,30 @@ private let rx = Receiver.Config(inputRate: 250_000, offsetHz: 0, mode: .usb, ba
         }
     }
 
-    @Test func singleAudioProducer() {
+    /// The Receiver's audio plays with the modem on as well as off (`DSPEngine.modemPlaysListenAudio`
+    /// is off): the DSP thread is the only producer through modem toggles and a restart, the worker
+    /// never pushes, and stop() joins both threads.
+    @Test func receiverAudioStaysOnWithTheModem() {
         let sink = RecordingSink()
         let engine = DSPEngine(audioSink: sink)
         sink.identify(worker: engine.modemWorker, engine: engine)
         guard start(engine, source()) else { return }
         engine.update(modemBoxDialOffset: 20_000)
         #expect(waitUntil(3) { sink.samples(from: dspThread) > 0 })
-        #expect(sink.samples(from: modemThread) == 0, "box present but modem off: Receiver audio")
 
         engine.update(modemSettings: ModemSettings(mode: .psk31))
-        #expect(waitUntil(3) { sink.samples(from: modemThread) > 4_800 })
-        let dspWhileOn = sink.samples(from: dspThread)
-        Thread.sleep(forTimeInterval: 0.5)
-        #expect(sink.samples(from: dspThread) == dspWhileOn, "no Receiver audio while the modem is on")
-
+        let worker = engine.modemWorker
+        #expect(waitUntil(3) { worker.boxSamplesWritten.load(ordering: .relaxed) > 6_000 }, "the modem runs")
+        let dspAtOn = sink.samples(from: dspThread)
+        #expect(waitUntil(3) { sink.samples(from: dspThread) > dspAtOn + 4_800 }, "Receiver audio continues")
+        engine.update(modemSettings: ModemSettings(mode: .ft8))
+        let dspAtSwitch = sink.samples(from: dspThread)
+        #expect(waitUntil(3) { sink.samples(from: dspThread) > dspAtSwitch + 4_800 }, "and across a mode change")
         engine.update(modemSettings: ModemSettings())
-        let modemAtOff = sink.samples(from: modemThread)
-        #expect(waitUntil(3) { sink.samples(from: dspThread) > dspWhileOn + 4_800 })
-        Thread.sleep(forTimeInterval: 0.3)
-        #expect(sink.samples(from: modemThread) - modemAtOff < 48_000 / 2, "listen audio stops")
-        let modemOff = sink.samples(from: modemThread)
-        Thread.sleep(forTimeInterval: 0.3)
-        #expect(sink.samples(from: modemThread) == modemOff)
-        #expect(sink.runs == [dspThread, modemThread, dspThread], "one handover each way: \(sink.runs)")
+        let dspAtOff = sink.samples(from: dspThread)
+        #expect(waitUntil(3) { sink.samples(from: dspThread) > dspAtOff + 4_800 })
+        #expect(sink.samples(from: modemThread) == 0, "the worker never pushes")
+        #expect(sink.runs == [dspThread], "\(sink.runs)")
 
         // stop() joins both threads: nothing pushes afterwards.
         engine.stop()
@@ -589,14 +610,11 @@ private let rx = Receiver.Config(inputRate: 250_000, offsetHz: 0, mode: .usb, ba
         Thread.sleep(forTimeInterval: 0.2)
         #expect(sink.total == stopped)
 
-        // Restart with the modem on: the worker resumes as the only producer.
+        // Restart with the modem on: still the Receiver's audio.
         engine.update(modemSettings: ModemSettings(mode: .cw))
         guard start(engine, source()) else { return }
         defer { engine.stop() }
         #expect(waitUntil(3) { sink.total > stopped + 4_800 })
-        Thread.sleep(forTimeInterval: 0.3)
-        #expect(sink.runs == [dspThread, modemThread, dspThread, modemThread], "\(sink.runs)")
-        #expect(!sink.didOverlap)
         for _ in 0..<6 {
             engine.update(modemSettings: ModemSettings(mode: .psk31))
             Thread.sleep(forTimeInterval: 0.05)
@@ -604,6 +622,8 @@ private let rx = Receiver.Config(inputRate: 250_000, offsetHz: 0, mode: .usb, ba
             Thread.sleep(forTimeInterval: 0.05)
         }
         Thread.sleep(forTimeInterval: 0.2)
+        #expect(sink.samples(from: modemThread) == 0)
+        #expect(sink.runs == [dspThread], "\(sink.runs)")
         #expect(!sink.didOverlap, "two producers pushed at once")
     }
 
@@ -617,7 +637,7 @@ private let rx = Receiver.Config(inputRate: 250_000, offsetHz: 0, mode: .usb, ba
         defer { engine.stop() }
         let worker = engine.modemWorker
         #expect(waitUntil(3) { worker.boxSamplesWritten.load(ordering: .relaxed) > 6_000 })
-        #expect(sink.samples(from: dspThread) == 0)
+        #expect(waitUntil(3) { sink.samples(from: dspThread) > 4_800 }, "Receiver audio plays with the modem on")
 
         let epoch = engine.modemEvents.epoch
         engine.update(modemBoxDialOffset: nil)
@@ -625,7 +645,8 @@ private let rx = Receiver.Config(inputRate: 250_000, offsetHz: 0, mode: .usb, ba
         let stopped = worker.boxSamplesWritten.load(ordering: .relaxed)
         Thread.sleep(forTimeInterval: 0.4)
         #expect(worker.boxSamplesWritten.load(ordering: .relaxed) == stopped, "no box audio")
-        #expect(waitUntil(3) { sink.samples(from: dspThread) > 4_800 }, "Receiver audio is back")
+        let receiverNow = sink.samples(from: dspThread)
+        #expect(waitUntil(3) { sink.samples(from: dspThread) > receiverNow + 4_800 }, "Receiver audio continues")
         #expect(engine.modemEvents.epoch == epoch, "leaving the span is not a reset")
 
         // Back in the span: box audio resumes in a new epoch.
@@ -719,8 +740,11 @@ private let rx = Receiver.Config(inputRate: 250_000, offsetHz: 0, mode: .usb, ba
         engine.update(modemSettings: ModemSettings(mode: .psk31))
         #expect(engine.modemEvents.epoch == e + 1, "turning on")
         e += 1
-        engine.update(modemSettings: ModemSettings(mode: .cw, autoDetect: true))
-        #expect(engine.modemEvents.epoch == e, "a mode change keeps the rows")
+        engine.update(modemSettings: ModemSettings(mode: .cw))
+        #expect(engine.modemEvents.epoch == e + 1, "a mode change starts from nothing")
+        e += 1
+        engine.update(modemSettings: ModemSettings(mode: .cw, audioBand: 500...2_500))
+        #expect(engine.modemEvents.epoch == e, "a new passband is not a reset")
         engine.update(modemBoxDialOffset: 1_004)
         engine.update(modemBoxDialOffset: 996)
         #expect(engine.modemEvents.epoch == e, "within 5 Hz of the reset point")
@@ -740,9 +764,11 @@ private let rx = Receiver.Config(inputRate: 250_000, offsetHz: 0, mode: .usb, ba
         #expect(engine.modemEvents.epoch == e + 1, "back in the span")
         e += 1
         engine.update(modemSettings: ModemSettings())
+        #expect(engine.modemEvents.epoch == e + 1, "turning off drops the old mode's late results")
+        e += 1
         engine.update(modemBoxDialOffset: 50_000)
         #expect(engine.modemEvents.epoch == e, "modem off: nothing to reset")
-        engine.update(modemSettings: ModemSettings(mode: .rtty))
+        engine.update(modemSettings: ModemSettings(mode: .ft8))
         #expect(engine.modemEvents.epoch == e + 1)
         #expect(engine.modemEvents.drain().clearedAt != nil)
     }

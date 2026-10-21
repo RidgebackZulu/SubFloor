@@ -50,18 +50,28 @@ public enum ModeID: String, CaseIterable, Codable, Sendable, Identifiable {
 
 /// User-selected modem configuration.
 public struct ModemSettings: Codable, Sendable, Equatable {
+    /// The widest audio band the box carries (`ModemChannel`: 300…3300 Hz).
+    public static let fullBand = 300.0...3_300.0
+
     /// Selected mode; nil means the modem is off.
     public var mode: ModeID?
     public var autoDetect = false
     public var audioWide = false
     public var slotModesEnabled = true
+    /// The box audio that is decoded: signals outside it get no decoder and no row, and slot modes
+    /// decode only inside it. The app sets it from the receiver's passband; it is not persisted.
+    public var audioBand: ClosedRange<Double> = ModemSettings.fullBand
 
-    public init(mode: ModeID? = nil, autoDetect: Bool = false, audioWide: Bool = false, slotModesEnabled: Bool = true) {
+    public init(mode: ModeID? = nil, autoDetect: Bool = false, audioWide: Bool = false, slotModesEnabled: Bool = true,
+                audioBand: ClosedRange<Double> = ModemSettings.fullBand) {
         self.mode = mode
         self.autoDetect = autoDetect
         self.audioWide = audioWide
         self.slotModesEnabled = slotModesEnabled
+        self.audioBand = audioBand
     }
+
+    private enum CodingKeys: String, CodingKey { case mode, autoDetect, audioWide, slotModesEnabled }
 }
 
 /// A point-in-time description of one tracked signal, for display.
@@ -141,8 +151,11 @@ public protocol SlotModem {
 }
 
 /// Registry of the available modems. Each modem task appends its type here.
+///
+/// RTTY is disabled for now: `RTTYModem` and its tests are kept, and adding `RTTYModem.self` to
+/// `streaming` (and `.rtty` to the panel's mode choices) brings it back.
 public enum ModemCatalog {
-    public static var streaming: [any StreamingModem.Type] { [CWModem.self, PSK31Modem.self, RTTYModem.self] }
+    public static var streaming: [any StreamingModem.Type] { [CWModem.self, PSK31Modem.self] }
     public static var slot: [any SlotModem.Type] { [FT8Modem.self, WSPRModem.self] }
 
     public static func streaming(_ id: ModeID) -> (any StreamingModem.Type)? {

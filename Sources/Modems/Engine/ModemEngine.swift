@@ -120,12 +120,16 @@ public final class ModemEngine {
 
     public let sampleRate: Double
     public let maxDecoders: Int
+    /// The streaming modems signals can be decoded with (`ModemCatalog.streaming`; tests add
+    /// disabled ones). A mode without one here gets no decoder.
+    public let streamingModems: [any StreamingModem.Type]
 
     public var settings: ModemSettings {
         didSet {
             guard settings != oldValue else { return }
             if settings.mode == nil { unlockCursor() }
-            if settings.mode != oldValue.mode || settings.autoDetect != oldValue.autoDetect { dirty = true }
+            if settings.mode != oldValue.mode || settings.autoDetect != oldValue.autoDetect
+                || settings.audioBand != oldValue.audioBand { dirty = true }
         }
     }
 
@@ -213,10 +217,12 @@ public final class ModemEngine {
 
     // MARK: Init
 
-    public init(sampleRate: Double = 12_000, maxDecoders: Int = 40) {
+    public init(sampleRate: Double = 12_000, maxDecoders: Int = 40,
+                streamingModems: [any StreamingModem.Type] = ModemCatalog.streaming) {
         precondition(maxDecoders >= 1, "the cursor always needs a decoder")
         self.sampleRate = sampleRate
         self.maxDecoders = maxDecoders
+        self.streamingModems = streamingModems
         settings = ModemSettings()
         tracker = SignalTracker(sampleRate: sampleRate)
         analyzer = CursorAnalyzer(sampleRate: sampleRate)
@@ -233,7 +239,7 @@ public final class ModemEngine {
     /// exactly `hz`.
     public func lockCursor(atAudioHz hz: Double) {
         unlockCursor()
-        let candidates = tracker.tracks.filter { abs($0.frequencyHz - hz) <= lockRange(forTrack: $0.id) }
+        let candidates = bandTracks.filter { abs($0.frequencyHz - hz) <= lockRange(forTrack: $0.id) }
         if let t = candidates.min(by: { abs($0.frequencyHz - hz) < abs($1.frequencyHz - hz) }) {
             cursor = Cursor(key: t.id, trackID: t.id, frequencyHz: slot(t.id)?.decoder.frequencyHz ?? t.frequencyHz)
         } else {
@@ -258,7 +264,7 @@ public final class ModemEngine {
     /// it stays put (no wrap-around: a jump across the whole box is never what an arrow key means).
     public func nudgeCursor(_ direction: Int) {
         guard direction != 0 else { return }
-        let tracks = tracker.tracks.sorted { $0.frequencyHz < $1.frequencyHz }
+        let tracks = bandTracks.sorted { $0.frequencyHz < $1.frequencyHz }
         let target: Track?
         if let c = cursor {
             let f = c.trackID.flatMap { id in tracks.first { $0.id == id }?.frequencyHz } ?? c.frequencyHz
@@ -432,9 +438,15 @@ public final class ModemEngine {
 
     // MARK: Management
 
+    /// The tracks inside `settings.audioBand`: only these are decoded, reported and selectable.
+    private var bandTracks: [Track] {
+        let band = settings.audioBand
+        return tracker.tracks.filter { band.contains($0.frequencyHz) }
+    }
+
     private func manage() {
         dirty = false
-        let tracks = tracker.tracks
+        let tracks = bandTracks
         var byID: [Int: Track] = [:]
         for t in tracks { byID[t.id] = t }
 
@@ -614,7 +626,8 @@ public final class ModemEngine {
 
     private func makeDecoder(_ mode: ModeID, at hz: Double) -> any SignalDecoder {
         decodersCreated += 1
-        return ModemCatalog.streaming(mode)!.makeDecoder(frequencyHz: hz, sampleRate: sampleRate)
+        // Only modes `decodable` passes reach here.
+        return streamingModems.first { $0.id == mode }!.makeDecoder(frequencyHz: hz, sampleRate: sampleRate)
     }
 
     /// Feeds `d` the history from `start` (clamped to what is kept) to now; returns the samples fed.
@@ -641,20 +654,26 @@ public final class ModemEngine {
 
     // MARK: Modes
 
+    /// `mode` when it has a streaming modem in `streamingModems`, else nil.
+    private func decodable(_ mode: ModeID?) -> ModeID? {
+        guard let mode, streamingModems.contains(where: { $0.id == mode }) else { return nil }
+        return mode
+    }
+
     /// The streaming mode a (non-cursor) track should be decoded in, or nil for none.
     private func trackMode(_ t: Track) -> ModeID? {
         guard let selected = settings.mode else { return nil }
-        if !settings.autoDetect { return selected.isSlotMode ? nil : selected }
+        if !settings.autoDetect { return selected.isSlotMode ? nil : decodable(selected) }
         guard let m = classes[t.id]?.classification?.mode, !m.isSlotMode else { return nil }
-        return m
+        return decodable(m)
     }
 
     /// The streaming mode for the cursor's signal: its classified mode, else the fallback.
     private func cursorMode() -> ModeID? {
         guard let c = cursor, let selected = settings.mode else { return nil }
-        let fallback = selected.isSlotMode ? nil : selected
+        let fallback = selected.isSlotMode ? nil : decodable(selected)
         guard settings.autoDetect, let id = c.trackID, let m = classes[id]?.classification?.mode else { return fallback }
-        return m.isSlotMode ? nil : m
+        return m.isSlotMode ? nil : decodable(m)
     }
 
     /// The mode shown for a signal: its decoder's, else its classification's (slot modes included),
@@ -685,7 +704,7 @@ public final class ModemEngine {
 
     private func snapshots() -> [SignalSnapshot] {
         var out: [SignalSnapshot] = []
-        for t in tracker.tracks {
+        for t in bandTracks {
             let s = slot(t.id)
             out.append(SignalSnapshot(id: t.id, frequencyHz: t.frequencyHz, snrDb: t.snrDb, mode: displayMode(key: t.id),
                                       submode: s?.decoder.submode ?? classes[t.id]?.classification?.submode ?? "",
