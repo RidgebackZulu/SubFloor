@@ -91,7 +91,16 @@ final class AppModel {
     /// The user's modem settings, as persisted (`modemSettings` is what the engine gets).
     private var modemUserSettings = ModemSettings()
     private(set) var modemCursorAudioHz: Double?
+    /// The rows as shown: `liveLog`, published at 5 Hz with the other stats (and at once after a user
+    /// action on the rows). Each publish re-renders the rows, the signal count and the ruler; at
+    /// 10 Hz those SwiftUI passes cost about a sixth of a core on the Mac.
     private(set) var decodeLog = DecodeLog()
+    /// The rows as the engine's output arrives (10 Hz); not observed.
+    @ObservationIgnored private var liveLog = DecodeLog()
+    @ObservationIgnored private var liveLogChanged = false
+    /// The live rows' audio frequencies, for the ruler's ticks: assigned only when a tick would move
+    /// (to the nearest hertz), so the rows' text doesn't redraw the ruler.
+    private(set) var modemTrackAudioHz: [Double] = []
     /// The system clock's offset from network time (`ClockCheck`), once measured.
     private(set) var clockOffset: Double?
     private var clockCheckStarted = false
@@ -653,18 +662,24 @@ final class AppModel {
 
     /// Clicking a row locks the cursor on its signal; clicking the cursor's row unlocks it.
     func selectRow(_ id: Int) {
-        guard let row = decodeLog.row(forTrack: id) ?? decodeLog.slotRows.first(where: { $0.id == id }) else { return }
+        guard let row = liveLog.row(forTrack: id) ?? liveLog.slotRows.first(where: { $0.id == id }) else { return }
         let active = modemBoxActive
         changeModem { $0.select(row, boxActive: active) }
     }
 
     /// Set while the pointer is over the rows: new rows wait (`DecodeLog.holdNew`).
     func setRowHold(_ on: Bool) {
-        guard decodeLog.holdNew != on else { return }
-        decodeLog.holdNew = on
+        guard liveLog.holdNew != on else { return }
+        liveLog.holdNew = on
+        liveLogChanged = true
+        publishLog()
     }
 
-    func releaseHeldRows() { decodeLog.releaseHeld() }
+    func releaseHeldRows() {
+        liveLog.releaseHeld()
+        liveLogChanged = true
+        publishLog()
+    }
 
     /// Test seam: adopts `kind` as the running source's kind without starting anything.
     func setSourceKindForTesting(_ kind: SourceKind) {
@@ -706,9 +721,19 @@ final class AppModel {
         if batch.isEmpty {
             m.observeEpoch(batch.epoch)
         } else {
-            m.take(batch, into: &decodeLog, now: engine.modemWorker.utcNow())
+            m.take(batch, into: &liveLog, now: engine.modemWorker.utcNow())
+            liveLogChanged = true
         }
         setModem(m)
+    }
+
+    /// Shows `liveLog` (when it changed since last shown).
+    private func publishLog() {
+        guard liveLogChanged else { return }
+        liveLogChanged = false
+        decodeLog = liveLog
+        let ticks = liveLog.liveRows.map(\.frequencyHz)
+        if ticks.map({ $0.rounded() }) != modemTrackAudioHz.map({ $0.rounded() }) { modemTrackAudioHz = ticks }
     }
 
     /// Measures the clock offset once, the first time the modem is on with the radio running.
@@ -723,15 +748,17 @@ final class AppModel {
 
     // MARK: Stats & persistence
 
-    /// 10 Hz. Observed properties are assigned only when their shown value changes: every
-    /// assignment re-renders the views that read them, even with the same value. (The meter used to
-    /// animate each 0.2 s update over 0.2 s, so it animated for good, at the display's frame rate.)
+    /// 10 Hz: the engine's modem output is drained every tick, and everything shown changes together
+    /// every other tick (5 Hz), since each tick that assigns an observed property costs a SwiftUI
+    /// update pass over the window. Observed properties are assigned only when their shown value
+    /// changes: every assignment re-renders the views that read them, even with the same value.
     private func refreshStats() {
         pumpModem()
-        let db = engine.stats.withLock { $0.signalDb }
-        if (db * 2).rounded() != (signalDb * 2).rounded() { signalDb = db }
         statsTicks += 1
         guard statsTicks % 2 == 0 else { return }
+        publishLog()
+        let db = engine.stats.withLock { $0.signalDb }
+        if (db * 2).rounded() != (signalDb * 2).rounded() { signalDb = db }
         let lostBlocks = engine.audio.underruns.load(ordering: .relaxed)
         if lostBlocks != underruns { underruns = lostBlocks }
         let cpuNow = cpu.sample()

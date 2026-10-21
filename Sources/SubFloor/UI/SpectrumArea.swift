@@ -205,8 +205,8 @@ private struct FrequencyRuler: View {
                     // Tracked modem signals: thin blue ticks.
                     if model.modemSettings.mode != nil && model.modemBoxActive {
                         let box = model.modemBox
-                        for row in model.decodeLog.liveRows {
-                            let x = CGFloat(vp.fraction(ofHz: box.rfHz(forAudio: row.frequencyHz))) * size.width
+                        for audioHz in model.modemTrackAudioHz {
+                            let x = CGFloat(vp.fraction(ofHz: box.rfHz(forAudio: audioHz))) * size.width
                             ctx.stroke(Path { $0.move(to: CGPoint(x: x, y: size.height - 13)); $0.addLine(to: CGPoint(x: x, y: size.height - 3)) },
                                        with: .color(Theme.accent), lineWidth: 1)
                         }
