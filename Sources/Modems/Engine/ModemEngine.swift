@@ -366,6 +366,9 @@ public final class ModemEngine {
         slotRecorder.dueSlots(modes: wantedSlotModes(), now: now)
     }
 
+    /// The slots `dueSlotJobs` skipped for a gap in their audio since the previous call.
+    public func takeSkippedSlots() -> [SlotOutcome] { slotRecorder.takeSkipped() }
+
     func wantedSlotModes() -> [any SlotModem.Type] {
         guard settings.slotModesEnabled, let mode = settings.mode else { return [] }
         if settings.autoDetect { return ModemCatalog.slot }

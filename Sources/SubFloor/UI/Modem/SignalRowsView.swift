@@ -27,7 +27,8 @@ struct SignalRowsView: View {
             LazyVStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     SectionHeader("Decodes")
-                    Text("\(slots.count + live.count)").font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
+                    // The rows shown (in a slot mode the other tracked signals are not).
+                    Text("\(cursorRows.count + slots.count + otherLive.count)").font(.caption.monospacedDigit()).foregroundStyle(.tertiary)
                     Spacer()
                 }
                 .padding(.vertical, 3)

@@ -137,6 +137,21 @@ import Testing
         #expect(!status(mode: nil).isOn)
     }
 
+    @Test func slotOutcomes() {
+        let at = Date(timeIntervalSince1970: 1_800_000_000 + 14 * 3_600 + 32 * 60)   // a day boundary + 14:32 UTC
+        let start = Date(timeIntervalSince1970: (at.timeIntervalSince1970 / 86_400).rounded(.down) * 86_400 + 14 * 3_600 + 32 * 60)
+        #expect(ModemPanelFormat.slotOutcome(SlotOutcome(mode: .ft8, slotStart: start, decodes: 3)) == "FT8 14:32 · 3 decodes")
+        #expect(ModemPanelFormat.slotOutcome(SlotOutcome(mode: .ft8, slotStart: start, decodes: 1)) == "FT8 14:32 · 1 decode")
+        #expect(ModemPanelFormat.slotOutcome(SlotOutcome(mode: .wspr, slotStart: start, decodes: 0)) == "WSPR 14:32 · no decodes")
+        #expect(ModemPanelFormat.slotOutcome(SlotOutcome(mode: .wspr, slotStart: start, decodes: nil))
+                == "WSPR 14:32 · skipped (audio gap)")
+        var s = status(mode: .wspr)
+        #expect(s.slotOutcomeText == nil)
+        s.slotOutcomes = [.wspr: SlotOutcome(mode: .wspr, slotStart: start, decodes: nil),
+                          .ft8: SlotOutcome(mode: .ft8, slotStart: start, decodes: 2)]
+        #expect(s.slotOutcomeText == "WSPR 14:32 · skipped (audio gap)", "only the running slot modes")
+    }
+
     /// A slot row is the cursor's when the cursor is on its signal's centre (FT8 reports tone 0).
     @Test func slotRowAtTheCursor() {
         let ft8 = DecodeRow(id: Int.min, frequencyHz: 1_200, mode: .ft8, submode: "", snrDb: -10, recentText: "CQ",

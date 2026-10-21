@@ -111,6 +111,25 @@ private func starts(_ jobs: [SlotJob]) -> [Double] { jobs.map { $0.slotStart.tim
         #expect(last.samples.count == 15 * 12_000)
     }
 
+    /// A slot skipped for a gap is reported (once, with its mode and start) so the panel can say so;
+    /// a slot already under way when recording began is not, and a reset forgets pending reports.
+    @Test func skippedSlotsAreReported() {
+        let recorder = SlotRecorder()
+        let audio = [Float](repeating: 0, count: Int(47 * fs))
+        let jump = Int(23 * fs)
+        // Starts at t0 + 5 (the slot from t0 is under way), with a gap inside the slot from t0 + 15.
+        let jobs = feed(recorder, audio, start: t0 + 5) { t, i in i >= jump ? t + 0.1 : t }
+        #expect(starts(jobs) == [30])
+        let skipped = recorder.takeSkipped()
+        #expect(skipped == [SlotOutcome(mode: .ft8, slotStart: date(t0 + 15), decodes: nil)])
+        #expect(recorder.takeSkipped().isEmpty, "each skip is reported once")
+
+        let again = SlotRecorder()
+        _ = feed(again, audio, start: t0 - 1) { t, i in i >= jump ? t + 0.1 : t }
+        again.reset()
+        #expect(again.takeSkipped().isEmpty)
+    }
+
     @Test(arguments: [0.015, -0.015, -0.1, 0.021])
     func timestampJumps(seconds: Double) {
         let audio = [Float](repeating: 0, count: Int(47 * fs))

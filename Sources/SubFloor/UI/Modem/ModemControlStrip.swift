@@ -32,6 +32,12 @@ struct ModemControlStrip: View {
                 if !status.slotModes.isEmpty {
                     SlotProgressView(modes: status.slotModes)
                 }
+                if let outcome = status.slotOutcomeText {
+                    Text(outcome)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .help("The last slot of each mode: how many messages it decoded, or skipped because some of its audio was missing")
+                }
                 ModemSignalCount()
                 Text(status.bandText)
                     .foregroundStyle(status.boxActive ? Theme.modemBox : Color.secondary)

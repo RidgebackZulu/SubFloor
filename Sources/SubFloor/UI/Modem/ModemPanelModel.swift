@@ -25,6 +25,22 @@ enum ModemPanelFormat {
     /// The box's dial frequency: "14.074.000 USB".
     static func dial(_ box: ModemBox) -> String { FrequencyFormatter.grouped(box.dialHz) + " USB" }
 
+    /// One slot's outcome: "FT8 14:32 · 3 decodes", "· 1 decode", "· no decodes", or
+    /// "· skipped (audio gap)", with the slot's UTC start.
+    static func slotOutcome(_ o: SlotOutcome) -> String {
+        let t = Int(o.slotStart.timeIntervalSince1970.rounded(.down))
+        let day = ((t % 86_400) + 86_400) % 86_400
+        let time = String(format: "%02d:%02d", day / 3_600, day / 60 % 60)
+        let what: String
+        switch o.decodes {
+        case nil: what = "skipped (audio gap)"
+        case 0: what = "no decodes"
+        case 1: what = "1 decode"
+        case let n?: what = "\(n) decodes"
+        }
+        return "\(o.mode.label) \(time) · \(what)"
+    }
+
     /// The decode band: "300–2,800 Hz", or "—" when nothing can be decoded.
     static func band(_ band: ClosedRange<Double>?) -> String {
         guard let band else { return "—" }
@@ -150,6 +166,8 @@ struct ModemPanelStatus: Equatable {
     var clockOffset: Double?
     /// The decode band (`ModemControl.audioBand`).
     var audioBand: ClosedRange<Double>?
+    /// The last slot of each slot mode (`AppModel.slotOutcomes`).
+    var slotOutcomes: [ModeID: SlotOutcome] = [:]
 
     var isOn: Bool { mode != nil }
 
@@ -178,6 +196,13 @@ struct ModemPanelStatus: Equatable {
     }
 
     var bandText: String { ModemPanelFormat.band(audioBand) }
+
+    /// The last slot of each running slot mode: "FT8 14:32 · 3 decodes · WSPR 14:30 · skipped (audio
+    /// gap)", or nil before any.
+    var slotOutcomeText: String? {
+        let parts = slotModes.compactMap { slotOutcomes[$0].map(ModemPanelFormat.slotOutcome) }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
 }
 
 /// The bench panes' amber readouts.

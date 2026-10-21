@@ -127,6 +127,21 @@ public struct SlotDecode: Sendable, Equatable, Identifiable {
     }
 }
 
+/// What became of one slot of a slot mode: decoded (with how many messages), or skipped because
+/// some of its audio was missing (a gap: dropped samples, a stall, a clock step).
+public struct SlotOutcome: Sendable, Equatable {
+    public var mode: ModeID
+    public var slotStart: Date
+    /// The messages decoded; nil when the slot was skipped.
+    public var decodes: Int?
+
+    public init(mode: ModeID, slotStart: Date, decodes: Int?) {
+        self.mode = mode
+        self.slotStart = slotStart
+        self.decodes = decodes
+    }
+}
+
 /// Decodes one tracked signal from narrowband audio. Not thread-safe; owned by one thread at a time.
 public protocol SignalDecoder: AnyObject {
     var frequencyHz: Double { get }

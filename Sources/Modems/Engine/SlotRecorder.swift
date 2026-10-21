@@ -74,6 +74,8 @@ public final class SlotRecorder {
     private var gapPending = true
     /// Per mode, the start (Unix seconds) of the next slot to return.
     private var nextSlot: [ModeID: Double] = [:]
+    /// Slots skipped for a gap since the last `takeSkipped()`.
+    private var skipped: [SlotOutcome] = []
 
     public init(sampleRate: Double = 12_000, retainSeconds: Double = 150) {
         precondition(sampleRate > 0 && retainSeconds > 0)
@@ -141,6 +143,14 @@ public final class SlotRecorder {
         startIndex = endIndex
         gapPending = true
         nextSlot.removeAll()
+        skipped.removeAll()
+    }
+
+    /// The slots `dueSlots` skipped because audio was missing inside them (a gap), oldest first,
+    /// since the previous call. A slot already under way when recording began is not one of them.
+    public func takeSkipped() -> [SlotOutcome] {
+        defer { skipped.removeAll() }
+        return skipped
     }
 
     // MARK: Slots
@@ -160,8 +170,9 @@ public final class SlotRecorder {
                 case .ready(let first):
                     jobs.append(SlotJob(mode: mode, samples: samples(from: first, count: slotSampleCount(length)),
                                         slotStart: Date(timeIntervalSince1970: start), sampleRate: sampleRate))
-                case .missing:
-                    break
+                case .missing(let started):
+                    // A slot under way when the recording began is expected; a gap is worth telling.
+                    if !started { skipped.append(SlotOutcome(mode: mode.id, slotStart: Date(timeIntervalSince1970: start), decodes: nil)) }
                 case .pending:
                     break scan
                 }
@@ -176,8 +187,9 @@ public final class SlotRecorder {
     private enum SlotStatus {
         /// Complete; its first sample is at this absolute index.
         case ready(Int)
-        /// Some of its audio is missing: skip it.
-        case missing
+        /// Some of its audio is missing: skip it. `startedAfter`: only because the recording (or
+        /// the run after a reset) began after the slot's start.
+        case missing(startedAfter: Bool)
         /// Its audio has not all arrived yet.
         case pending
     }
@@ -189,20 +201,20 @@ public final class SlotRecorder {
         // The run holding the boundary: the last one that starts at or before it.
         guard let a = anchors.lastIndex(where: { $0.time <= s }) else {
             // Nothing recorded at or before the boundary: missing, unless nothing has come since either.
-            return anchors.isEmpty ? .pending : .missing
+            return anchors.isEmpty ? .pending : .missing(startedAfter: true)
         }
         let first = anchors[a].index + Int(((s - anchors[a].time) * sampleRate).rounded())
-        if first >= endIndex { return a == anchors.count - 1 ? .pending : .missing }
-        guard first >= startIndex else { return .missing }
+        if first >= endIndex { return a == anchors.count - 1 ? .pending : .missing(startedAfter: false) }
+        guard first >= startIndex else { return .missing(startedAfter: false) }
         // Past its own run's end, the boundary must fall where the next run (continuous, within the
         // tolerance) puts it.
         if first >= anchors[a].index + anchors[a].count {
-            guard let c = anchors.lastIndex(where: { $0.index <= first }) else { return .missing }
+            guard let c = anchors.lastIndex(where: { $0.index <= first }) else { return .missing(startedAfter: false) }
             let t = anchors[c].time + Double(first - anchors[c].index) / sampleRate
-            if abs(t - s) > Self.gapToleranceSeconds { return .missing }
+            if abs(t - s) > Self.gapToleranceSeconds { return .missing(startedAfter: false) }
         }
         let end = first + count
-        for r in anchors where r.gapBefore && r.index > first && r.index < end { return .missing }
+        for r in anchors where r.gapBefore && r.index > first && r.index < end { return .missing(startedAfter: false) }
         return end <= endIndex ? .ready(first) : .pending
     }
 

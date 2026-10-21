@@ -343,6 +343,11 @@ private let t0 = 1_800_000_000.0
         c.batches.append(w.events.drain())
         #expect(c.slotDecodes.map(\.message) == ["CQ W9XYZ EN37"], "\(c.slotDecodes)")
         #expect(c.slotDecodes.first?.slotStart == Date(timeIntervalSince1970: t0 + 15))
+        // The panel hears about both: the first slot skipped for the gap, the second decoded.
+        let outcomes = c.batches.flatMap(\.slotOutcomes)
+        #expect(outcomes == [SlotOutcome(mode: .ft8, slotStart: Date(timeIntervalSince1970: t0), decodes: nil),
+                             SlotOutcome(mode: .ft8, slotStart: Date(timeIntervalSince1970: t0 + 15), decodes: 1)],
+                "\(outcomes)")
     }
 
     /// Commands from an epoch the engine has left are dropped.

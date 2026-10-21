@@ -94,6 +94,9 @@ final class AppModel {
     private(set) var modemCursorAudioHz: Double?
     /// The audio band decoded (the passband's part of the box); nil when none of it can be.
     private(set) var modemAudioBand: ClosedRange<Double>? = ModemSettings.fullBand
+    /// The last slot of each slot mode: decoded (how many messages) or skipped for a gap. Cleared
+    /// when the modem resets.
+    private(set) var slotOutcomes: [ModeID: SlotOutcome] = [:]
     /// The rows as shown: `liveLog`, published at 5 Hz with the other stats (and at once after a user
     /// action on the rows). Each publish re-renders the rows, the signal count and the ruler; at
     /// 10 Hz those SwiftUI passes cost about a sixth of a core on the Mac.
@@ -623,7 +626,7 @@ final class AppModel {
     var modemPanelStatus: ModemPanelStatus {
         ModemPanelStatus(mode: modemUserSettings.mode, autoDetect: modemUserSettings.autoDetect,
                          isFileSource: sourceKind == .file, boxActive: modemBoxActive, clockOffset: clockOffset,
-                         audioBand: modemAudioBand)
+                         audioBand: modemAudioBand, slotOutcomes: slotOutcomes)
     }
 
     /// "3 signals": the live rows (read by its own small view, so the log's 10 Hz changes don't
@@ -725,6 +728,11 @@ final class AppModel {
         } else {
             m.take(batch, into: &liveLog, now: engine.modemWorker.utcNow())
             liveLogChanged = true
+            var outcomes = batch.clearedAt == nil ? slotOutcomes : [:]
+            for o in batch.slotOutcomes where (outcomes[o.mode]?.slotStart ?? .distantPast) <= o.slotStart {
+                outcomes[o.mode] = o
+            }
+            if outcomes != slotOutcomes { slotOutcomes = outcomes }
         }
         setModem(m)
     }

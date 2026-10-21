@@ -34,6 +34,7 @@ final class ModemEventQueue: Sendable {
     static let cutoffMarginSeconds = 1.0
     static let maxPendingText = 8_192
     static let maxPendingSlotDecodes = 1_024
+    static let maxPendingSlotOutcomes = 64
 
     struct Batch: Sendable {
         /// The epoch the batch belongs to.
@@ -44,8 +45,12 @@ final class ModemEventQueue: Sendable {
         var signals: [SignalSnapshot]?
         var text: [DecodedText]
         var slotDecodes: [SlotDecode]
+        /// Slots decoded (with their message counts) or skipped for a gap, oldest first.
+        var slotOutcomes: [SlotOutcome] = []
 
-        var isEmpty: Bool { clearedAt == nil && signals == nil && text.isEmpty && slotDecodes.isEmpty }
+        var isEmpty: Bool {
+            clearedAt == nil && signals == nil && text.isEmpty && slotDecodes.isEmpty && slotOutcomes.isEmpty
+        }
     }
 
     private struct State {
@@ -54,6 +59,7 @@ final class ModemEventQueue: Sendable {
         var signals: [SignalSnapshot]?
         var text: [DecodedText] = []
         var slotDecodes: [SlotDecode] = []
+        var slotOutcomes: [SlotOutcome] = []
     }
 
     private let state = Mutex(State())
@@ -70,6 +76,7 @@ final class ModemEventQueue: Sendable {
             s.signals = nil
             s.text.removeAll()
             s.slotDecodes.removeAll()
+            s.slotOutcomes.removeAll()
             return s.epoch
         }
     }
@@ -99,15 +106,30 @@ final class ModemEventQueue: Sendable {
         }
     }
 
+    /// Modem thread or slot queue: what became of slots (decoded, or skipped for a gap). Returns false
+    /// (and drops them) when `epoch` is stale.
+    @discardableResult
+    func append(slotOutcomes: [SlotOutcome], epoch: UInt64) -> Bool {
+        state.withLock { s in
+            guard epoch == s.epoch else { return false }
+            s.slotOutcomes.append(contentsOf: slotOutcomes)
+            if s.slotOutcomes.count > Self.maxPendingSlotOutcomes {
+                s.slotOutcomes.removeFirst(s.slotOutcomes.count - Self.maxPendingSlotOutcomes)
+            }
+            return true
+        }
+    }
+
     /// Returns everything queued since the previous drain and empties the queue.
     func drain() -> Batch {
         state.withLock { s in
             let batch = Batch(epoch: s.epoch, clearedAt: s.clearedAt, signals: s.signals, text: s.text,
-                              slotDecodes: s.slotDecodes)
+                              slotDecodes: s.slotDecodes, slotOutcomes: s.slotOutcomes)
             s.clearedAt = nil
             s.signals = nil
             s.text = []
             s.slotDecodes = []
+            s.slotOutcomes = []
             return batch
         }
     }

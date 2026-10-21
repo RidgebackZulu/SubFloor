@@ -512,6 +512,8 @@ final class ModemWorker: @unchecked Sendable {
                 for job in engine.dueSlotJobs(now: Date(timeIntervalSince1970: t)) {
                     dispatch(job, epoch: epoch, band: engine.settings.audioBand)   // the passband, from the app
                 }
+                let skipped = engine.takeSkippedSlots()
+                if !skipped.isEmpty { events.append(slotOutcomes: skipped, epoch: epoch) }
             }
 
             if count == 0 { _ = wake.wait(timeout: .now() + .milliseconds(20)) }
@@ -545,6 +547,8 @@ final class ModemWorker: @unchecked Sendable {
             let decodes = job.decode(audioBand: band)
             self?.slotJobsDecoded.add(1, ordering: .relaxed)
             events.append(slotDecodes: decodes, epoch: epoch)
+            events.append(slotOutcomes: [SlotOutcome(mode: job.mode.id, slotStart: job.slotStart, decodes: decodes.count)],
+                          epoch: epoch)
         }
     }
 }
