@@ -385,8 +385,9 @@ final class AppModel {
 
     // MARK: Tuning
 
-    /// Direct tune (typed frequency, quick-tune, bookmark): retunes hardware and resets the view.
-    func tune(to displayHz: Double) {
+    /// Direct tune (typed frequency, quick-tune): retunes hardware and resets the view, or with
+    /// `keepZoom` (a bookmark) keeps the view's span and centres it on the new VFO.
+    func tune(to displayHz: Double, keepZoom: Bool = false) {
         let hz = clampedDisplay(displayHz)
         vfoHz = hz
         if sourceKind == .file {
@@ -396,7 +397,7 @@ final class AppModel {
             retuneHardware()
         }
         viewport.setCapture(centerHz: centerHz, spanHz: sampleRate)
-        viewport.reset()
+        if keepZoom { viewport.center(on: vfoHz) } else { viewport.reset() }
         pushReceiver()
         syncModem()
     }
@@ -544,11 +545,23 @@ final class AppModel {
 
     // MARK: Bookmarks
 
+    /// Tunes to `bookmark`: its HamItUp state, mode, passband width and frequency, at the current zoom.
     func select(_ bookmark: Bookmark) {
         setUpconverter(bookmark.upconverter)
         mode = bookmark.mode
-        bandwidthHz = bookmark.bandwidthHz
-        tune(to: bookmark.frequencyHz)
+        let range = bookmark.mode.bandwidthRange
+        bandwidthHz = min(max(bookmark.bandwidthHz, range.lowerBound), range.upperBound).rounded()
+        tune(to: bookmark.frequencyHz, keepZoom: true)
+    }
+
+    /// `bookmark` with the current frequency, mode, passband width and HamItUp state.
+    func withCurrentTuning(_ bookmark: Bookmark) -> Bookmark {
+        var b = bookmark
+        b.frequencyHz = vfoHz
+        b.mode = mode
+        b.bandwidthHz = bandwidthHz
+        b.upconverter = upconverter.enabled
+        return b
     }
 
     func addBookmark() {

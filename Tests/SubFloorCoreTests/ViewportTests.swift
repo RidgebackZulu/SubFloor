@@ -41,6 +41,18 @@ private func make() -> SpectrumViewport { SpectrumViewport(captureCenterHz: 14_0
     #expect(v.lowerHz <= 20_900_000 && v.upperHz >= 20_900_000)
 }
 
+/// A bookmark retune: the new capture at the same span, centred on the VFO (clamped to the capture).
+@Test func centerKeepsSpan() {
+    var v = make()
+    v.zoom(by: 0.05, anchorFraction: 0.2)
+    v.setCapture(centerHz: 7_200_000, spanHz: 2_000_000)
+    v.center(on: 7_074_000)
+    #expect(v.spanHz == 100_000)
+    #expect(abs(v.centerHz - 7_074_000) < 1e-6)
+    v.center(on: 6_200_000)
+    #expect(v.spanHz == 100_000 && v.lowerHz == 6_200_000)
+}
+
 @Test func rulerScaleChoosesNiceSteps() {
     #expect(RulerScale.step(span: 2_000_000, width: 1_100) == 200_000)
     #expect(RulerScale.step(span: 10_000, width: 1_100) == 1_000)

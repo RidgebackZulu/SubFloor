@@ -50,6 +50,12 @@ public struct SpectrumViewport: Equatable, Sendable {
         clamp()
     }
 
+    /// Centres the view on `hz` at the same span (as near as the capture allows).
+    public mutating func center(on hz: Double) {
+        centerHz = hz
+        clamp()
+    }
+
     public mutating func ensureVisible(_ hz: Double) {
         let margin = spanHz * 0.05
         if hz < lowerHz + margin { centerHz = hz - margin + spanHz / 2 }

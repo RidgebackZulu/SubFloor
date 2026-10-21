@@ -31,7 +31,8 @@ Without an RSP connected, SubFloor runs on a built-in demo signal around 14.1 MH
 | Bandwidth | Drag the passband edges |
 | Bookmarks | ⌘D add · ⌘B show on spectrum · sidebar list |
 | HamItUp | Top-bar button (green when on) or ⌘U (LO set in Settings, default 125 MHz) |
-| Edit a bookmark | Click its flag above the spectrum: name, frequency, mode, group, HamItUp; Tune or Delete |
+| Tune a bookmark | Click its flag above the spectrum: frequency, mode, passband width and HamItUp, at the current zoom |
+| Edit a bookmark | Right-click (or ⌃-click) its flag: name, frequency, mode, bandwidth, group, HamItUp; Use Current Tuning, Tune or Delete |
 
 ## Modem panel
 Pick a mode (CW, PSK31, FT8, WSPR) in the panel under the spectrum. The modem decodes what the receiver

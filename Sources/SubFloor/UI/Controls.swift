@@ -60,6 +60,37 @@ struct VerticalSlider: View {
     }
 }
 
+/// Left and right clicks on an overlaid SwiftUI view (a control-click counts as a right click).
+struct ClickCatcher: NSViewRepresentable {
+    /// The NSView covers the SwiftUI view, so the tooltip is set on it (`.help` would not show).
+    var toolTip: String?
+    var onLeft: () -> Void
+    var onRight: () -> Void
+
+    func makeNSView(context: Context) -> CatcherView {
+        let view = CatcherView()
+        updateNSView(view, context: context)
+        return view
+    }
+
+    func updateNSView(_ view: CatcherView, context: Context) {
+        view.onLeft = onLeft
+        view.onRight = onRight
+        view.toolTip = toolTip
+    }
+
+    final class CatcherView: NSView {
+        var onLeft: () -> Void = {}
+        var onRight: () -> Void = {}
+
+        override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+        override func mouseDown(with event: NSEvent) {
+            event.modifierFlags.contains(.control) ? onRight() : onLeft()
+        }
+        override func rightMouseDown(with event: NSEvent) { onRight() }
+    }
+}
+
 /// Captures scroll-wheel ticks and clicks for an overlaid SwiftUI view.
 struct ScrollCatcher: NSViewRepresentable {
     var onScroll: (Int) -> Void

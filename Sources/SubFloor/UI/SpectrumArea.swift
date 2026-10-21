@@ -205,7 +205,8 @@ private struct FrequencyRuler: View {
     }
 }
 
-/// A bookmark above the spectrum; a click opens its editor (with Tune and Delete).
+/// A bookmark above the spectrum: a click tunes to it (keeping the zoom), a right click opens its
+/// editor.
 private struct BookmarkFlag: View {
     @Environment(AppModel.self) private var model
     let bookmark: Bookmark
@@ -213,21 +214,22 @@ private struct BookmarkFlag: View {
 
     var body: some View {
         let color = Color(hex: bookmark.colorHex) ?? Theme.accent
-        Button { editing = true } label: {
-            HStack(spacing: 3) {
-                Image(systemName: bookmark.upconverter ? "arrow.up.arrow.down" : "flag.fill").font(.system(size: 8, weight: .bold))
-                Text(bookmark.name).font(.system(size: 10, weight: .medium)).lineLimit(1)
-            }
-            .padding(.horizontal, 5)
-            .padding(.vertical, 1)
-            .foregroundStyle(.black)
-            .background(Capsule().fill(color.opacity(0.9)))
+        HStack(spacing: 3) {
+            Image(systemName: bookmark.upconverter ? "arrow.up.arrow.down" : "flag.fill").font(.system(size: 8, weight: .bold))
+            Text(bookmark.name).font(.system(size: 10, weight: .medium)).lineLimit(1)
         }
-        .buttonStyle(.plain)
-        .help("\(bookmark.name) — \(FrequencyFormatter.short(bookmark.frequencyHz)) \(bookmark.mode.label)\(bookmark.upconverter ? " via HamItUp" : ""). Click to edit or tune")
+        .padding(.horizontal, 5)
+        .padding(.vertical, 1)
+        .foregroundStyle(.black)
+        .background(Capsule().fill(color.opacity(0.9)))
+        .overlay { ClickCatcher(toolTip: help, onLeft: { model.select(bookmark) }, onRight: { editing = true }) }
         .popover(isPresented: $editing, arrowEdge: .bottom) {
             BookmarkEditor(bookmark: bookmark) { editing = false }
         }
+    }
+
+    private var help: String {
+        "\(bookmark.name) — \(FrequencyFormatter.short(bookmark.frequencyHz)) \(bookmark.mode.label) \(FrequencyFormatter.audio(bookmark.bandwidthHz))\(bookmark.upconverter ? " via HamItUp" : ""). Click to tune, right-click to edit"
     }
 }
 
@@ -254,6 +256,8 @@ private struct BookmarkEditor: View {
                 Picker("Mode", selection: $draft.mode) {
                     ForEach(DemodMode.allCases) { Text($0.label).tag($0) }
                 }
+                TextField("Bandwidth (Hz)", value: $draft.bandwidthHz, format: .number.precision(.fractionLength(0)))
+                    .help("The passband width tuned with the bookmark")
                 TextField("Group", text: Binding(get: { draft.group ?? "" },
                                                   set: { draft.group = $0.isEmpty ? nil : $0 }))
                 Toggle("Via HamItUp", isOn: $draft.upconverter)
@@ -264,6 +268,11 @@ private struct BookmarkEditor: View {
                     close()
                 }
                 Spacer()
+                Button("Use Current Tuning") {
+                    draft = model.withCurrentTuning(draft)
+                    frequencyText = FrequencyFormatter.grouped(draft.frequencyHz)
+                }
+                .help("Save the current frequency, mode, passband width and HamItUp state in this bookmark")
                 Button("Tune") {
                     commitFrequency()
                     model.select(draft)
