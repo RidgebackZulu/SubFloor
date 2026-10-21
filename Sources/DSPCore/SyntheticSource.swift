@@ -54,6 +54,9 @@ public final class SyntheticSource: IQSource, @unchecked Sendable {
     private var phases: [Double]
     private var envelopes: [Float]
     private var keyPatterns: [[Bool]]
+    /// Per FM signal, `e^{iβs}` sampled over s ∈ [−1, 1] (β = deviation / tone), for linear
+    /// interpolation; empty for other kinds.
+    private var fmTables: [[(re: Double, im: Double)]]
     private var rng: UInt64 = 0x9E37_79B9_7F4A_7C15
 
     public init(sampleRate: Double = 2_000_000, centerFrequency: Double = 14_100_000, signals: [Signal] = demoSignals) {
@@ -67,6 +70,16 @@ public final class SyntheticSource: IQSource, @unchecked Sendable {
             var units: [Bool] = []
             for e in MorseCode.timeline(for: text) { units += Array(repeating: e.on, count: e.units) }
             return units + Array(repeating: false, count: 21)   // 3-word gap before repeating
+        }
+        fmTables = signals.map { signal in
+            guard case .fm(let tone, let deviation) = signal.kind, tone > 0 else { return [] }
+            let beta = deviation / tone
+            // Spacing in phase β·Δs ≤ 0.02 rad: interpolation error about 5e-5 of the amplitude.
+            let n = max(1_024, Int((2 * beta / 0.02).rounded(.up)))
+            return (0...n).map { i in
+                let phase = beta * (2 * Double(i) / Double(n) - 1)
+                return (cos(phase), sin(phase))
+            }
         }
     }
 
@@ -107,40 +120,105 @@ public final class SyntheticSource: IQSource, @unchecked Sendable {
         return (a + b - 1) * noiseAmplitude
     }
 
+    /// The next `count` samples. Each signal is a rotating phasor (one complex multiply per sample),
+    /// re-seeded from its exact phase at every block so nothing drifts; the modulation tones are
+    /// phasors too, and FM's `e^{iβ·sin θ}` comes from a table. Matches the direct per-sample
+    /// `cos`/`sin` formula to Float rounding (about 1e-7 of the amplitude; FM, through its table, about
+    /// 5e-5 at broadcast deviation; see the tests).
     func makeBlock(count: Int) -> [DSPComplex] {
         let (fs, center) = lock.withLock { (_sampleRate, _center - _antennaOffset) }
         var block = (0..<count).map { _ in DSPComplex(real: noise(), imag: noise()) }
-        for (si, signal) in signals.enumerated() {
-            let offset = signal.frequency - center
-            guard abs(offset) < fs / 2 else { continue }
-            let w = 2 * Double.pi * offset / fs
-            var phase = phases[si]
-            var env = envelopes[si]
-            for k in 0..<count {
-                let t = Double(sampleIndex + k) / fs
-                var amp = signal.amplitude
-                var ph = phase
+        let t0 = Double(sampleIndex) / fs
+        block.withUnsafeMutableBufferPointer { out in
+            for (si, signal) in signals.enumerated() {
+                let offset = signal.frequency - center
+                guard abs(offset) < fs / 2 else { continue }
+                let w = 2 * Double.pi * offset / fs
+                let phase = phases[si]
+                var env = envelopes[si]
+                // The carrier (with SSB's audio offset folded in) and the modulating tone, at t0.
+                var carrierPhase = phase, step = w
+                var tone = (re: 1.0, im: 0.0), toneStep = (re: 1.0, im: 0.0)
                 switch signal.kind {
-                case .carrier:
-                    break
-                case .am(let tone):
-                    amp *= Float(1 + 0.6 * sin(2 * .pi * tone * t))
-                case .fm(let tone, let deviation):
-                    ph += deviation / tone * sin(2 * .pi * tone * t)
                 case .ssbTone(let audio):
-                    ph += 2 * .pi * audio * t
+                    carrierPhase += 2 * .pi * audio * t0
+                    step += 2 * .pi * audio / fs
+                case .am(let hz), .fm(let hz, _):
+                    tone = (cos(2 * .pi * hz * t0), sin(2 * .pi * hz * t0))
+                    toneStep = (cos(2 * .pi * hz / fs), sin(2 * .pi * hz / fs))
+                case .carrier, .cw:
+                    break
+                }
+                var c = (re: cos(carrierPhase), im: sin(carrierPhase))
+                let r = (re: cos(step), im: sin(step))
+                let amplitude = signal.amplitude
+                // One tight loop per kind: the kind, its tables and constants are fixed for the block.
+                switch signal.kind {
+                case .carrier, .ssbTone:
+                    for k in 0..<count {
+                        out[k].real += amplitude * Float(c.re)
+                        out[k].imag += amplitude * Float(c.im)
+                        c = (c.re * r.re - c.im * r.im, c.re * r.im + c.im * r.re)
+                    }
+                case .am:
+                    for k in 0..<count {
+                        let amp = amplitude * Float(1 + 0.6 * tone.im)
+                        out[k].real += amp * Float(c.re)
+                        out[k].imag += amp * Float(c.im)
+                        c = (c.re * r.re - c.im * r.im, c.re * r.im + c.im * r.re)
+                        tone = (tone.re * toneStep.re - tone.im * toneStep.im, tone.re * toneStep.im + tone.im * toneStep.re)
+                    }
+                case .fm:
+                    // e^{iβ·sin θ} by linear interpolation in the table over sin θ ∈ [−1, 1].
+                    let table = fmTables[si]
+                    let last = table.count - 1
+                    let scale = Double(last) / 2
+                    for k in 0..<count {
+                        let x = (min(max(tone.im, -1), 1) + 1) * scale
+                        let i = min(Int(x), last - 1)
+                        let f = x - Double(i)
+                        let a = table[i], b = table[i + 1]
+                        let m = (re: a.re + f * (b.re - a.re), im: a.im + f * (b.im - a.im))
+                        out[k].real += amplitude * Float(c.re * m.re - c.im * m.im)
+                        out[k].imag += amplitude * Float(c.re * m.im + c.im * m.re)
+                        c = (c.re * r.re - c.im * r.im, c.re * r.im + c.im * r.re)
+                        tone = (tone.re * toneStep.re - tone.im * toneStep.im, tone.re * toneStep.im + tone.im * toneStep.re)
+                    }
                 case .cw(_, let wpm):
                     let pattern = keyPatterns[si]
-                    let unit = Int(t / MorseCode.dotSeconds(wpm: wpm)) % pattern.count
-                    env += ((pattern[unit] ? 1 : 0) - env) * 0.002
-                    amp *= env
+                    let dot = MorseCode.dotSeconds(wpm: wpm)
+                    // The Morse unit of sample n is `Int(n / fs / dot)`; it changes only every dot
+                    // (about 1200 samples), so it is evaluated at its boundaries, with the same formula.
+                    let unitAt = { (n: Int) in Int(Double(n) / fs / dot) }
+                    let boundary = { (unit: Int) -> Int in   // the first sample of the next unit
+                        var b = Int(Double(unit + 1) * fs * dot)
+                        while b > 0 && unitAt(b - 1) > unit { b -= 1 }
+                        while unitAt(b) <= unit { b += 1 }
+                        return b
+                    }
+                    let first = sampleIndex
+                    var unit = unitAt(first)
+                    var next = boundary(unit) - first   // as an index into this block
+                    var key: Float = pattern[unit % pattern.count] ? 1 : 0
+                    for k in 0..<count {
+                        if k == next {
+                            unit = unitAt(first + k)
+                            next = boundary(unit) - first
+                            key = pattern[unit % pattern.count] ? 1 : 0
+                        }
+                        env += (key - env) * 0.002
+                        // Key-up decays towards 0; stop at 1e-7 rather than run into subnormal floats
+                        // (slow on x86; the difference is far below the noise).
+                        if env < 1e-7 { env = 0 }
+                        let amp = amplitude * env
+                        out[k].real += amp * Float(c.re)
+                        out[k].imag += amp * Float(c.im)
+                        c = (c.re * r.re - c.im * r.im, c.re * r.im + c.im * r.re)
+                    }
                 }
-                block[k].real += amp * Float(cos(ph))
-                block[k].imag += amp * Float(sin(ph))
-                phase += w
+                phases[si] = (phase + w * Double(count)).truncatingRemainder(dividingBy: 2 * .pi)
+                envelopes[si] = env
             }
-            phases[si] = phase.truncatingRemainder(dividingBy: 2 * .pi)
-            envelopes[si] = env
         }
         sampleIndex += count
         return block

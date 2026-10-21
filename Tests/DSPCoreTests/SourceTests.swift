@@ -125,3 +125,53 @@ final class BlockCounter: @unchecked Sendable {
     #expect(block.allSatisfy { $0.real.isFinite && $0.imag.isFinite })
     #expect(block[0].real == 0.5 && block[1].real == 0 && block[1].imag == 0 && block[2].imag == 0.125 && block[3].imag == 0)
 }
+
+/// The phasor generator against the direct formula it replaced (per-sample `cos`/`sin` of the
+/// accumulated carrier phase plus the modulation), noise off, over consecutive blocks.
+@Test(arguments: [
+    SyntheticSource.Signal(frequency: 14_075_500, amplitude: 0.004, kind: .carrier),
+    SyntheticSource.Signal(frequency: 14_200_000, amplitude: 0.01, kind: .ssbTone(audioHz: 1_000)),
+    SyntheticSource.Signal(frequency: 13_990_000, amplitude: 0.01, kind: .ssbTone(audioHz: -800)),
+    SyntheticSource.Signal(frequency: 13_650_000, amplitude: 0.05, kind: .am(toneHz: 600)),
+    SyntheticSource.Signal(frequency: 14_500_000, amplitude: 0.02, kind: .fm(toneHz: 1_000, deviation: 3_000)),
+    SyntheticSource.Signal(frequency: 14_300_000, amplitude: 0.1, kind: .fm(toneHz: 440, deviation: 60_000)),
+    SyntheticSource.Signal(frequency: 14_030_000, amplitude: 0.02, kind: .cw(text: "CQ DE K", wpm: 20)),
+])
+func phasorGeneratorMatchesDirectFormula(_ signal: SyntheticSource.Signal) {
+    let fs = 2_000_000.0, center = 14_100_000.0, count = 20_000
+    let source = SyntheticSource(sampleRate: fs, centerFrequency: center, signals: [signal])
+    source.noiseAmplitude = 0
+    var pattern: [Bool] = []
+    if case .cw(let text, _) = signal.kind {
+        for e in MorseCode.timeline(for: text) { pattern += Array(repeating: e.on, count: e.units) }
+        pattern += Array(repeating: false, count: 21)
+    }
+    var phase = 0.0, env: Float = 0, index = 0, worst: Float = 0
+    for _ in 0..<3 {
+        let block = source.makeBlock(count: count)
+        let w = 2 * Double.pi * (signal.frequency - center) / fs
+        for k in 0..<count {
+            let t = Double(index + k) / fs
+            var amp = signal.amplitude
+            var ph = phase
+            switch signal.kind {
+            case .carrier: break
+            case .am(let tone): amp *= Float(1 + 0.6 * sin(2 * .pi * tone * t))
+            case .fm(let tone, let deviation): ph += deviation / tone * sin(2 * .pi * tone * t)
+            case .ssbTone(let audio): ph += 2 * .pi * audio * t
+            case .cw(_, let wpm):
+                let unit = Int(t / MorseCode.dotSeconds(wpm: wpm)) % pattern.count
+                env += ((pattern[unit] ? 1 : 0) - env) * 0.002
+                amp *= env
+            }
+            worst = max(worst, abs(block[k].real - amp * Float(cos(ph))), abs(block[k].imag - amp * Float(sin(ph))))
+            phase += w
+        }
+        phase = phase.truncatingRemainder(dividingBy: 2 * .pi)
+        index += count
+    }
+    // Float rounding (about 1e-7 of the amplitude), except FM, whose table interpolation is about
+    // 5e-5 at broadcast deviation (β = 136).
+    let tolerance: Float = if case .fm = signal.kind { 1e-4 } else { 1e-6 }
+    #expect(worst <= tolerance * signal.amplitude, "worst error \(worst / signal.amplitude) of the amplitude")
+}
