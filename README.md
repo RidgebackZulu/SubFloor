@@ -11,7 +11,8 @@ decodes every CW, PSK31, FT8 and WSPR signal in the receiver's passband at once.
 ## Build & run
 ```bash
 swift run -c release SubFloor        # run from source
-scripts/bundle.sh                    # build build/SubFloor.app
+scripts/bundle.sh                    # build build/SubFloor.app (with its icon)
+python3 scripts/make_icon.py Sources/SubFloor/Resources/AppIcon.png   # redraw the icon (needs Pillow, NumPy)
 swift test                           # unit tests
 SUBFLOOR_HW=1 swift test             # also run the RSP1B hardware smoke test
 ```

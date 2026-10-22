@@ -26,6 +26,7 @@ let package = Package(
         .executableTarget(
             name: "SubFloor",
             dependencies: ["DSPCore", "SubFloorCore", "SDRplayKit", "Modems"],
+            resources: [.copy("Resources/AppIcon.png")],
             swiftSettings: fastMath,
             linkerSettings: sdrplayLinker),
         .testTarget(name: "DSPCoreTests", dependencies: ["DSPCore"]),

@@ -4,6 +4,23 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: AppModel?
 
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        MainActor.assumeIsolated { Self.setDockIcon() }
+    }
+
+    /// The .app from `scripts/bundle.sh` has its icon in Info.plist; under `swift run` there is no
+    /// bundle, so the Dock icon is set from the SwiftPM resource next to the executable. Looked up
+    /// by hand: `Bundle.module` traps when the resource bundle is missing.
+    @MainActor private static func setDockIcon() {
+        guard Bundle.main.object(forInfoDictionaryKey: "CFBundleIconFile") == nil,
+              let dir = Bundle.main.executableURL?.deletingLastPathComponent(),
+              let url = Bundle(url: dir.appendingPathComponent("SubFloor_SubFloor.bundle"))?
+                  .url(forResource: "AppIcon", withExtension: "png"),
+              let image = NSImage(contentsOf: url)
+        else { return }
+        NSApp.applicationIconImage = image
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
         MainActor.assumeIsolated { model?.shutdown() }
     }
