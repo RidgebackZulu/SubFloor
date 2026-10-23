@@ -2,6 +2,7 @@ import AppKit
 import DSPCore
 import Modems
 import Observation
+import Recording
 import SDRplayKit
 import SubFloorCore
 import SwiftUI
@@ -48,6 +49,7 @@ private struct SessionState: Codable {
     /// before and after it decode.
     var modemBox: ModemBox?
     var modemSettings: ModemSettings?
+    var recording: RecordingSettings?
 }
 
 @MainActor @Observable
@@ -68,6 +70,19 @@ final class AppModel {
     var squelchDb: Float = -80 { didSet { pushReceiver() } }
     var agcSpeed: AGCSpeed = .medium { didSet { pushReceiver() } }
     var volume: Float = 0.5 { didSet { engine.update(volume: volume) } }
+
+    // MARK: Recording
+    /// Recording preferences (Settings). Kept valid; a change to the pre-roll or a sample format
+    /// starts the pre-roll over and ends a recording in progress (`StreamRecorder.configure`).
+    var recording = RecordingSettings() {
+        didSet {
+            let valid = recording.normalized()
+            if valid != recording { recording = valid }
+            if recording != oldValue { pushRecording() }
+        }
+    }
+    /// Each recorder's state, polled at 5 Hz (`refreshStats`); set at once on start.
+    private(set) var recordingStatus: [StreamKind: RecordingStatus] = [:]
 
     // MARK: Display
     var spectrum = SpectrumSettings() { didSet { engine.update(spectrum: spectrum) } }
@@ -151,6 +166,7 @@ final class AppModel {
             break
         }
         restoreSession()
+        pushRecording()
         followPassband()
         engine.audio.onError = { [weak self] message in
             Task { @MainActor in self?.show(Banner(kind: .error, message: message, action: .retry)) }
@@ -203,6 +219,7 @@ final class AppModel {
     private func pushReceiver() {
         engine.update(receiver: receiverConfig)
         followPassband()
+        pushRecordingContexts()
     }
 
     /// The modem decodes what the receiver is tuned to: its box follows the passband.
@@ -271,6 +288,8 @@ final class AppModel {
         if abs(vfoHz - centerHz) > sampleRate * TuningPlanner.usableFraction { vfoHz = centerHz + TuningPlanner.dcOffset(sampleRate: sampleRate) }
         viewport.setCapture(centerHz: centerHz, spanHz: sampleRate)
         syncModem()
+        pushRecording()
+        pushRecordingContexts()
         do {
             try engine.start(source: activeSource, receiver: receiverConfig, spectrum: spectrum, volume: volume)
             isRunning = true
@@ -283,9 +302,10 @@ final class AppModel {
 
     func stop() {
         guard isRunning else { return }
-        engine.stop()
+        engine.stop()   // finalises any recording
         isRunning = false
         overloaded = false
+        refreshRecordingStatus()
     }
 
     /// Orderly shutdown (app quit): stop the engine, release the RSP, persist the session. Idempotent.
@@ -488,6 +508,7 @@ final class AppModel {
         } catch {
             show(Banner(kind: .error, message: "Tune failed: \(error)"))
         }
+        pushRecordingContexts()
         if !upconverter.enabled && vfoHz < 50_000 {
             show(Banner(kind: .info, message: "Below 50 kHz the RSP1B is weak — enable HamItUp if it is connected."))
         }
@@ -615,6 +636,102 @@ final class AppModel {
         }
         do { try bookmarkStore.save(bookmarks) } catch {
             show(Banner(kind: .error, message: "Could not save bookmarks: \(error.localizedDescription)"))
+        }
+    }
+
+    // MARK: Recording
+
+    private func recorder(_ kind: StreamKind) -> StreamRecorder { kind == .iq ? engine.iqRecorder : engine.audioRecorder }
+
+    func isRecording(_ kind: StreamKind) -> Bool { recordingStatus[kind]?.isRecording ?? false }
+    var isRecordingAny: Bool { StreamKind.allCases.contains { isRecording($0) } }
+    var isRecordingAll: Bool { StreamKind.allCases.allSatisfy { isRecording($0) } }
+    /// The IQ ring's size and the pre-roll it gives at the current rate (Settings).
+    var iqRingPlan: StreamRecorder.RingPlan? { engine.iqRecorder.ringPlan }
+
+    func toggleRecording(_ kind: StreamKind) { isRecording(kind) ? stopRecording(kind) : startRecording(kind) }
+
+    /// Both: stops everything when both are recording, otherwise starts whichever is not.
+    func toggleRecordingBoth() {
+        if isRecordingAll {
+            StreamKind.allCases.forEach(stopRecording)
+        } else {
+            StreamKind.allCases.filter { !isRecording($0) }.forEach(startRecording)
+        }
+    }
+
+    /// Starts recording `kind` from up to the pre-roll ago. Needs the radio running.
+    func startRecording(_ kind: StreamKind) {
+        guard isRunning else {
+            show(Banner(kind: .info, message: "Start the radio before recording."))
+            return
+        }
+        guard !isRecording(kind) else { return }
+        let folder = recording.folder
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        } catch {
+            show(Banner(kind: .error, message: "Cannot use the recordings folder \(folder.path): \(error.localizedDescription)"))
+            return
+        }
+        if let free = try? folder.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage,
+           free < 500_000_000 {
+            show(Banner(kind: .warning, message: "Less than 500 MB free where recordings go."))
+        }
+        recorder(kind).start()
+        refreshRecordingStatus()
+    }
+
+    func stopRecording(_ kind: StreamKind) {
+        guard isRecording(kind) else { return }
+        recorder(kind).stop()
+    }
+
+    func revealRecordings() {
+        let folder = recording.folder
+        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let latest = StreamKind.allCases.compactMap { recordingStatus[$0]?.url }.filter { FileManager.default.fileExists(atPath: $0.path) }
+        if latest.isEmpty { NSWorkspace.shared.open(folder) } else { NSWorkspace.shared.activateFileViewerSelecting(latest) }
+    }
+
+    func chooseRecordingsFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.directoryURL = recording.folder
+        panel.message = "Choose where recordings are saved"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        recording.folderPath = url.path
+    }
+
+    /// Both recorders get the stream rates and the preferences (the audio ring is tiny, so its
+    /// memory limit is a formality).
+    private func pushRecording() {
+        let r = recording
+        engine.iqRecorder.configure(StreamRecorder.Setup(
+            sampleRate: sampleRate, channels: StreamKind.iq.channels, fileFormat: r.iqFormat, sampleFormat: r.iqSampleFormat,
+            preRollSeconds: r.preRollSeconds, memoryLimitBytes: r.iqMemoryLimitBytes, folder: r.folder))
+        engine.audioRecorder.configure(StreamRecorder.Setup(
+            sampleRate: Receiver.audioRate, channels: StreamKind.audio.channels, fileFormat: r.audioFormat, sampleFormat: r.audioSampleFormat,
+            preRollSeconds: r.preRollSeconds, memoryLimitBytes: 256 << 20, folder: r.folder))
+    }
+
+    /// File names: the IQ file carries the capture centre (a change rolls it), the audio file the VFO and mode.
+    private func pushRecordingContexts() {
+        let hardware = activeSource.name
+        engine.iqRecorder.setContext(RecordingContext(frequencyHz: centerHz, label: "IQ", hardware: hardware))
+        engine.audioRecorder.setContext(RecordingContext(frequencyHz: vfoHz, label: mode.label, hardware: hardware))
+    }
+
+    private func refreshRecordingStatus() {
+        for kind in StreamKind.allCases {
+            let s = recorder(kind).status
+            guard s != recordingStatus[kind] else { continue }
+            if let error = s.error, error != recordingStatus[kind]?.error {
+                show(Banner(kind: .error, message: "\(kind.label) recording stopped: \(error)"))
+            }
+            recordingStatus[kind] = s
         }
     }
 
@@ -786,6 +903,7 @@ final class AppModel {
         if lostBlocks != underruns { underruns = lostBlocks }
         let cpuNow = cpu.sample()
         if cpuNow.rounded() != cpuPercent.rounded() { cpuPercent = cpuNow }
+        refreshRecordingStatus()
         saveSessionIfChanged()
     }
 
@@ -794,7 +912,7 @@ final class AppModel {
                                  hardware: hardware, spectrum: spectrum, dbMin: dbMin, dbMax: dbMax, colormap: colormap,
                                  showBookmarks: showBookmarks, volume: volume, agcSpeed: agcSpeed, cwPitchHz: cwPitchHz,
                                  preferredSource: preferredSource == .file ? .sdrplay : preferredSource,
-                                 modemBox: nil, modemSettings: modem.settings)
+                                 modemBox: nil, modemSettings: modem.settings, recording: recording)
         guard let data = try? JSONEncoder().encode(state), data != lastSavedSession else { return }
         defaults.set(data, forKey: "session")
         lastSavedSession = data
@@ -809,6 +927,7 @@ final class AppModel {
         volume = s.volume; agcSpeed = s.agcSpeed; cwPitchHz = s.cwPitchHz; preferredSource = s.preferredSource
         // The box follows the passband (`followPassband`, after this); a saved box is not used.
         setModem(ModemControl(box: modem.box, settings: s.modemSettings ?? modem.settings))
+        if let r = s.recording { recording = r }
         lastSavedSession = data
     }
 }
