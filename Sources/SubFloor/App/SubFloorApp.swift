@@ -1,4 +1,5 @@
 import AppKit
+import Recording
 import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -84,6 +85,14 @@ struct RadioCommands: Commands {
             Button("Toggle HamItUp") { model.setUpconverter(!model.upconverter.enabled) }.keyboardShortcut("u")
             Button("Open IQ Recording…") { model.openIQFile() }.keyboardShortcut("o")
             Button("Reset Zoom") { model.resetView() }.keyboardShortcut("0")
+            Divider()
+            Button(model.isRecording(.audio) ? "Stop Recording Audio" : "Record Audio") { model.toggleRecording(.audio) }
+                .keyboardShortcut("a", modifiers: [.command, .shift])
+            Button(model.isRecording(.iq) ? "Stop Recording IQ" : "Record IQ") { model.toggleRecording(.iq) }
+                .keyboardShortcut("i", modifiers: [.command, .shift])
+            Button(model.isRecordingAll ? "Stop All Recording" : "Record Audio and IQ") { model.toggleRecordingBoth() }
+                .keyboardShortcut("r", modifiers: [.command, .shift])
+            Button("Show Recordings in Finder") { model.revealRecordings() }
         }
     }
 }
