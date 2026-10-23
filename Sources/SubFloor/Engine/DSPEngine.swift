@@ -2,6 +2,7 @@ import Accelerate
 import DSPCore
 import Foundation
 import Modems
+import Recording
 import Synchronization
 
 struct SpectrumSettings: Codable, Equatable, Sendable {
@@ -91,6 +92,11 @@ final class DSPEngine: @unchecked Sendable {
     /// Test hook: ModemChannels built by the DSP thread.
     let modemChannelBuilds = Atomic<Int>(0)
     let modemWorker: ModemWorker
+    /// The recorders, fed on the DSP thread with every block: the IQ as it arrives, and the
+    /// Receiver's audio before the volume knob and the limiter. Their pre-roll rings run whenever
+    /// the engine does; a new run starts them over (`start`), and `stop` finalises any open file.
+    let iqRecorder = StreamRecorder(kind: .iq, rollsOnContextChange: true)
+    let audioRecorder = StreamRecorder(kind: .audio, rollsOnContextChange: false)
 
     /// What the DSP thread should do with the box.
     struct ModemBoxState: Equatable, Sendable {
@@ -154,11 +160,17 @@ final class DSPEngine: @unchecked Sendable {
         modemWorker = ModemWorker(audioSink: sink, events: modemEvents, cursorFrames: cursorFrames, now: now)
     }
 
-    deinit { stop() }
+    deinit {
+        stop()
+        iqRecorder.shutdown()
+        audioRecorder.shutdown()
+    }
 
     func start(source: any IQSource, receiver: Receiver.Config, spectrum: SpectrumSettings, volume: Float) throws {
         stop()
         ring.drain()
+        iqRecorder.clearHistory()
+        audioRecorder.clearHistory()
         pending.withLock { $0 = Pending() }
         dropped.store(0, ordering: .relaxed)
         losses.drain()
@@ -215,6 +227,9 @@ final class DSPEngine: @unchecked Sendable {
         }
         exited = nil
         dspThread = nil
+        // After the DSP thread: every block it pushed is in the files.
+        iqRecorder.stop(wait: true)
+        audioRecorder.stop(wait: true)
         modemWorker.stop()
         audio.stop()
     }
@@ -359,6 +374,10 @@ final class DSPEngine: @unchecked Sendable {
                 continue
             }
 
+            block.withUnsafeBufferPointer { b in
+                b.withMemoryRebound(to: Float.self) { iqRecorder.push(UnsafeBufferPointer(rebasing: $0[0..<(2 * n)])) }
+            }
+
             // Box audio, with a gap wherever the callback dropped IQ inside this block.
             var done = 0
             while true {
@@ -415,6 +434,7 @@ final class DSPEngine: @unchecked Sendable {
             audioOut.removeAll(keepingCapacity: true)
             block.withUnsafeBufferPointer { receiver.process(UnsafeBufferPointer(rebasing: $0[0..<n]), audio: &audioOut) }
             guard !audioOut.isEmpty else { continue }
+            audioOut.withUnsafeBufferPointer { audioRecorder.push($0) }
             audioOut.withUnsafeMutableBufferPointer { a in
                 var gain = volume
                 vDSP_vsmul(a.baseAddress!, 1, &gain, a.baseAddress!, 1, vDSP_Length(a.count))

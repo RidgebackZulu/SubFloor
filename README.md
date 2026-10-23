@@ -1,8 +1,9 @@
 # SubFloor
 
 A fast, native macOS (Apple Silicon) receiver for the SDRplay RSP1B: Metal spectrum + waterfall,
-AM/NFM/WFM/USB/LSB/CW audio, HamItUp upconverter mode, bookmarks, and a multi-signal modem panel that
-decodes every CW, PSK31, FT8 and WSPR signal in the receiver's passband at once.
+AM/NFM/WFM/USB/LSB/CW audio, HamItUp upconverter mode, bookmarks, lossless audio and IQ recording with
+a rolling pre-roll, and a multi-signal modem panel that decodes every CW, PSK31, FT8 and WSPR signal in
+the receiver's passband at once.
 
 ## Requirements
 - macOS on Apple Silicon, Xcode 26 / Swift 6.2
@@ -25,6 +26,7 @@ Without an RSP connected, SubFloor runs on a built-in demo signal around 14.1 MH
 | Quick tune | ⌘L or `/` — frequency or bookmark name (`ft8 20`) |
 | Run / Stop | Space or ⌘R |
 | Open IQ recording | ⌘O (stereo I/Q WAV) |
+| Record | Top-bar `Audio` / `IQ` / `Both` (⌘⇧A / ⌘⇧I / ⌘⇧R); red with the elapsed time while recording. See Recording |
 | Reset zoom | ⌘0 |
 | Step VFO | ← / → (⇧ ×10); with a modem mode on they move the modem cursor instead |
 | Mode | Top bar, or `[` / `]` |
@@ -34,6 +36,22 @@ Without an RSP connected, SubFloor runs on a built-in demo signal around 14.1 MH
 | HamItUp | Top-bar button (green when on) or ⌘U (LO set in Settings, default 125 MHz) |
 | Tune a bookmark | Click its flag above the spectrum: frequency, mode, passband width and HamItUp, at the current zoom |
 | Edit a bookmark | Right-click (or ⌃-click) its flag: name, frequency, mode, bandwidth, group, HamItUp; Use Current Tuning, Tune or Delete |
+
+## Recording
+The save buffer is always running: each stream keeps its last 5–120 s (Settings, default 30 s) in
+memory while the radio runs, and a recording starts that far *before* the click, so a signal that has
+already begun is not lost. Idle, the buttons' faint red fill shows how much pre-roll is primed.
+
+- **Audio** is the receiver's output after AGC and squelch and before the volume knob, 48 kHz mono:
+  FLAC 24-bit by default, or WAV (16/24-bit, 32-bit float) or Apple Lossless.
+- **IQ** is the capture at the source rate as stereo I/Q: WAV 16-bit by default (lossless for the
+  RSP1B's 14-bit ADC; the name is SDR#-style, so ⌘O reads it back), 32-bit float, or SigMF
+  (`.sigmf-data` + `.sigmf-meta` with rate, centre and UTC time). A retune starts a new IQ file; WAV
+  files roll just under 4 GiB.
+- Files go to `~/Music/SubFloor` (Settings: folder, formats, pre-roll, and the memory the IQ pre-roll
+  may use, 2 GB by default; at high rates that limit shortens the IQ pre-roll and Settings says by how much).
+- Names: `SubFloor_20261022_143000Z_14074000Hz_USB.flac`, `SubFloor_20261022_143000Z_14100000Hz_IQ.wav`;
+  the time is the first sample's. Stopping the radio finalises any open recording.
 
 ## Modem panel
 Pick a mode (CW, PSK31, FT8, WSPR) in the panel under the spectrum. The modem decodes what the receiver
