@@ -4,6 +4,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @Environment(AppModel.self) private var model
+    @Environment(DialController.self) private var dial
     @AppStorage("appearance") private var appearance = "dark"
     @State private var loText = ""
 
@@ -22,6 +23,17 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             RecordingSection()
+            Section("SubFloor Dial") {
+                @Bindable var dial = dial
+                Toggle("Connect over Bluetooth", isOn: $dial.useBluetooth)
+                Toggle("Connect over USB", isOn: $dial.useUSB)
+                HStack {
+                    Button("Pair New Dial") { dial.pairNewDial() }
+                    Button("Forget Dial") { dial.forgetDial() }.disabled(!dial.hasKnownBluetoothDial)
+                }
+                Text("On the dial: long-press the knob › Bluetooth › Pair new Mac, then Pair New Dial here.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
             Section("Calibration") {
                 Stepper(String(format: "Frequency correction %.1f ppm", model.hardware.ppm),
                         value: Binding(get: { model.hardware.ppm }, set: { v in model.updateHardware { $0.ppm = v } }),

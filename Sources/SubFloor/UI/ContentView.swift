@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @Environment(AppModel.self) private var model
+    @Environment(DialController.self) private var dial
 
     var body: some View {
         let window = WindowContentLayout(minSize: CGSize(width: 1280, height: 720))
@@ -24,6 +25,21 @@ struct ContentView: View {
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
             }
+            .overlay(alignment: .topTrailing) {
+                if dial.hudVisible && dial.isConnected {
+                    DialHUD()
+                        .padding(.top, 72)
+                        .padding(.trailing, 18)
+                        .transition(.opacity.combined(with: .scale(scale: 0.92, anchor: .topTrailing)))
+                }
+            }
+            .overlay(alignment: .top) {
+                if dial.toastVisible && dial.isConnected {
+                    DialConnectedToast()
+                        .padding(.top, 140)
+                        .transition(.opacity.combined(with: .scale(scale: 0.85)))
+                }
+            }
             .overlay {
                 if model.quickTuneVisible {
                     ZStack(alignment: .top) {
@@ -35,6 +51,8 @@ struct ContentView: View {
             }
             .animation(.snappy(duration: 0.2), value: model.banner)
             .animation(.snappy(duration: 0.15), value: model.quickTuneVisible)
+            .animation(.easeOut(duration: 0.25), value: dial.hudVisible)
+            .animation(.spring(duration: 0.5, bounce: 0.3), value: dial.toastVisible)
         }
         .onAppear { model.startIfNeeded() }
     }

@@ -49,6 +49,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key><string>${BUILD}</string>
     <key>LSMinimumSystemVersion</key><string>15.0</string>
     <key>NSHighResolutionCapable</key><true/>
+    <key>NSBluetoothAlwaysUsageDescription</key><string>SubFloor connects to the SubFloor Dial tuning knob over Bluetooth.</string>
     <key>NSPrincipalClass</key><string>NSApplication</string>
 </dict>
 </plist>

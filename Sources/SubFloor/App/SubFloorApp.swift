@@ -4,6 +4,7 @@ import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: AppModel?
+    weak var dial: DialController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         MainActor.assumeIsolated {
@@ -26,7 +27,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        MainActor.assumeIsolated { model?.shutdown() }
+        MainActor.assumeIsolated {
+            dial?.shutdown()
+            model?.shutdown()
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { true }
@@ -35,10 +39,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct SubFloorApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @State private var model = AppModel()
+    @State private var model: AppModel
+    @State private var dial: DialController
     @AppStorage("appearance") private var appearance = "dark"
 
-    init() { NSApplication.shared.setActivationPolicy(.regular) }
+    init() {
+        NSApplication.shared.setActivationPolicy(.regular)
+        let model = AppModel()
+        _model = State(initialValue: model)
+        _dial = State(initialValue: DialController(model: model))
+    }
 
     private var scheme: ColorScheme? {
         switch appearance {
@@ -52,10 +62,13 @@ struct SubFloorApp: App {
         Window("SubFloor", id: "main") {
             ContentView()
                 .environment(model)
+                .environment(dial)
                 .preferredColorScheme(scheme)
                 .tint(Theme.accent)
                 .onAppear {
                     appDelegate.model = model
+                    appDelegate.dial = dial
+                    dial.start()
                     KeyboardController.shared.install(model: model)
                     NSApp.activate()
                 }
@@ -66,6 +79,7 @@ struct SubFloorApp: App {
         Settings {
             SettingsView()
                 .environment(model)
+                .environment(dial)
                 .preferredColorScheme(scheme)
         }
     }

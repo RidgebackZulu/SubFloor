@@ -5,10 +5,12 @@ import SwiftUI
 
 struct TopBarView: View {
     @Environment(AppModel.self) private var model
+    @Environment(DialController.self) private var dial
 
     var body: some View {
         HStack(spacing: 14) {
             DeviceChip()
+            DialChip()
             Button { model.toggleRun() } label: {
                 Image(systemName: model.isRunning ? "stop.fill" : "play.fill").frame(width: 18)
             }
@@ -16,7 +18,8 @@ struct TopBarView: View {
             .controlSize(.large)
             .help("Run / Stop (Space)")
 
-            FrequencyReadout(hz: model.vfoHz, onCommit: { model.tune(to: $0) }, onDigitStep: model.stepDigit)
+            FrequencyReadout(hz: model.vfoHz, onCommit: { model.tune(to: $0) }, onDigitStep: model.stepDigit,
+                             dialPower: dial.isConnected && dial.knob == .tune ? dial.stepPower : nil)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text("CENTER").font(.system(size: 9, weight: .semibold)).foregroundStyle(.tertiary)

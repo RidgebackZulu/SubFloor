@@ -6,10 +6,13 @@ struct FrequencyReadout: View {
     let hz: Double
     var onCommit: (Double) -> Void
     var onDigitStep: (Int, Int) -> Void
+    /// The power of ten the SubFloor Dial tunes (its step), underlined; nil without a dial.
+    var dialPower: Int?
 
     @State private var editing = false
     @State private var text = ""
     @FocusState private var focused: Bool
+    @Namespace private var dialDigit
 
     var body: some View {
         if editing {
@@ -37,7 +40,15 @@ struct FrequencyReadout: View {
                         Text(".").foregroundStyle(i <= firstSignificant ? .tertiary : .secondary)
                     }
                     Text("\(digits[i])")
-                        .foregroundStyle(i < firstSignificant ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.primary))
+                        .foregroundStyle(9 - i == dialPower ? AnyShapeStyle(Theme.vfo)
+                                         : i < firstSignificant ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.primary))
+                        .overlay(alignment: .bottom) {
+                            if 9 - i == dialPower {
+                                Capsule().fill(Theme.vfo).frame(height: 2.5).padding(.horizontal, 2).offset(y: 3)
+                                    .shadow(color: Theme.vfo.opacity(0.9), radius: 4)
+                                    .matchedGeometryEffect(id: "dialDigit", in: dialDigit)
+                            }
+                        }
                         .overlay(ScrollCatcher(onScroll: { onDigitStep(9 - i, $0) },
                                                onClick: { editing = true }))
                 }
@@ -47,6 +58,7 @@ struct FrequencyReadout: View {
             .monospacedDigit()
             .lineLimit(1)
             .fixedSize()
+            .animation(.snappy(duration: 0.18), value: dialPower)
             .help("Scroll a digit to step it · click to type (14.074, 7074k, 144.39m)")
         }
     }

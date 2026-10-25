@@ -539,6 +539,16 @@ final class AppModel {
         setVFO(((vfoHz / step).rounded() + Double(steps)) * step)
     }
 
+    /// The dial's knob: `steps` of `stepHz` from that step's grid, as `stepVFO` does with the mode's step.
+    func stepVFO(_ steps: Int, stepHz: Double) {
+        guard stepHz > 0 else { return }
+        setVFO(((vfoHz / stepHz).rounded() + Double(steps)) * stepHz)
+    }
+
+    func stepBandwidth(_ steps: Int) {
+        setBandwidth(bandwidthHz + Double(steps) * mode.bandwidthStep)
+    }
+
     func setMode(_ newMode: DemodMode) {
         guard newMode != mode else { return }
         mode = newMode

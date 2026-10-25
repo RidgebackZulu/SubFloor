@@ -4,6 +4,12 @@ import PackageDescription
 let sdrplayLinker: [LinkerSetting] = [
     .unsafeFlags(["-L/usr/local/lib", "-Xlinker", "-rpath", "-Xlinker", "/usr/local/lib"])
 ]
+/// `swift run` has no app bundle: the executable carries its Info.plist (the Bluetooth usage text
+/// macOS requires before SubFloor may look for the dial) in a section of its own.
+let embeddedInfoPlist: [LinkerSetting] = [
+    .unsafeFlags(["-Xlinker", "-sectcreate", "-Xlinker", "__TEXT", "-Xlinker", "__info_plist",
+                  "-Xlinker", "\(Context.packageDirectory)/Sources/SubFloor/Info.plist"])
+]
 let fastMath: [SwiftSetting] = [.unsafeFlags(["-Ounchecked"], .when(configuration: .release))]
 /// Vendored ft8_lib (see Sources/CFT8/VENDORED.md): its sources include each other by root-relative
 /// paths (<ft8/decode.h>), and its monitor logs to stderr unless LOG_PRINTF is defined.
@@ -27,9 +33,10 @@ let package = Package(
         .executableTarget(
             name: "SubFloor",
             dependencies: ["DSPCore", "SubFloorCore", "SDRplayKit", "Modems", "Recording"],
+            exclude: ["Info.plist"],
             resources: [.copy("Resources/AppIcon.png")],
             swiftSettings: fastMath,
-            linkerSettings: sdrplayLinker),
+            linkerSettings: sdrplayLinker + embeddedInfoPlist),
         .testTarget(name: "DSPCoreTests", dependencies: ["DSPCore"]),
         .testTarget(name: "ModemsTests", dependencies: ["Modems", "DSPCore"]),
         .testTarget(name: "SubFloorCoreTests", dependencies: ["SubFloorCore", "DSPCore"]),

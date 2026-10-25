@@ -11,6 +11,8 @@ enum Theme {
     static let modemBox = Color(red: 0.30, green: 0.86, blue: 0.47)
     static let modemCursor = Color(red: 1.0, green: 0.78, blue: 0.16)
     static let readout = Font.system(size: 30, weight: .medium, design: .monospaced)
+    /// The SubFloor Dial's "connected" glow.
+    static let dialGlow = Color(red: 0.32, green: 0.95, blue: 0.62)
 }
 
 extension Color {

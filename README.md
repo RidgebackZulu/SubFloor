@@ -124,6 +124,13 @@ already begun is not lost. Idle, the buttons' faint red fill shows how much pre-
 - Names: `SubFloor_20261022_143000Z_14074000Hz_USB.flac`, `SubFloor_20261022_143000Z_14100000Hz_IQ.wav`;
   the time is the first sample's. Stopping the radio finalises any open recording.
 
+## SubFloor Dial
+An M5Stack Dial running the SubFloor Dial firmware (`~/Desktop/code/radiodial`) tunes SubFloor over
+USB or Bluetooth LE; USB wins when both are up. The top-bar chip glows "Dial Connected" while it is,
+the readout underlines the digit the dial tunes, and a HUD shows the knob, step and mode while it is
+used. Pair: on the dial long-press the knob › Bluetooth › Pair new Mac, then click the Dial chip ›
+Pair New Dial (or Settings › SubFloor Dial). Code: `Sources/SubFloor/Dial/`.
+
 ## Modem panel
 Pick a mode (CW, PSK31, FT8, WSPR) in the panel under the spectrum. The modem decodes what the receiver
 is tuned to: its window is the receiver's passband (on USB, 300 Hz up to the passband's top edge, at
