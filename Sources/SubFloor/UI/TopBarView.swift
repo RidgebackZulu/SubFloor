@@ -68,10 +68,11 @@ private struct DeviceChip: View {
 
     var body: some View {
         HStack(spacing: 6) {
+            let connecting = !model.isRunning && model.rspConnection == .opening
             Circle()
-                .fill(model.isRunning ? (model.sourceKind == .sdrplay ? Color.green : Color.orange) : Color.gray)
+                .fill(model.isRunning ? (model.sourceKind == .sdrplay ? Color.green : Color.orange) : connecting ? Color.yellow : Color.gray)
                 .frame(width: 8, height: 8)
-            Text(model.isRunning ? model.deviceName : "Stopped").font(.callout.weight(.medium))
+            Text(model.isRunning ? model.deviceName : connecting ? "Connecting…" : "Stopped").font(.callout.weight(.medium))
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 5)

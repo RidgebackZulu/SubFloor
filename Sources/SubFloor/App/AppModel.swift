@@ -8,7 +8,7 @@ import SubFloorCore
 import SwiftUI
 import UniformTypeIdentifiers
 
-enum BannerAction: Equatable { case retry, reduceGain }
+enum BannerAction: Equatable { case retry, reduceGain, copyServiceRestart }
 
 struct Banner: Identifiable, Equatable {
     enum Kind { case info, warning, error }
@@ -137,6 +137,20 @@ final class AppModel {
     /// Set when opening the RSP failed; later start() calls fall back to demo without retrying until retry()/useSource(.sdrplay).
     private(set) var rspOpenFailed = false
 
+    /// The RSP is opened on a background thread (`openRSPInBackground`): the SDRplay API blocks for
+    /// ever when its service is stuck (a client died holding the API's cross-process lock), and on
+    /// the main thread that left the app without a window. `.opening`: an open is in flight and the
+    /// radio waits for it. `.stalled`: it has not returned within `rspOpenTimeout`; the demo signal
+    /// runs, and since that thread is still inside the API no other open is tried until relaunch.
+    enum RSPConnection: Equatable { case idle, opening, stalled }
+    private(set) var rspConnection: RSPConnection = .idle
+    private var rspOpenAttempt = 0
+    private let openRSP: @Sendable () throws -> SDRplayDevice
+    private let rspOpenTimeout: Duration
+    private var isShutDown = false
+    static let serviceRestartCommand = "sudo launchctl kickstart -k system/com.sdrplay.service"
+    static let serviceStalledMessage = "The SDRplay service is not responding, so the demo signal is running. Restart the service in Terminal, then reopen SubFloor."
+
     let engine = DSPEngine()
     private var sdrplay: SDRplayDevice?
     private let synthetic = SyntheticSource()
@@ -151,9 +165,14 @@ final class AppModel {
 
     convenience init() { self.init(bookmarkStore: BookmarkStore(url: BookmarkStore.defaultURL), defaults: .standard) }
 
-    init(bookmarkStore: BookmarkStore, defaults: UserDefaults) {
+    /// `openRSP` and `rspOpenTimeout`: tests replace the device and the wait.
+    init(bookmarkStore: BookmarkStore, defaults: UserDefaults,
+         openRSP: @escaping @Sendable () throws -> SDRplayDevice = { try SDRplayDevice.open() },
+         rspOpenTimeout: Duration = .seconds(10)) {
         self.bookmarkStore = bookmarkStore
         self.defaults = defaults
+        self.openRSP = openRSP
+        self.rspOpenTimeout = rspOpenTimeout
         let (loaded, result) = bookmarkStore.load()
         bookmarks = loaded
         switch result {
@@ -251,23 +270,24 @@ final class AppModel {
 
     func toggleRun() { isRunning ? stop() : start() }
 
+    /// Starts the preferred source. Without an open RSP this first opens one in the background and
+    /// returns; the open's outcome starts the radio (`finishRSPOpen`, `rspOpenTimedOut`).
     func start() {
         stop()
         var kind = preferredSource
-        if kind == .sdrplay && sdrplay == nil && rspOpenFailed {
-            kind = .synthetic
-        } else if kind == .sdrplay && sdrplay == nil {
-            do {
-                let device = try SDRplayDevice.open()
-                device.onEvent = { [weak self, weak device] event in
-                    guard let self, let device else { return }
-                    Task { @MainActor in self.handle(event, from: device) }
-                }
-                sdrplay = device
-            } catch {
-                rspOpenFailed = true
-                show(Banner(kind: .warning, message: "No RSP found — demo signal. \(error)", action: .retry))
+        if kind == .sdrplay && sdrplay == nil {
+            switch rspConnection {
+            case .opening:
+                return
+            case .stalled:
                 kind = .synthetic
+            case .idle:
+                if rspOpenFailed {
+                    kind = .synthetic
+                } else {
+                    openRSPInBackground()
+                    return
+                }
             }
         }
         if kind == .file && fileSource == nil { kind = .synthetic }
@@ -310,6 +330,7 @@ final class AppModel {
 
     /// Orderly shutdown (app quit): stop the engine, release the RSP, persist the session. Idempotent.
     func shutdown() {
+        isShutDown = true
         engine.stop()
         isRunning = false
         sdrplay?.close()
@@ -327,6 +348,7 @@ final class AppModel {
             device.close()
             sdrplay = nil
         }
+        if preferredSource == .sdrplay, rspConnection == .stalled { showServiceStalled() }
         start()
     }
 
@@ -336,7 +358,79 @@ final class AppModel {
         case .reduceGain:
             updateHardware { $0.ifGainReductionDb = min($0.ifGainReductionDb + 6, RSP1B.ifGainReductionRange.upperBound) }
             banner = nil
+        case .copyServiceRestart:
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(Self.serviceRestartCommand, forType: .string)
+            banner = Banner(kind: .info, message: "Copied. Paste it into Terminal, enter your password, then reopen SubFloor.")
         }
+    }
+
+    // MARK: Opening the RSP
+
+    /// Opens the RSP on its own thread. The radio stays stopped (the chip says "Connecting") until
+    /// the open returns, or for at most `rspOpenTimeout`, after which the demo signal runs.
+    private func openRSPInBackground() {
+        rspConnection = .opening
+        rspOpenAttempt += 1
+        let attempt = rspOpenAttempt, open = openRSP
+        let thread = Thread { [weak self] in
+            let result = Result { try open() }
+            Task { @MainActor in
+                guard let self else {
+                    if case .success(let device) = result { device.close() }
+                    return
+                }
+                self.finishRSPOpen(attempt, result)
+            }
+        }
+        thread.name = "SubFloor RSP open"
+        thread.start()
+        Task { [weak self, timeout = rspOpenTimeout] in
+            try? await Task.sleep(for: timeout)
+            self?.rspOpenTimedOut(attempt)
+        }
+    }
+
+    private func rspOpenTimedOut(_ attempt: Int) {
+        guard attempt == rspOpenAttempt, rspConnection == .opening, !isShutDown else { return }
+        rspConnection = .stalled
+        guard preferredSource == .sdrplay else { return }
+        showServiceStalled()
+        start()
+    }
+
+    private func finishRSPOpen(_ attempt: Int, _ result: Result<SDRplayDevice, any Error>) {
+        guard attempt == rspOpenAttempt else {
+            if case .success(let device) = result { device.close() }
+            return
+        }
+        let wasStalled = rspConnection == .stalled
+        rspConnection = .idle
+        switch result {
+        case .success(let device):
+            // Not wanted any more (another source chosen, or quitting): release it at once.
+            guard !isShutDown, preferredSource == .sdrplay, sdrplay == nil else {
+                device.close()
+                return
+            }
+            device.onEvent = { [weak self, weak device] event in
+                guard let self, let device else { return }
+                Task { @MainActor in self.handle(event, from: device) }
+            }
+            sdrplay = device
+            if banner?.action == .copyServiceRestart { banner = nil }
+            start()
+        case .failure(let error):
+            rspOpenFailed = true
+            // After a stall the demo is already running and the banner already up.
+            guard !isShutDown, preferredSource == .sdrplay, !wasStalled else { return }
+            show(Banner(kind: .warning, message: "No RSP found — demo signal. \(error)", action: .retry))
+            start()
+        }
+    }
+
+    private func showServiceStalled() {
+        show(Banner(kind: .error, message: Self.serviceStalledMessage, action: .copyServiceRestart))
     }
 
     func useSource(_ kind: SourceKind) {
@@ -347,6 +441,7 @@ final class AppModel {
         preferredSource = kind
         if kind == .sdrplay {
             rspOpenFailed = false
+            if rspConnection == .stalled { showServiceStalled() }
         } else if sdrplay != nil {
             // Free the RSP for other apps while a different source is in use.
             stop()

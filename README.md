@@ -7,7 +7,7 @@ the receiver's passband at once.
 
 ## Requirements
 - macOS on Apple Silicon, Xcode 26 / Swift 6.2
-- [SDRplay API 3.15](https://www.sdrplay.com/api/) installed (`/usr/local/lib/libsdrplay_api.dylib`). The SDRplay API service must be installed and running, or the RSP cannot be opened (SubFloor then falls back to the demo signal; use Retry once it is up).
+- [SDRplay API 3.15](https://www.sdrplay.com/api/) installed (`/usr/local/lib/libsdrplay_api.dylib`). The SDRplay API service must be installed and running, or the RSP cannot be opened (SubFloor then falls back to the demo signal; use Retry once it is up). If the service stops answering (a client that died inside the API can leave its lock held), SubFloor shows "Connecting…", then runs the demo signal with a banner; restart the service with `sudo launchctl kickstart -k system/com.sdrplay.service` (the banner copies it) and reopen SubFloor. Ctrl-C, `kill` and closing the terminal quit SubFloor normally, so the RSP is always released.
 
 ## Build & run
 ```bash
