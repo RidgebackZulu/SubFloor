@@ -32,6 +32,8 @@ records lossless audio and IQ that start *before* you press the button.
   passbands.
 - ⬆️ **HamItUp in one click.** Upconverter mode tunes the radio 125 MHz above what you see, so HF and
   LF work through a HamItUp.
+- 🎛️ **A real tuning knob.** The SubFloor Dial (an M5Stack Dial) tunes from 1 Hz to 1 MHz a step,
+  switches AM/LSB/USB with a tap, and connects over Bluetooth or USB. [More below](#subfloor-dial).
 - 🔖 **Bookmarks on the spectrum.** Flags float above the signals; click one to tune, right-click to edit.
 - 🛟 **Calm when the radio isn't.** No RSP or a stuck SDRplay service? SubFloor falls back to a built-in
   demo signal and tells you how to fix it.
@@ -125,11 +127,26 @@ already begun is not lost. Idle, the buttons' faint red fill shows how much pre-
   the time is the first sample's. Stopping the radio finalises any open recording.
 
 ## SubFloor Dial
-An M5Stack Dial running the SubFloor Dial firmware (`~/Desktop/code/radiodial`) tunes SubFloor over
-USB or Bluetooth LE; USB wins when both are up. The top-bar chip glows "Dial Connected" while it is,
-the readout underlines the digit the dial tunes, and a HUD shows the knob, step and mode while it is
-used. Pair: on the dial long-press the knob › Bluetooth › Pair new Mac, then click the Dial chip ›
-Pair New Dial (or Settings › SubFloor Dial). Code: `Sources/SubFloor/Dial/`.
+<p align="center"><img src="docs/images/dial.png" alt="The SubFloor Dial tuning SubFloor" width="100%"></p>
+
+An [M5Stack Dial](https://docs.m5stack.com/en/core/M5Dial) becomes a tuning knob for SubFloor, over
+Bluetooth LE or USB (USB wins when both are up). The top-bar chip glows "Dial Connected", the readout
+underlines the digit the knob tunes, and a HUD shows the knob, step and mode while you turn it.
+
+| On the dial | Does |
+| --- | --- |
+| Turn | Tune by the step (the amber digit) |
+| Press | Next coarser step, 1 Hz → 1 MHz, then back to 1 Hz |
+| Hold and turn | Pick the step |
+| Long-press | Settings: Bluetooth, acceleration, direction, brightness, sounds |
+| Tap AM / LSB / USB | Switch mode |
+| Tap a digit · swipe | Tune that digit · coarser / finer step |
+| Tap the BW line | The knob sets the bandwidth; press to go back to tuning |
+
+**Firmware:** flash `SubFloorDial-<version>.bin` from the release with
+`esptool.py --chip esp32s3 write_flash 0 SubFloorDial-1.0.0.bin`.
+**Pairing:** on the dial, long-press › Bluetooth › Pair new Mac; in SubFloor, click the Dial chip ›
+Pair New Dial (or Settings › SubFloor Dial). Over USB, just plug it in. Code: `Sources/SubFloor/Dial/`.
 
 ## Modem panel
 Pick a mode (CW, PSK31, FT8, WSPR) in the panel under the spectrum. The modem decodes what the receiver
