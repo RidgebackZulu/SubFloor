@@ -1,5 +1,5 @@
 #!/bin/zsh
-# Builds a release SubFloor.app in ./build with an ad-hoc signature.
+# Builds a release SubFloor.app in ./build (ad-hoc signed, or with SIGN_IDENTITY; see the end).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -20,7 +20,9 @@ for size in 16 32 128 256 512; do
 done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+VERSION="${VERSION:-0.1.0}"
+BUILD="${BUILD:-1}"
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -30,8 +32,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key><string>app.subfloor.SubFloor</string>
     <key>CFBundleName</key><string>SubFloor</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>0.1.0</string>
-    <key>CFBundleVersion</key><string>1</string>
+    <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+    <key>CFBundleVersion</key><string>${BUILD}</string>
     <key>LSMinimumSystemVersion</key><string>15.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -39,5 +41,13 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-codesign --force --sign - "$APP"
+# Ad-hoc by default. SIGN_IDENTITY="Developer ID Application: …" signs for distribution: hardened
+# runtime, a secure timestamp, and the entitlement that lets the SDRplay API load.
+if [[ -n "${SIGN_IDENTITY:-}" ]]; then
+    codesign --force --options runtime --timestamp --entitlements scripts/SubFloor.entitlements \
+        --sign "$SIGN_IDENTITY" "$APP"
+    codesign --verify --strict --verbose=2 "$APP"
+else
+    codesign --force --sign - "$APP"
+fi
 echo "Built $APP"

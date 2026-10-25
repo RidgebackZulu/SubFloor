@@ -1,23 +1,97 @@
-# SubFloor
+<p align="center">
+  <img src="docs/images/banner.png" alt="SubFloor: a fast, native macOS receiver for the SDRplay RSP1B" width="100%">
+</p>
 
-A fast, native macOS (Apple Silicon) receiver for the SDRplay RSP1B: Metal spectrum + waterfall,
-AM/NFM/WFM/USB/LSB/CW audio, HamItUp upconverter mode, bookmarks, lossless audio and IQ recording with
-a rolling pre-roll, and a multi-signal modem panel that decodes every CW, PSK31, FT8 and WSPR signal in
-the receiver's passband at once.
+<p align="center">
+  <a href="https://github.com/RidgebackZulu/SubFloor/releases/latest"><img alt="Download SubFloor for macOS" src="https://img.shields.io/badge/Download-macOS%20·%20Apple%20Silicon-5CD6FF?style=for-the-badge&logo=apple&logoColor=white"></a>
+</p>
 
-## Requirements
-- macOS on Apple Silicon, Xcode 26 / Swift 6.2
-- [SDRplay API 3.15](https://www.sdrplay.com/api/) installed (`/usr/local/lib/libsdrplay_api.dylib`). The SDRplay API service must be installed and running, or the RSP cannot be opened (SubFloor then falls back to the demo signal; use Retry once it is up). If the service stops answering (a client that died inside the API can leave its lock held), SubFloor shows "Connecting…", then runs the demo signal with a banner; restart the service with `sudo launchctl kickstart -k system/com.sdrplay.service` (the banner copies it) and reopen SubFloor. Ctrl-C, `kill` and closing the terminal quit SubFloor normally, so the RSP is always released.
+<p align="center">
+  <img alt="Latest release" src="https://img.shields.io/github/v/release/RidgebackZulu/SubFloor?style=flat-square&color=4DDB78">
+  <img alt="macOS 15 or later" src="https://img.shields.io/badge/macOS-15%2B-0B1020?style=flat-square&logo=apple">
+  <img alt="Swift 6.2" src="https://img.shields.io/badge/Swift-6.2-FF6B35?style=flat-square&logo=swift&logoColor=white">
+  <img alt="SDRplay API 3.15" src="https://img.shields.io/badge/SDRplay%20API-3.15-FFB847?style=flat-square">
+</p>
 
-## Build & run
+<h3 align="center">Plug in your RSP1B, hit Space, and watch the band light up.</h3>
+
+SubFloor is a native macOS receiver for the SDRplay RSP1B. It's built for Apple Silicon, with a Metal
+waterfall that keeps up with the radio. It decodes every digital signal in your passband at once, and it
+records lossless audio and IQ that start *before* you press the button.
+
+## ✨ What it does
+
+- 🌊 **A waterfall that keeps up.** Metal rendering at up to 120 fps, FFTs up to 65,536 points, and
+  pinch, zoom and pan that never retune the radio.
+- 📡 **Decodes the whole passband at once.** Every CW, PSK31, FT8 and WSPR signal in the receiver's
+  passband gets its own decoder. Click one and the bench shows its waveform, its spectrum within
+  ±100 Hz and its IQ.
+- ⏪ **Records the past.** A rolling pre-roll keeps the last 5 to 120 seconds in memory, so a recording
+  starts before your click. FLAC, WAV, Apple Lossless or SigMF, and all of it lossless.
+- 🎧 **Every voice mode.** AM, NFM, WFM, USB, LSB and CW, with AGC, squelch and drag-to-resize
+  passbands.
+- ⬆️ **HamItUp in one click.** Upconverter mode tunes the radio 125 MHz above what you see, so HF and
+  LF work through a HamItUp.
+- 🔖 **Bookmarks on the spectrum.** Flags float above the signals; click one to tune, right-click to edit.
+- 🛟 **Calm when the radio isn't.** No RSP or a stuck SDRplay service? SubFloor falls back to a built-in
+  demo signal and tells you how to fix it.
+
+## 📡 Every FT8 signal on 20 m, live
+
+<p align="center"><img src="docs/images/ft8.jpg" alt="SubFloor decoding 23 FT8 messages in one slot on 20 m, with the bench showing the strongest signal's waveform, micro spectrum and IQ" width="100%"></p>
+
+That's a real capture from an RSP1B through a HamItUp: 23 FT8 messages decoded in one 15-second slot,
+from across North America and Europe. The amber row is locked on the strongest signal, and the bench
+above the list takes it apart.
+
+## ⏪ Missed the start? You didn't.
+
+<p align="center"><img src="docs/images/recording.jpg" alt="SubFloor recording audio and IQ on the 19 m shortwave broadcast band, started 20 seconds before the click" width="100%"></p>
+
+The 19 m shortwave broadcast band, two megahertz wide. Both recordings started 20 seconds before the
+click, because the save buffer never stops running. Press **Audio**, **IQ** or **Both** (⌘⇧A, ⌘⇧I,
+⌘⇧R) and SubFloor writes what it has already heard, then keeps going.
+
+## 🎛 Lossless, your way
+
+<p align="center"><img src="docs/images/recording-settings.png" alt="SubFloor's recording settings: pre-roll length, audio and IQ formats, sample formats, memory limit and folder" width="100%"></p>
+
+## 🚀 Install
+
+<p align="center"><img src="docs/images/install.png" alt="The SubFloor disk image: drag SubFloor to Applications" width="560"></p>
+
+1. **Install the [SDRplay API 3.15](https://www.sdrplay.com/api/).** SubFloor links against it and
+   won't open without it.
+2. **Download `SubFloor-x.y.z.dmg`** from the [latest release](https://github.com/RidgebackZulu/SubFloor/releases/latest),
+   open it, and drag SubFloor to Applications.
+3. **Approve it once.** The app is signed with a Developer ID but not yet notarized, so the first launch
+   is blocked. Open **System Settings → Privacy & Security** and click **Open Anyway**. Or run:
+   ```bash
+   xattr -dr com.apple.quarantine /Applications/SubFloor.app
+   ```
+
+You need an Apple Silicon Mac with macOS 15 or later. No radio yet? SubFloor runs a built-in demo
+signal around 14.1 MHz, so you can explore everything first.
+
+## Build from source
+You need macOS 15 or later on Apple Silicon, Xcode 26 (Swift 6.2), and the
+[SDRplay API 3.15](https://www.sdrplay.com/api/) installed at `/usr/local/lib/libsdrplay_api.dylib`.
 ```bash
 swift run -c release SubFloor        # run from source
 scripts/bundle.sh                    # build build/SubFloor.app (with its icon)
+VERSION=0.1.0 SIGN_IDENTITY="Developer ID Application: …" scripts/make_dmg.sh   # signed release DMG
 python3 scripts/make_icon.py Sources/SubFloor/Resources/AppIcon.png   # redraw the icon (needs Pillow, NumPy)
 swift test                           # unit tests
 SUBFLOOR_HW=1 swift test             # also run the RSP1B hardware smoke test
 ```
-Without an RSP connected, SubFloor runs on a built-in demo signal around 14.1 MHz.
+
+### When the RSP won't connect
+The SDRplay API service must be running, or the RSP can't be opened: SubFloor then falls back to the
+demo signal (use Retry once it is up). If the service stops answering (a client that died inside the
+API can leave its lock held), SubFloor shows "Connecting…", then runs the demo signal with a banner.
+Restart the service with `sudo launchctl kickstart -k system/com.sdrplay.service` (the banner copies
+it) and reopen SubFloor. Ctrl-C, `kill` and closing the terminal quit SubFloor normally, so the RSP is
+always released.
 
 ## Using it
 | Action | How |
