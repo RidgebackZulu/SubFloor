@@ -64,11 +64,8 @@ click, because the save buffer never stops running. Press **Audio**, **IQ** or *
    won't open without it.
 2. **Download `SubFloor-x.y.z.dmg`** from the [latest release](https://github.com/RidgebackZulu/SubFloor/releases/latest),
    open it, and drag SubFloor to Applications.
-3. **Approve it once.** The app is signed with a Developer ID but not yet notarized, so the first launch
-   is blocked. Open **System Settings → Privacy & Security** and click **Open Anyway**. Or run:
-   ```bash
-   xattr -dr com.apple.quarantine /Applications/SubFloor.app
-   ```
+3. **Open it.** SubFloor is signed with a Developer ID and notarized by Apple, so it opens like any
+   other app.
 
 You need an Apple Silicon Mac with macOS 15 or later. No radio yet? SubFloor runs a built-in demo
 signal around 14.1 MHz, so you can explore everything first.

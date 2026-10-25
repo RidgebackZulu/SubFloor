@@ -11,6 +11,19 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/SubFloor"
 
+# No library search paths outside the app or the OS. SwiftPM leaves this Mac's Xcode toolchain and
+# /usr/local/lib as rpaths; dyld would try the toolchain path first on every user's Mac (absent there,
+# and a hijack point, since the app may load libraries from other signers). The SDRplay API is linked
+# by the path its installer creates instead.
+EXE="$APP/Contents/MacOS/SubFloor"
+install_name_tool -change @rpath/libsdrplay_api.so.3 /usr/local/lib/libsdrplay_api.so.3 "$EXE"
+for rpath in $(otool -l "$EXE" | awk '$1 == "cmd" && $2 == "LC_RPATH" { getline; getline; print $2 }'); do
+    case "$rpath" in
+        /usr/lib/swift|@*) ;;
+        *) install_name_tool -delete_rpath "$rpath" "$EXE" ;;
+    esac
+done
+
 # App icon: every size iconutil wants, from the 1024 px PNG (redraw it with scripts/make_icon.py).
 ICONSET="$(mktemp -d)/AppIcon.iconset"
 mkdir -p "$ICONSET"
