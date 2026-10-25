@@ -6,7 +6,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: AppModel?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        MainActor.assumeIsolated { Self.setDockIcon() }
+        MainActor.assumeIsolated {
+            Self.setDockIcon()
+            TerminationSignals.install()
+        }
     }
 
     /// The .app from `scripts/bundle.sh` has its icon in Info.plist; under `swift run` there is no

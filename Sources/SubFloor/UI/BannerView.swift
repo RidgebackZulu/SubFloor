@@ -8,10 +8,11 @@ struct BannerView: View {
     var body: some View {
         HStack(spacing: 10) {
             Image(systemName: icon).foregroundStyle(tint)
-            Text(banner.message).lineLimit(2)
+            Text(banner.message).lineLimit(3)
             if let action = banner.action {
-                Button(action == .retry ? "Retry" : "Reduce gain") { model.perform(action) }
+                Button(label(action)) { model.perform(action) }
                     .controlSize(.small)
+                    .help(action == .copyServiceRestart ? AppModel.serviceRestartCommand : "")
             }
             Button { model.banner = nil } label: { Image(systemName: "xmark") }
                 .buttonStyle(.plain).foregroundStyle(.secondary)
@@ -21,6 +22,14 @@ struct BannerView: View {
         .background(.regularMaterial, in: Capsule())
         .overlay(Capsule().strokeBorder(tint.opacity(0.4)))
         .shadow(color: .black.opacity(0.35), radius: 12, y: 4)
+    }
+
+    private func label(_ action: BannerAction) -> String {
+        switch action {
+        case .retry: "Retry"
+        case .reduceGain: "Reduce gain"
+        case .copyServiceRestart: "Copy restart command"
+        }
     }
 
     private var icon: String {

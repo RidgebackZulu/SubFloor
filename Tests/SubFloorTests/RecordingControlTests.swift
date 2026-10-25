@@ -75,11 +75,14 @@ struct RecordingControlTests {
         #expect(!m.isRecordingAny)
         let iq = m.recordingStatus[.iq]!, audio = m.recordingStatus[.audio]!
         #expect(iq.error == nil && audio.error == nil)
-        // The files start as far before the click as the pre-roll had primed, then run to the stop.
+        // The files start before the click (by the pre-roll, at most its length) and run to the stop.
+        // The exact rewind is checked with a fixed clock in StreamRecorderTests: here the pre-roll is
+        // counted in samples and the click in wall time, which drift apart when the debug demo
+        // source falls behind real time under load.
         for s in [iq, audio] {
             let before = click.timeIntervalSince(s.startedAt!)
-            #expect(abs(before - primed) < 0.15)
-            #expect(s.duration > before + 0.1 && s.duration < 3)
+            #expect(before > 0.02 && before < m.recording.preRollSeconds + 0.5)
+            #expect(s.duration > before && s.duration < 3)
         }
         #expect(iq.url?.lastPathComponent.hasSuffix("Hz_IQ.wav") == true)
         #expect(audio.url?.lastPathComponent.hasSuffix("Hz_USB.flac") == true)

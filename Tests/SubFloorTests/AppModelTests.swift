@@ -1,8 +1,31 @@
+import AppKit
 import DSPCore
 import Foundation
+import SDRplayKit
 import SubFloorCore
+import Synchronization
 import Testing
 @testable import SubFloor
+
+/// A stand-in for `SDRplayDevice.open`: counts calls, and either fails at once or blocks until
+/// released (a stuck SDRplay service), then fails.
+final class FakeRSPOpener: Sendable {
+    let calls = Mutex(0)
+    private let blocks: Bool
+    private let gate = DispatchSemaphore(value: 0)
+
+    init(blocks: Bool = false) { self.blocks = blocks }
+
+    var callCount: Int { calls.withLock { $0 } }
+    /// Lets every blocked open return (with an error).
+    func release() { for _ in 0..<8 { gate.signal() } }
+
+    func open() throws -> SDRplayDevice {
+        calls.withLock { $0 += 1 }
+        if blocks { gate.wait() }
+        throw SDRplayError.noDevice
+    }
+}
 
 @MainActor
 struct AppModelTests {
@@ -12,10 +35,28 @@ struct AppModelTests {
         return dir
     }
 
-    private func makeModel(dir: URL? = nil) -> AppModel {
+    /// Never opens the real RSP: a unit test that did could hang on a stuck SDRplay service.
+    private func makeModel(dir: URL? = nil, opener: FakeRSPOpener = FakeRSPOpener(),
+                           timeout: Duration = .seconds(10)) -> AppModel {
         let dir = dir ?? tempDir()
         return AppModel(bookmarkStore: BookmarkStore(url: dir.appendingPathComponent("bookmarks.json")),
-                        defaults: UserDefaults(suiteName: UUID().uuidString)!)
+                        defaults: UserDefaults(suiteName: UUID().uuidString)!,
+                        openRSP: { try opener.open() }, rspOpenTimeout: timeout)
+    }
+
+    /// Waits (letting the main actor run) until `condition` holds or `seconds` pass. In the full
+    /// suite other tests can hold the main thread for seconds; past the deadline it yields once
+    /// more, so main-actor work that came due meanwhile (the open's timeout) runs before the last check.
+    private func eventually(_ seconds: Double = 10, _ condition: () -> Bool) async -> Bool {
+        let deadline = Date().addingTimeInterval(seconds)
+        while !condition() {
+            if Date() > deadline {
+                await Task.yield()
+                return condition()
+            }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return true
     }
 
     @Test func shutdownOnUnstartedModelIsSafeAndIdempotent() {
@@ -25,17 +66,76 @@ struct AppModelTests {
         #expect(!m.isRunning)
     }
 
-    @Test func failedRSPOpenFallsBackToDemoWithoutRetrying() {
-        let m = makeModel()
-        m.start()
+    @Test func failedRSPOpenFallsBackToDemoWithoutRetrying() async {
+        let opener = FakeRSPOpener()
+        let m = makeModel(opener: opener)
         defer { m.shutdown() }
-        guard m.sourceKind == .synthetic else { return }   // an RSP is actually present: nothing to assert
+        m.start()
+        #expect(await eventually { m.isRunning })
+        #expect(m.sourceKind == .synthetic)
         #expect(m.rspOpenFailed)
+        #expect(m.banner?.action == .retry)
+        #expect(m.rspConnection == .idle)
         m.banner = nil
         m.start()   // e.g. a sample-rate change: must not retry or re-show the banner
         #expect(m.banner == nil)
+        #expect(opener.callCount == 1)
         m.useSource(.sdrplay)   // explicit request clears the flag and tries again
-        #expect(m.banner != nil)
+        #expect(await eventually { m.banner != nil })
+        #expect(opener.callCount == 2)
+    }
+
+    /// A stuck SDRplay service blocks the open for ever: the radio waits (stopped, "Connecting")
+    /// until the timeout, then runs the demo signal with the restart banner, and opens nothing more.
+    @Test func stalledRSPOpenFallsBackToDemoWithTheRestartBanner() async {
+        let opener = FakeRSPOpener(blocks: true)
+        let m = makeModel(opener: opener, timeout: .milliseconds(200))
+        defer {
+            m.shutdown()
+            opener.release()
+        }
+        m.start()
+        #expect(!m.isRunning)
+        #expect(m.rspConnection == .opening)
+        #expect(await eventually { m.isRunning })
+        #expect(m.sourceKind == .synthetic)
+        #expect(m.rspConnection == .stalled)
+        #expect(m.banner?.action == .copyServiceRestart)
+        #expect(m.banner?.message == AppModel.serviceStalledMessage)
+        m.banner = nil
+        m.start()
+        m.useSource(.sdrplay)   // the API is stuck in this process: no second open
+        #expect(m.banner?.action == .copyServiceRestart)
+        try? await Task.sleep(for: .milliseconds(300))
+        #expect(opener.callCount == 1)
+        #expect(m.isRunning && m.sourceKind == .synthetic)
+        // The stuck open finally failing changes nothing the user sees.
+        opener.release()
+        #expect(await eventually { m.rspConnection == .idle })
+        #expect(m.isRunning && m.sourceKind == .synthetic)
+        #expect(m.banner?.action == .copyServiceRestart)
+    }
+
+    @Test func choosingDemoWhileTheRSPOpensRunsTheDemoAndIgnoresTheOpen() async {
+        let opener = FakeRSPOpener(blocks: true)
+        let m = makeModel(opener: opener)
+        defer { m.shutdown() }
+        m.start()
+        #expect(m.rspConnection == .opening)
+        m.useSource(.synthetic)
+        #expect(m.isRunning && m.sourceKind == .synthetic)
+        opener.release()
+        #expect(await eventually { m.rspConnection == .idle })
+        #expect(m.isRunning && m.sourceKind == .synthetic)
+        #expect(m.banner == nil)
+    }
+
+    @Test func copyingTheRestartCommandPutsItOnThePasteboard() {
+        let m = makeModel()
+        defer { m.shutdown() }
+        m.perform(.copyServiceRestart)
+        #expect(NSPasteboard.general.string(forType: .string) == AppModel.serviceRestartCommand)
+        #expect(m.banner?.kind == .info)
     }
 
     @Test func switchingToDemoLeavesNoDeviceOpen() {
