@@ -1,3 +1,4 @@
+import Accelerate
 import Foundation
 
 public enum AGCSpeed: String, CaseIterable, Codable, Sendable {
@@ -59,6 +60,36 @@ public struct AGC: Sendable {
         }
         envelope = env
     }
+}
+
+/// Mean power of a complex stream over a sliding window of the last `window` samples (fewer
+/// until that many have arrived), whatever size the blocks come in.
+struct MovingPower: Sendable {
+    private var squares: [Float]
+    private var next = 0
+    private var filled = 0
+    private var sum = 0.0
+
+    init(window: Int) {
+        squares = [Float](repeating: 0, count: max(1, window))
+    }
+
+    mutating func add(_ x: UnsafeBufferPointer<DSPComplex>) {
+        let n = squares.count
+        for v in x {
+            let p = v.real * v.real + v.imag * v.imag
+            sum += Double(p) - Double(squares[next])
+            squares[next] = p
+            filled = min(filled + 1, n)
+            next += 1
+            if next == n {
+                next = 0
+                sum = squares.reduce(0) { $0 + Double($1) }   // once per window: no drift
+            }
+        }
+    }
+
+    var mean: Float { filled == 0 ? 0 : Float(max(sum, 0) / Double(filled)) }
 }
 
 /// Streaming linear-interpolation resampler for band-limited audio.

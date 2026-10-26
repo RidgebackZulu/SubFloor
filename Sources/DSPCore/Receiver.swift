@@ -26,8 +26,18 @@ public final class Receiver: @unchecked Sendable {
 
     public static let audioRate = 48_000.0
 
+    /// Squelch timing. The level is the channel power over the last `levelSeconds` (one block is
+    /// too few samples: on noise it jitters by more than the hysteresis, and the gate chatters);
+    /// the gate stays open `hangSeconds` after the level falls below the threshold, and its gain
+    /// ramps over `fadeSeconds` rather than stepping.
+    static let squelchLevelSeconds = 0.03
+    static let squelchHangSeconds = 0.15
+    static let squelchFadeSeconds = 0.005
+    static let squelchHysteresisDb: Float = 2
+
     public private(set) var config: Config
     public private(set) var channelRate: Double = 0
+    /// Channel power in dBFS over the last `squelchLevelSeconds`.
     public private(set) var signalDb: Float = -200
 
     private var nco = NCO()
@@ -37,7 +47,10 @@ public final class Receiver: @unchecked Sendable {
     private var audioFilter = FIRDecimator(taps: [1], factor: 1)
     private var resampler = LinearResampler(inputRate: 48_000, outputRate: 48_000)
     private var agc = AGC(speed: .medium, sampleRate: 48_000)
-    private var squelchOpen = true
+    private var squelchOpen = false       // starts shut: audio fades in from the first block
+    private var squelchHang = 0.0         // seconds left before an open gate may close
+    private var squelchGain: Float = 0    // ramps towards 1 (open) or 0 (shut)
+    private var level = MovingPower(window: 1)
     private var work: [DSPComplex] = []
     private var work2: [DSPComplex] = []
     private var demodOut: [Float] = []
@@ -111,7 +124,7 @@ public final class Receiver: @unchecked Sendable {
         audioFilter = FIRDecimator(taps: audioTaps, factor: audioFactor)
         resampler = LinearResampler(inputRate: rate / Double(audioFactor), outputRate: Self.audioRate)
         agc.reconfigure(speed: config.agc, sampleRate: Self.audioRate)   // keeps the envelope: no pop on rebuild
-        squelchOpen = true
+        level = MovingPower(window: Int(rate * Self.squelchLevelSeconds))   // the gate keeps its state
         retune()
     }
 
@@ -128,17 +141,20 @@ public final class Receiver: @unchecked Sendable {
         work.withUnsafeBufferPointer { channelFilter.process($0, into: &work2) }
         guard !work2.isEmpty else { return }
 
-        work2.withUnsafeBufferPointer { channel in
-            var meanSquare: Float = 0
-            channel.withMemoryRebound(to: Float.self) { floats in
-                vDSP_measqv(floats.baseAddress!, 1, &meanSquare, vDSP_Length(floats.count))
-            }
-            signalDb = 10 * log10(max(2 * meanSquare, 1e-20))
-        }
+        let seconds = Double(input.count) / config.inputRate
+        work2.withUnsafeBufferPointer { level.add($0) }
+        signalDb = 10 * log10(max(level.mean, 1e-20))
         if let threshold = config.squelchDb {
-            squelchOpen = squelchOpen ? signalDb > threshold - 2 : signalDb > threshold
+            if signalDb > threshold || (squelchOpen && signalDb > threshold - Self.squelchHysteresisDb) {
+                squelchOpen = true
+                squelchHang = Self.squelchHangSeconds
+            } else if squelchOpen {
+                squelchHang -= seconds
+                if squelchHang <= 0 { squelchOpen = false }
+            }
         } else {
             squelchOpen = true
+            squelchHang = 0
         }
 
         demodOut.removeAll(keepingCapacity: true)
@@ -148,8 +164,19 @@ public final class Receiver: @unchecked Sendable {
         let start = audio.count
         filtered.withUnsafeBufferPointer { resampler.process($0, into: &audio) }
         agc.process(&audio, from: start)
-        if !squelchOpen {
-            for k in start..<audio.count { audio[k] = 0 }
+        applySquelchGain(&audio, from: start)
+    }
+
+    /// Ramps the gate gain towards open or shut, sample by sample, so the gate never steps.
+    private func applySquelchGain(_ audio: inout [Float], from start: Int) {
+        let target: Float = squelchOpen ? 1 : 0
+        let step = Float(1 / (Self.squelchFadeSeconds * Self.audioRate))
+        var gain = squelchGain
+        if gain == 1, target == 1 { return }
+        for k in start..<audio.count {
+            if gain != target { gain = target > gain ? min(target, gain + step) : max(target, gain - step) }
+            audio[k] *= gain
         }
+        squelchGain = gain
     }
 }
