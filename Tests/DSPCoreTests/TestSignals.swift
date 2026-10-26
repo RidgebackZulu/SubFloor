@@ -10,6 +10,19 @@ enum TestSignals {
         }
     }
 
+    /// Seeded complex Gaussian noise, `sigma` per component.
+    static func noise(count: Int, sigma: Double, seed: UInt64) -> [DSPComplex] {
+        var state = seed
+        func uniform() -> Double {
+            state = state &* 6_364_136_223_846_793_005 &+ 1_442_695_040_888_963_407
+            return (Double(state >> 11) + 0.5) / Double(1 << 53)
+        }
+        return (0..<count).map { _ in
+            let r = sigma * sqrt(-2 * log(uniform())), t = 2 * Double.pi * uniform()
+            return DSPComplex(real: Float(r * cos(t)), imag: Float(r * sin(t)))
+        }
+    }
+
     /// Complex baseband built from an (amplitude, phase) function of time in seconds.
     static func modulated(sampleRate: Double, seconds: Double, _ f: (Double) -> (amp: Double, phase: Double)) -> [DSPComplex] {
         (0..<Int(sampleRate * seconds)).map { i in

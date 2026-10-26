@@ -84,6 +84,92 @@ private func config(_ mode: DemodMode, offset: Double = 50_000) -> Receiver.Conf
     #expect(!audio.isEmpty && audio.allSatisfy { $0 == 0 })
 }
 
+/// Feeds `iq` in `block`-sample pieces, as the SDRplay callback does (1,008 samples, 0.5 ms).
+private func run(_ rx: Receiver, _ iq: [DSPComplex], block: Int) -> [Float] {
+    var audio = [Float]()
+    var i = 0
+    while i < iq.count {
+        let end = min(iq.count, i + block)
+        iq[i..<end].withUnsafeBufferPointer { rx.process($0, audio: &audio) }
+        i = end
+    }
+    return audio
+}
+
+/// The channel power of steady noise, measured over long blocks.
+private func noiseFloor(_ c: Receiver.Config, _ iq: [DSPComplex]) -> Float {
+    let rx = Receiver(config: c)
+    var levels = [Float]()
+    var i = 0
+    while i < iq.count {
+        let end = min(iq.count, i + 20_000)
+        var audio = [Float]()
+        iq[i..<end].withUnsafeBufferPointer { rx.process($0, audio: &audio) }
+        levels.append(rx.signalDb)
+        i = end
+    }
+    let tail = levels.suffix(levels.count / 2)
+    return tail.reduce(0, +) / Float(tail.count)
+}
+
+/// Runs of non-silent audio, as (start, end) sample indices.
+private func openRuns(_ audio: [Float]) -> [Range<Int>] {
+    var runs = [Range<Int>]()
+    var start: Int?
+    for (k, v) in audio.enumerated() {
+        if v != 0, start == nil { start = k }
+        if v == 0, let s = start { runs.append(s..<k); start = nil }
+    }
+    if let s = start { runs.append(s..<audio.count) }
+    return runs
+}
+
+private func rms(_ x: ArraySlice<Float>) -> Float {
+    (x.reduce(0) { $0 + $1 * $1 } / Float(max(x.count, 1))).squareRoot()
+}
+
+/// With the threshold on the noise floor and short SDRplay-sized blocks, noise peaks must not
+/// flick the gate open for a millisecond at a time (heard as crackle).
+@Test(arguments: [DemodMode.nfm, .am, .usb])
+func squelchDoesNotChatterOnNoiseAtThreshold(_ mode: DemodMode) {
+    let iq = TestSignals.noise(count: Int(fs * 2), sigma: 0.01, seed: 7)
+    var c = config(mode)
+    let floor = noiseFloor(c, iq)
+    for offset: Float in [-1, 0, 1, 2] {
+        c.squelchDb = floor + offset
+        let audio = run(Receiver(config: c), iq, block: 1_008)
+        let runs = openRuns(audio)
+        let label = "\(mode) at floor\(offset >= 0 ? "+" : "")\(offset) dB"
+        #expect(runs.count <= 2, "\(label): \(runs.count) openings in 2 s")
+        // Still a squelch: open below the floor, shut above it.
+        let open = Double(runs.reduce(0) { $0 + $1.count }) / Double(audio.count)
+        if offset < 0 { #expect(open > 0.9, "\(label): open \(open)") }
+        if offset >= 2 { #expect(open < 0.1, "\(label): open \(open)") }
+    }
+}
+
+/// The gate fades rather than switching: a tone burst well above the threshold opens it once, and
+/// both edges ramp instead of stepping between silence and full level.
+@Test func squelchFadesInAndOut() {
+    let noise = TestSignals.noise(count: Int(fs * 1.5), sigma: 0.001, seed: 11)
+    let tone = TestSignals.tone(frequency: 51_000, sampleRate: fs, count: noise.count, amplitude: 0.05)
+    let iq = (0..<noise.count).map { i -> DSPComplex in
+        let on = i >= Int(fs * 0.5) && i < Int(fs * 1.0)
+        return DSPComplex(real: noise[i].real + (on ? tone[i].real : 0), imag: noise[i].imag + (on ? tone[i].imag : 0))
+    }
+    var c = config(.usb)
+    c.squelchDb = noiseFloor(c, Array(noise.prefix(Int(fs * 0.5)))) + 10
+    let audio = run(Receiver(config: c), iq, block: 1_008)
+    let runs = openRuns(audio)
+    #expect(runs.count == 1, "\(runs.count) openings")
+    guard runs.count == 1, let run = runs.first, run.count > 2_400 else { return }
+    // First and last millisecond of the opening are well under the level 10 ms inside it.
+    let rise = rms(audio[run.lowerBound..<run.lowerBound + 48]) / rms(audio[run.lowerBound + 480..<run.lowerBound + 960])
+    let fall = rms(audio[run.upperBound - 48..<run.upperBound]) / rms(audio[run.upperBound - 960..<run.upperBound - 480])
+    #expect(rise < 0.3, "rise \(rise)")
+    #expect(fall < 0.3, "fall \(fall)")
+}
+
 @Test func retuningOffsetDoesNotRebuildChain() {
     let rx = Receiver(config: config(.usb))
     let rate = rx.channelRate
