@@ -141,6 +141,17 @@ private func bytes<T>(_ values: [T]) -> [UInt8] { values.withUnsafeBytes { Array
         #expect(bound.marginSeconds == 12)
     }
 
+    @Test func holdbackGrowsTheRingButNotThePreRoll() {
+        let p = StreamRecorder.plan(sampleRate: 48_000, bytesPerFrame: 3, preRollSeconds: 30, holdbackSeconds: 612, memoryLimitBytes: 256 << 20)
+        #expect(p.preRollBytes == 30 * 48_000 * 3 && p.capacityBytes >= (30 + 612) * 48_000 * 3 && p.effectivePreRollSeconds == 30)
+    }
+
+    @Test func holdbackIsKeptWhenMemoryBindsAndThePreRollShrinks() {
+        let p = StreamRecorder.plan(sampleRate: 48_000, bytesPerFrame: 3, preRollSeconds: 30, holdbackSeconds: 612, memoryLimitBytes: 48_000 * 3 * 640)
+        #expect(p.capacityBytes == 48_000 * 3 * 640)
+        #expect(abs(p.effectivePreRollSeconds - (640 - 612 - p.marginSeconds)) < 1e-6)
+    }
+
     @Test func namesFollowTheSDRSharpShape() {
         let t = Date(timeIntervalSince1970: 1_792_000_000)   // 2026-10-14 17:46:40 UTC
         #expect(RecordingNames.base(firstSample: t, frequencyHz: 14_074_000, label: "USB") == "SubFloor_20261014_174640Z_14074000Hz_USB")
@@ -451,6 +462,132 @@ private enum AppStyleName {
         #expect(waitUntil { !r.status.isRecording })
         #expect(r.status.preRollFill == 0)
         #expect(r.effectivePreRollSeconds == 5)
+    }
+
+    // MARK: Auto sessions
+
+    @Test func autoSessionStartsAtTheRequestedFrameAndEndsAtTheStop() throws {
+        let dir = tempDir()
+        let r = makeRecorder(folder: dir)
+        defer { r.shutdown() }
+        let click = Date(timeIntervalSince1970: 1_792_000_000)
+        r.now = { click }
+        for b in stride(from: 0, to: 100_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        #expect(r.headFrame == 100_000)
+        r.start(fromFrame: 95_000)
+        r.commit(throughFrame: 100_000)
+        #expect(waitUntil { r.status.url != nil })
+        for b in stride(from: 100_000, to: 110_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        r.commit(throughFrame: 104_000)
+        r.stop(atFrame: 104_000)
+        #expect(waitUntil { !r.status.isRecording })
+        let status = r.status
+        #expect(status.error == nil)
+        let frames = try wavFrames(status.url!)
+        #expect(frames.first == 95_000 && frames.last == 103_999 && frames.count == 9_000)
+        #expect(zip(frames, frames.dropFirst()).allSatisfy { $1 == $0 + 1 })
+        #expect(status.isAuto && status.startedAt == click.addingTimeInterval(-0.5))
+        #expect(r.sessionKind == .none)
+    }
+
+    @Test func autoWriterNeverPassesTheCommit() throws {
+        let dir = tempDir()
+        let r = makeRecorder(folder: dir)
+        defer { r.shutdown() }
+        for b in stride(from: 0, to: 100_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        r.start(fromFrame: 95_000)
+        r.commit(throughFrame: 97_000)
+        for b in stride(from: 100_000, to: 120_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        #expect(waitUntil { r.status.framesWritten == 2_000 })
+        Thread.sleep(forTimeInterval: 0.2)
+        #expect(r.status.framesWritten == 2_000)
+        r.commit(throughFrame: 90_000)   // a commit never goes backwards
+        r.commit(throughFrame: 98_000)
+        #expect(waitUntil { r.status.framesWritten == 3_000 })
+    }
+
+    @Test func manualStartTakesOverAnAutoSession() throws {
+        let dir = tempDir()
+        let r = makeRecorder(folder: dir)
+        defer { r.shutdown() }
+        for b in stride(from: 0, to: 100_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        r.start(fromFrame: 95_000)
+        r.commit(throughFrame: 96_000)
+        #expect(waitUntil { r.status.framesWritten == 1_000 })
+        r.start()
+        #expect(r.sessionKind == .manual)
+        r.stop(atFrame: 96_000)   // only an auto session is ended by a frame
+        for b in stride(from: 100_000, to: 110_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        r.stop(wait: true)
+        let status = r.status
+        #expect(status.isAuto == false && status.filesWritten == 1)
+        let frames = try wavFrames(status.url!)
+        #expect(frames.first == 95_000 && frames.last == 109_999)
+        #expect(zip(frames, frames.dropFirst()).allSatisfy { $1 == $0 + 1 })
+    }
+
+    @Test func autoStartBeyondTheRingClampsToTheOldestFrame() throws {
+        let dir = tempDir()
+        let r = makeRecorder(folder: dir)   // 5 s of pre-roll + 2 s margin = 70_000 frames of ring
+        defer { r.shutdown() }
+        for b in stride(from: 0, to: 200_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        r.start(fromFrame: 0)
+        r.commit(throughFrame: 200_000)
+        #expect(waitUntil { r.status.framesWritten >= 70_000 })
+        r.stop(atFrame: 200_000)
+        #expect(waitUntil { !r.status.isRecording })
+        #expect(r.status.error == nil && r.status.overrunBytes == 0)
+        let frames = try wavFrames(r.status.url!)
+        #expect(frames.last == 199_999)
+        #expect(frames.first! >= Float(200_000 - 70_000))
+        #expect(zip(frames, frames.dropFirst()).allSatisfy { $1 == $0 + 1 })
+    }
+
+    @Test func stopAtAFrameAlreadyWrittenClampsToTheWrittenPosition() throws {
+        let dir = tempDir()
+        let r = makeRecorder(folder: dir)
+        defer { r.shutdown() }
+        for b in stride(from: 0, to: 100_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        r.start(fromFrame: 95_000)
+        r.commit(throughFrame: 98_000)
+        #expect(waitUntil { r.status.framesWritten == 3_000 })
+        r.stop(atFrame: 96_000)
+        #expect(waitUntil { !r.status.isRecording })
+        let frames = try wavFrames(r.status.url!)
+        #expect(frames.count == 3_000 && frames.last == 97_999)
+    }
+
+    @Test func sessionKindTracksTheSession() throws {
+        let dir = tempDir()
+        let r = makeRecorder(folder: dir)
+        defer { r.shutdown() }
+        for b in stride(from: 0, to: 20_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        #expect(r.sessionKind == .none)
+        r.start(fromFrame: 10_000)
+        #expect(r.sessionKind == .auto)
+        r.start(fromFrame: 5_000)   // ignored while a session is open
+        #expect(r.sessionKind == .auto)
+        r.start()
+        #expect(r.sessionKind == .manual)
+        r.stop(wait: true)
+        #expect(r.sessionKind == .none)
+        #expect(r.status.filesWritten == 1)
+        r.start()
+        #expect(r.sessionKind == .manual)
+        r.stop(wait: true)
+        #expect(r.sessionKind == .none)
+    }
+
+    @Test func aPlainStopEndsAnAutoSessionAtWhatWasCommitted() throws {
+        let dir = tempDir()
+        let r = makeRecorder(folder: dir)
+        defer { r.shutdown() }
+        for b in stride(from: 0, to: 100_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        r.start(fromFrame: 95_000)
+        r.commit(throughFrame: 97_000)
+        r.stop(wait: true)
+        #expect(r.sessionKind == .none && !r.status.isRecording)
+        #expect(r.status.framesWritten == 2_000)
     }
 
     @Test func flacRecordingThroughTheRecorder() throws {

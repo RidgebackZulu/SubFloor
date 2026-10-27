@@ -51,6 +51,8 @@ public final class HistoryRing: @unchecked Sendable {
     public var capacity: Int { withState { $0.capacity } }
     public var bytesPerFrame: Int { withState { $0.bytesPerFrame } }
     public var head: Int { withState { $0.head } }
+    /// Whole frames ever pushed since `reset`.
+    public var headFrames: Int { withState { $0.head / $0.bytesPerFrame } }
     /// Bytes behind the head a rewind may reach.
     public var available: Int { withState { $0.head - max($0.oldest, $0.barrier) } }
 
@@ -75,6 +77,11 @@ public final class HistoryRing: @unchecked Sendable {
     /// The position `bytes` behind the head, no further back than what is available.
     public func rewind(bytes: Int) -> Int {
         withState { s in s.head - min(max(bytes, 0), s.head - max(s.oldest, s.barrier)) }
+    }
+
+    /// `position` limited to what a rewind may reach: no older than `rewind` goes, no newer than the head.
+    public func clamped(position: Int) -> Int {
+        withState { s in min(max(position, max(s.oldest, s.barrier)), s.head) }
     }
 
     /// Consumer: copies from `position` toward the head (at most `out.count` bytes, whole frames) and

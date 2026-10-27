@@ -18,6 +18,8 @@ public struct RecordingContext: Equatable, Sendable {
 
 public struct RecordingStatus: Equatable, Sendable {
     public var isRecording = false
+    /// Started by the squelch (an auto session) rather than by hand; a manual start takes it over.
+    public var isAuto = false
     /// The time of the first sample in the recording (the click minus the pre-roll).
     public var startedAt: Date?
     /// Across every file of this recording.
@@ -72,16 +74,20 @@ public final class StreamRecorder: @unchecked Sendable {
         public var fileFormat: FileFormat
         public var sampleFormat: SampleFormat
         public var preRollSeconds: Double
+        /// Extra history the ring keeps beyond the pre-roll, so an auto session can hold its tail back
+        /// (see `commit`) without the start of the file being overwritten.
+        public var holdbackSeconds: Double
         public var memoryLimitBytes: Int
         public var folder: URL
 
         public init(sampleRate: Double, channels: Int, fileFormat: FileFormat, sampleFormat: SampleFormat,
-                    preRollSeconds: Double, memoryLimitBytes: Int, folder: URL) {
+                    preRollSeconds: Double, holdbackSeconds: Double = 0, memoryLimitBytes: Int, folder: URL) {
             self.sampleRate = sampleRate
             self.channels = channels
             self.fileFormat = fileFormat
             self.sampleFormat = sampleFormat
             self.preRollSeconds = preRollSeconds
+            self.holdbackSeconds = holdbackSeconds
             self.memoryLimitBytes = memoryLimitBytes
             self.folder = folder
         }
@@ -97,13 +103,16 @@ public final class StreamRecorder: @unchecked Sendable {
         public var marginSeconds: Double
     }
 
-    /// The ring holds the pre-roll plus a margin (2 s or 10 %) for the writer to lag behind. When the
-    /// memory limit binds, the margin is kept and the pre-roll shrinks.
-    public static func plan(sampleRate: Double, bytesPerFrame: Int, preRollSeconds: Double, memoryLimitBytes: Int) -> RingPlan {
+    /// The ring holds the pre-roll plus the holdback plus a margin (2 s or 10 % of the pre-roll) for
+    /// the writer to lag behind. When the memory limit binds, the margin and the holdback are kept and
+    /// the pre-roll shrinks.
+    public static func plan(sampleRate: Double, bytesPerFrame: Int, preRollSeconds: Double, holdbackSeconds: Double = 0,
+                            memoryLimitBytes: Int) -> RingPlan {
         let margin = max(2.0, preRollSeconds * 0.1)
-        let wanted = Int(((preRollSeconds + margin) * sampleRate).rounded(.up))
+        let holdback = max(0, holdbackSeconds)
+        let wanted = Int(((preRollSeconds + holdback + margin) * sampleRate).rounded(.up))
         let frames = max(min(wanted, memoryLimitBytes / max(bytesPerFrame, 1)), 1)
-        let effective = max(0, Double(frames) / sampleRate - margin)
+        let effective = max(0, Double(frames) / sampleRate - margin - holdback)
         let preRollFrames = Int((effective * sampleRate).rounded(.down))
         return RingPlan(capacityBytes: frames * bytesPerFrame, preRollBytes: preRollFrames * bytesPerFrame,
                         effectivePreRollSeconds: effective, marginSeconds: margin)
@@ -134,7 +143,10 @@ public final class StreamRecorder: @unchecked Sendable {
         var now: @Sendable () -> Date = { Date() }
     }
 
-    private enum Command { case start, stop, roll, quit }
+    /// What kind of recording is open (or being opened). Read cheaply from any thread.
+    public enum SessionKind: Int, Sendable { case none, auto, manual }
+
+    private enum Command { case start, startAuto(byte: Int), stop, stopAuto(byte: Int), roll, quit }
     private enum Cut { case stop, roll }
 
     /// The writer thread's open recording.
@@ -153,9 +165,14 @@ public final class StreamRecorder: @unchecked Sendable {
         var dataLimit: Int?
         var cutAt: Int?
         var cut: Cut?
+        /// An auto session writes only below the commit; a manual one writes up to the head.
+        var isAuto: Bool
+        /// The cut was set by `stop(atFrame:)`, so a manual takeover cancels it.
+        var cutByFrame = false
 
         init(file: any RecordingFile, layout: StreamLayout, fileFormat: FileFormat, folder: URL, context: RecordingContext,
-             position: Int, firstSample: Date, dataLimit: Int?) {
+             position: Int, firstSample: Date, dataLimit: Int?, isAuto: Bool) {
+            self.isAuto = isAuto
             self.file = file
             self.layout = layout
             self.fileFormat = fileFormat
@@ -187,6 +204,9 @@ public final class StreamRecorder: @unchecked Sendable {
     private let recording = Atomic<Bool>(false)
     private let exited = DispatchSemaphore(value: 0)
     private let quitting = Atomic<Bool>(false)
+    private let kindBox = Atomic<Int>(SessionKind.none.rawValue)
+    /// Frames an auto session may write up to (exclusive); only grows within a session.
+    private let committedFrames = Atomic<Int>(0)
 
     public init(kind: StreamKind, rollsOnContextChange: Bool) {
         self.kind = kind
@@ -207,7 +227,7 @@ public final class StreamRecorder: @unchecked Sendable {
     public func configure(_ setup: Setup) {
         let bpf = setup.layout.bytesPerFrame
         let plan = Self.plan(sampleRate: setup.sampleRate, bytesPerFrame: bpf, preRollSeconds: setup.preRollSeconds,
-                             memoryLimitBytes: setup.memoryLimitBytes)
+                             holdbackSeconds: setup.holdbackSeconds, memoryLimitBytes: setup.memoryLimitBytes)
         producer.withLock { p in
             let old = p.setup
             let ringChanged = old == nil || old!.sampleRate != setup.sampleRate || old!.channels != setup.channels
@@ -241,16 +261,59 @@ public final class StreamRecorder: @unchecked Sendable {
         if recording.load(ordering: .relaxed) { enqueue(.roll) }
     }
 
-    /// The status says "recording" at once; the writer thread opens the file.
+    /// The status says "recording" at once; the writer thread opens the file. While an auto session is
+    /// open this turns it into a manual one (no commit limit) instead of starting a new file.
     public func start() {
+        let wasAuto = kindBox.compareExchange(expected: SessionKind.auto.rawValue, desired: SessionKind.manual.rawValue,
+                                              ordering: .acquiringAndReleasing).exchanged
+        if !wasAuto { _ = kindBox.compareExchange(expected: SessionKind.none.rawValue, desired: SessionKind.manual.rawValue,
+                                                  ordering: .acquiringAndReleasing) }
         statusLock.withLock { s in
             if !s.isRecording {
                 s = RecordingStatus()
                 s.isRecording = true
+            } else if wasAuto {
+                s.isAuto = false
             }
         }
         recording.store(true, ordering: .releasing)
         enqueue(.start)
+    }
+
+    public var sessionKind: SessionKind { SessionKind(rawValue: kindBox.load(ordering: .acquiring)) ?? .none }
+
+    /// Frames pushed since the last ring reset: the frame numbering `start(fromFrame:)`, `commit` and
+    /// `stop(atFrame:)` use.
+    public var headFrame: Int { ring.headFrames }
+
+    /// Begins an auto session at `fromFrame` (clamped to the oldest frame the ring still holds). The
+    /// writer sends nothing to the file until `commit(throughFrame:)` allows it. Ignored while any
+    /// session is open.
+    public func start(fromFrame: Int) {
+        guard kindBox.compareExchange(expected: SessionKind.none.rawValue, desired: SessionKind.auto.rawValue,
+                                      ordering: .acquiringAndReleasing).exchanged else { return }
+        committedFrames.store(0, ordering: .releasing)
+        let byte = ring.clamped(position: max(fromFrame, 0) * ring.bytesPerFrame)
+        statusLock.withLock { s in
+            s = RecordingStatus()
+            s.isRecording = true
+            s.isAuto = true
+        }
+        recording.store(true, ordering: .releasing)
+        enqueue(.startAuto(byte: byte))
+    }
+
+    /// Lets an auto session write frames below `throughFrame`. Never moves backwards; one atomic
+    /// store, cheap enough for every DSP block.
+    public func commit(throughFrame: Int) {
+        _ = committedFrames.max(throughFrame, ordering: .releasing)
+    }
+
+    /// Ends an auto session at `atFrame` (at the written position if that is already behind us, at the
+    /// head if it is ahead). Ignored unless the session is an auto one.
+    public func stop(atFrame: Int) {
+        guard sessionKind == .auto else { return }
+        enqueue(.stopAuto(byte: max(atFrame, 0) * ring.bytesPerFrame))
     }
 
     /// Ends the recording at the current head. With `wait`, returns once the file is finalised (or
@@ -317,20 +380,43 @@ public final class StreamRecorder: @unchecked Sendable {
             for command in batch {
                 switch command {
                 case .start:
-                    if session == nil { session = begin() }
+                    if let s = session {
+                        if s.isAuto {
+                            // A manual start takes over: write to the head from here on, and drop an
+                            // end that `stop(atFrame:)` had set.
+                            s.isAuto = false
+                            statusLock.withLock { $0.isAuto = false }
+                            if s.cutByFrame {
+                                s.cutAt = nil
+                                s.cut = nil
+                                s.cutByFrame = false
+                            }
+                        }
+                    } else {
+                        session = begin(autoByte: nil)
+                    }
+                case .startAuto(let byte):
+                    if session == nil { session = begin(autoByte: byte) }
                 case .stop:
                     if let s = session, s.cut != .stop {
-                        s.cutAt = ring.head
+                        s.cutAt = cutPoint(s)
                         s.cut = .stop
+                        s.cutByFrame = false
+                    }
+                case .stopAuto(let byte):
+                    if let s = session, s.isAuto, s.cut != .stop {
+                        s.cutAt = min(max(byte, s.position), ring.head)
+                        s.cut = .stop
+                        s.cutByFrame = true
                     }
                 case .roll:
                     if let s = session, s.cut == nil {
-                        s.cutAt = ring.head
+                        s.cutAt = cutPoint(s)
                         s.cut = .roll
                     }
                 case .quit:
                     if let s = session {
-                        s.cutAt = ring.head
+                        s.cutAt = cutPoint(s)
                         s.cut = .stop
                         drain(s, chunk: chunk, session: &session)
                         if let s = session { end(s, error: nil) }
@@ -344,19 +430,44 @@ public final class StreamRecorder: @unchecked Sendable {
         }
     }
 
-    /// Opens the first file of a recording, rewound by the pre-roll.
-    private func begin() -> Session? {
+    /// Where a plain stop, roll or quit cuts: the head, or for an auto session only what is committed.
+    private func cutPoint(_ s: Session) -> Int {
+        let head = ring.head
+        guard s.isAuto else { return head }
+        return min(head, max(committedFrames.load(ordering: .acquiring) * s.layout.bytesPerFrame, s.position))
+    }
+
+    /// Marks the session over for `sessionKind`, unless a manual start has meanwhile claimed it.
+    private func release(wasAuto: Bool) {
+        let mine = (wasAuto ? SessionKind.auto : SessionKind.manual).rawValue
+        _ = kindBox.compareExchange(expected: mine, desired: SessionKind.none.rawValue, ordering: .acquiringAndReleasing)
+    }
+
+    /// A recording that never opened: nothing is pending, whichever kind a takeover left it as.
+    private func abandon() {
+        kindBox.store(SessionKind.none.rawValue, ordering: .releasing)
+        recording.store(false, ordering: .releasing)
+    }
+
+    /// Opens the first file of a recording: an auto session at `autoByte`, otherwise a manual one
+    /// rewound by the pre-roll.
+    private func begin(autoByte: Int?) -> Session? {
+        let isAuto = autoByte != nil
+        if !isAuto { kindBox.store(SessionKind.manual.rawValue, ordering: .releasing) }
         let (setup, plan, limitOverride, now) = producer.withLock { ($0.setup, $0.plan, $0.dataLimitOverride, $0.now) }
         guard let setup, let plan else {
             statusLock.withLock { $0 = RecordingStatus(); $0.error = "The \(kind.label) recorder is not set up." }
+            abandon()
             return nil
         }
         let context = self.context.withLock { $0 } ?? RecordingContext(frequencyHz: 0, label: kind.label, hardware: "")
-        let position = ring.rewind(bytes: plan.preRollBytes)
+        // The ring may have moved on since the byte was chosen: never start behind what it holds.
+        let position = autoByte.map { ring.clamped(position: $0) } ?? ring.rewind(bytes: plan.preRollBytes)
         let back = Double((ring.head - position) / setup.layout.bytesPerFrame) / setup.sampleRate
         let first = now().addingTimeInterval(-back)
         var status = RecordingStatus()
         status.isRecording = true
+        status.isAuto = isAuto
         status.startedAt = first
         statusLock.withLock { $0 = status }
         recording.store(true, ordering: .releasing)
@@ -364,10 +475,11 @@ public final class StreamRecorder: @unchecked Sendable {
             let file = try open(setup.fileFormat, layout: setup.layout, folder: setup.folder, context: context, firstSample: first)
             statusLock.withLock { $0.url = file.url; $0.filesWritten = 1 }
             return Session(file: file, layout: setup.layout, fileFormat: setup.fileFormat, folder: setup.folder, context: context,
-                           position: position, firstSample: first, dataLimit: limitOverride ?? setup.fileFormat.dataLimit)
+                           position: position, firstSample: first, dataLimit: limitOverride ?? setup.fileFormat.dataLimit,
+                           isAuto: isAuto)
         } catch {
             statusLock.withLock { $0.isRecording = false; $0.error = "\(error)" }
-            recording.store(false, ordering: .releasing)
+            abandon()
             return nil
         }
     }
@@ -389,9 +501,15 @@ public final class StreamRecorder: @unchecked Sendable {
                 let toCut = s.cutAt.map { $0 - s.position } ?? Int.max
                 let inFile = s.dataLimit.map { $0 - s.file.bytesWritten } ?? Int.max
                 let want = min(chunk.count, toCut, inFile)
+                // An auto session holds back whatever is not committed, until a cut says where it ends.
+                let held = s.isAuto && s.cutAt == nil
+                    ? committedFrames.load(ordering: .acquiring) * bpf - s.position : Int.max
+                if want > 0 && held <= 0 { break }
                 if want <= 0 {
                     try s.file.finalize()
                     if toCut <= 0 && s.cut == .stop {
+                        // The kind is released first, so whoever sees the recording end sees `.none`.
+                        release(wasAuto: s.isAuto)
                         statusLock.withLock { $0.isRecording = false }
                         recording.store(false, ordering: .releasing)
                         session = nil
@@ -408,7 +526,7 @@ public final class StreamRecorder: @unchecked Sendable {
                     statusLock.withLock { $0.url = s.file.url; $0.filesWritten += 1 }
                     continue
                 }
-                let (n, skipped) = ring.read(from: &s.position, into: UnsafeMutableRawBufferPointer(rebasing: chunk[0..<want]))
+                let (n, skipped) = ring.read(from: &s.position, into: UnsafeMutableRawBufferPointer(rebasing: chunk[0..<min(want, held)]))
                 if skipped > 0 { statusLock.withLock { $0.overrunBytes += skipped } }
                 if n == 0 { break }
                 try s.file.write(UnsafeRawBufferPointer(rebasing: chunk[0..<n]))
@@ -432,6 +550,7 @@ public final class StreamRecorder: @unchecked Sendable {
 
     private func end(_ s: Session, error: String?) {
         if error != nil { try? s.file.finalize() }
+        release(wasAuto: s.isAuto)
         statusLock.withLock {
             $0.isRecording = false
             if let error { $0.error = error }
