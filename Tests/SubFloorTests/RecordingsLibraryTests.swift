@@ -113,16 +113,70 @@ struct RecordingsLibraryTests {
         #expect(aFiles.allSatisfy { library.catalog.recording($0) == nil && !library.catalog.files.contains($0) })
     }
 
+    /// Holds one read of a folder in flight, after it has read, so a test can change the library under it.
+    private actor Gate {
+        private(set) var reads = 0
+        private var armed = false
+        private var waiter: CheckedContinuation<Void, Never>?
+        var isHeld: Bool { waiter != nil }
+        func arm() { armed = true }
+        func pass() async {
+            reads += 1
+            guard armed else { return }
+            armed = false
+            await withCheckedContinuation { waiter = $0 }
+        }
+        func release() { waiter?.resume(); waiter = nil }
+    }
+
+    private func gated(_ library: RecordingsLibrary) -> Gate {
+        let gate = Gate()
+        library.reader = { folder in
+            let snapshot = RecordingsLibrary.read(folder)   // the data as it was when the read began
+            await gate.pass()
+            return snapshot
+        }
+        return gate
+    }
+
+    private func waitUntilHeld(_ gate: Gate) async throws {
+        for _ in 0..<500 where !(await gate.isHeld) { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(await gate.isHeld)
+    }
+
     @Test func aReloadThatFinishesAfterSetFolderIsDiscarded() async throws {
         let a = tempFolder(), b = tempFolder()
-        try populate(a, offsets: [0, 60])
+        let aFiles = try populate(a, offsets: [0, 60])
+        let bFiles = try populate(b, offsets: [120])
         let library = RecordingsLibrary(folder: a)
-        async let stale: Void = library.reload()   // starts on A
-        library.setFolder(b)                       // B is empty
-        await stale
-        await library.reload()
+        let gate = gated(library)
+        await gate.arm()
+        let stale = Task { await library.reload() }   // reads A, then waits
+        try await waitUntilHeld(gate)
+        library.setFolder(b)
+        await library.reload()   // B's, which is not held
+        await gate.release()
+        await stale.value        // A's finishes last, and must not replace B's
         #expect(library.folder == b)
-        #expect(library.catalog.files.isEmpty)
+        #expect(library.catalog.files.isDisjoint(with: aFiles))
+        #expect(bFiles.allSatisfy { library.catalog.recording($0) != nil })
+        #expect(library.unheardCount == 1)
+    }
+
+    @Test func aLineLoggedWhileAReadIsInFlightIsNotLost() async throws {
+        let folder = tempFolder()
+        let files = try populate(folder, offsets: [0])
+        let library = RecordingsLibrary(folder: folder)
+        let gate = gated(library)
+        await library.reload()
+        #expect(library.unheardCount == 1)
+        await gate.arm()
+        let reading = Task { await library.reload() }   // reads the log without the heard line, then waits
+        try await waitUntilHeld(gate)
+        library.markHeard(files[0])                    // written and applied meanwhile
+        await gate.release()
+        await reading.value
+        #expect(await gate.reads == 3)   // the first, the held one and the read again
         #expect(library.unheardCount == 0)
     }
 

@@ -33,6 +33,17 @@ final class RecordingsLibrary {
     @ObservationIgnored private var readFailed = false
     @ObservationIgnored private var writeFailed = false
 
+    /// What one read of a recordings folder finds.
+    struct Snapshot: Sendable {
+        var files: [String], entries: [RecordingLogEntry], failure: String?
+    }
+
+    /// Test hook: how a folder is read. The default reads off the main actor; a test replaces it to hold a
+    /// read in flight while the library changes under it.
+    @ObservationIgnored var reader: @Sendable (URL) async -> Snapshot = { folder in
+        await Task.detached(priority: .userInitiated) { RecordingsLibrary.read(folder) }.value
+    }
+
     init(folder: URL) {
         self.folder = folder
         catalog = RecordingsCatalog()
@@ -61,10 +72,10 @@ final class RecordingsLibrary {
         let folder = self.folder
         while true {
             let seen = revision
-            let (files, entries, failure) = await Task.detached(priority: .userInitiated) { Self.read(folder) }.value
+            let read = await reader(folder)
             guard folder == self.folder else { return }   // setFolder came in while reading
             guard seen == revision else { continue }      // a line was logged meanwhile: read again
-            if let failure {
+            if let failure = read.failure {
                 // One unreadable day file fails them all. The files are still listed, and with no log they
                 // all read as heard and manual, which loses nothing.
                 if !readFailed { onError?("Could not read the recordings log: \(failure)") }
@@ -72,7 +83,7 @@ final class RecordingsLibrary {
             } else {
                 readFailed = false
             }
-            var fresh = RecordingsCatalog(files: files, entries: entries, live: live)
+            var fresh = RecordingsCatalog(files: read.files, entries: read.entries, live: live)
             for (file, seconds) in measured { fresh.setMeasuredSeconds(seconds, for: file) }
             catalog = fresh
             changed()
@@ -169,12 +180,12 @@ final class RecordingsLibrary {
         (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
     }
 
-    nonisolated private static func read(_ folder: URL) -> (files: [String], entries: [RecordingLogEntry], failure: String?) {
+    nonisolated static func read(_ folder: URL) -> Snapshot {
         let files = listing(of: folder)
         do {
-            return (files, try RecordingLog(folder: folder).allEntries(), nil)
+            return Snapshot(files: files, entries: try RecordingLog(folder: folder).allEntries(), failure: nil)
         } catch {
-            return (files, [], error.localizedDescription)
+            return Snapshot(files: files, entries: [], failure: error.localizedDescription)
         }
     }
 
