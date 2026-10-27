@@ -228,6 +228,75 @@ struct AutoRecordControlTests {
         #expect(FileManager.default.fileExists(atPath: m.recording.folder.appendingPathComponent(file).path))
     }
 
+    /// Waits on the recorder itself, without running the run loop, so the model's timer does not poll.
+    private func spin(upTo timeout: Double, until done: () -> Bool) -> Bool {
+        let end = Date().addingTimeInterval(timeout)
+        while !done() {
+            if Date() >= end { return false }
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        return true
+    }
+
+    /// An auto session at the head with everything so far committed, written to a file; no poll.
+    private func recordUnseen(_ recorder: StreamRecorder) -> Bool {
+        let first = recorder.headFrame
+        recorder.start(fromFrame: first)
+        guard spin(upTo: 5, until: { recorder.headFrame > first + 2_400 }) else { return false }   // 50 ms of audio
+        recorder.commit(throughFrame: recorder.headFrame)
+        return spin(upTo: 5) { recorder.status.framesWritten > 0 && recorder.status.url != nil }
+    }
+
+    private func recordings(_ entries: [RecordingLogEntry]) -> [(file: String, hz: Double, auto: Bool)] {
+        entries.compactMap { if case .recording(let file, _, _, let hz, _, let auto) = $0 { (file, hz, auto) } else { nil } }
+    }
+
+    @Test func aRecordingReplacedBetweenTwoPollsIsLoggedWithItsOwnTuning() throws {
+        let (m, _) = makeModel()
+        defer { m.shutdown() }
+        guard runningDemo(m) != nil else { return }
+        let recorder = m.engine.audioRecorder
+        let firstVFO = m.vfoHz
+        #expect(recordUnseen(recorder))
+        m.refreshRecordingStatus()   // A is seen recording
+        #expect(m.isAutoRecording)
+        let a = try #require(m.recordingStatus[.audio])
+        m.stepVFO(1)
+        let secondVFO = m.vfoHz
+        recorder.stop(wait: true)
+        #expect(recordUnseen(recorder))
+        m.refreshRecordingStatus()   // B, never having seen A end
+        let b = try #require(recorder.status.url)
+        #expect(b != a.url)
+        recorder.stop(wait: true)
+        m.refreshRecordingStatus()
+        m.refreshRecordingStatus()   // nothing is logged twice
+
+        let logged = recordings(try m.recordingLog.entries(forUTCDay: try #require(a.startedAt)))
+        #expect(logged.map(\.file) == [a.url!.lastPathComponent, b.lastPathComponent])
+        #expect(logged.map(\.hz) == [firstVFO, secondVFO])
+        #expect(logged.allSatisfy { $0.auto })
+    }
+
+    @Test func aRecordingThatCameAndWentBetweenTwoPollsIsLogged() throws {
+        let (m, _) = makeModel()
+        defer { m.shutdown() }
+        guard runningDemo(m) != nil else { return }
+        let recorder = m.engine.audioRecorder
+        m.refreshRecordingStatus()
+        #expect(recordUnseen(recorder))
+        recorder.stop(wait: true)
+        m.refreshRecordingStatus()   // first sight of it, already ended
+        m.refreshRecordingStatus()
+        let status = recorder.status
+        #expect(!status.isRecording)
+        let logged = recordings(try m.recordingLog.entries(forUTCDay: try #require(status.startedAt)))
+        #expect(logged.count == 1)
+        #expect(logged.first?.file == status.url?.lastPathComponent)
+        #expect(logged.first?.hz == m.vfoHz)
+        #expect(logged.first?.auto == true)
+    }
+
     @Test func vfoChangeCutsAndCentreRetuneDoesNot() {
         let (m, _) = makeModel()
         defer { m.shutdown() }

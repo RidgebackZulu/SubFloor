@@ -283,6 +283,41 @@ import Testing
         #expect(abs(end - cutFrame) <= oneBlock, "ends \(end - cutFrame) frames from the cut (one block is \(oneBlock))")
     }
 
+    @Test func aRecordingAfterACutNeverReachesBackPastIt() throws {
+        let before = Self.train(from: 2, count: 8)                  // on until 6.6 s
+        let cutAtSeconds = 7.0
+        let after = Self.train(from: cutAtSeconds + 0.2, count: 10) // 0.2 s after the cut, until 12.8 s
+        let iq = Self.signal(seconds: after.last!.end + 17, bursts: before + after)
+
+        let rig = Rig()
+        var cutFrame: Int?
+        rig.run(iq) { i, frames in
+            if cutFrame == nil, Double(i) / Self.inputRate >= cutAtSeconds {
+                cutFrame = frames
+                rig.auto.cut()
+            }
+        }
+        #expect(rig.waitForWriter())
+        guard let cutFrame else { Issue.record("never cut"); return }
+
+        // Where each file sits in the stream: its first heard sample matched exactly, then the whole file.
+        func start(of file: [Float]) -> Int? {
+            guard let f = file.firstIndex(where: { $0 != 0 }) else { return nil }
+            return rig.audio.indices.first { s in
+                rig.audio[s] == file[f] && s >= f && s - f + file.count <= rig.audio.count
+                    && file.elementsEqual(rig.audio[(s - f)..<(s - f + file.count)])
+            }.map { $0 - f }
+        }
+        let starts = try rig.wavs().map { try start(of: Self.readWAV($0)) }
+        #expect(starts.count == 2, "\(starts.count) files")
+        #expect(!starts.contains(nil), "every file is a verbatim stretch of the audio")
+        let ordered = starts.compactMap { $0 }.sorted()
+        guard ordered.count == 2 else { return }
+        #expect(ordered[0] < cutFrame)
+        // Without the floor the lead would start it 0.5 s before the burst, 0.3 s before the cut.
+        #expect(ordered[1] >= cutFrame, "the second file starts \(Self.seconds(cutFrame - ordered[1])) s before the cut")
+    }
+
     @Test func manualSessionPausesTheTrigger() throws {
         let speech = Self.train(from: 3, count: 10)
         let pop: Burst = (1, 1.3)      // the trigger would log this if it were running

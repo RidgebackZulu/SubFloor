@@ -124,9 +124,12 @@ final class AppModel {
     @ObservationIgnored private var audioTuning: (hz: Double, mode: String)?
     /// The VFO and mode when the current audio recording started, for its log entry.
     @ObservationIgnored private var recordingTuning: (hz: Double, mode: String)?
+    /// The first-sample time of the last audio recording logged, so none is logged twice.
+    @ObservationIgnored private var loggedRecordingStart: Date?
     /// The last log write failed (its banner has been shown).
     @ObservationIgnored private var logWriteFailed = false
-    /// Held while Auto is on and the radio runs, so the Mac does not idle to sleep.
+    /// Held while Auto is on and the radio runs: the Mac does not idle to sleep, and App Nap does not
+    /// throttle the timer that logs recordings and checks the disk while the window is hidden.
     @ObservationIgnored private var sleepActivity: (any NSObjectProtocol)?
 
     // MARK: Display
@@ -238,9 +241,13 @@ final class AppModel {
             Task { @MainActor in self?.show(Banner(kind: .error, message: message, action: .retry)) }
         }
         // 10 Hz: the modem drain every tick, the other stats every other one.
-        statsTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+        // In the common modes, so it also runs during menu tracking, a modal panel or a live resize:
+        // auto-record keeps recording through those, and its log and disk checks ride on this timer.
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshStats() }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        statsTimer = timer
     }
 
     // MARK: Derived
@@ -890,7 +897,8 @@ final class AppModel {
     }
 
     /// Polls the recorders, logs an audio recording that ended and the pops heard since the last poll.
-    private func refreshRecordingStatus() {
+    /// Internal for tests, which drive the status sequence without the timer.
+    func refreshRecordingStatus() {
         var entries: [RecordingLogEntry] = []
         for kind in StreamKind.allCases {
             let s = recorder(kind).status
@@ -899,7 +907,7 @@ final class AppModel {
             if let error = s.error, error != previous?.error {
                 show(Banner(kind: .error, message: "\(kind.label) recording stopped: \(error)"))
             }
-            if kind == .audio, let entry = audioLogEntry(from: previous, to: s) { entries.append(entry) }
+            if kind == .audio { entries += audioLogEntries(from: previous, to: s) }
             recordingStatus[kind] = s
         }
         let hz = vfoHz, label = mode.label
@@ -907,18 +915,42 @@ final class AppModel {
         appendToLog(entries)
     }
 
-    /// Notes the tuning when an audio recording starts; the log entry once it has ended. The ended
-    /// status has the final length; auto or manual is what it was while it ran (a takeover is manual).
-    private func audioLogEntry(from previous: RecordingStatus?, to s: RecordingStatus) -> RecordingLogEntry? {
-        let was = previous?.isRecording ?? false
-        if s.isRecording && !was { recordingTuning = (vfoHz, mode.label) }
-        guard was, !s.isRecording, let previous else { return nil }
-        defer { recordingTuning = nil }
-        let ended = s.url != nil ? s : previous
-        guard let url = ended.url, let start = ended.startedAt else { return nil }
-        let tuning = recordingTuning ?? (vfoHz, mode.label)
-        return .recording(file: url.lastPathComponent, start: start, seconds: ended.duration,
-                          frequencyHz: tuning.hz, mode: tuning.mode, auto: previous.isAuto)
+    /// Notes the tuning when an audio recording is first seen, and logs every recording that has
+    /// ended since the last poll, including one replaced by the next between two polls and one that
+    /// began and ended between them (the poll can be late: the timer is 5 Hz and the main thread may
+    /// be busy). Each is logged once, keyed by its first-sample time.
+    private func audioLogEntries(from previous: RecordingStatus?, to s: RecordingStatus) -> [RecordingLogEntry] {
+        let now = (hz: vfoHz, mode: mode.label)
+        var entries: [RecordingLogEntry] = []
+        let continued = previous.map { $0.isRecording && Self.sameRecording($0, s) } ?? false
+        // The recording seen last time has ended, or another has replaced it.
+        if let previous, previous.isRecording, !(s.isRecording && continued) {
+            // Its own ended status has the final length and url; a replaced one only what was last seen.
+            let ended = Self.sameRecording(previous, s) ? s : previous
+            if let entry = logEntry(for: ended, tuning: recordingTuning ?? now) { entries.append(entry) }
+            recordingTuning = nil
+        }
+        if s.isRecording && !continued { recordingTuning = now }
+        // One that started and ended unseen. Its tuning at the start is unknown: the current VFO and
+        // mode are the best there is (a retune would have cut an auto recording anyway).
+        if !s.isRecording, let entry = logEntry(for: s, tuning: now) { entries.append(entry) }
+        return entries
+    }
+
+    /// The same recording in two statuses: the same first sample. A status not yet begun (no first
+    /// sample) after one that had begun is a new recording; before it, the same one.
+    private static func sameRecording(_ a: RecordingStatus, _ b: RecordingStatus) -> Bool {
+        guard let first = a.startedAt else { return true }
+        return b.startedAt == first
+    }
+
+    /// The log entry for a recording with a file, unless it has been logged already. Auto or manual
+    /// is what the status says when it was last seen (a takeover by the Audio button is manual).
+    private func logEntry(for status: RecordingStatus, tuning: (hz: Double, mode: String)) -> RecordingLogEntry? {
+        guard let url = status.url, let start = status.startedAt, start != loggedRecordingStart else { return nil }
+        loggedRecordingStart = start
+        return .recording(file: url.lastPathComponent, start: start, seconds: status.duration,
+                          frequencyHz: tuning.hz, mode: tuning.mode, auto: status.isAuto)
     }
 
     /// A failed write shows one banner until a write succeeds again; recording carries on.
@@ -955,7 +987,7 @@ final class AppModel {
         if config != engine.autoRecorder.config { engine.autoRecorder.configure(config) }
         let hold = autoRecordEnabled && isRunning
         if hold, sleepActivity == nil {
-            sleepActivity = ProcessInfo.processInfo.beginActivity(options: .idleSystemSleepDisabled, reason: "Auto-record is listening")
+            sleepActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "Auto-record is listening")
         } else if !hold, let activity = sleepActivity {
             ProcessInfo.processInfo.endActivity(activity)
             sleepActivity = nil

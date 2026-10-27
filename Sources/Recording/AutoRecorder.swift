@@ -53,6 +53,9 @@ public final class AutoRecorder: @unchecked Sendable {
     private var applied = Config()
     private var trigger: AutoRecordTrigger?
     private var triggerRate = 0.0
+    /// The head when the last cut was applied: an auto recording never starts before it, so its lead
+    /// never reaches back into audio from before a retune.
+    private var startFloor = 0
     /// Reused every block so the steady state allocates nothing.
     private var events: [AutoRecordTrigger.Event] = []
 
@@ -130,6 +133,7 @@ public final class AutoRecorder: @unchecked Sendable {
 
         events.removeAll(keepingCapacity: true)
         let head = recorder.headFrame
+        if startFloor > head { startFloor = 0 }   // the ring was rebuilt; its frames count from 0 again
         trigger?.advance(to: head, gateOpen: gateOpen, into: &events)
         apply(events, head: head, rate: rate)
     }
@@ -145,6 +149,7 @@ public final class AutoRecorder: @unchecked Sendable {
             applied = config
             trigger?.timing = config.timing.normalized()
         }
+        if request.cut { startFloor = recorder.headFrame }
         if request.cut || request.reset {
             cutTrigger()
             if request.reset { trigger = nil }
@@ -163,7 +168,7 @@ public final class AutoRecorder: @unchecked Sendable {
         for event in events {
             switch event {
             case .start(let frame):
-                recorder.start(fromFrame: frame)
+                recorder.start(fromFrame: max(frame, startFloor))
             case .commit(let frame):
                 recorder.commit(throughFrame: frame)
             case .stop(let frame):
