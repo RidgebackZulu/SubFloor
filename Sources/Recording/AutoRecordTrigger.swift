@@ -43,7 +43,8 @@ public struct AutoRecordTrigger: Sendable {
         case commit(throughFrame: Int)
         /// The file ends before this frame.
         case stop(atFrame: Int)
-        /// A run of gate activity that never reached Start after: its first open frame and its open frames.
+        /// A run of gate activity that never reached Start after: its first open frame and the span from
+        /// there to its last open frame (bridged gaps included), which the timeline shows as a length of time.
         case pop(atFrame: Int, frames: Int)
     }
 
@@ -104,7 +105,7 @@ public struct AutoRecordTrigger: Sendable {
                 committed = head
                 events.append(.commit(throughFrame: head))
             } else if !gateOpen && head - lastOpenEnd > frames(AutoRecordTiming.bridge) {
-                events.append(.pop(atFrame: runStart, frames: openFrames))
+                events.append(.pop(atFrame: runStart, frames: lastOpenEnd - runStart))
                 phase = .idle
             }
         case .recording:

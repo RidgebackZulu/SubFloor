@@ -25,6 +25,11 @@ private func isPop(_ e: AutoRecordTrigger.Event) -> Bool { if case .pop = e { tr
         #expect(e == [.pop(atFrame: 1_000, frames: 300)])
     }
 
+    @Test func aPopReportsItsSpanIncludingBridgedGaps() {
+        let e = feed([(0.5, false), (0.3, true), (1.0, false), (0.3, true), (5, false)])
+        #expect(e == [.pop(atFrame: 500, frames: 1_600)])
+    }
+
     @Test func speechWithSyllableGapsStartsHalfASecondBeforeTheFirstWord() {
         let e = feed([(10, false)] + Array(repeating: [(0.4, true), (0.2, false)], count: 6).flatMap { $0 })
         #expect(e.first == .start(atFrame: 9_500))
