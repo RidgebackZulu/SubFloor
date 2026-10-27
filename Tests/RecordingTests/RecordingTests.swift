@@ -115,12 +115,33 @@ private func bytes<T>(_ values: [T]) -> [UInt8] { values.withUnsafeBytes { Array
         s.iqSampleFormat = .int24
         s.preRollSeconds = 1000
         s.iqMemoryLimitBytes = 12345
+        s.autoTiming = AutoRecordTiming(startAfter: 40, stopAfter: 7)
         let n = s.normalized()
+        #expect(n.autoTiming == AutoRecordTiming(startAfter: 10, stopAfter: 5))
         #expect(n.audioSampleFormat == .int24)
         #expect(n.iqSampleFormat == .int16)
         #expect(n.preRollSeconds == 120)
         #expect(n.iqMemoryLimitBytes == 2 << 30)
         #expect(RecordingSettings().normalized() == RecordingSettings())
+    }
+
+    @Test func settingsSavedBeforeAutoRecordStillDecode() throws {
+        var s = RecordingSettings()
+        s.preRollSeconds = 45
+        s.audioFormat = .wav
+        s.audioSampleFormat = .float32
+        s.folderPath = "/tmp/somewhere"
+        var json = try #require(try JSONSerialization.jsonObject(with: JSONEncoder().encode(s)) as? [String: Any])
+        #expect(json["autoTiming"] != nil)
+        json["autoTiming"] = nil   // as saved before auto-record
+        let old = try JSONDecoder().decode(RecordingSettings.self, from: JSONSerialization.data(withJSONObject: json))
+        #expect(old.autoTiming == AutoRecordTiming())
+        #expect(old == s)
+        // Every key is optional: an empty object is the defaults.
+        #expect(try JSONDecoder().decode(RecordingSettings.self, from: Data("{}".utf8)) == RecordingSettings())
+        // The timing round-trips.
+        s.autoTiming = AutoRecordTiming(startAfter: 3, stopAfter: 60)
+        #expect(try JSONDecoder().decode(RecordingSettings.self, from: JSONEncoder().encode(s)) == s)
     }
 
     @Test func iqNeverOffers24Bit() {

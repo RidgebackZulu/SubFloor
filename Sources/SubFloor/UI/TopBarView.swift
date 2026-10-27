@@ -127,14 +127,15 @@ private struct RecordButton: View {
 
     var body: some View {
         let status = model.recordingStatus[kind] ?? RecordingStatus()
+        let on = model.isRecording(kind)   // manual only: an auto recording is the Auto button's
         let preRoll = Int((kind == .iq ? model.iqRingPlan?.effectivePreRollSeconds : model.recording.preRollSeconds) ?? 0)
         let key = kind == .audio ? "⌘⇧A" : "⌘⇧I"
         Button { model.toggleRecording(kind) } label: {
-            RecordButtonLabel(title: status.isRecording ? RecordingFormat.elapsed(status.duration) : kind.label,
-                              on: status.isRecording, fill: status.preRollFill)
+            RecordButtonLabel(title: on ? RecordingFormat.elapsed(status.duration) : kind.label,
+                              on: on, fill: status.preRollFill)
         }
             .buttonStyle(.plain)
-            .help(status.isRecording
+            .help(on
                   ? "Stop recording \(kind.label.lowercased()) (\(key)) — \(RecordingFormat.bytes(status.bytesWritten)) so far"
                   : "Record \(kind.label.lowercased()) (\(key)) — the file starts \(preRoll) s before the click")
     }
