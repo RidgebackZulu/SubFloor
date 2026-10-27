@@ -118,10 +118,40 @@ private struct RecordCluster: View {
             .opacity(model.isRunning ? 1 : 0.5)
             .disabled(!model.isRunning)
             AutoRecordButton()
+            RecordingsButton()
         }
         .padding(3)
         .background(RoundedRectangle(cornerRadius: 7).fill(Color.white.opacity(0.04)))
         .accessibilityLabel("Recording")
+    }
+}
+
+/// Opens the Recordings window. Always enabled, radio running or not; a red badge counts the unheard recordings.
+private struct RecordingsButton: View {
+    @Environment(AppModel.self) private var model
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        let unheard = model.library.unheardCount
+        Button { openWindow(id: "recordings") } label: {
+            RecordButtonLabel(title: "Recordings", on: false, fill: 0, symbol: "waveform")
+        }
+        .buttonStyle(.plain)
+        .overlay(alignment: .topTrailing) {
+            if let text = RecordingsBadge.text(unheard) {
+                Text(text)
+                    .font(.system(size: 10, weight: .bold))
+                    .foregroundStyle(Color.white)
+                    .padding(.horizontal, 4)
+                    .frame(minWidth: 14, minHeight: 14)
+                    .background(Capsule().fill(Color.red))
+                    .offset(x: 7, y: -7)
+                    .allowsHitTesting(false)
+            }
+        }
+        .help("Recordings (⌘⇧L) — \(unheard) unheard")
+        .accessibilityLabel("Recordings")
+        .accessibilityValue("\(unheard) unheard")
     }
 }
 
@@ -205,10 +235,16 @@ private struct RecordButtonLabel: View {
     /// 0…1 of the idle button to tint: the pre-roll primed so far.
     let fill: Double
     var ring: Ring = .none
+    /// An SF Symbol to show in place of the red dot.
+    var symbol: String?
 
     var body: some View {
         HStack(spacing: 5) {
-            Circle().fill(on ? Color.white : Color.red.opacity(0.9)).frame(width: 7, height: 7)
+            if let symbol {
+                Image(systemName: symbol)
+            } else {
+                Circle().fill(on ? Color.white : Color.red.opacity(0.9)).frame(width: 7, height: 7)
+            }
             Text(title).monospacedDigit().lineLimit(1)
         }
         .font(.callout.weight(.medium))

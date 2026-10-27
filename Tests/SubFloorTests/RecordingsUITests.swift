@@ -166,4 +166,16 @@ import Testing
         let loading = WaveformDisplay.decide(loaded: true, hasEnvelope: false, loadError: nil, peaksFailed: false, duration: 168)
         #expect(loading == WaveformDisplay(drawsPeaks: false, message: nil, seekable: true, playable: true))
     }
+
+    // MARK: The Recordings button's badge
+
+    @Test func badgeText() {
+        #expect(RecordingsBadge.text(-1) == nil)
+        #expect(RecordingsBadge.text(0) == nil)
+        #expect(RecordingsBadge.text(1) == "1")
+        #expect(RecordingsBadge.text(7) == "7")
+        #expect(RecordingsBadge.text(99) == "99")
+        #expect(RecordingsBadge.text(100) == "99+")
+        #expect(RecordingsBadge.text(12_345) == "99+")
+    }
 }
