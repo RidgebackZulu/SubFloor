@@ -37,6 +37,8 @@ let package = Package(
             resources: [.copy("Resources/AppIcon.png")],
             swiftSettings: fastMath,
             linkerSettings: sdrplayLinker + embeddedInfoPlist),
+        /// Command-line tool: replays an IQ capture through the receiver and the auto-record trigger.
+        .executableTarget(name: "AutoRecordReplay", dependencies: ["DSPCore", "Recording"], swiftSettings: fastMath),
         .testTarget(name: "DSPCoreTests", dependencies: ["DSPCore"]),
         .testTarget(name: "ModemsTests", dependencies: ["Modems", "DSPCore"]),
         .testTarget(name: "SubFloorCoreTests", dependencies: ["SubFloorCore", "DSPCore"]),
