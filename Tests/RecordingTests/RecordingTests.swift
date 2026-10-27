@@ -578,6 +578,36 @@ private enum AppStyleName {
         #expect(r.sessionKind == .none)
     }
 
+    @Test func aTakeoverLeavesNoStaleKindBehind() throws {
+        let dir = tempDir()
+        let r = makeRecorder(folder: dir)
+        defer { r.shutdown() }
+        for b in stride(from: 0, to: 20_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        // In order, before the writer has necessarily woken: auto, then taken over.
+        r.start(fromFrame: 10_000)
+        r.start()
+        r.stop(wait: true)
+        #expect(r.sessionKind == .none)
+        // Racing the two starts from two threads: whichever wins, the kind must end at .none.
+        for round in 0..<40 {
+            let racer = Thread { r.start(fromFrame: 10_000) }
+            racer.start()
+            r.start()
+            while !racer.isFinished { Thread.sleep(forTimeInterval: 0.0005) }
+            #expect(waitUntil { r.sessionKind == .manual || r.sessionKind == .auto })
+            r.commit(throughFrame: r.headFrame)
+            r.stop(wait: true)
+            #expect(waitUntil { r.sessionKind == .none }, "round \(round)")
+        }
+        // Auto-record still works afterwards.
+        r.start(fromFrame: 10_000)
+        #expect(r.sessionKind == .auto)
+        r.commit(throughFrame: 20_000)
+        r.stop(atFrame: 20_000)
+        #expect(waitUntil { !r.status.isRecording && r.sessionKind == .none })
+        #expect(r.status.isAuto && r.status.framesWritten == 10_000)
+    }
+
     @Test func aPlainStopEndsAnAutoSessionAtWhatWasCommitted() throws {
         let dir = tempDir()
         let r = makeRecorder(folder: dir)

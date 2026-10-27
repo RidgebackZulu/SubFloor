@@ -264,10 +264,18 @@ public final class StreamRecorder: @unchecked Sendable {
     /// The status says "recording" at once; the writer thread opens the file. While an auto session is
     /// open this turns it into a manual one (no commit limit) instead of starting a new file.
     public func start() {
-        let wasAuto = kindBox.compareExchange(expected: SessionKind.auto.rawValue, desired: SessionKind.manual.rawValue,
-                                              ordering: .acquiringAndReleasing).exchanged
-        if !wasAuto { _ = kindBox.compareExchange(expected: SessionKind.none.rawValue, desired: SessionKind.manual.rawValue,
-                                                  ordering: .acquiringAndReleasing) }
+        // One retrying claim, so a concurrent `start(fromFrame:)` can never slip between two attempts.
+        var wasAuto = false
+        var seen = kindBox.load(ordering: .acquiring)
+        while seen != SessionKind.manual.rawValue {
+            let (exchanged, original) = kindBox.compareExchange(expected: seen, desired: SessionKind.manual.rawValue,
+                                                                ordering: .acquiringAndReleasing)
+            if exchanged {
+                wasAuto = seen == SessionKind.auto.rawValue
+                break
+            }
+            seen = original
+        }
         statusLock.withLock { s in
             if !s.isRecording {
                 s = RecordingStatus()
@@ -385,6 +393,8 @@ public final class StreamRecorder: @unchecked Sendable {
                             // A manual start takes over: write to the head from here on, and drop an
                             // end that `stop(atFrame:)` had set.
                             s.isAuto = false
+                            // Whatever order the claims landed in, the open session is a manual one now.
+                            kindBox.store(SessionKind.manual.rawValue, ordering: .releasing)
                             statusLock.withLock { $0.isAuto = false }
                             if s.cutByFrame {
                                 s.cutAt = nil
