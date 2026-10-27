@@ -99,6 +99,7 @@ final class AppModel {
             if recording != oldValue {
                 pushRecording()
                 pushAutoRecord()
+                library.setFolder(recording.folder)
             }
         }
     }
@@ -130,6 +131,10 @@ final class AppModel {
 
     /// The log of finished recordings and ignored pops, in the recordings folder.
     var recordingLog: RecordingLog { RecordingLog(folder: recording.folder) }
+
+    /// The recordings in the folder, with when they were made and whether they have been heard. It follows
+    /// the folder setting, the log writes below and the recording in progress.
+    let library: RecordingsLibrary
 
     /// Test hook: the free bytes on the volume recordings go to (nil: unknown).
     @ObservationIgnored var freeSpaceProbe: (URL) -> Int64? = { AppModel.freeSpace(at: $0) }
@@ -239,6 +244,7 @@ final class AppModel {
         self.defaults = defaults
         self.openRSP = openRSP
         self.rspOpenTimeout = rspOpenTimeout
+        library = RecordingsLibrary(folder: RecordingSettings().folder)   // the folder `restoreSession` may replace
         let (loaded, result) = bookmarkStore.load()
         bookmarks = loaded
         switch result {
@@ -258,6 +264,8 @@ final class AppModel {
         engine.audio.onError = { [weak self] message in
             Task { @MainActor in self?.show(Banner(kind: .error, message: message, action: .retry)) }
         }
+        library.onError = { [weak self] message in self?.show(Banner(kind: .error, message: message)) }
+        Task { [library] in await library.reload() }
         // 10 Hz: the modem drain every tick, the other stats every other one.
         // In the common modes, so it also runs during menu tracking, a modal panel or a live resize:
         // auto-record keeps recording through those, and its log and disk checks ride on this timer.
@@ -919,6 +927,7 @@ final class AppModel {
     /// Internal for tests, which drive the status sequence without the timer.
     func refreshRecordingStatus() {
         var entries: [RecordingLogEntry] = []
+        var live: LiveRecording??   // set when the audio status changed: the recording in progress, or none
         for kind in StreamKind.allCases {
             let s = recorder(kind).status
             let previous = recordingStatus[kind]
@@ -926,12 +935,26 @@ final class AppModel {
             if let error = s.error, error != previous?.error {
                 show(Banner(kind: .error, message: "\(kind.label) recording stopped: \(error)"))
             }
-            if kind == .audio { entries += audioLogEntries(from: previous, to: s) }
+            if kind == .audio {
+                entries += audioLogEntries(from: previous, to: s)
+                live = .some(liveRecording(for: s))
+            }
             recordingStatus[kind] = s
         }
         let hz = vfoHz, label = mode.label
         entries += engine.autoRecorder.drainPops().map { .pop(at: $0.at, seconds: $0.seconds, frequencyHz: hz, mode: label) }
         appendToLog(entries)
+        // After the log: a recording that ended is then already a finished one when it stops being live.
+        if let live { library.setLive(live) }
+    }
+
+    /// The audio recording in progress for the library: its file, the tuning it started with (as it is
+    /// logged) and its length so far. nil when none is recording or it has no file yet.
+    private func liveRecording(for s: RecordingStatus) -> LiveRecording? {
+        guard s.isRecording, let url = s.url, let start = s.startedAt else { return nil }
+        let tuning = recordingTuning ?? (hz: vfoHz, mode: mode.label)
+        return LiveRecording(file: url.lastPathComponent, start: start, seconds: s.duration,
+                             frequencyHz: tuning.hz, mode: tuning.mode, auto: s.isAuto)
     }
 
     /// Notes the tuning when an audio recording is first seen, and logs every recording that has
@@ -989,6 +1012,7 @@ final class AppModel {
         do {
             try recordingLog.append(entries)
             logWriteFailed = false
+            library.didLog(entries)   // only what is on disk
         } catch {
             guard !logWriteFailed else { return }
             logWriteFailed = true
