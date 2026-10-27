@@ -83,6 +83,7 @@ struct SubFloorApp: App {
                 .tint(Theme.accent)
         }
         .defaultSize(width: 1100, height: 640)
+        .defaultLaunchBehavior(.suppressed)   // opened from the menu or the button, never restored at launch
 
         Settings {
             SettingsView()
