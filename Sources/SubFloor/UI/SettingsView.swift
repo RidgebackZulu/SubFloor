@@ -62,6 +62,19 @@ private struct RecordingSection: View {
                 Slider(value: $model.recording.preRollSeconds, in: RecordingSettings.preRollRange, step: 1)
                 Text(preRollNote).font(.caption).foregroundStyle(.secondary)
             }
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("Auto-record starts after")
+                    Spacer()
+                    Text(RecordingFormat.span(r.autoTiming.startAfter)).monospacedDigit().foregroundStyle(.secondary)
+                }
+                Slider(value: $model.recording.autoTiming.startAfter, in: AutoRecordTiming.startAfterRange, step: 0.5)
+            }
+            Picker("and stops after", selection: $model.recording.autoTiming.stopAfter) {
+                ForEach(AutoRecordTiming.stopAfterChoices, id: \.self) { Text(RecordingFormat.span($0)).tag($0) }
+            }
+            Text("Auto-record starts when the squelch has been open that long (gaps under 1.5 s don't count against it), begins half a second before the signal, and ends 2 s after the signal once the squelch has stayed shut for the stop time.")
+                .font(.caption).foregroundStyle(.secondary)
             Picker("Audio file", selection: $model.recording.audioFormat) {
                 ForEach(StreamKind.audio.fileFormats) { Text($0.label).tag($0) }
             }

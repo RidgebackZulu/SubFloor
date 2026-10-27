@@ -109,6 +109,8 @@ struct RadioCommands: Commands {
                 .keyboardShortcut("i", modifiers: [.command, .shift])
             Button(model.isRecordingAll ? "Stop All Recording" : "Record Audio and IQ") { model.toggleRecordingBoth() }
                 .keyboardShortcut("r", modifiers: [.command, .shift])
+            Button(model.autoRecordEnabled ? "Turn Auto-Record Off" : "Turn Auto-Record On") { model.toggleAutoRecord() }
+                .keyboardShortcut("t", modifiers: [.command, .shift])
             Button("Show Recordings in Finder") { model.revealRecordings() }
         }
     }

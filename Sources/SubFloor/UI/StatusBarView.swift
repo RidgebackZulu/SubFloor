@@ -15,12 +15,12 @@ struct StatusBarView: View {
             Spacer()
             ForEach(StreamKind.allCases) { kind in
                 if let s = model.recordingStatus[kind], s.isRecording {
-                    Label("REC \(kind.label) \(RecordingFormat.bytes(s.bytesWritten))" + (s.filesWritten > 1 ? " · file \(s.filesWritten)" : "")
+                    Label("\(s.isAuto ? "AUTO REC" : "REC \(kind.label)") \(RecordingFormat.bytes(s.bytesWritten))" + (s.filesWritten > 1 ? " · file \(s.filesWritten)" : "")
                           + (s.overrunBytes > 0 ? " · gaps" : ""), systemImage: "record.circle")
                         .foregroundStyle(.red)
                 }
             }
-            if !model.isRecordingAny {
+            if !model.isRecordingAny && !model.isAutoRecording {
                 let iq = model.iqRingPlan?.effectivePreRollSeconds ?? model.recording.preRollSeconds
                 Text("Pre-roll \(Int(model.recording.preRollSeconds)) s" + (iq < model.recording.preRollSeconds - 0.5 ? " (IQ \(Int(iq)) s)" : ""))
                     .help("Recordings start this long before the click")

@@ -668,4 +668,11 @@ private enum AppStyleName {
         #expect(RecordingFormat.elapsed(754) == "12:34")
         #expect(RecordingFormat.elapsed(3723) == "1:02:03")
     }
+
+    @Test func spansReadAsWords() {
+        let shown = AutoRecordTiming.stopAfterChoices.map(RecordingFormat.span)
+        #expect(shown == ["5 s", "10 s", "15 s", "30 s", "45 s", "1 min", "1 min 30 s", "2 min", "3 min", "5 min", "10 min"])
+        #expect(RecordingFormat.span(2.5) == "2.5 s")
+        #expect(RecordingFormat.span(0.5) == "0.5 s")
+    }
 }

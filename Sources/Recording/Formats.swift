@@ -222,6 +222,15 @@ public enum RecordingFormat {
         return s >= 3600 ? String(format: "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60) : String(format: "%d:%02d", s / 60, s % 60)
     }
 
+    /// A length of time in words: `5 s`, `2.5 s`, `1 min`, `1 min 30 s`, `10 min`.
+    public static func span(_ seconds: Double) -> String {
+        func secs(_ v: Double) -> String { v == v.rounded() ? "\(Int(v)) s" : String(format: "%.1f s", v) }
+        guard seconds >= 60 else { return secs(max(0, seconds)) }
+        let minutes = Int(seconds / 60)
+        let rest = seconds - Double(minutes * 60)
+        return rest == 0 ? "\(minutes) min" : "\(minutes) min \(secs(rest))"
+    }
+
     /// `12 MB`, `1.9 GB` (decimal units, as the Finder shows file sizes).
     public static func bytes(_ n: Int) -> String {
         let f = ByteCountFormatter()
