@@ -76,6 +76,14 @@ struct SubFloorApp: App {
         .defaultSize(width: 1440, height: 900)
         .commands { RadioCommands(model: model) }
 
+        Window("Recordings", id: "recordings") {
+            RecordingsWindow()
+                .environment(model)
+                .preferredColorScheme(.dark)   // its own fixed palette, whatever the appearance setting
+                .tint(Theme.accent)
+        }
+        .defaultSize(width: 1100, height: 640)
+
         Settings {
             SettingsView()
                 .environment(model)
@@ -87,6 +95,7 @@ struct SubFloorApp: App {
 
 struct RadioCommands: Commands {
     let model: AppModel
+    @Environment(\.openWindow) private var openWindow
 
     var body: some Commands {
         CommandMenu("Radio") {
@@ -111,6 +120,8 @@ struct RadioCommands: Commands {
                 .keyboardShortcut("r", modifiers: [.command, .shift])
             Button(model.autoRecordEnabled ? "Turn Auto-Record Off" : "Turn Auto-Record On") { model.toggleAutoRecord() }
                 .keyboardShortcut("t", modifiers: [.command, .shift])
+            Button("Recordings…") { openWindow(id: "recordings") }
+                .keyboardShortcut("l", modifiers: [.command, .shift])
             Button("Show Recordings in Finder") { model.revealRecordings() }
         }
     }
