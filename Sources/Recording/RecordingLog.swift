@@ -153,6 +153,21 @@ public struct RecordingLog: Sendable {
     public func entries(forUTCDay day: Date) throws -> [RecordingLogEntry] {
         let url = fileURL(forUTCDay: day)
         guard FileManager.default.fileExists(atPath: url.path) else { return [] }
+        return try Self.decodeLines(of: url)
+    }
+
+    /// Every day's entries, oldest day first and in the order written within a day. The recordings window needs
+    /// all of them: a `heard` entry is filed under the day it was heard, which can be long after the recording.
+    /// Lines that do not decode are skipped; no `.subfloor/` folder gives [].
+    public func allEntries() throws -> [RecordingLogEntry] {
+        guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
+        let days = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+            .filter { $0.pathExtension == "jsonl" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }   // yyyy-MM-dd sorts as time does
+        return try days.flatMap { try Self.decodeLines(of: $0) }
+    }
+
+    private static func decodeLines(of url: URL) throws -> [RecordingLogEntry] {
         let decoder = JSONDecoder()
         return try Data(contentsOf: url).split(separator: 0x0A).compactMap { line in
             try? decoder.decode(RecordingLogEntry.self, from: Data(line))
