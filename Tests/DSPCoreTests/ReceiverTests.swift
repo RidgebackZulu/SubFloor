@@ -170,6 +170,41 @@ func squelchDoesNotChatterOnNoiseAtThreshold(_ mode: DemodMode) {
     #expect(fall < 0.3, "fall \(fall)")
 }
 
+/// The gate is readable between blocks: shut on noise, open during the burst, and always open with no
+/// squelch set (nothing is gated).
+@Test func gateStateIsExposed() {
+    let noise = TestSignals.noise(count: Int(fs * 1.5), sigma: 0.001, seed: 11)
+    let tone = TestSignals.tone(frequency: 51_000, sampleRate: fs, count: noise.count, amplitude: 0.05)
+    let iq = (0..<noise.count).map { i -> DSPComplex in
+        let on = i >= Int(fs * 0.5) && i < Int(fs * 1.0)
+        return DSPComplex(real: noise[i].real + (on ? tone[i].real : 0), imag: noise[i].imag + (on ? tone[i].imag : 0))
+    }
+    var c = config(.usb)
+    c.squelchDb = noiseFloor(c, Array(noise.prefix(Int(fs * 0.5)))) + 10
+    let rx = Receiver(config: c)
+    var audio = [Float]()
+    var shutAfterNoise: Bool?
+    var openDuringTone = false
+    var i = 0
+    while i < iq.count {
+        let end = min(iq.count, i + 1_008)
+        iq[i..<end].withUnsafeBufferPointer { rx.process($0, audio: &audio) }
+        if end >= Int(fs * 0.5) - 1_008, end < Int(fs * 0.5), shutAfterNoise == nil { shutAfterNoise = !rx.isSquelchOpen }
+        if end > Int(fs * 0.6), end < Int(fs * 0.9), rx.isSquelchOpen { openDuringTone = true }
+        i = end
+    }
+    #expect(shutAfterNoise == true, "the gate is shut after 0.5 s of noise")
+    #expect(openDuringTone, "the gate opens for the burst")
+    #expect(!rx.isSquelchOpen, "and shuts again after it")
+
+    var open = config(.usb)
+    open.squelchDb = nil
+    let plain = Receiver(config: open)
+    var sink = [Float]()
+    iq.prefix(20_000).withUnsafeBufferPointer { plain.process($0, audio: &sink) }
+    #expect(plain.isSquelchOpen, "with no squelch set the gate is open")
+}
+
 @Test func retuningOffsetDoesNotRebuildChain() {
     let rx = Receiver(config: config(.usb))
     let rate = rx.channelRate

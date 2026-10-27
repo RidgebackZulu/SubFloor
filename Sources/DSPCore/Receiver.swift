@@ -39,6 +39,9 @@ public final class Receiver: @unchecked Sendable {
     public private(set) var channelRate: Double = 0
     /// Channel power in dBFS over the last `squelchLevelSeconds`.
     public private(set) var signalDb: Float = -200
+    /// Whether the squelch gate is open after the last block: true when no squelch is set. The audio
+    /// of that block was gated by it.
+    public var isSquelchOpen: Bool { squelchOpen }
 
     private var nco = NCO()
     private var stages: [ComplexDecimator] = []
