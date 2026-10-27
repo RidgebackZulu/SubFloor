@@ -210,6 +210,7 @@ import Testing
         let logged = rig.auto.drainPops()
         #expect(logged.count == 3, "\(logged.count) pops")
         #expect(rig.auto.drainPops().isEmpty, "draining empties the queue")
+        #expect(rig.auto.popQueueCapacity > AutoRecorder.popCapacity, "draining keeps the queue's storage")
         guard logged.count == 3 else { return }
         for (pop, burst) in zip(logged, pops) {
             #expect(pop.seconds >= burst.end - burst.start - 0.05 && pop.seconds <= burst.end - burst.start + 0.4, "pop of \(pop.seconds) s")
@@ -316,6 +317,88 @@ import Testing
         #expect(ordered[0] < cutFrame)
         // Without the floor the lead would start it 0.5 s before the burst, 0.3 s before the cut.
         #expect(ordered[1] >= cutFrame, "the second file starts \(Self.seconds(cutFrame - ordered[1])) s before the cut")
+    }
+
+    /// Where each file sits in the stream, found by matching it whole; nil for a file that is not a
+    /// verbatim stretch of the audio.
+    static func starts(of files: [[Float]], in audio: [Float]) -> [Int?] {
+        files.map { file in
+            guard let f = file.firstIndex(where: { $0 != 0 }) else { return nil }
+            return audio.indices.first { s in
+                audio[s] == file[f] && s >= f && s - f + file.count <= audio.count
+                    && file.elementsEqual(audio[(s - f)..<(s - f + file.count)])
+            }.map { $0 - f }
+        }
+    }
+
+    /// A write error ends an auto recording behind the trigger's back (stood in for here by a plain
+    /// stop): Auto stays armed, and later bursts make a new file.
+    @Test func autoStaysArmedAfterARecordingEndsBehindItsBack() throws {
+        let first = Self.train(from: 2, count: 10)                  // on until 7.8 s
+        let endAt = 6.0
+        let second = Self.train(from: 12, count: 10)                // on until 17.8 s
+        let iq = Self.signal(seconds: second.last!.end + 17, bursts: first + second)
+
+        let rig = Rig()
+        var endFrame: Int?
+        rig.run(iq) { i, frames in
+            if endFrame == nil, Double(i) / Self.inputRate >= endAt {
+                #expect(rig.recorder.sessionKind == .auto)
+                endFrame = frames
+                rig.recorder.stop(wait: true)
+                #expect(rig.recorder.sessionKind == .none)
+            }
+        }
+        #expect(rig.waitForWriter())
+        guard let endFrame else { Issue.record("never ended"); return }
+
+        let files = try rig.wavs().map(Self.readWAV)
+        #expect(files.count == 2, "\(files.count) files")
+        let starts = Self.starts(of: files, in: rig.audio)
+        #expect(!starts.contains(nil), "every file is a verbatim stretch of the audio")
+        guard files.count == 2, let a = starts[0], let b = starts[1] else { return }
+        #expect(a + files[0].count <= endFrame, "the first file ends where it was stopped")
+        #expect(abs(Self.seconds(b) - (second[0].start - AutoRecordTiming.lead)) <= 0.05, "the second starts 0.5 s before its first burst")
+        #expect(rig.recorder.status.isAuto)
+    }
+
+    /// The Audio button takes an auto recording over; when it is stopped, Auto picks up again and
+    /// later bursts make a new auto file.
+    @Test func autoResumesAfterAManualTakeoverEnds() throws {
+        let first = Self.train(from: 2, count: 10)                  // on until 7.8 s
+        let takeOverAt = 5.0, stopAt = 9.0
+        let second = Self.train(from: 12, count: 10)                // on until 17.8 s
+        let iq = Self.signal(seconds: second.last!.end + 17, bursts: first + second)
+
+        let rig = Rig()
+        var tookOver = false, stopped = false
+        var manualWhileHeld = true
+        rig.run(iq) { i, _ in
+            let t = Double(i) / Self.inputRate
+            if !tookOver, t >= takeOverAt {
+                tookOver = true
+                #expect(rig.recorder.sessionKind == .auto)
+                rig.recorder.start()
+            } else if tookOver, !stopped, t >= stopAt {
+                stopped = true
+                rig.recorder.stop(wait: true)
+            } else if tookOver, !stopped, rig.recorder.sessionKind != .manual {
+                manualWhileHeld = false
+            }
+        }
+        #expect(tookOver && stopped)
+        #expect(manualWhileHeld, "the trigger never ended the manual recording")
+        #expect(rig.waitForWriter())
+
+        let files = try rig.wavs().map(Self.readWAV)
+        #expect(files.count == 2, "\(files.count) files")
+        let starts = Self.starts(of: files, in: rig.audio)
+        #expect(!starts.contains(nil), "every file is a verbatim stretch of the audio")
+        guard files.count == 2, let a = starts[0], let b = starts[1] else { return }
+        // The taken-over file runs to the manual stop, not to the trigger's end of the first bursts.
+        #expect(Self.seconds(a + files[0].count) >= first.last!.end + 0.5)
+        #expect(abs(Self.seconds(b) - (second[0].start - AutoRecordTiming.lead)) <= 0.05, "the second starts 0.5 s before its first burst")
+        #expect(rig.recorder.status.isAuto)
     }
 
     @Test func manualSessionPausesTheTrigger() throws {

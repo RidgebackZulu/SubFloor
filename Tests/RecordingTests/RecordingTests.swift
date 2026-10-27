@@ -485,6 +485,39 @@ private enum AppStyleName {
         #expect(r.effectivePreRollSeconds == 5)
     }
 
+    @Test func aRingPlannedForTheLongestPreRollKeepsRecordingWhenThePreRollChanges() throws {
+        let dir = tempDir()
+        let r = StreamRecorder(kind: .audio, rollsOnContextChange: false)
+        defer { r.shutdown() }
+        func setup(preRoll: Double) -> StreamRecorder.Setup {
+            StreamRecorder.Setup(sampleRate: Self.rate, channels: 1, fileFormat: .wav, sampleFormat: .float32, preRollSeconds: preRoll,
+                                 ringPreRollSeconds: 10, memoryLimitBytes: 1 << 30, folder: dir)
+        }
+        r.configure(setup(preRoll: 3))
+        let plan = r.ringPlan
+        #expect(plan?.effectivePreRollSeconds == 10)
+        #expect(r.effectivePreRollSeconds == 3)
+        for b in stride(from: 0, to: 100_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        #expect(r.status.preRollFill == 1)
+        r.start()
+        #expect(waitUntil { r.status.url != nil })
+        r.configure(setup(preRoll: 8))   // only how far the next manual start rewinds
+        #expect(r.ringPlan == plan)
+        #expect(r.effectivePreRollSeconds == 8)
+        for b in stride(from: 100_000, to: 110_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        r.stop(wait: true)
+        let first = r.status
+        #expect(first.error == nil && first.filesWritten == 1)
+        let frames = try wavFrames(first.url!)
+        #expect(frames.first == 70_000 && frames.last == 109_999, "3 s of pre-roll, then on through the change")
+        #expect(zip(frames, frames.dropFirst()).allSatisfy { $1 == $0 + 1 })
+        r.start()
+        #expect(waitUntil { r.status.url != nil && r.status.url != first.url })
+        r.stop(wait: true)
+        let again = try wavFrames(r.status.url!)
+        #expect(again.first == 30_000 && again.last == 109_999, "the next start rewinds the new 8 s")
+    }
+
     // MARK: Auto sessions
 
     @Test func autoSessionStartsAtTheRequestedFrameAndEndsAtTheStop() throws {

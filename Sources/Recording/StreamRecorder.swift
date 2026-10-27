@@ -77,17 +77,23 @@ public final class StreamRecorder: @unchecked Sendable {
         /// Extra history the ring keeps beyond the pre-roll, so an auto session can hold its tail back
         /// (see `commit`) without the start of the file being overwritten.
         public var holdbackSeconds: Double
+        /// The pre-roll the ring is planned for, when that differs from `preRollSeconds`: planned for the
+        /// longest pre-roll, a change of `preRollSeconds` only changes how far a manual start rewinds and
+        /// never rebuilds the ring (which would end a recording). nil: plan for `preRollSeconds`.
+        public var ringPreRollSeconds: Double?
         public var memoryLimitBytes: Int
         public var folder: URL
 
         public init(sampleRate: Double, channels: Int, fileFormat: FileFormat, sampleFormat: SampleFormat,
-                    preRollSeconds: Double, holdbackSeconds: Double = 0, memoryLimitBytes: Int, folder: URL) {
+                    preRollSeconds: Double, holdbackSeconds: Double = 0, ringPreRollSeconds: Double? = nil,
+                    memoryLimitBytes: Int, folder: URL) {
             self.sampleRate = sampleRate
             self.channels = channels
             self.fileFormat = fileFormat
             self.sampleFormat = sampleFormat
             self.preRollSeconds = preRollSeconds
             self.holdbackSeconds = holdbackSeconds
+            self.ringPreRollSeconds = ringPreRollSeconds
             self.memoryLimitBytes = memoryLimitBytes
             self.folder = folder
         }
@@ -222,11 +228,13 @@ public final class StreamRecorder: @unchecked Sendable {
     // MARK: Caller side (main thread)
 
     /// Sets the stream and the file preferences. A change to the rate, channels, sample format,
-    /// pre-roll or memory limit rebuilds the ring (the pre-roll starts over) and ends a recording in
-    /// progress; a change of folder or container takes effect at the next start.
+    /// planned pre-roll or memory limit rebuilds the ring (the pre-roll starts over) and ends a recording
+    /// in progress; a change of folder or container takes effect at the next start. With
+    /// `ringPreRollSeconds` set, a change of `preRollSeconds` alone never rebuilds the ring.
     public func configure(_ setup: Setup) {
         let bpf = setup.layout.bytesPerFrame
-        let plan = Self.plan(sampleRate: setup.sampleRate, bytesPerFrame: bpf, preRollSeconds: setup.preRollSeconds,
+        let plan = Self.plan(sampleRate: setup.sampleRate, bytesPerFrame: bpf,
+                             preRollSeconds: setup.ringPreRollSeconds ?? setup.preRollSeconds,
                              holdbackSeconds: setup.holdbackSeconds, memoryLimitBytes: setup.memoryLimitBytes)
         producer.withLock { p in
             let old = p.setup
@@ -242,8 +250,19 @@ public final class StreamRecorder: @unchecked Sendable {
     }
 
     public var setup: Setup? { producer.withLock { $0.setup } }
+    /// The ring's plan. Its pre-roll is the planned one (`ringPreRollSeconds`, if set), not
+    /// necessarily what a manual start rewinds: that is `effectivePreRollSeconds`.
     public var ringPlan: RingPlan? { producer.withLock { $0.plan } }
-    public var effectivePreRollSeconds: Double { ringPlan?.effectivePreRollSeconds ?? 0 }
+    public var effectivePreRollSeconds: Double { producer.withLock { p in p.setup.flatMap { setup in p.plan.map { Self.preRoll(setup, $0).seconds } } } ?? 0 }
+
+    /// What a manual start rewinds: the plan's pre-roll, or `preRollSeconds` when the ring was planned
+    /// for more (`ringPreRollSeconds`).
+    private static func preRoll(_ setup: Setup, _ plan: RingPlan) -> (bytes: Int, seconds: Double) {
+        guard setup.ringPreRollSeconds != nil else { return (plan.preRollBytes, plan.effectivePreRollSeconds) }
+        let seconds = min(plan.effectivePreRollSeconds, max(0, setup.preRollSeconds))
+        let bytes = min(plan.preRollBytes, Int((seconds * setup.sampleRate).rounded(.down)) * setup.layout.bytesPerFrame)
+        return (bytes, seconds)
+    }
 
     /// Forgets the pre-roll (a new run of the radio).
     public func clearHistory() { ring.clear() }
@@ -342,8 +361,9 @@ public final class StreamRecorder: @unchecked Sendable {
 
     public var status: RecordingStatus {
         var s = statusLock.withLock { $0 }
-        if let plan = ringPlan, plan.preRollBytes > 0 {
-            s.preRollFill = min(1, Double(ring.available) / Double(plan.preRollBytes))
+        let preRollBytes = producer.withLock { p in p.setup.flatMap { setup in p.plan.map { Self.preRoll(setup, $0).bytes } } } ?? 0
+        if preRollBytes > 0 {
+            s.preRollFill = min(1, Double(ring.available) / Double(preRollBytes))
         }
         return s
     }
@@ -472,7 +492,7 @@ public final class StreamRecorder: @unchecked Sendable {
         }
         let context = self.context.withLock { $0 } ?? RecordingContext(frequencyHz: 0, label: kind.label, hardware: "")
         // The ring may have moved on since the byte was chosen: never start behind what it holds.
-        let position = autoByte.map { ring.clamped(position: $0) } ?? ring.rewind(bytes: plan.preRollBytes)
+        let position = autoByte.map { ring.clamped(position: $0) } ?? ring.rewind(bytes: Self.preRoll(setup, plan).bytes)
         let back = Double((ring.head - position) / setup.layout.bytesPerFrame) / setup.sampleRate
         let first = now().addingTimeInterval(-back)
         var status = RecordingStatus()

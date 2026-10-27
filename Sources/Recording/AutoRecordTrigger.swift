@@ -24,6 +24,17 @@ public struct AutoRecordTiming: Equatable, Sendable, Codable {
         self.stopAfter = stopAfter
     }
 
+    private enum CodingKeys: String, CodingKey { case startAfter, stopAfter }
+
+    /// Every key is optional and a missing one keeps its default, so a timing saved by another
+    /// SubFloor (with a field added or gone) still decodes instead of losing the whole session.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = AutoRecordTiming()
+        self = AutoRecordTiming(startAfter: try c.decodeIfPresent(Double.self, forKey: .startAfter) ?? d.startAfter,
+                                stopAfter: try c.decodeIfPresent(Double.self, forKey: .stopAfter) ?? d.stopAfter).normalized()
+    }
+
     /// Clamps Start after into its range and snaps Stop after to the nearest choice (the lower on a tie).
     public func normalized() -> AutoRecordTiming {
         let start = min(max(startAfter, Self.startAfterRange.lowerBound), Self.startAfterRange.upperBound)

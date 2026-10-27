@@ -62,6 +62,8 @@ public final class AutoRecorder: @unchecked Sendable {
     public init(recorder: StreamRecorder) {
         self.recorder = recorder
         events.reserveCapacity(8)
+        // Room for every pop the queue may hold, so the DSP thread's append never allocates.
+        pops.withLock { $0.reserveCapacity(Self.popCapacity + 1) }
     }
 
     // MARK: Any thread
@@ -90,14 +92,21 @@ public final class AutoRecorder: @unchecked Sendable {
         hasPending.store(true, ordering: .releasing)
     }
 
-    /// The pops logged since the last call, oldest first.
+    /// The pops logged since the last call, oldest first. They are copied out into an array of the
+    /// caller's, so the queue keeps its storage and the DSP thread's next pop allocates nothing.
     public func drainPops() -> [IgnoredPop] {
         pops.withLock { queue in
-            let drained = queue
-            queue.removeAll()
+            guard !queue.isEmpty else { return [] }
+            var drained: [IgnoredPop] = []
+            drained.reserveCapacity(queue.count)
+            drained.append(contentsOf: queue)
+            queue.removeAll(keepingCapacity: true)
             return drained
         }
     }
+
+    /// Test hook: the pop queue's capacity.
+    var popQueueCapacity: Int { pops.withLock { $0.capacity } }
 
     /// Test hook: how many times `cut()` has been called.
     public var cuts: Int { cutRequests.load(ordering: .relaxed) }

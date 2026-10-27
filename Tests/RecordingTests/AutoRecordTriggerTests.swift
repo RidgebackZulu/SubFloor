@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import Recording
 
@@ -129,5 +130,16 @@ private func isPop(_ e: AutoRecordTrigger.Event) -> Bool { if case .pop = e { tr
         #expect(AutoRecordTiming(startAfter: 20, stopAfter: 7).normalized() == .init(startAfter: 10, stopAfter: 5))
         #expect(AutoRecordTiming().normalized() == AutoRecordTiming())
         #expect(AutoRecordTiming.maxHoldbackSeconds == 612)
+    }
+
+    @Test func timingDecodesMissingFieldsAsDefaultsAndNormalizes() throws {
+        let decoder = JSONDecoder()
+        #expect(try decoder.decode(AutoRecordTiming.self, from: Data("{}".utf8)) == AutoRecordTiming())
+        #expect(try decoder.decode(AutoRecordTiming.self, from: Data(#"{"stopAfter":60,"later":true}"#.utf8))
+                == AutoRecordTiming(startAfter: 2, stopAfter: 60))
+        #expect(try decoder.decode(AutoRecordTiming.self, from: Data(#"{"startAfter":0.1,"stopAfter":40}"#.utf8))
+                == AutoRecordTiming(startAfter: 0.5, stopAfter: 45))
+        let timing = AutoRecordTiming(startAfter: 3, stopAfter: 120)
+        #expect(try decoder.decode(AutoRecordTiming.self, from: JSONEncoder().encode(timing)) == timing)
     }
 }
