@@ -80,6 +80,29 @@ struct AutoRecordControlTests {
         #expect(m.engine.autoRecorder.config.enabled == false)
     }
 
+    @Test func aManualAudioRecordingPausesAuto() {
+        let (m, _) = makeModel()
+        defer { m.shutdown() }
+        guard runningDemo(m) != nil else { return }
+        m.setSourceKindForTesting(.file)   // a source Auto may record
+        m.squelchDb = 50                   // the gate never opens, so Auto never records here
+        m.squelchEnabled = true
+        m.autoRecordEnabled = true
+        #expect(m.autoRecordState == .armed)
+        m.startRecording(.audio)
+        #expect(m.isRecording(.audio))
+        #expect(m.autoRecordState == .paused)
+        m.stopRecording(.audio)
+        #expect(wait(upTo: 5) { m.recordingStatus[.audio]?.isRecording == false })
+        #expect(m.autoRecordState == .armed)
+        // The waiting states come first: with the squelch off it needs the squelch, recording or not.
+        m.startRecording(.audio)
+        m.squelchEnabled = false
+        #expect(m.autoRecordState == .needsSquelch)
+        m.stopRecording(.audio)
+        #expect(wait(upTo: 5) { m.recordingStatus[.audio]?.isRecording == false })
+    }
+
     @Test func autoIsOffWhileTheRadioIsStopped() {
         let (m, _) = makeModel()
         defer { m.shutdown() }
@@ -166,8 +189,10 @@ struct AutoRecordControlTests {
         // A recording taken over by the Audio button is logged as manual.
         let status = try #require(m.recordingStatus[.audio])
         let entries = try m.recordingLog.entries(forUTCDay: try #require(status.startedAt))
-        #expect(entries.count == 1)
-        if case .recording(let file, _, _, _, _, let auto) = entries.first {
+        #expect(entries.count == 2)   // the auto start, seen before the takeover, and the recording
+        if case .autoStarted(let file, _, _, _) = entries.first { #expect(file == url?.lastPathComponent) }
+        else { Issue.record("expected the auto start first, got \(entries)") }
+        if case .recording(let file, _, _, _, _, let auto) = entries.last {
             #expect(file == url?.lastPathComponent)
             #expect(!auto)
         } else {
@@ -193,6 +218,25 @@ struct AutoRecordControlTests {
         #expect(m.recordingStatus[.audio]?.filesWritten == 1)
     }
 
+    @Test func changingThePreRollDoesNotEndAnAutoRecording() {
+        let (m, _) = makeModel()
+        defer { m.shutdown() }
+        guard runningDemo(m) != nil else { return }
+        #expect(startAutoSession(m))
+        let url = m.recordingStatus[.audio]?.url
+        let plan = m.engine.audioRecorder.ringPlan
+        m.recording.preRollSeconds = 60
+        m.recording.preRollSeconds = RecordingSettings.preRollRange.lowerBound
+        #expect(m.engine.audioRecorder.ringPlan == plan)
+        #expect(m.engine.audioRecorder.effectivePreRollSeconds == RecordingSettings.preRollRange.lowerBound)
+        m.engine.audioRecorder.commit(throughFrame: m.engine.audioRecorder.headFrame)
+        wait(0.4)
+        #expect(m.isAutoRecording)
+        #expect(m.recordingStatus[.audio]?.url == url)
+        #expect(m.recordingStatus[.audio]?.filesWritten == 1)
+        #expect(m.recordingStatus[.audio]?.error == nil)
+    }
+
     @Test func theAudioRingAlwaysHoldsTheLongestHoldbackAndTheFullPreRoll() {
         let (m, _) = makeModel()
         defer { m.shutdown() }
@@ -201,6 +245,11 @@ struct AutoRecordControlTests {
         m.recording.preRollSeconds = RecordingSettings.preRollRange.upperBound
         #expect(m.engine.audioRecorder.setup?.holdbackSeconds == AutoRecordTiming.maxHoldbackSeconds)
         #expect(m.engine.audioRecorder.effectivePreRollSeconds == RecordingSettings.preRollRange.upperBound)
+        // Planned for the longest pre-roll whatever the chosen one, so a change never rebuilds it.
+        let plan = m.engine.audioRecorder.ringPlan
+        m.recording.preRollSeconds = RecordingSettings.preRollRange.lowerBound
+        #expect(m.engine.audioRecorder.ringPlan == plan)
+        #expect(plan?.effectivePreRollSeconds == RecordingSettings.preRollRange.upperBound)
     }
 
     @Test func stoppingTheRadioLogsTheAutoRecording() throws {
@@ -211,6 +260,17 @@ struct AutoRecordControlTests {
         wait(0.3)
         #expect(startAutoSession(m))
         let recorder = m.engine.audioRecorder
+        // Its start is logged as soon as the app sees it, before it ends.
+        let seen = try #require(m.recordingStatus[.audio])
+        let started = try m.recordingLog.entries(forUTCDay: try #require(seen.startedAt))
+        #expect(started.count == 1)
+        if case .autoStarted(let file, let start, let hz, let label) = started.first {
+            #expect(file == seen.url?.lastPathComponent)
+            #expect(abs(start.timeIntervalSince(seen.startedAt!)) < 0.002)   // the log keeps milliseconds
+            #expect(hz == vfo && label == mode)
+        } else {
+            Issue.record("expected the auto start, got \(started)")
+        }
         recorder.commit(throughFrame: recorder.headFrame)
         #expect(wait(upTo: 5) { (m.recordingStatus[.audio]?.framesWritten ?? 0) > 0 })
         m.stop()
@@ -219,6 +279,8 @@ struct AutoRecordControlTests {
         let entries = try m.recordingLog.entries(forUTCDay: try #require(status.startedAt))
         let recordings = entries.filter { if case .recording = $0 { true } else { false } }
         #expect(recordings.count == 1)
+        #expect(entries.count == 2, "the start is logged once: \(entries)")
+        if case .autoStarted = entries.first {} else { Issue.record("the start comes first: \(entries)") }
         guard case .recording(let file, let start, let seconds, let hz, let label, let auto) = recordings.first else { return }
         #expect(auto)
         #expect(file == status.url?.lastPathComponent)
@@ -290,11 +352,21 @@ struct AutoRecordControlTests {
         m.refreshRecordingStatus()
         let status = recorder.status
         #expect(!status.isRecording)
-        let logged = recordings(try m.recordingLog.entries(forUTCDay: try #require(status.startedAt)))
+        let entries = try m.recordingLog.entries(forUTCDay: try #require(status.startedAt))
+        let logged = recordings(entries)
         #expect(logged.count == 1)
         #expect(logged.first?.file == status.url?.lastPathComponent)
         #expect(logged.first?.hz == m.vfoHz)
         #expect(logged.first?.auto == true)
+        // Its start too, before its end.
+        #expect(entries.count == 2)
+        if case .autoStarted(let file, let start, let hz, let label) = entries.first {
+            #expect(file == status.url?.lastPathComponent)
+            #expect(abs(start.timeIntervalSince(status.startedAt!)) < 0.002)
+            #expect(hz == m.vfoHz && label == m.mode.label)
+        } else {
+            Issue.record("expected the auto start first, got \(entries)")
+        }
     }
 
     @Test func vfoChangeCutsAndCentreRetuneDoesNot() {
@@ -337,10 +409,16 @@ struct AutoRecordControlTests {
         m.checkRecordingsDiskSpace()
         #expect(m.banner?.kind == .warning)   // crossed again
         free = 50_000_000
+        let before = Date()
         m.checkRecordingsDiskSpace()
         #expect(!m.autoRecordEnabled)
         #expect(m.banner?.kind == .error)
         #expect(m.banner?.message == "Auto-record is off: less than 100 MB free where recordings go.")
+        // And the log says so.
+        let entries = (try? m.recordingLog.entries(forUTCDay: before)) ?? []
+        let after = (try? m.recordingLog.entries(forUTCDay: Date())) ?? []
+        let reasons = (entries + after).compactMap { if case .autoOff(let at, let reason) = $0, at >= before.addingTimeInterval(-0.01) { reason } else { nil } }
+        #expect(reasons.first == "less than 100 MB free")
     }
 
     @Test func lowDiskStopsAnAutoRecordingButNotAManualOne() {

@@ -146,7 +146,8 @@ private struct RecordButton: View {
 }
 
 /// Squelch auto-record. Off: plain. Armed: a faint red ring. Recording: solid red with the elapsed
-/// time. Waiting (squelch off, radio stopped, demo source): a dashed, dimmed ring and help saying why.
+/// time. Waiting (squelch off, radio stopped, demo source) or paused (a manual audio recording runs):
+/// a dashed, dimmed ring and help saying why.
 private struct AutoRecordButton: View {
     @Environment(AppModel.self) private var model
 
@@ -156,7 +157,7 @@ private struct AutoRecordButton: View {
         let ring: RecordButtonLabel.Ring = switch state {
         case .off, .recording: .none
         case .armed: .armed
-        case .needsSquelch, .needsRadio, .demoSource: .waiting
+        case .needsSquelch, .needsRadio, .demoSource, .paused: .waiting
         }
         let timing = model.recording.autoTiming
         let status = model.recordingStatus[.audio] ?? RecordingStatus()
@@ -167,6 +168,19 @@ private struct AutoRecordButton: View {
         .buttonStyle(.plain)
         .help(helpText(state, timing))
         .accessibilityLabel("Auto-record")
+        .accessibilityValue(accessibilityValue(state, duration: status.duration))
+    }
+
+    private func accessibilityValue(_ state: AppModel.AutoRecordState, duration: Double) -> String {
+        switch state {
+        case .off: "off"
+        case .armed: "listening"
+        case .recording: "recording \(RecordingFormat.elapsed(duration))"
+        case .needsSquelch: "waiting for squelch"
+        case .needsRadio: "waiting for the radio"
+        case .demoSource: "demo source"
+        case .paused: "paused"
+        }
     }
 
     private func helpText(_ state: AppModel.AutoRecordState, _ timing: AutoRecordTiming) -> String {
@@ -178,6 +192,7 @@ private struct AutoRecordButton: View {
         case .needsSquelch: return "Waiting: turn the squelch on"
         case .needsRadio: return "Waiting: start the radio"
         case .demoSource: return "Waiting: auto-record never records the demo source"
+        case .paused: return "Paused while you record audio by hand"
         }
     }
 }

@@ -70,14 +70,28 @@ final class AppModel {
     private(set) var upconverter = Upconverter()
     private(set) var hardware = SDRplaySettings()
     var cwPitchHz: Double = 700 { didSet { pushReceiver() } }
-    var squelchEnabled = false { didSet { pushReceiver(); pushAutoRecord() } }
+    /// Turning it off disables auto-record before the receiver opens the gate, so the DSP thread never
+    /// runs a block with the gate open and the trigger still on (it would commit the whole silent gap).
+    var squelchEnabled = false {
+        didSet {
+            if squelchEnabled {
+                pushReceiver()
+                pushAutoRecord()
+            } else {
+                pushAutoRecord()
+                pushReceiver()
+            }
+        }
+    }
     var squelchDb: Float = -80 { didSet { pushReceiver() } }
     var agcSpeed: AGCSpeed = .medium { didSet { pushReceiver() } }
     var volume: Float = 0.5 { didSet { engine.update(volume: volume) } }
 
     // MARK: Recording
-    /// Recording preferences (Settings). Kept valid; a change to the pre-roll or a sample format
-    /// starts the pre-roll over and ends a recording in progress (`StreamRecorder.configure`).
+    /// Recording preferences (Settings). Kept valid; a change to a sample format starts the pre-roll
+    /// over and ends a recording in progress, and so does a pre-roll change for IQ
+    /// (`StreamRecorder.configure`). The audio ring is planned for the longest pre-roll, so a pre-roll
+    /// change never ends an audio recording.
     var recording = RecordingSettings() {
         didSet {
             let valid = recording.normalized()
@@ -101,7 +115,8 @@ final class AppModel {
         }
     }
 
-    enum AutoRecordState: Equatable { case off, armed, recording, needsSquelch, needsRadio, demoSource }
+    /// `paused`: Auto is on but a manual audio recording owns the recorder; the trigger resumes after it.
+    enum AutoRecordState: Equatable { case off, armed, recording, needsSquelch, needsRadio, demoSource, paused }
 
     /// What the Auto button shows: why it is waiting, if it is.
     var autoRecordState: AutoRecordState {
@@ -109,6 +124,7 @@ final class AppModel {
         if !isRunning { return .needsRadio }
         if sourceKind == .synthetic { return .demoSource }
         if !squelchEnabled { return .needsSquelch }
+        if isRecording(.audio) { return .paused }
         return isAutoRecording ? .recording : .armed
     }
 
@@ -126,6 +142,8 @@ final class AppModel {
     @ObservationIgnored private var recordingTuning: (hz: Double, mode: String)?
     /// The first-sample time of the last audio recording logged, so none is logged twice.
     @ObservationIgnored private var loggedRecordingStart: Date?
+    /// The first-sample time of the last auto recording whose start was logged.
+    @ObservationIgnored private var loggedAutoStart: Date?
     /// The last log write failed (its banner has been shown).
     @ObservationIgnored private var logWriteFailed = false
     /// Held while Auto is on and the radio runs: the Mac does not idle to sleep, and App Nap does not
@@ -873,8 +891,9 @@ final class AppModel {
     }
 
     /// Both recorders get the stream rates and the preferences. The audio ring always holds the
-    /// longest auto-record holdback, so a timing change never rebuilds it (which would end a
-    /// recording); at most (120 + 612 + 12) s of 48 kHz float, 143 MB, inside its 256 MB limit.
+    /// longest pre-roll and the longest auto-record holdback, so neither a timing nor a pre-roll change
+    /// rebuilds it (which would end a recording); the pre-roll only sets how far a manual start
+    /// rewinds. That is (120 + 612 + 12) s of 48 kHz audio: 143 MB of float, inside its 256 MB limit.
     private func pushRecording() {
         let r = recording
         engine.iqRecorder.configure(StreamRecorder.Setup(
@@ -883,7 +902,7 @@ final class AppModel {
         engine.audioRecorder.configure(StreamRecorder.Setup(
             sampleRate: Receiver.audioRate, channels: StreamKind.audio.channels, fileFormat: r.audioFormat, sampleFormat: r.audioSampleFormat,
             preRollSeconds: r.preRollSeconds, holdbackSeconds: AutoRecordTiming.maxHoldbackSeconds,
-            memoryLimitBytes: 256 << 20, folder: r.folder))
+            ringPreRollSeconds: RecordingSettings.preRollRange.upperBound, memoryLimitBytes: 256 << 20, folder: r.folder))
     }
 
     /// File names: the IQ file carries the capture centre (a change rolls it), the audio file the VFO
@@ -921,6 +940,7 @@ final class AppModel {
     /// be busy). Each is logged once, keyed by its first-sample time.
     private func audioLogEntries(from previous: RecordingStatus?, to s: RecordingStatus) -> [RecordingLogEntry] {
         let now = (hz: vfoHz, mode: mode.label)
+        let tuningBefore = recordingTuning
         var entries: [RecordingLogEntry] = []
         let continued = previous.map { $0.isRecording && Self.sameRecording($0, s) } ?? false
         // The recording seen last time has ended, or another has replaced it.
@@ -934,6 +954,16 @@ final class AppModel {
         // One that started and ended unseen. Its tuning at the start is unknown: the current VFO and
         // mode are the best there is (a retune would have cut an auto recording anyway).
         if !s.isRecording, let entry = logEntry(for: s, tuning: now) { entries.append(entry) }
+        // An auto recording's start, logged once when it is first seen with a file, so a crash or a
+        // force-quit mid-recording still leaves a record of it. It goes before this recording's end,
+        // if that is logged in the same poll.
+        if s.isAuto, let url = s.url, let start = s.startedAt, start != loggedAutoStart {
+            loggedAutoStart = start
+            let tuning = s.isRecording ? recordingTuning ?? now : continued ? tuningBefore ?? now : now
+            let entry = RecordingLogEntry.autoStarted(file: url.lastPathComponent, start: start, frequencyHz: tuning.hz, mode: tuning.mode)
+            let end = entries.firstIndex { if case .recording(_, start, _, _, _, _) = $0 { true } else { false } }
+            entries.insert(entry, at: end ?? entries.endIndex)
+        }
         return entries
     }
 
@@ -996,6 +1026,7 @@ final class AppModel {
 
     static let lowDiskBytes: Int64 = 500_000_000
     static let lowDiskMessage = "Less than 500 MB free where recordings go."
+    static let autoOffLowDiskReason = "less than 100 MB free"
 
     /// Once a minute while Auto is on.
     private func checkRecordingsDiskSpaceIfDue() {
@@ -1013,6 +1044,8 @@ final class AppModel {
         if free < 100_000_000 {
             autoRecordEnabled = false
             if engine.audioRecorder.sessionKind == .auto { engine.audioRecorder.stop() }
+            // Logged before the banner, so a failed log write cannot replace it.
+            appendToLog([.autoOff(at: Date(), reason: Self.autoOffLowDiskReason)])
             show(Banner(kind: .error, message: "Auto-record is off: less than 100 MB free where recordings go."))
         } else if free < Self.lowDiskBytes {
             if !diskLow { show(Banner(kind: .warning, message: Self.lowDiskMessage)) }

@@ -98,7 +98,7 @@ private struct RecordingSection: View {
                     Button("Show") { model.revealRecordings() }.controlSize(.small)
                 }
             }
-            Text("Audio is the receiver's output before the volume knob, 48 kHz. IQ is the capture at the source rate; a retune starts a new IQ file. 16-bit IQ is lossless for the RSP1B's 14-bit ADC. Changing the pre-roll or a sample format starts the pre-roll over and ends a recording in progress.")
+            Text("Audio is the receiver's output before the volume knob, 48 kHz. IQ is the capture at the source rate; a retune starts a new IQ file. 16-bit IQ is lossless for the RSP1B's 14-bit ADC. Changing a sample format starts the pre-roll over and ends a recording in progress; changing the pre-roll does that for IQ only.")
                 .font(.caption).foregroundStyle(.secondary)
         }
     }
