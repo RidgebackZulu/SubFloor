@@ -39,6 +39,24 @@ private func lines(_ url: URL) throws -> [String] {
         #expect(written[0].contains("\"file\":\"SubFloor_20261026_143000Z_146520000Hz_NFM.wav\""))
     }
 
+    @Test func autoStartedAndAutoOffRoundTrip() throws {
+        let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let log = RecordingLog(folder: dir)
+        let start = utc(2026, 10, 26, 9, 15, 2.5)
+        let entries: [RecordingLogEntry] = [
+            .autoStarted(file: "SubFloor_20261026_091502Z_11175000Hz_USB.flac", start: start, frequencyHz: 11_175_000, mode: "USB"),
+            .autoOff(at: utc(2026, 10, 26, 9, 20, 0.125), reason: "less than 100 MB free"),
+        ]
+        try log.append(entries)
+        #expect(try log.entries(forUTCDay: start) == entries)
+        #expect(entries.map(\.date) == [start, utc(2026, 10, 26, 9, 20, 0.125)])
+        let written = try lines(log.fileURL(forUTCDay: start))
+        #expect(written == [
+            #"{"file":"SubFloor_20261026_091502Z_11175000Hz_USB.flac","frequencyHz":11175000,"mode":"USB","start":"2026-10-26T09:15:02.500Z","type":"autoStarted"}"#,
+            #"{"at":"2026-10-26T09:20:00.125Z","reason":"less than 100 MB free","type":"autoOff"}"#,
+        ])
+    }
+
     @Test func entriesLandInTheirUTCDay() throws {
         let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
         let log = RecordingLog(folder: dir)

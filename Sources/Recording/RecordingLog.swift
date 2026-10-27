@@ -13,20 +13,27 @@ public enum RecordingLogEntry: Codable, Equatable, Sendable {
     case pop(at: Date, seconds: Double, frequencyHz: Double, mode: String)
     /// The listener opened a recording. Written by the recordings window; defined here so the format is fixed.
     case heard(file: String, at: Date)
+    /// An auto recording has begun writing `file`, whose first sample is at `start`. Its `.recording`
+    /// entry follows when it ends; one without (a crash, a force-quit) is a recording cut short.
+    case autoStarted(file: String, start: Date, frequencyHz: Double, mode: String)
+    /// Auto-record turned itself off, and why (low disk).
+    case autoOff(at: Date, reason: String)
 
-    /// What the entry is filed under: a recording's start, a pop's or heard mark's `at`.
+    /// What the entry is filed under: a recording's start, or the entry's `at`.
     public var date: Date {
         switch self {
         case .recording(_, let start, _, _, _, _): start
         case .pop(let at, _, _, _): at
         case .heard(_, let at): at
+        case .autoStarted(_, let start, _, _): start
+        case .autoOff(let at, _): at
         }
     }
 
-    private enum Kind: String, Codable { case recording, pop, heard }
+    private enum Kind: String, Codable { case recording, pop, heard, autoStarted, autoOff }
 
     private enum Keys: String, CodingKey {
-        case type, file, start, at, seconds, frequencyHz, mode, auto
+        case type, file, start, at, seconds, frequencyHz, mode, auto, reason
     }
 
     public init(from decoder: Decoder) throws {
@@ -48,6 +55,14 @@ public enum RecordingLogEntry: Codable, Equatable, Sendable {
                 mode: try c.decode(String.self, forKey: .mode))
         case .heard:
             self = .heard(file: try c.decode(String.self, forKey: .file), at: try Self.decodeDate(c, .at))
+        case .autoStarted:
+            self = .autoStarted(
+                file: try c.decode(String.self, forKey: .file),
+                start: try Self.decodeDate(c, .start),
+                frequencyHz: try c.decode(Double.self, forKey: .frequencyHz),
+                mode: try c.decode(String.self, forKey: .mode))
+        case .autoOff:
+            self = .autoOff(at: try Self.decodeDate(c, .at), reason: try c.decode(String.self, forKey: .reason))
         }
     }
 
@@ -72,6 +87,16 @@ public enum RecordingLogEntry: Codable, Equatable, Sendable {
             try c.encode(Kind.heard, forKey: .type)
             try c.encode(file, forKey: .file)
             try c.encode(Self.format.format(at), forKey: .at)
+        case .autoStarted(let file, let start, let frequencyHz, let mode):
+            try c.encode(Kind.autoStarted, forKey: .type)
+            try c.encode(file, forKey: .file)
+            try c.encode(Self.format.format(start), forKey: .start)
+            try c.encode(frequencyHz, forKey: .frequencyHz)
+            try c.encode(mode, forKey: .mode)
+        case .autoOff(let at, let reason):
+            try c.encode(Kind.autoOff, forKey: .type)
+            try c.encode(Self.format.format(at), forKey: .at)
+            try c.encode(reason, forKey: .reason)
         }
     }
 
@@ -86,7 +111,7 @@ public enum RecordingLogEntry: Codable, Equatable, Sendable {
     }
 }
 
-/// An append-only log of finished recordings and ignored pops, one JSON-lines file per UTC day in
+/// An append-only log of recordings, ignored pops and auto-record events, one JSON-lines file per UTC day in
 /// `<recordings folder>/.subfloor/yyyy-MM-dd.jsonl`. An entry is filed under the UTC day of its
 /// `date`, so a recording that runs past midnight stays with the day it started.
 public struct RecordingLog: Sendable {
