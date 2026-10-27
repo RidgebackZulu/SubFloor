@@ -85,7 +85,17 @@ final class AppModel {
     }
     var squelchDb: Float = -80 { didSet { pushReceiver() } }
     var agcSpeed: AGCSpeed = .medium { didSet { pushReceiver() } }
-    var volume: Float = 0.5 { didSet { engine.update(volume: volume) } }
+    var volume: Float = 0.5 {
+        didSet {
+            engine.update(volume: effectiveVolume)
+            player?.volume = volume
+        }
+    }
+    /// The live radio is silent while a recording plays (`RecordingPlayer`). The volume knob keeps its place
+    /// and the session keeps saving `volume`; only what the engine is told changes.
+    var liveAudioMuted = false { didSet { engine.update(volume: effectiveVolume) } }
+    /// What the engine plays the live radio at.
+    var effectiveVolume: Float { liveAudioMuted ? 0 : volume }
 
     // MARK: Recording
     /// Recording preferences (Settings). Kept valid; a change to a sample format starts the pre-roll
@@ -135,6 +145,10 @@ final class AppModel {
     /// The recordings in the folder, with when they were made and whether they have been heard. It follows
     /// the folder setting, the log writes below and the recording in progress.
     let library: RecordingsLibrary
+
+    /// Plays a recording from the library and mutes the live radio while it does. Set once in `init`, which
+    /// is why it is not a `let`: its mute closure needs `self`.
+    @ObservationIgnored private(set) var player: RecordingPlayer!
 
     /// Test hook: the free bytes on the volume recordings go to (nil: unknown).
     @ObservationIgnored var freeSpaceProbe: (URL) -> Int64? = { AppModel.freeSpace(at: $0) }
@@ -245,6 +259,7 @@ final class AppModel {
         self.openRSP = openRSP
         self.rspOpenTimeout = rspOpenTimeout
         library = RecordingsLibrary(folder: RecordingSettings().folder)   // the folder `restoreSession` may replace
+        player = RecordingPlayer(library: library, setLiveMuted: { [weak self] muted in self?.liveAudioMuted = muted })
         let (loaded, result) = bookmarkStore.load()
         bookmarks = loaded
         switch result {
@@ -257,6 +272,7 @@ final class AppModel {
             break
         }
         restoreSession()
+        player.volume = volume
         pushRecording()
         pushRecordingContexts()
         pushAutoRecord()
@@ -265,6 +281,10 @@ final class AppModel {
             Task { @MainActor in self?.show(Banner(kind: .error, message: message, action: .retry)) }
         }
         library.onError = { [weak self] message in self?.show(Banner(kind: .error, message: message)) }
+        library.onChange = { [weak self] in
+            guard let self else { return }
+            player.reconcile(with: library.catalog)
+        }
         Task { [library] in await library.reload() }
         // 10 Hz: the modem drain every tick, the other stats every other one.
         // In the common modes, so it also runs during menu tracking, a modal panel or a live resize:
@@ -392,7 +412,7 @@ final class AppModel {
         pushRecording()
         pushRecordingContexts()
         do {
-            try engine.start(source: activeSource, receiver: receiverConfig, spectrum: spectrum, volume: volume)
+            try engine.start(source: activeSource, receiver: receiverConfig, spectrum: spectrum, volume: effectiveVolume)
             isRunning = true
             deviceName = activeSource.name
             startClockCheckIfNeeded()
@@ -413,6 +433,7 @@ final class AppModel {
     /// Orderly shutdown (app quit): stop the engine, release the RSP, persist the session. Idempotent.
     func shutdown() {
         isShutDown = true
+        player.unload()
         engine.stop()
         isRunning = false
         pushAutoRecord()
