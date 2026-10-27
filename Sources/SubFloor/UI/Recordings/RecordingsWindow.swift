@@ -36,6 +36,8 @@ struct RecordingsWindow: View {
     @State private var selection: String?
     /// Moves the now line; ticks only on today's view.
     @State private var now = Date()
+    /// The window's content holds focus so Space and the arrows reach the player without a click first.
+    @FocusState private var keysFocused: Bool
 
     private var library: RecordingsLibrary { model.library }
     private var today: Date { RecordingsCatalog.utcDayStart(now) }
@@ -58,17 +60,36 @@ struct RecordingsWindow: View {
                     .frame(height: height)
             }
             .scrollBounceBehavior(.basedOnSize)
-            .frame(height: min(height, 400))
+            // The timeline gives way before the player does: a short window scrolls the lanes, never cuts
+            // off the player.
+            .frame(minHeight: min(height, 120), maxHeight: min(height, 400))
             .padding(.top, 16)
             .padding(.bottom, 8)
 
-            playerArea
+            PlayerPanel(recording: selectedRecording,
+                        lane: selectedRecording.flatMap { r in lanes.firstIndex { $0.id == r.laneID } } ?? 0,
+                        player: model.player, audioURL: selectedRecording.map { library.url(for: $0.file) },
+                        cacheFolder: library.folder.appendingPathComponent(".subfloor/peaks", isDirectory: true))
                 .padding(.horizontal, 18)
                 .padding(.bottom, 18)
         }
-        .frame(minWidth: 760, minHeight: 360, alignment: .top)
+        .frame(minWidth: 760, minHeight: 480, alignment: .top)
         .background(RecordingsTheme.background)
         .foregroundStyle(RecordingsTheme.text)
+        .focusable()
+        .focusEffectDisabled()
+        .focused($keysFocused)
+        // Always handled, so a key with nothing loaded is quiet rather than a beep. The player ignores both
+        // with nothing to play.
+        .onKeyPress(.space, phases: .down) { _ in
+            model.player.togglePlay()
+            return .handled
+        }
+        .onKeyPress(keys: [.leftArrow, .rightArrow]) { press in
+            let direction = press.key == .leftArrow ? -1 : 1
+            if press.modifiers.contains(.shift) { stepRecording(direction) } else { model.player.move(jumps: direction) }
+            return .handled
+        }
         .onAppear(perform: opened)
         .onDisappear { model.player.pause() }
         .onChange(of: selectedRecording == nil) { _, gone in
@@ -134,27 +155,6 @@ struct RecordingsWindow: View {
         .padding(.vertical, 12)
     }
 
-    // MARK: Player
-
-    /// Task 6's player panel goes here, reading `selectedRecording` and `model.player`.
-    @ViewBuilder private var playerArea: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            if let r = selectedRecording {
-                Text(RecordingsCatalog.laneTitle(frequencyHz: r.frequencyHz, mode: r.mode)).font(.system(size: 15, weight: .semibold))
-                Text([RecordingsFormat.clock(r.start), r.seconds.map(RecordingsFormat.length), r.auto ? "Auto" : "Manual"]
-                        .compactMap { $0 }.joined(separator: " · "))
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundStyle(RecordingsTheme.muted)
-            } else {
-                Text("Pick a recording on the timeline").foregroundStyle(RecordingsTheme.muted)
-            }
-        }
-        .frame(maxWidth: .infinity, minHeight: 90, alignment: .topLeading)
-        .padding(16)
-        .background(RoundedRectangle(cornerRadius: 12).fill(RecordingsTheme.panel))
-        .overlay(RoundedRectangle(cornerRadius: 12).stroke(RecordingsTheme.line))
-    }
-
     // MARK: Actions
 
     /// Today, or the day of the newest unheard recording when today has none, so what is new is in view.
@@ -170,6 +170,7 @@ struct RecordingsWindow: View {
             day = today
         }
         if let file = model.player.file, catalog.recording(file) != nil { selection = file }
+        keysFocused = true
     }
 
     private func step(_ days: Int) {
@@ -187,6 +188,21 @@ struct RecordingsWindow: View {
         guard !recording.inProgress else { return }
         selection = recording.file
         if model.player.file != recording.file { model.player.load(recording) }
+        keysFocused = true
+    }
+
+    /// ⇧← / ⇧→: the previous or next recording on the shown day, in start order, as a click on it would pick
+    /// it. One in progress cannot be played, so it is stepped over. With nothing selected on this day, → takes
+    /// the first and ← the last.
+    private func stepRecording(_ direction: Int) {
+        let playable = library.catalog.recordings(onUTCDay: day).filter { !$0.inProgress }
+        guard !playable.isEmpty else { return }
+        if let i = playable.firstIndex(where: { $0.file == selection }) {
+            let j = i + direction
+            if playable.indices.contains(j) { select(playable[j]) }
+        } else {
+            select(direction > 0 ? playable[0] : playable[playable.count - 1])
+        }
     }
 
     private func showInFinder() {
@@ -198,19 +214,23 @@ struct RecordingsWindow: View {
     }
 }
 
-/// The mockup's chip buttons: dark, rounded, quiet until hovered or pressed.
-private struct ChipButtonStyle: ButtonStyle {
+/// The mockup's chip buttons: dark, rounded, quiet until hovered or pressed. `on` fills the chosen one in amber,
+/// like the selected jump chip.
+struct ChipButtonStyle: ButtonStyle {
+    var on = false
+    var monospaced = false
     @Environment(\.isEnabled) private var isEnabled
 
     func makeBody(configuration: Configuration) -> some View {
+        let amber = RecordingsTheme.lanes[0]
         configuration.label
-            .font(.system(size: 12))
-            .foregroundStyle(Color(red: 0.73, green: 0.77, blue: 0.83))
+            .font(.system(size: 12, design: monospaced ? .monospaced : .default))
+            .foregroundStyle(on ? amber : Color(red: 0.73, green: 0.77, blue: 0.83))
             .padding(.horizontal, 10)
             .padding(.vertical, 4)
-            .background(RoundedRectangle(cornerRadius: 7).fill(Color(red: 0.106, green: 0.133, blue: 0.188)
-                .opacity(configuration.isPressed ? 0.6 : 1)))
-            .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color(red: 0.165, green: 0.2, blue: 0.267)))
+            .background(RoundedRectangle(cornerRadius: 7).fill(on ? amber.opacity(0.16) : Color(red: 0.106, green: 0.133, blue: 0.188))
+                .opacity(configuration.isPressed ? 0.6 : 1))
+            .overlay(RoundedRectangle(cornerRadius: 7).stroke(on ? amber.opacity(0.5) : Color(red: 0.165, green: 0.2, blue: 0.267)))
             .opacity(isEnabled ? 1 : 0.4)
             .contentShape(Rectangle())
     }

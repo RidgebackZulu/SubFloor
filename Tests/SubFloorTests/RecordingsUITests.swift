@@ -1,6 +1,7 @@
 import CoreGraphics
 import Foundation
 import Testing
+@testable import Recording
 @testable import SubFloor
 
 /// The Recordings window's pure parts: where a time falls on the day timeline, which marker a click lands on,
@@ -83,5 +84,56 @@ import Testing
 
     @Test func dayTitleFormat() {
         #expect(RecordingsFormat.dayTitle(Self.day) == "Tue 27 Oct 2026 UTC")
+    }
+
+    // MARK: Waveform zoom
+
+    @Test func wholeFileAtScaleOne() {
+        let zoom = WaveformZoom()
+        for playhead in [0.0, 37, 100] {
+            #expect(zoom.visibleRange(duration: 100, playhead: playhead) == 0...100)
+        }
+    }
+
+    @Test func zoomCentresOnThePlayhead() {
+        let zoom = WaveformZoom(scale: 10)
+        #expect(zoom.visibleRange(duration: 100, playhead: 50) == 45...55)
+    }
+
+    @Test func zoomStaysInsideTheFile() {
+        let zoom = WaveformZoom(scale: 10)
+        #expect(zoom.visibleRange(duration: 100, playhead: 1) == 0...10)
+        #expect(zoom.visibleRange(duration: 100, playhead: 99) == 90...100)
+    }
+
+    @Test func xMapsToSeconds() {
+        let zoom = WaveformZoom(scale: 10)
+        #expect(zoom.seconds(atX: 0, width: 1000, duration: 100, playhead: 50) == 45)
+        #expect(zoom.seconds(atX: 500, width: 1000, duration: 100, playhead: 50) == 50)
+        #expect(zoom.seconds(atX: 1000, width: 1000, duration: 100, playhead: 50) == 55)
+    }
+
+    @Test func zoomIsClamped() {
+        var zoom = WaveformZoom()
+        zoom.zoom(by: 0.1)
+        #expect(zoom.scale == 1)
+        zoom.zoom(by: 1e6)
+        #expect(zoom.scale == 600)
+        #expect(WaveformZoom.maxScale == 600)
+    }
+
+    @Test func envelopeFindsTheLoudestBinInAnyRange() {
+        let bins = (0..<1000).map { UInt8(truncatingIfNeeded: ($0 * 37 + 11) % 251) }
+        let envelope = PeakEnvelope(WaveformPeaks(sampleRate: 48_000, frames: 480_000, peaks: bins))
+        #expect(envelope.top == bins.max())
+        #expect(envelope.duration == 10)
+        for range in [0..<1, 0..<1000, 3..<4, 5..<517, 511..<513, 640..<1000, 999..<1000, 998..<2000, 1000..<1001] {
+            let clipped = range.clamped(to: 0..<1000)
+            #expect(envelope.peak(bins: range) == (clipped.isEmpty ? 0 : bins[clipped].max()), "bins \(range)")
+        }
+    }
+
+    @Test @MainActor func jumpChipTitles() {
+        #expect(RecordingPlayer.jumpSizes.map(PlayerPanel.jumpTitle) == ["0.1 s", "0.5 s", "1 s", "5 s", "30 s", "5 min"])
     }
 }
