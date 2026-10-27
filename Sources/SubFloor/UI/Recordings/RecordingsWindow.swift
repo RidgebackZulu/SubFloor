@@ -38,6 +38,8 @@ struct RecordingsWindow: View {
     @State private var now = Date()
     /// The window's content holds focus so Space and the arrows reach the player without a click first.
     @FocusState private var keysFocused: Bool
+    /// The file whose peaks the player panel could not read: unplayable, for Space as for the play button.
+    @State private var peaksFailure: URL?
 
     private var library: RecordingsLibrary { model.library }
     private var today: Date { RecordingsCatalog.utcDayStart(now) }
@@ -69,7 +71,8 @@ struct RecordingsWindow: View {
             PlayerPanel(recording: selectedRecording,
                         lane: selectedRecording.flatMap { r in lanes.firstIndex { $0.id == r.laneID } } ?? 0,
                         player: model.player, audioURL: selectedRecording.map { library.url(for: $0.file) },
-                        cacheFolder: library.folder.appendingPathComponent(".subfloor/peaks", isDirectory: true))
+                        cacheFolder: library.folder.appendingPathComponent(".subfloor/peaks", isDirectory: true),
+                        peaksFailure: $peaksFailure)
                 .padding(.horizontal, 18)
                 .padding(.bottom, 18)
         }
@@ -79,15 +82,20 @@ struct RecordingsWindow: View {
         .focusable()
         .focusEffectDisabled()
         .focused($keysFocused)
-        // Always handled, so a key with nothing loaded is quiet rather than a beep. The player ignores both
-        // with nothing to play.
+        // Always handled, so a key with nothing loaded is quiet rather than a beep. Space pauses whatever plays,
+        // and starts only what the panel would let the play button start.
         .onKeyPress(.space, phases: .down) { _ in
-            model.player.togglePlay()
+            let player: RecordingPlayer = model.player
+            if player.isPlaying { player.pause() } else if playerDisplay.playable { player.play() }
             return .handled
         }
         .onKeyPress(keys: [.leftArrow, .rightArrow]) { press in
             let direction = press.key == .leftArrow ? -1 : 1
-            if press.modifiers.contains(.shift) { stepRecording(direction) } else { model.player.move(jumps: direction) }
+            if press.modifiers.contains(.shift) {
+                stepRecording(direction)
+            } else if playerDisplay.seekable {
+                model.player.move(jumps: direction)
+            }
             return .handled
         }
         .onAppear(perform: opened)
@@ -153,6 +161,19 @@ struct RecordingsWindow: View {
         }
         .padding(.horizontal, 18)
         .padding(.vertical, 12)
+    }
+
+    /// The panel's rule for the selected recording, for the keys. Read only from the key handlers, never from
+    /// `body`, so the window does not re-render with the player.
+    private var playerDisplay: WaveformDisplay {
+        let player: RecordingPlayer = model.player
+        guard let r = selectedRecording else {
+            return WaveformDisplay(drawsPeaks: false, message: nil, seekable: false, playable: false)
+        }
+        let loaded = player.file == r.file
+        return WaveformDisplay.decide(loaded: loaded, hasEnvelope: false, loadError: loaded ? player.loadError : nil,
+                                      peaksFailed: peaksFailure == library.url(for: r.file),
+                                      duration: loaded ? player.duration : 0)
     }
 
     // MARK: Actions

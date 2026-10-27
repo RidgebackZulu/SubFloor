@@ -133,7 +133,8 @@ final class RecordingPlayer {
 
     // MARK: Private
 
-    private static let cannotPlay = "Can't play this file"
+    /// Also what the window says for a file whose peaks cannot be read: to the listener it is the same file.
+    nonisolated static let cannotPlay = "Can't play this file"
 
     private func muteLive(_ muted: Bool) {
         guard muted != liveIsMuted else { return }

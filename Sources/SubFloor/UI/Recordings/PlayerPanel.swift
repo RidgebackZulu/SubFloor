@@ -1,6 +1,27 @@
 import Recording
 import SwiftUI
 
+/// What the player area shows and allows for the selected recording. A file the player cannot open, one that
+/// stopped decoding, and one whose peaks cannot be read are all the same to the listener: `Can't play this
+/// file`, nothing drawn, no playhead, no seeking and no playing, from the button or from Space.
+struct WaveformDisplay: Equatable {
+    var drawsPeaks: Bool
+    var message: String?
+    var seekable: Bool
+    var playable: Bool
+
+    /// - Parameters:
+    ///   - loaded: the player holds the selected recording.
+    ///   - loadError: the player's, for the selected recording.
+    ///   - peaksFailed: reading the selected recording's peaks threw (not merely cancelled).
+    ///   - duration: the player's length of the file; 0 when it could not open it.
+    static func decide(loaded: Bool, hasEnvelope: Bool, loadError: String?, peaksFailed: Bool, duration: Double) -> Self {
+        let message = loadError ?? (peaksFailed ? RecordingPlayer.cannotPlay : nil)
+        let usable = loaded && message == nil && duration > 0
+        return Self(drawsPeaks: hasEnvelope && message == nil, message: message, seekable: usable, playable: usable)
+    }
+}
+
 /// Under the timeline: the selected recording's title line and playhead clock, its waveform to click, drag and
 /// zoom, and the play button and jump chips. Space and the arrow keys are the window's (see `RecordingsWindow`).
 ///
@@ -16,6 +37,9 @@ struct PlayerPanel: View {
     let audioURL: URL?
     /// `<recordings folder>/.subfloor/peaks`.
     let cacheFolder: URL
+    /// The file whose peaks could not be read. The window's, so its Space key follows the same rule as the play
+    /// button; and a file, not a flag, so a failure never carries over to the next selection.
+    @Binding var peaksFailure: URL?
 
     @State private var envelope: PeakEnvelope?
     @State private var loadingPeaks = false
@@ -32,9 +56,10 @@ struct PlayerPanel: View {
             if let r = recording {
                 let color = RecordingsTheme.lane(lane)
                 titleLine(r)
-                PlayerWaveform(recording: r, player: player, envelope: envelope, loading: loadingPeaks, color: color,
-                               zoom: $zoom)
-                PlayerControls(recording: r, player: player, color: color)
+                let peaksFailed = audioURL != nil && peaksFailure == audioURL
+                PlayerWaveform(recording: r, player: player, envelope: envelope, loading: loadingPeaks,
+                               peaksFailed: peaksFailed, color: color, zoom: $zoom)
+                PlayerControls(recording: r, player: player, peaksFailed: peaksFailed, color: color)
             } else {
                 Text("Pick a recording on the timeline")
                     .foregroundStyle(RecordingsTheme.muted)
@@ -78,7 +103,8 @@ struct PlayerPanel: View {
     }
 
     /// Reads the selected file's peaks (from the cache when it is current) and builds the envelope, both off
-    /// the main actor. A file that cannot be read leaves the waveform empty: the player says it can't play it.
+    /// the main actor. A file whose peaks cannot be read is marked failed, which makes it unplayable: a file cut
+    /// short by a crash can still open in the player and then play garbage, or nothing, against an empty box.
     private func loadPeaks() async {
         envelope = nil
         zoom = WaveformZoom()                // a new recording starts whole
@@ -92,8 +118,14 @@ struct PlayerPanel: View {
             let built = await Task.detached(priority: .userInitiated) { PeakEnvelope(peaks) }.value
             guard !Task.isCancelled else { return }
             envelope = built
+            if peaksFailure == audioURL { peaksFailure = nil }
+        } catch is CancellationError {
+            return                          // the next selection's read owns the state now
         } catch {
-            // Cancelled (the next selection's read owns the state now), or unreadable: nothing to draw.
+            guard !Task.isCancelled else { return }
+            peaksFailure = audioURL
+            // Started before the read failed: stop it, as the play button and Space now refuse to.
+            if player.isPlaying, let file = player.file, audioURL.lastPathComponent == file { player.pause() }
         }
         if !Task.isCancelled { loadingPeaks = false }
     }
@@ -116,25 +148,29 @@ private struct PlayheadClock: View {
 }
 
 /// The waveform as the player has it: the position, the length, and seeking, or `Can't play this file` over
-/// an empty waveform when the file could not be opened.
+/// an empty waveform, with no playhead, when the file cannot be played or its peaks cannot be read.
 private struct PlayerWaveform: View {
     let recording: CatalogRecording
     let player: RecordingPlayer
     let envelope: PeakEnvelope?
     let loading: Bool
+    let peaksFailed: Bool
     let color: Color
     @Binding var zoom: WaveformZoom
 
     var body: some View {
         let loaded = player.file == recording.file
-        let error = loaded ? player.loadError : nil
-        let duration = loaded && player.duration > 0 ? player.duration : envelope?.duration ?? 0
+        let display = WaveformDisplay.decide(loaded: loaded, hasEnvelope: envelope != nil,
+                                             loadError: loaded ? player.loadError : nil, peaksFailed: peaksFailed,
+                                             duration: loaded ? player.duration : 0)
+        // No playhead at all with the message up; the peaks' own length only before the player has the file.
+        let duration = display.message != nil ? 0 : display.seekable ? player.duration : envelope?.duration ?? 0
         let player = player
-        WaveformView(envelope: error == nil ? envelope : nil, loading: loading && error == nil, color: color,
-                     duration: error == nil ? duration : 0, position: loaded ? player.position : 0, zoom: $zoom,
-                     onSeek: loaded && error == nil && player.duration > 0 ? { player.seek(to: $0) } : nil)
+        WaveformView(envelope: display.drawsPeaks ? envelope : nil, loading: loading && display.message == nil,
+                     color: color, duration: duration, position: loaded ? player.position : 0, zoom: $zoom,
+                     onSeek: display.seekable ? { player.seek(to: $0) } : nil)
             .overlay {
-                if let error {
+                if let error = display.message {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
                         .font(.system(size: 13))
                         .foregroundStyle(RecordingsTheme.text)
@@ -148,10 +184,15 @@ private struct PlayerWaveform: View {
 private struct PlayerControls: View {
     let recording: CatalogRecording
     let player: RecordingPlayer
+    let peaksFailed: Bool
     let color: Color
 
     var body: some View {
-        let canPlay = player.file == recording.file && player.loadError == nil && player.duration > 0
+        let loaded = player.file == recording.file
+        let display = WaveformDisplay.decide(loaded: loaded, hasEnvelope: false, loadError: loaded ? player.loadError : nil,
+                                             peaksFailed: peaksFailed, duration: loaded ? player.duration : 0)
+        // Pausing is always allowed; starting only what can be played.
+        let canPlay = player.isPlaying || display.playable
         HStack(spacing: 6) {
             Button { player.togglePlay() } label: {
                 Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")

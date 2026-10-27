@@ -136,4 +136,34 @@ import Testing
     @Test @MainActor func jumpChipTitles() {
         #expect(RecordingPlayer.jumpSizes.map(PlayerPanel.jumpTitle) == ["0.1 s", "0.5 s", "1 s", "5 s", "30 s", "5 min"])
     }
+
+    // MARK: What the waveform shows
+
+    @Test func unreadablePeaksShowCantPlayAndBlockPlay() {
+        // AVAudioPlayer opened the file, but its peaks could not be read: it counts as unplayable.
+        let d = WaveformDisplay.decide(loaded: true, hasEnvelope: false, loadError: nil, peaksFailed: true, duration: 168)
+        #expect(d.message == "Can't play this file")
+        #expect(!d.drawsPeaks && !d.seekable && !d.playable)
+    }
+
+    @Test func playerLoadErrorShowsCantPlayAndBlocksPlay() {
+        // The player could not open the file.
+        let open = WaveformDisplay.decide(loaded: true, hasEnvelope: true, loadError: "Can't play this file", peaksFailed: false,
+                                          duration: 0)
+        #expect(open.message == "Can't play this file")
+        #expect(!open.drawsPeaks && !open.seekable && !open.playable)
+        // It stopped decoding mid-play: the length is known and the peaks were read, and still it does not play.
+        let midPlay = WaveformDisplay.decide(loaded: true, hasEnvelope: true, loadError: "Can't play this file",
+                                             peaksFailed: false, duration: 168)
+        #expect(midPlay.message == "Can't play this file")
+        #expect(!midPlay.drawsPeaks && !midPlay.seekable && !midPlay.playable)
+    }
+
+    @Test func readableFileDrawsSeeksAndPlays() {
+        let ready = WaveformDisplay.decide(loaded: true, hasEnvelope: true, loadError: nil, peaksFailed: false, duration: 168)
+        #expect(ready == WaveformDisplay(drawsPeaks: true, message: nil, seekable: true, playable: true))
+        // Peaks still loading: it plays and seeks meanwhile, with nothing drawn yet.
+        let loading = WaveformDisplay.decide(loaded: true, hasEnvelope: false, loadError: nil, peaksFailed: false, duration: 168)
+        #expect(loading == WaveformDisplay(drawsPeaks: false, message: nil, seekable: true, playable: true))
+    }
 }
