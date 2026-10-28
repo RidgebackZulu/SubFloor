@@ -129,7 +129,7 @@ struct RecordingPlayerTests {
         p.play()
         // Bounded, not paced: under a full test run (other suites starting and stopping audio, a busy main
         // thread) the last 0.1 s, and the end's delegate call or poll, can come seconds late.
-        #expect(wait(upTo: 60) { !p.isPlaying })
+        #expect(wait(upTo: 180) { !p.isPlaying })   // 28 s and 40 s seen in full runs
         #expect(abs(p.position - p.duration) < 0.001)
         #expect(abs(p.duration - 3) < 0.05)
         #expect(r.muted.values.last == false)
