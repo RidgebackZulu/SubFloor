@@ -272,7 +272,9 @@ struct AutoRecordControlTests {
             Issue.record("expected the auto start, got \(started)")
         }
         recorder.commit(throughFrame: recorder.headFrame)
-        #expect(wait(upTo: 5) { (m.recordingStatus[.audio]?.framesWritten ?? 0) > 0 })
+        // On captured frames, with a bound rather than a pace: the demo source runs slower than real time in a
+        // debug build, and slower again under a full test run.
+        #expect(wait(upTo: 30) { (m.recordingStatus[.audio]?.framesWritten ?? 0) > 0 })
         m.stop()
         let status = try #require(m.recordingStatus[.audio])
         #expect(!status.isRecording)

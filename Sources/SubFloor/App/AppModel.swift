@@ -85,7 +85,17 @@ final class AppModel {
     }
     var squelchDb: Float = -80 { didSet { pushReceiver() } }
     var agcSpeed: AGCSpeed = .medium { didSet { pushReceiver() } }
-    var volume: Float = 0.5 { didSet { engine.update(volume: volume) } }
+    var volume: Float = 0.5 {
+        didSet {
+            engine.update(volume: effectiveVolume)
+            player?.volume = volume
+        }
+    }
+    /// The live radio is silent while a recording plays (`RecordingPlayer`). The volume knob keeps its place
+    /// and the session keeps saving `volume`; only what the engine is told changes.
+    var liveAudioMuted = false { didSet { engine.update(volume: effectiveVolume) } }
+    /// What the engine plays the live radio at.
+    var effectiveVolume: Float { liveAudioMuted ? 0 : volume }
 
     // MARK: Recording
     /// Recording preferences (Settings). Kept valid; a change to a sample format starts the pre-roll
@@ -99,6 +109,7 @@ final class AppModel {
             if recording != oldValue {
                 pushRecording()
                 pushAutoRecord()
+                library.setFolder(recording.folder)
             }
         }
     }
@@ -128,8 +139,34 @@ final class AppModel {
         return isAutoRecording ? .recording : .armed
     }
 
+    /// Reads the recordings folder for the unheard badge, and lists it again whenever the app comes to the
+    /// front: only the Recordings window lists it otherwise, so a file deleted in Finder while the window is
+    /// closed would stay counted. Internal for tests, which start it on a model pointed at a temp folder.
+    func startLibrary() {
+        guard libraryActivation == nil else { return }
+        libraryActivation = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let library = self?.library else { return }
+                Task { await library.refreshFiles() }
+            }
+        }
+        Task { [library] in await library.reload() }
+    }
+
+    @ObservationIgnored private var libraryActivation: (any NSObjectProtocol)?
+
     /// The log of finished recordings and ignored pops, in the recordings folder.
     var recordingLog: RecordingLog { RecordingLog(folder: recording.folder) }
+
+    /// The recordings in the folder, with when they were made and whether they have been heard. It follows
+    /// the folder setting, the log writes below and the recording in progress.
+    let library: RecordingsLibrary
+
+    /// Plays a recording from the library and mutes the live radio while it does. Set once in `init`, which
+    /// is why it is not a `let`: its mute closure needs `self`.
+    @ObservationIgnored private(set) var player: RecordingPlayer!
 
     /// Test hook: the free bytes on the volume recordings go to (nil: unknown).
     @ObservationIgnored var freeSpaceProbe: (URL) -> Int64? = { AppModel.freeSpace(at: $0) }
@@ -229,7 +266,12 @@ final class AppModel {
     private var cpu = CPUUsage()
     private var lastSavedSession: Data?
 
-    convenience init() { self.init(bookmarkStore: BookmarkStore(url: BookmarkStore.defaultURL), defaults: .standard) }
+    /// The app's model. Only this one reads the recordings folder at launch: a test's model, made with the
+    /// init below, points the library at its own folder (or none) rather than at the owner's recordings.
+    convenience init() {
+        self.init(bookmarkStore: BookmarkStore(url: BookmarkStore.defaultURL), defaults: .standard)
+        startLibrary()
+    }
 
     /// `openRSP` and `rspOpenTimeout`: tests replace the device and the wait.
     init(bookmarkStore: BookmarkStore, defaults: UserDefaults,
@@ -239,6 +281,8 @@ final class AppModel {
         self.defaults = defaults
         self.openRSP = openRSP
         self.rspOpenTimeout = rspOpenTimeout
+        library = RecordingsLibrary(folder: RecordingSettings().folder)   // the folder `restoreSession` may replace
+        player = RecordingPlayer(library: library, setLiveMuted: { [weak self] muted in self?.liveAudioMuted = muted })
         let (loaded, result) = bookmarkStore.load()
         bookmarks = loaded
         switch result {
@@ -251,12 +295,18 @@ final class AppModel {
             break
         }
         restoreSession()
+        player.volume = volume
         pushRecording()
         pushRecordingContexts()
         pushAutoRecord()
         followPassband()
         engine.audio.onError = { [weak self] message in
             Task { @MainActor in self?.show(Banner(kind: .error, message: message, action: .retry)) }
+        }
+        library.onError = { [weak self] message in self?.show(Banner(kind: .error, message: message)) }
+        library.onChange = { [weak self] in
+            guard let self else { return }
+            player.reconcile(with: library.catalog)
         }
         // 10 Hz: the modem drain every tick, the other stats every other one.
         // In the common modes, so it also runs during menu tracking, a modal panel or a live resize:
@@ -384,7 +434,7 @@ final class AppModel {
         pushRecording()
         pushRecordingContexts()
         do {
-            try engine.start(source: activeSource, receiver: receiverConfig, spectrum: spectrum, volume: volume)
+            try engine.start(source: activeSource, receiver: receiverConfig, spectrum: spectrum, volume: effectiveVolume)
             isRunning = true
             deviceName = activeSource.name
             startClockCheckIfNeeded()
@@ -405,6 +455,7 @@ final class AppModel {
     /// Orderly shutdown (app quit): stop the engine, release the RSP, persist the session. Idempotent.
     func shutdown() {
         isShutDown = true
+        player.unload()
         engine.stop()
         isRunning = false
         pushAutoRecord()
@@ -414,6 +465,8 @@ final class AppModel {
         saveSessionIfChanged()
         statsTimer?.invalidate()
         statsTimer = nil
+        if let libraryActivation { NotificationCenter.default.removeObserver(libraryActivation) }
+        libraryActivation = nil
     }
 
     func retry() {
@@ -919,6 +972,7 @@ final class AppModel {
     /// Internal for tests, which drive the status sequence without the timer.
     func refreshRecordingStatus() {
         var entries: [RecordingLogEntry] = []
+        var live: LiveRecording??   // set when the audio status changed: the recording in progress, or none
         for kind in StreamKind.allCases {
             let s = recorder(kind).status
             let previous = recordingStatus[kind]
@@ -926,12 +980,26 @@ final class AppModel {
             if let error = s.error, error != previous?.error {
                 show(Banner(kind: .error, message: "\(kind.label) recording stopped: \(error)"))
             }
-            if kind == .audio { entries += audioLogEntries(from: previous, to: s) }
+            if kind == .audio {
+                entries += audioLogEntries(from: previous, to: s)
+                live = .some(liveRecording(for: s))
+            }
             recordingStatus[kind] = s
         }
         let hz = vfoHz, label = mode.label
         entries += engine.autoRecorder.drainPops().map { .pop(at: $0.at, seconds: $0.seconds, frequencyHz: hz, mode: label) }
         appendToLog(entries)
+        // After the log: a recording that ended is then already a finished one when it stops being live.
+        if let live { library.setLive(live) }
+    }
+
+    /// The audio recording in progress for the library: its file, the tuning it started with (as it is
+    /// logged) and its length so far. nil when none is recording or it has no file yet.
+    private func liveRecording(for s: RecordingStatus) -> LiveRecording? {
+        guard s.isRecording, let url = s.url, let start = s.startedAt else { return nil }
+        let tuning = recordingTuning ?? (hz: vfoHz, mode: mode.label)
+        return LiveRecording(file: url.lastPathComponent, start: start, seconds: s.duration,
+                             frequencyHz: tuning.hz, mode: tuning.mode, auto: s.isAuto)
     }
 
     /// Notes the tuning when an audio recording is first seen, and logs every recording that has
@@ -989,6 +1057,7 @@ final class AppModel {
         do {
             try recordingLog.append(entries)
             logWriteFailed = false
+            library.didLog(entries)   // only what is on disk
         } catch {
             guard !logWriteFailed else { return }
             logWriteFailed = true
