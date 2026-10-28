@@ -172,14 +172,142 @@ struct DialScrubTests {
         #expect(sync.lines(for: nil, now: 0) == [])
         #expect(sync.lines(for: nil, now: 1) == [])
     }
+}
 
-    @MainActor @Test func controllerTargetsNothingWithoutAKeyWindow() {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("SubFloorTests-\(UUID().uuidString)")
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        let model = AppModel(bookmarkStore: BookmarkStore(url: dir.appendingPathComponent("bookmarks.json")),
-                             defaults: UserDefaults(suiteName: UUID().uuidString)!)
-        let controller = DialController(model: model, defaults: UserDefaults(suiteName: UUID().uuidString)!)
-        #expect(!model.recordingsWindowIsKey)
-        #expect(controller.scrubTarget == nil)
+extension DialScrubTests {
+    /// The controller between the dial's lines and the player, on a hermetic model with a real three-second
+    /// recording loaded. Lines go in through `receive` and come out through `sentLinesForTesting` (no link is open).
+    @MainActor
+    @Suite(.serialized)
+    struct Controller {
+        private final class Sent { var lines: [String] = [] }
+
+        private struct Rig {
+            let model: AppModel, controller: DialController, sent: Sent
+            @MainActor var player: RecordingPlayer { model.player }
+        }
+
+        private static let start = Date(timeIntervalSince1970: 1_792_074_600.456)
+
+        /// A model whose recordings folder holds one three-second WAV with its log line, loaded in the player, and a
+        /// controller whose sent lines are captured.
+        private func rig(windowIsKey: Bool = true) async throws -> Rig {
+            let dir = FileManager.default.temporaryDirectory.appendingPathComponent("SubFloorDialTests-\(UUID().uuidString)",
+                                                                                    isDirectory: true)
+            let folder = dir.appendingPathComponent("rec", isDirectory: true)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            let file = "SubFloor_20261015_143000Z_146520000Hz_NFM.wav"
+            try writeWAV(folder.appendingPathComponent(file), seconds: 3)
+            try RecordingLog(folder: folder).append([
+                .recording(file: file, start: Self.start, seconds: 3, frequencyHz: 146_520_000, mode: "NFM", auto: true),
+            ])
+            let model = AppModel(bookmarkStore: BookmarkStore(url: dir.appendingPathComponent("bookmarks.json")),
+                                 defaults: UserDefaults(suiteName: UUID().uuidString)!)
+            model.recording.folderPath = folder.path
+            await model.library.reload()
+            model.player.volume = 0
+            model.player.load(try #require(model.library.catalog.recording(file)))
+            try #require(model.player.loadError == nil && model.player.duration > 0)
+            model.recordingsWindowIsKey = windowIsKey
+            let controller = DialController(model: model, defaults: UserDefaults(suiteName: UUID().uuidString)!)
+            let sent = Sent()
+            controller.sentLinesForTesting = { sent.lines.append($0) }
+            return Rig(model: model, controller: controller, sent: sent)
+        }
+
+        /// A mono 16-bit PCM WAV of silence.
+        private func writeWAV(_ url: URL, seconds: Double, rate: Int = 48_000) throws {
+            let frames = Int(seconds * Double(rate))
+            var data = Data()
+            func u32(_ v: Int) { withUnsafeBytes(of: UInt32(v).littleEndian) { data.append(contentsOf: $0) } }
+            func u16(_ v: Int) { withUnsafeBytes(of: UInt16(v).littleEndian) { data.append(contentsOf: $0) } }
+            data.append(contentsOf: Array("RIFF".utf8)); u32(36 + frames * 2)
+            data.append(contentsOf: Array("WAVEfmt ".utf8)); u32(16); u16(1); u16(1); u32(rate); u32(rate * 2); u16(2); u16(16)
+            data.append(contentsOf: Array("data".utf8)); u32(frames * 2)
+            data.append(Data(count: frames * 2))
+            try data.write(to: url)
+        }
+
+        /// Feeds the dial's line and returns what the controller sent in reply.
+        @discardableResult
+        private func receive(_ rig: Rig, _ line: String) -> [String] {
+            rig.sent.lines = []
+            rig.controller.receive(line, on: .usb)
+            return rig.sent.lines
+        }
+
+        private func isScrubLine(_ line: String) -> Bool {
+            ["SCRUB", "POS", "PLAY", "JUMP"].contains { line.hasPrefix($0 + " ") }
+        }
+
+        @Test func helloFromNewFirmwareStartsScrubAtOnce() async throws {
+            let r = try await rig()
+            defer { r.player.unload() }
+            let lines = receive(r, "HELLO SubFloorDial 1.1.0 step=100 knob=tune")
+            // Straight after the state, not on the next tick: a turn right after a link change must be a J, not a T.
+            #expect(lines.count == 3)
+            #expect(lines.first?.hasPrefix("S f=") == true)
+            #expect(lines.last == DialProtocol.scrubOn(startSecondOfDay: 52_200.456, length: r.player.duration,
+                                                       position: 0, playing: false, jump: 1, title: "146.520 MHz NFM"))
+            #expect(lines.last?.hasPrefix("SCRUB on t0=52200.456 len=3.00 pos=0.00 play=0 jump=1 title=") == true)
+        }
+
+        @Test func aTurnSeeksThePlayerAndAnswersItsPosition() async throws {
+            let r = try await rig()
+            defer { r.player.unload() }
+            receive(r, "HELLO SubFloorDial 1.1.0 step=100 knob=tune")
+            #expect(receive(r, "J 1 2 1") == ["POS 2.00 1"])
+            #expect(abs(r.player.position - 2) < 1e-9)
+            #expect(receive(r, "J 2 -5 0.1") == ["POS 1.50 2"])
+            #expect(abs(r.player.position - 1.5) < 1e-9)
+            // Past the end: the player clamps, and the answer is the clamped position.
+            #expect(receive(r, "J 3 4 1") == ["POS 3.00 3"])
+            #expect(r.player.position == r.player.duration)
+        }
+
+        @Test func aJumpFromTheDialSetsThePlayersJump() async throws {
+            let r = try await rig()
+            defer { r.player.unload() }
+            receive(r, "HELLO SubFloorDial 1.1.0 step=100 knob=tune")
+            #expect(receive(r, "JUMP 5") == [], "not echoed")
+            #expect(r.player.jump == 5)
+            #expect(receive(r, "JUMP 7") == [])
+            #expect(r.player.jump == 5, "not a jump size")
+        }
+
+        @Test func aTapTogglesPlayAndAnswersThePlayState() async throws {
+            let r = try await rig()
+            defer { r.player.unload() }
+            receive(r, "HELLO SubFloorDial 1.1.0 step=100 knob=tune")
+            #expect(receive(r, "PLAY") == ["PLAY 1", "POS 0.00"])
+            #expect(r.player.isPlaying)
+            let paused = receive(r, "PLAY")
+            #expect(!r.player.isPlaying)
+            #expect(paused.first == "PLAY 0")
+            #expect(paused.count == 2 && paused[1].hasPrefix("POS "))
+        }
+
+        @Test func oldFirmwareGetsNoScrubLines() async throws {
+            let r = try await rig()
+            defer { r.player.unload() }
+            let hello = receive(r, "HELLO SubFloorDial 1.0.0 step=100 knob=tune")
+            #expect(!hello.isEmpty && !hello.contains(where: isScrubLine))
+            #expect(receive(r, "J 1 2 1") == [])
+            #expect(receive(r, "JUMP 5") == [])
+            #expect(receive(r, "PLAY") == [])
+            #expect(r.player.position == 0 && r.player.jump == 1 && !r.player.isPlaying)
+        }
+
+        @Test func noKeyWindowNoScrub() async throws {
+            let r = try await rig(windowIsKey: false)
+            defer { r.player.unload() }
+            let hello = receive(r, "HELLO SubFloorDial 1.1.0 step=100 knob=tune")
+            #expect(!hello.isEmpty && !hello.contains(where: isScrubLine))
+            #expect(r.controller.scrubTarget == nil)
+            #expect(receive(r, "J 1 2 1") == [])
+            #expect(receive(r, "JUMP 5") == [])
+            #expect(receive(r, "PLAY") == [])
+            #expect(r.player.position == 0 && r.player.jump == 1 && !r.player.isPlaying)
+        }
     }
 }

@@ -61,6 +61,8 @@ final class DialController {
     @ObservationIgnored private var scrubSync = DialScrubSync()
     @ObservationIgnored private var hudTask: Task<Void, Never>?
     @ObservationIgnored private var toastTask: Task<Void, Never>?
+    /// Tests: sees every line sent to the active link (tests open no link). Always nil in the app.
+    @ObservationIgnored var sentLinesForTesting: ((String) -> Void)?
 
     /// What the dial was last told, so only changes are sent.
     private struct SentState {
@@ -184,7 +186,9 @@ final class DialController {
     }
 
     private func send(_ line: String) {
-        if let active { sendOn(active, line) }
+        guard let active else { return }
+        sentLinesForTesting?(line)
+        sendOn(active, line)
     }
 
     private func updateStatus() {
@@ -211,6 +215,9 @@ final class DialController {
 
     // MARK: Dial → SubFloor
 
+    /// Tests: a line from the dial, as the link would deliver it.
+    func receive(_ line: String, on t: Transport) { received(line, on: t) }
+
     private func received(_ line: String, on t: Transport) {
         lastHeard[t] = Date()
         guard let event = DialProtocol.parse(line) else { return }
@@ -226,6 +233,8 @@ final class DialController {
             sent = SentState()
             scrubSync.reset()
             sendState()
+            // At once, not on the next tick: a turn in between would be a T and tune the radio.
+            sendScrubLines()
             updateStatus()
             return
         }
