@@ -63,8 +63,11 @@ public struct AutoRecordTrigger: Sendable {
         case commit(throughFrame: Int)
         /// The file ends before this frame.
         case stop(atFrame: Int)
-        /// A squelch gap longer than Keep gaps up to: these frames, not yet committed, are written silent.
-        case silence(fromFrame: Int, toFrame: Int)
+        /// Part of a squelch gap longer than Keep gaps up to: these frames, not yet committed, are written
+        /// silent. A long gap is silenced as it goes, block by block, so the pieces follow on from each
+        /// other: the first fades out at its start, and the last, sent when the squelch reopens, fades the
+        /// audio back in just after its end.
+        case silence(fromFrame: Int, toFrame: Int, fadeOut: Bool, fadeIn: Bool)
         /// A run of gate activity that never reached Start after: its first open frame and the span from
         /// there to its last open frame (bridged gaps included), which the timeline shows as a length of time.
         case pop(atFrame: Int, frames: Int)
@@ -86,6 +89,8 @@ public struct AutoRecordTrigger: Sendable {
     /// The end of the most recent open block.
     private var lastOpenEnd = 0
     private var committed = 0
+    /// Inside a long gap: silenced up to here so far. nil when no gap is being silenced.
+    private var silencedThrough: Int?
 
     public init(sampleRate: Double, timing: AutoRecordTiming) {
         self.sampleRate = sampleRate
@@ -106,7 +111,6 @@ public struct AutoRecordTrigger: Sendable {
         lastHead = head
         guard head > previous else { return }
 
-        let gapStart = lastOpenEnd
         if gateOpen {
             if phase == .idle {
                 phase = .run
@@ -132,10 +136,23 @@ public struct AutoRecordTrigger: Sendable {
                 phase = .idle
             }
         case .recording:
-            if gateOpen, previous - gapStart > frames(timing.keepGapsUpTo) {
-                // Reopened after a long gap. Only up to the gap's tail is committed, so the rest is still ours.
-                let from = gapStart + frames(AutoRecordTiming.tail), to = previous - frames(AutoRecordTiming.lead)
-                if to > from { events.append(.silence(fromFrame: from, toFrame: to)) }
+            if gateOpen {
+                if let done = silencedThrough {
+                    // Reopened after a long gap: the rest of it up to the lead, then fade the audio back in.
+                    events.append(.silence(fromFrame: done, toFrame: max(done, previous - frames(AutoRecordTiming.lead)),
+                                           fadeOut: false, fadeIn: true))
+                    silencedThrough = nil
+                }
+            } else if head - lastOpenEnd > frames(timing.keepGapsUpTo) {
+                // A long gap: silence it as it goes, keeping the tail after the last word and, at the head, a
+                // lead's worth for the next one (any frame further back is at least that far before a reopen).
+                // Only up to the tail is committed during a gap, so these frames are still ours.
+                let from = silencedThrough ?? lastOpenEnd + frames(AutoRecordTiming.tail)
+                let to = head - frames(AutoRecordTiming.lead)
+                if to > from {
+                    events.append(.silence(fromFrame: from, toFrame: to, fadeOut: silencedThrough == nil, fadeIn: false))
+                    silencedThrough = to
+                }
             }
             let through = min(head, lastOpenEnd + frames(AutoRecordTiming.tail))
             if through > committed {
@@ -159,6 +176,7 @@ public struct AutoRecordTrigger: Sendable {
     }
 
     private mutating func reset() {
+        silencedThrough = nil
         phase = .idle
         isRecording = false
         openFrames = 0

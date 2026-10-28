@@ -116,13 +116,13 @@ public final class AutoRecorder: @unchecked Sendable {
     /// One block of mono audio and whether the squelch gate was open over it. The audio always goes to
     /// the recorder's history first, so the trigger sees the head after it.
     ///
-    /// `ungated` is the same block before the squelch gate. While Auto is on (and no manual recording
-    /// owns the recorder) that is what the history keeps, so a recording carries the real audio through
-    /// the pauses between words and the edges of each word; the trigger then silences only the gaps
-    /// longer than Keep gaps up to. Otherwise the history keeps `audio`, as heard.
+    /// `ungated` is the same block before the squelch gate. While Auto is on that is what the history
+    /// keeps, so a recording carries the real audio through the pauses between words and the edges of
+    /// each word; the trigger silences only the gaps longer than Keep gaps up to. A manual recording made
+    /// while Auto is on keeps the squelch-open audio too, all of it, pre-roll included, so one file never
+    /// mixes the two. With Auto off the history keeps `audio`, as heard.
     public func process(_ audio: UnsafeBufferPointer<Float>, ungated: UnsafeBufferPointer<Float>? = nil, gateOpen: Bool) {
-        let keepsGaps = applied.enabled && recorder.sessionKind != .manual
-        recorder.push(keepsGaps ? (ungated ?? audio) : audio)
+        recorder.push(applied.enabled ? (ungated ?? audio) : audio)
         applyPending()
 
         guard applied.enabled else {
@@ -188,8 +188,8 @@ public final class AutoRecorder: @unchecked Sendable {
                 recorder.commit(throughFrame: frame)
             case .stop(let frame):
                 recorder.stop(atFrame: frame)
-            case .silence(let from, let to):
-                recorder.silence(fromFrame: from, toFrame: to)
+            case .silence(let from, let to, let fadeOut, let fadeIn):
+                recorder.silence(fromFrame: from, toFrame: to, fadeOut: fadeOut, fadeIn: fadeIn)
             case .pop(let frame, let frames):
                 let at = recorder.now().addingTimeInterval(-Double(head - frame) / rate)
                 log(IgnoredPop(at: at, seconds: Double(frames) / rate))
