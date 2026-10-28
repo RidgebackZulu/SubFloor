@@ -291,3 +291,52 @@ private func keyedToneDb(_ y: [Float], latency: Int, from: Double, to: Double) -
     _ = run(reducer, mix(syllables(seconds: 8, amplitude: amplitude(3, over: 0.1)), noise(seconds: 8, rms: 0.1, seed: 9)))
     #expect(reducer.voiceLossDb < 0.5, "\(reducer.voiceLossDb) dB")
 }
+
+/// A clean 317 Hz tone with a whisper of noise: its sample-to-sample steps are tiny, so any
+/// discontinuity in the output shows up.
+private func cleanTone(seconds: Double) -> [Float] {
+    mix(tone(seconds: seconds, amplitude: 0.45, frequency: 317), noise(seconds: seconds, rms: 0.003, seed: 30))
+}
+
+private func largestStep(_ y: [Float], _ range: Range<Int>) -> Float {
+    range.dropFirst().map { abs(y[$0] - y[$0 - 1]) }.max()!
+}
+
+private func rmsDb(_ y: [Float], _ start: Int, _ count: Int = 128) -> Double { levelDb(y[start..<(start + count)]) }
+
+@Test func turningOnFromIdleHasNoStepOrDip() {
+    let x = cleanTone(seconds: 3)
+    let nr = NoiseReducer()
+    let toggle = Int(fs) + 38      // a quarter period (38 samples) past a zero crossing: the tone is at its peak
+    var y = runNR(nr, Array(x[0..<toggle]))
+    nr.update(NoiseReductionSettings(enabled: true, strength: 0.5))
+    y += runNR(nr, Array(x[toggle...]))
+    let l = SpectralNoiseReducer().latency
+    // No step beyond what the input itself has (the reducer is silent for `latency` samples).
+    let inputStep = largestStep(x, 1000..<(2 * Int(fs)))
+    let around = largestStep(y, (toggle - 10)..<(toggle + l + Int(0.03 * fs) + 400))
+    #expect(around <= 1.5 * inputStep, "around \(around) vs input \(inputStep)")
+    // No dip while the reducer fills: until the wet fade starts the output is the dry input.
+    let dip = stride(from: toggle, to: toggle + l + 128, by: 128).map { rmsDb(y, $0) - rmsDb(x, $0) }.min()!
+    #expect(dip >= -3, "dip \(dip) dB")
+}
+
+@Test func resetWhileOnHasNoDropoutOrStep() {
+    let x = cleanTone(seconds: 4)
+    let nr = NoiseReducer()
+    nr.update(NoiseReductionSettings(enabled: true, strength: 0.5))
+    let at = Int(2.5 * fs) + 38, l = SpectralNoiseReducer().latency      // tone at its peak
+    var y = runNR(nr, Array(x[0..<at]))
+    nr.reset()
+    y += runNR(nr, Array(x[at...]))
+    let inputStep = largestStep(x, 1000..<(3 * Int(fs)))
+    let around = largestStep(y, (at - 10)..<(at + l + Int(0.2 * fs)))
+    #expect(around <= 1.5 * inputStep, "around \(around) vs input \(inputStep)")
+    // The output goes to the dry path and back, never to silence: between the reset and the fade
+    // back to wet (30 ms + latency) it stays within 3 dB of the level it had before, or of the
+    // input if that is lower.
+    let wetBefore = rmsDb(y, at - 2048, 2048)
+    let floorDb = min(wetBefore, rmsDb(x, at - 2048, 2048)) - 3
+    let low = stride(from: at, to: at + Int(0.03 * fs) + l, by: 128).map { rmsDb(y, $0) }.min()!
+    #expect(low >= floorDb, "lowest 128-sample level \(low) dB vs floor \(floorDb) dB (before the reset \(wetBefore) dB)")
+}

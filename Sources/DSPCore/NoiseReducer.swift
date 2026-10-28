@@ -37,6 +37,12 @@ public final class NoiseReducer {
     private var strengthStep: Double = 0
     private var strengthRampLeft = 0
     private var rampTarget: Double = 0.5
+    /// A reset requested while running: the old reducer keeps playing out its wet path while the
+    /// mix fades to dry, and is reset once the mix reaches 0, so the output never drops to silence.
+    private var resetPending = false
+    /// Samples the freshly reset reducer still needs before its output is real audio rather than
+    /// silence; the wet fade starts after this many.
+    private var priming = 0
     /// Smoothed linear make-up gain on the wet path (1 = 0 dB).
     private var makeup: Float = 1
     private let makeupCoefficient: Float
@@ -61,8 +67,8 @@ public final class NoiseReducer {
         let idle = !settings.enabled && wetMix == 0
         if new.enabled && idle {
             // Coming on from idle: the reducer holds stale audio and a stale noise estimate.
-            reducer.reset()
-            makeup = 1
+            // Its output is silence for `latency` samples, so stay dry until that has passed.
+            restartReducer()
         }
         if idle {
             currentStrength = target                 // not running, nothing to ramp
@@ -90,10 +96,23 @@ public final class NoiseReducer {
         }
     }
 
-    /// Clears the reducer and the make-up gain; keeps the settings.
+    /// Clears the reducer and the make-up gain; keeps the settings. Call on the processing thread
+    /// only. While NR is on, the output fades to the dry path over 30 ms, the reducer is reset
+    /// there, and it fades back to wet once the reducer has primed: it never drops to silence.
     public func reset() {
+        if !settings.enabled && wetMix == 0 {
+            reducer.reset()
+            makeup = 1
+        } else {
+            resetPending = true
+        }
+    }
+
+    private func restartReducer() {
         reducer.reset()
         makeup = 1
+        resetPending = false
+        priming = reducer.latency
     }
 
     private func processChunk(_ p: UnsafeMutablePointer<Float>, _ count: Int) {
@@ -112,7 +131,7 @@ public final class NoiseReducer {
         let limit = max(0, -SpectralNoiseReducer.floorDb(strength: currentStrength) - 6)
         let targetDb = min(max(reducer.voiceLossDb, 0), limit)
         let target = Float(pow(10, Double(targetDb) / 20))
-        let mixTarget: Float = settings.enabled ? 1 : 0
+        let mixTarget: Float = settings.enabled && !resetPending && priming <= 0 ? 1 : 0
         let mixStep = 1 / Float(rampSamples)
         var g = makeup, m = wetMix
         for i in 0..<count {
@@ -122,5 +141,7 @@ public final class NoiseReducer {
         }
         makeup = g
         wetMix = m
+        if priming > 0 { priming -= count }
+        if resetPending && m == 0 { restartReducer() }
     }
 }
