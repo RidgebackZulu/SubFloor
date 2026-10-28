@@ -130,6 +130,16 @@ private let am = "SubFloor_20261027_090000Z_6925000Hz_AM.flac"
         #expect(c.lanes(onUTCDay: day(2026, 10, 27)).map(\.id) == ["11175000 USB"])
     }
 
+    @Test func aListedLiveRecordingAppearsOnceAndInProgress() {
+        let live = LiveRecording(file: usb, start: utc(2026, 10, 27, 18, 32, 19), seconds: 2.5, frequencyHz: 11_175_000, mode: "USB", auto: true)
+        var c = RecordingsCatalog(files: [usb], live: live)
+        c.apply([.autoStarted(file: usb, start: live.start, frequencyHz: 11_175_000, mode: "USB")])
+        let r = c.recordings(onUTCDay: day(2026, 10, 27))
+        #expect(r.map(\.file) == [usb]); #expect(r.map(\.inProgress) == [true])
+        c.setLive(nil)
+        #expect(c.recordings(onUTCDay: day(2026, 10, 27)).map(\.inProgress) == [false])
+    }
+
     @Test func lanesPerFrequencyAndMode() {
         let files = [
             "SubFloor_20261027_100000Z_11175000Hz_USB.flac",

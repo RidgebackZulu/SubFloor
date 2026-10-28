@@ -212,7 +212,9 @@ public struct RecordingsCatalog: Equatable, Sendable {
     /// The day's recordings by start time. `day` is any instant in the UTC day.
     public func recordings(onUTCDay day: Date) -> [CatalogRecording] {
         let d = Self.dayNumber(day)
-        var all = (filesByDay[d] ?? []).compactMap { file in names[file].map { recording(file, $0) } }
+        var all = (filesByDay[d] ?? []).compactMap { file in
+            file == live?.file ? nil : names[file].map { recording(file, $0) }   // the live one is added below, once
+        }
         if let live, Self.dayNumber(live.start) == d { all.append(liveRecording(live)) }   // listed even before the folder shows it
         return all.sorted { ($0.start, $0.file) < ($1.start, $1.file) }
     }

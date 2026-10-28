@@ -110,7 +110,8 @@ final class RecordingsLibrary {
     func refreshFiles() async {
         let folder = self.folder
         let files = await Task.detached(priority: .userInitiated) { Self.listing(of: folder).map(Set.init) }.value
-        guard folder == self.folder, let files, catalog.setFiles(files) else { return }
+        // Compared first: even an unchanged `setFiles` writes `catalog`, which redraws the window and the badge.
+        guard folder == self.folder, let files, files != catalog.files, catalog.setFiles(files) else { return }
         listingRevision += 1
         changed()
     }
