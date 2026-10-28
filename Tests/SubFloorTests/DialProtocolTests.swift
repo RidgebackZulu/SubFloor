@@ -58,9 +58,10 @@ struct DialProtocolTests {
     }
 
     @Test func formatsTheScrubLines() {
-        #expect(DialProtocol.scrubOn(startSecondOfDay: 28_092.4, length: 312.456, position: 0, playing: false, jump: 1,
+        // t0 to the millisecond (a recording's start), so the dial's clock truncates to the same tenth as the window's.
+        #expect(DialProtocol.scrubOn(startSecondOfDay: 28_092.456, length: 312.456, position: 0, playing: false, jump: 1,
                                      title: "11.175 MHz USB")
-                == "SCRUB on t0=28092.40 len=312.46 pos=0.00 play=0 jump=1 title=11.175 MHz USB")
+                == "SCRUB on t0=28092.456 len=312.46 pos=0.00 play=0 jump=1 title=11.175 MHz USB")
         #expect(DialProtocol.scrubOff == "SCRUB off")
         #expect(DialProtocol.position(12.346) == "POS 12.35")
         #expect(DialProtocol.position(0, seq: 4) == "POS 0.00 4")

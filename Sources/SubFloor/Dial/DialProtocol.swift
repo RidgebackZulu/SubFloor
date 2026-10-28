@@ -101,10 +101,12 @@ enum DialProtocol {
     static func signal(_ db: Float) -> String { String(format: "SIG %.1f", max(db, -200)) }
 
     /// Scrub mode on: the recording's start (UTC seconds since midnight), length, position, play state, jump size and
-    /// lane title. The title ends the line: the dial shows everything after "title=".
+    /// lane title. The title ends the line: the dial shows everything after "title=". `t0` goes to the millisecond
+    /// (a recording's start is), not `%.2f` like the other seconds, so the dial's clock truncates to the same tenth
+    /// as `RecordingsFormat.clock`; only the position's 0.01 s rounding is left between them.
     static func scrubOn(startSecondOfDay: Double, length: Double, position: Double, playing: Bool, jump: Double,
                         title: String) -> String {
-        "SCRUB on t0=\(seconds(startSecondOfDay)) len=\(seconds(length)) pos=\(seconds(position)) "
+        "SCRUB on t0=\(String(format: "%.3f", startSecondOfDay)) len=\(seconds(length)) pos=\(seconds(position)) "
             + "play=\(playing ? 1 : 0) jump=\(jumpText(jump)) title=\(title.replacingOccurrences(of: "\n", with: " "))"
     }
 
