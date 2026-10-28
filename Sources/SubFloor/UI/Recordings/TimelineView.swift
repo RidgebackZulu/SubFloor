@@ -2,7 +2,8 @@ import Recording
 import SwiftUI
 
 /// One UTC day in lanes: a lane per frequency and mode, each recording a glowing pill as long as it ran, a
-/// faint row of the squelch pops that were too short to keep, and the now line on today's view.
+/// faint row of the squelch pops that were too short to keep, and the now line on today's view. Pills that
+/// would touch are stacked in rows within their lane, so each stays whole, hoverable and clickable.
 ///
 /// Three layers, so the expensive one is drawn only when what it shows changes:
 /// - the day itself, one `Canvas` over a value `TimelineLayout`, redrawn only when the finished recordings,
@@ -32,7 +33,8 @@ struct DayTimelineView: View {
 
     @State private var width: CGFloat = 0
 
-    /// The height the view needs. A day with no recordings keeps one empty lane, which says so.
+    /// The height the view needs when no lane stacks its markers. A day with no recordings keeps one empty
+    /// lane, which says so. The view sets its own height, which can be more: `TimelineLayout.height`.
     static func height(lanes: Int) -> CGFloat {
         topInset + CGFloat(max(lanes, 1)) * TimelineGeometry.laneHeight + TimelineGeometry.popRowHeight + hourLabelHeight
     }
@@ -48,6 +50,7 @@ struct DayTimelineView: View {
             }
             TimelineHoverLayer(layout: layout, onSelect: onSelect)
         }
+        .frame(height: layout.height, alignment: .topLeading)
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
         .accessibilityElement()
         .accessibilityLabel("Recordings on \(RecordingsFormat.dayTitle(dayStart))")
@@ -75,6 +78,9 @@ struct TimelineLayout: Equatable {
     /// The whole view's width; the plot runs from `labelColumn` to `width - trailingInset`.
     let width: CGFloat
     let lanes: [CatalogLane]
+    /// Each lane's top and height: taller than one row where its markers are stacked.
+    let laneTops: [CGFloat]
+    let laneHeights: [CGFloat]
     let popXs: [CGFloat]
     let selection: String?
     /// The finished recordings, in drawing order: heard under unheard, and the selected one on top, so the
@@ -95,15 +101,40 @@ struct TimelineLayout: Equatable {
         let g = TimelineGeometry(dayStart: dayStart, width: Self.plotWidth(width))
         popXs = pops.map { DayTimelineView.labelColumn + g.x(for: $0.at) }
         let laneIndex = Dictionary(lanes.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { a, _ in a })
+
+        // Rows within each lane. A recording in progress keeps its row to the end of the day, since it grows
+        // there, so its length never moves another marker. Until the view has measured its width every pill
+        // sits at 0, so nothing is stacked: that would flash lanes as deep as the day is busy.
+        let measured = width > DayTimelineView.labelColumn + DayTimelineView.trailingInset
+        var row = [Int](repeating: 0, count: recordings.count)
+        var depth = [Int](repeating: 1, count: lanes.count)
+        if measured {
+            var byLane: [Int: [Int]] = [:]
+            for (i, r) in recordings.enumerated() { if let lane = laneIndex[r.laneID] { byLane[lane, default: []].append(i) } }
+            for (lane, members) in byLane {
+                let spans = members.map { i in
+                    let r = recordings[i], span = g.markerSpan(start: r.start, seconds: r.seconds ?? 0)
+                    return r.inProgress ? span.lowerBound...g.width : span
+                }
+                let rows = TimelineGeometry.rows(for: spans)
+                for (i, r) in zip(members, rows) { row[i] = r }
+                depth[lane] = (rows.max() ?? 0) + 1
+            }
+        }
+        laneHeights = depth.map { TimelineGeometry.laneHeight(rows: $0) }
+        var top = DayTimelineView.topInset
+        laneTops = laneHeights.map { h in defer { top += h }; return top }
+
         func rank(_ r: CatalogRecording) -> Int {
             r.file == selection ? 2 : r.heard ? 0 : 1
         }
+        let tops = laneTops
         let all: [Marker] = recordings.enumerated()
             .sorted { (rank($0.element), $0.offset) < (rank($1.element), $1.offset) }
-            .compactMap { _, r in
+            .compactMap { i, r in
                 guard let lane = laneIndex[r.laneID] else { return nil }
-                let rect = g.markerRect(start: r.start, seconds: r.seconds ?? 0, lane: lane)
-                    .offsetBy(dx: DayTimelineView.labelColumn, dy: DayTimelineView.topInset)
+                let rect = g.markerRect(start: r.start, seconds: r.seconds ?? 0, laneTop: tops[lane], row: row[i])
+                    .offsetBy(dx: DayTimelineView.labelColumn, dy: 0)
                 return Marker(recording: r, rect: rect, lane: lane)
             }
         settled = all.filter { !$0.recording.inProgress }
@@ -114,8 +145,15 @@ struct TimelineLayout: Equatable {
 
     func x(for date: Date) -> CGFloat { DayTimelineView.labelColumn + geometry.x(for: date) }
 
-    var lanesBottom: CGFloat { DayTimelineView.topInset + CGFloat(max(lanes.count, 1)) * TimelineGeometry.laneHeight }
+    var lanesBottom: CGFloat {
+        guard let top = laneTops.last, let height = laneHeights.last else {
+            return DayTimelineView.topInset + TimelineGeometry.laneHeight   // the one empty lane
+        }
+        return top + height
+    }
     var gridBottom: CGFloat { lanesBottom + TimelineGeometry.popRowHeight }
+    /// The whole view's height, hour labels included.
+    var height: CGFloat { gridBottom + DayTimelineView.hourLabelHeight }
 
     /// The marker under `point`; a recording in progress only when `selectableOnly` is false.
     func marker(at point: CGPoint, selectableOnly: Bool) -> Marker? {
@@ -136,8 +174,8 @@ private struct TimelineCanvas: View, Equatable {
     /// What it draws; the recordings in progress are the live layer's.
     nonisolated static func == (a: Self, b: Self) -> Bool {
         let (l, r) = (a.layout, b.layout)
-        return l.dayStart == r.dayStart && l.width == r.width && l.lanes == r.lanes && l.popXs == r.popXs
-            && l.selection == r.selection && l.settled == r.settled
+        return l.dayStart == r.dayStart && l.width == r.width && l.lanes == r.lanes && l.laneTops == r.laneTops
+            && l.laneHeights == r.laneHeights && l.popXs == r.popXs && l.selection == r.selection && l.settled == r.settled
     }
 
     var body: some View {
@@ -151,8 +189,7 @@ private struct TimelineCanvas: View, Equatable {
 
         // Lane strips and titles.
         for (i, lane) in layout.lanes.enumerated() {
-            let top = DayTimelineView.topInset + CGFloat(i) * TimelineGeometry.laneHeight
-            let strip = CGRect(x: x0, y: top + 3, width: g.width, height: TimelineGeometry.laneHeight - 6)
+            let strip = CGRect(x: x0, y: layout.laneTops[i] + 3, width: g.width, height: layout.laneHeights[i] - 6)
             ctx.fill(Path(roundedRect: strip, cornerRadius: 7), with: .color(RecordingsTheme.panel))
             let mid = strip.midY
             ctx.fill(Path(ellipseIn: CGRect(x: 12, y: mid - 3.5, width: 7, height: 7)), with: .color(RecordingsTheme.lane(i)))

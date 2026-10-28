@@ -40,6 +40,9 @@ struct RecordingsWindow: View {
     @FocusState private var keysFocused: Bool
     /// The file whose peaks the player panel could not read: unplayable, for Space as for the play button.
     @State private var peaksFailure: URL?
+    /// The timeline's height as it laid itself out: more than one row a lane where markers are stacked,
+    /// which depends on its width.
+    @State private var timelineHeight: CGFloat?
 
     private var library: RecordingsLibrary { model.library }
     private var today: Date { RecordingsCatalog.utcDayStart(now) }
@@ -51,7 +54,7 @@ struct RecordingsWindow: View {
     var body: some View {
         let catalog = library.catalog
         let lanes = catalog.lanes(onUTCDay: day)
-        let height = DayTimelineView.height(lanes: lanes.count)
+        let height = timelineHeight ?? DayTimelineView.height(lanes: lanes.count)
         VStack(spacing: 0) {
             header
             Rectangle().fill(RecordingsTheme.line).frame(height: 1)
@@ -59,7 +62,7 @@ struct RecordingsWindow: View {
                 DayTimelineView(dayStart: day, recordings: catalog.recordings(onUTCDay: day), lanes: lanes,
                                 pops: catalog.pops(onUTCDay: day), selection: selection, now: isToday ? now : nil,
                                 onSelect: select)
-                    .frame(height: height)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { timelineHeight = $0 }
             }
             .scrollBounceBehavior(.basedOnSize)
             // The timeline gives way before the player does: a short window scrolls the lanes, never cuts

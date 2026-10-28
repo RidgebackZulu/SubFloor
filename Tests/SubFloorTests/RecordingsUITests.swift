@@ -25,26 +25,26 @@ import Testing
 
     @Test func shortClipsKeepAClickableWidth() {
         let g = TimelineGeometry(dayStart: Self.day, width: 1200)
-        let rect = g.markerRect(start: at(7, 48, 12), seconds: 20, lane: 0)
+        let rect = g.markerRect(start: at(7, 48, 12), seconds: 20)
         #expect(rect.width == TimelineGeometry.minMarkerWidth)
         #expect(rect.width == 6)
     }
 
     @Test func clipsCrossingMidnightAreClipped() {
         let g = TimelineGeometry(dayStart: Self.day, width: 1200)
-        let rect = g.markerRect(start: at(23), seconds: 7200, lane: 1)
+        let rect = g.markerRect(start: at(23), seconds: 7200, laneTop: TimelineGeometry.laneHeight)
         #expect(rect.maxX == 1200)
         #expect(rect.minX == 1150)
         // A short clip in the last seconds keeps its width inside the day rather than being cut to nothing.
-        let late = g.markerRect(start: at(23, 59, 59), seconds: 20, lane: 0)
+        let late = g.markerRect(start: at(23, 59, 59), seconds: 20)
         #expect(late.maxX == 1200)
         #expect(late.width == 6)
     }
 
     @Test func hitTestFindsTheMarker() {
         let g = TimelineGeometry(dayStart: Self.day, width: 1200)
-        let a = g.markerRect(start: at(6), seconds: 1800, lane: 0)
-        let b = g.markerRect(start: at(12), seconds: 1800, lane: 1)
+        let a = g.markerRect(start: at(6), seconds: 1800)
+        let b = g.markerRect(start: at(12), seconds: 1800, laneTop: TimelineGeometry.laneHeight)
         let markers = [(file: "a.flac", rect: a), (file: "b.flac", rect: b)]
         #expect(g.recording(at: CGPoint(x: a.midX, y: a.midY), in: markers) == "a.flac")
         #expect(g.recording(at: CGPoint(x: b.midX, y: b.midY), in: markers) == "b.flac")
@@ -56,15 +56,98 @@ import Testing
 
     @Test func hitTestPrefersTheTopmostMarker() {
         let g = TimelineGeometry(dayStart: Self.day, width: 1200)
-        let under = g.markerRect(start: at(6), seconds: 3600, lane: 0)
-        let over = g.markerRect(start: at(6, 30), seconds: 3600, lane: 0)
+        let under = g.markerRect(start: at(6), seconds: 3600)
+        let over = g.markerRect(start: at(6, 30), seconds: 3600)
         let markers = [(file: "under.flac", rect: under), (file: "over.flac", rect: over)]
         #expect(g.recording(at: CGPoint(x: over.minX + 1, y: over.midY), in: markers) == "over.flac")
         // Inside one marker and within the slop of the next: the marker under the pointer wins.
-        let left = g.markerRect(start: at(9), seconds: 600, lane: 0)
+        let left = g.markerRect(start: at(9), seconds: 600)
         let right = CGRect(x: left.maxX + 2, y: left.minY, width: 20, height: left.height)
         let pair = [(file: "left.flac", rect: left), (file: "right.flac", rect: right)]
         #expect(g.recording(at: CGPoint(x: left.maxX - 1, y: left.midY), in: pair) == "left.flac")
+    }
+
+    // MARK: Stacking
+
+    /// Recordings at `starts` (seconds into the day), `seconds` long, in one lane, laid out `width` wide.
+    private func layout(_ starts: [Double], seconds: Double = 20, width: CGFloat = 950, live: Int? = nil,
+                        lane: String = "11175000 USB") -> TimelineLayout {
+        let recordings = starts.enumerated().map { i, t in
+            CatalogRecording(file: "r\(i).flac", start: Self.day.addingTimeInterval(t), seconds: seconds,
+                             frequencyHz: 11_175_000, mode: "USB", auto: true, heard: false, inProgress: i == live,
+                             laneID: lane)
+        }
+        let lanes = [CatalogLane(id: lane, frequencyHz: 11_175_000, mode: "USB", title: "11.175 MHz USB")]
+        // The view's width: the plot plus the label column and the trailing inset.
+        return TimelineLayout(dayStart: Self.day, width: width + DayTimelineView.labelColumn + DayTimelineView.trailingInset,
+                              recordings: recordings, lanes: lanes, pops: [], selection: nil)
+    }
+
+    @Test func threeMarkersTwoMinutesApartStackInThreeRows() {
+        let l = layout([68_400, 68_520, 68_640])   // 19:00, 19:02, 19:04
+        let rects = l.settled.sorted { $0.recording.file < $1.recording.file }.map(\.rect)
+        #expect(Set(rects.map { $0.minY }).count == 3)
+        #expect(l.laneHeights == [TimelineGeometry.laneHeight(rows: 3)])
+        for (i, a) in rects.enumerated() {
+            #expect(a.width >= TimelineGeometry.minMarkerWidth)
+            for b in rects[(i + 1)...] { #expect(!a.intersects(b)) }
+        }
+        // Every one is found by the hover and the click, at its middle.
+        for m in l.settled {
+            let mid = CGPoint(x: m.rect.midX, y: m.rect.midY)
+            #expect(l.marker(at: mid, selectableOnly: true)?.recording.file == m.recording.file)
+            #expect(l.marker(at: mid, selectableOnly: false)?.recording.file == m.recording.file)
+        }
+    }
+
+    @Test func markersApartKeepOneRowAndTheLookOfOne() {
+        let l = layout([21_600, 32_400])   // 06:00 and 09:00
+        #expect(Set(l.settled.map { $0.rect.minY }).count == 1)
+        #expect(l.laneHeights == [TimelineGeometry.laneHeight])
+        #expect(l.laneTops == [DayTimelineView.topInset])
+        // Where a lane of one row put its pills before stacking existed.
+        let g = TimelineGeometry(dayStart: Self.day, width: 950)
+        let first = g.markerRect(start: at(6), seconds: 20)
+        #expect(l.settled.first { $0.recording.file == "r0.flac" }?.rect
+                == first.offsetBy(dx: DayTimelineView.labelColumn, dy: DayTimelineView.topInset))
+        #expect(first.minY == (TimelineGeometry.laneHeight - TimelineGeometry.markerHeight) / 2)
+        #expect(l.height == DayTimelineView.height(lanes: 1))
+    }
+
+    @Test func rowsReuseTheFirstFreeRow() {
+        // 0 and 1 overlap; 2 starts after 0 ends (with the gap), so it goes back to row 0.
+        #expect(TimelineGeometry.rows(for: [0...10, 5...15, 12...20]) == [0, 1, 0])
+        #expect(TimelineGeometry.rows(for: [0...10, 11...20]) == [0, 1])   // a 1 pt gap is too close
+        #expect(TimelineGeometry.rows(for: [0...10, 12...20]) == [0, 0])
+        #expect(TimelineGeometry.rows(for: [12...20, 0...10]) == [0, 0])   // in start order, whatever the input order
+        #expect(TimelineGeometry.rows(for: []) == [])
+    }
+
+    @Test func stackingFollowsTheWidth() {
+        let starts: [Double] = [68_400, 68_520]
+        #expect(layout(starts, width: 950).laneHeights == [TimelineGeometry.laneHeight(rows: 2)])
+        #expect(layout(starts, width: 20_000).laneHeights == [TimelineGeometry.laneHeight])   // wide enough to sit side by side
+    }
+
+    @Test func aLaterLaneMovesDownUnderAStackedOne() {
+        let recordings = [0.0, 60, 120].enumerated().map { i, t in
+            CatalogRecording(file: "a\(i).flac", start: at(19).addingTimeInterval(t), seconds: 20, frequencyHz: 7_000_000,
+                             mode: "LSB", auto: true, heard: true, inProgress: false, laneID: "7000000 LSB")
+        } + [CatalogRecording(file: "b.flac", start: at(19), seconds: 20, frequencyHz: 11_175_000, mode: "USB", auto: true,
+                              heard: true, inProgress: false, laneID: "11175000 USB")]
+        let lanes = [CatalogLane(id: "7000000 LSB", frequencyHz: 7_000_000, mode: "LSB", title: "7.000 MHz LSB"),
+                     CatalogLane(id: "11175000 USB", frequencyHz: 11_175_000, mode: "USB", title: "11.175 MHz USB")]
+        let l = TimelineLayout(dayStart: Self.day, width: 1100, recordings: recordings, lanes: lanes, pops: [], selection: nil)
+        #expect(l.laneTops == [DayTimelineView.topInset, DayTimelineView.topInset + TimelineGeometry.laneHeight(rows: 3)])
+        let b = try! #require(l.settled.first { $0.recording.file == "b.flac" })
+        #expect(b.rect.minY == l.laneTops[1] + (TimelineGeometry.laneHeight - TimelineGeometry.markerHeight) / 2)
+        #expect(l.lanesBottom == l.laneTops[1] + TimelineGeometry.laneHeight)
+    }
+
+    @Test func nothingStacksBeforeTheWidthIsKnown() {
+        let l = TimelineLayout(dayStart: Self.day, width: 0, recordings: layout([0, 60, 120]).settled.map(\.recording),
+                               lanes: layout([0]).lanes, pops: [], selection: nil)
+        #expect(l.laneHeights == [TimelineGeometry.laneHeight])
     }
 
     @Test func clockFormat() {
