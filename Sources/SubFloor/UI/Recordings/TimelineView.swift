@@ -9,7 +9,8 @@ import SwiftUI
 /// - the day itself, one `Canvas` over a value `TimelineLayout`, redrawn only when the finished recordings,
 ///   the pops, the selection or the width change;
 /// - the live layer: the recording in progress and the now line, so neither the live-length poll nor the
-///   1 s tick redraws the day;
+///   1 s tick redraws the day. The live length comes in as `liveSeconds`, read only there, so its growth
+///   does not even rebuild the layout;
 /// - hover and clicks, with the hover state kept there, so a mouse move does not redraw the day.
 ///
 /// Named `DayTimelineView` because SwiftUI already has a `TimelineView`, which the app uses elsewhere.
@@ -30,6 +31,9 @@ struct DayTimelineView: View {
     var now: Date?
     /// A finished recording was clicked, or nil for a click on empty space.
     var onSelect: (CatalogRecording?) -> Void = { _ in }
+    /// The recording in progress's length now, or nil to draw it as long as `recordings` says. Read only by
+    /// the live layer and the hover, so the 5 Hz growth redraws one marker.
+    var liveSeconds: @MainActor () -> Double? = { nil }
 
     @State private var width: CGFloat = 0
 
@@ -46,9 +50,9 @@ struct DayTimelineView: View {
         ZStack(alignment: .topLeading) {
             TimelineCanvas(layout: layout).equatable()
             if now != nil || !layout.live.isEmpty {
-                LiveLayer(markers: layout.live, nowX: now.map(layout.x(for:)), bottom: layout.gridBottom)
+                LiveLayer(layout: layout, liveSeconds: liveSeconds, nowX: now.map(layout.x(for:)))
             }
-            TimelineHoverLayer(layout: layout, onSelect: onSelect)
+            TimelineHoverLayer(layout: layout, liveSeconds: liveSeconds, onSelect: onSelect)
         }
         .frame(height: layout.height, alignment: .topLeading)
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
@@ -86,11 +90,12 @@ struct TimelineLayout: Equatable {
     /// The finished recordings, in drawing order: heard under unheard, and the selected one on top, so the
     /// one the listener picked is never hidden.
     let settled: [Marker]
-    /// Recordings in progress, which grow with every poll. Drawn over the day on their own layer.
+    /// Recordings in progress, as long as they were when they began: `live(at:)` gives them their length now.
+    /// Drawn over the day on their own layer.
     let live: [Marker]
 
-    /// Every marker, bottom to top, for hit testing.
-    var markers: [Marker] { settled + live }
+    /// Every marker, bottom to top, for hit testing, with the recording in progress at `liveSeconds`.
+    func markers(liveSeconds: Double?) -> [Marker] { settled + live(at: liveSeconds) }
 
     init(dayStart: Date, width: CGFloat, recordings: [CatalogRecording], lanes: [CatalogLane], pops: [CatalogPop],
          selection: String?) {
@@ -155,9 +160,23 @@ struct TimelineLayout: Equatable {
     /// The whole view's height, hour labels included.
     var height: CGFloat { gridBottom + DayTimelineView.hourLabelHeight }
 
+    /// The recordings in progress at `seconds` long (nil: as they began), on the rows they were given.
+    func live(at seconds: Double?) -> [Marker] {
+        guard let seconds else { return live }
+        let g = geometry
+        return live.map { m in
+            var m = m
+            m.recording.seconds = seconds
+            let span = g.markerSpan(start: m.recording.start, seconds: seconds)
+            m.rect = CGRect(x: DayTimelineView.labelColumn + span.lowerBound, y: m.rect.minY,
+                            width: span.upperBound - span.lowerBound, height: m.rect.height)
+            return m
+        }
+    }
+
     /// The marker under `point`; a recording in progress only when `selectableOnly` is false.
-    func marker(at point: CGPoint, selectableOnly: Bool) -> Marker? {
-        let candidates = selectableOnly ? markers.filter { !$0.recording.inProgress } : markers
+    func marker(at point: CGPoint, selectableOnly: Bool, liveSeconds: Double? = nil) -> Marker? {
+        let candidates = selectableOnly ? settled : markers(liveSeconds: liveSeconds)
         guard let file = geometry.recording(at: point, in: candidates.map { ($0.recording.file, $0.rect) }) else { return nil }
         return candidates.last { $0.recording.file == file }
     }
@@ -331,12 +350,15 @@ private enum MarkerPaint {
 /// The recording in progress and the now line, over the day. They change every poll and every second, so
 /// they are drawn here, on their own, where redrawing costs one marker and one line.
 private struct LiveLayer: View {
-    let markers: [TimelineLayout.Marker]
+    let layout: TimelineLayout
+    let liveSeconds: @MainActor () -> Double?
     /// The now line's x, on today's view only.
     let nowX: CGFloat?
-    let bottom: CGFloat
 
     var body: some View {
+        // Read here, in this layer's body, so only this layer follows the live length.
+        let markers = layout.live(at: liveSeconds())
+        let bottom = layout.gridBottom
         Canvas { ctx, _ in
             for m in markers {
                 ctx.drawLayer { glow in
@@ -365,6 +387,8 @@ private struct LiveLayer: View {
 /// Hover and clicks over the day. The hover state lives here, so moving the mouse redraws only the label.
 private struct TimelineHoverLayer: View {
     let layout: TimelineLayout
+    /// Read when the mouse moves, not in `body`, so the live length does not redraw this layer.
+    let liveSeconds: @MainActor () -> Double?
     let onSelect: (CatalogRecording?) -> Void
 
     @State private var hover: Hover?
@@ -380,7 +404,7 @@ private struct TimelineHoverLayer: View {
             .onContinuousHover(coordinateSpace: .local) { phase in
                 switch phase {
                 case .active(let point):
-                    let next = layout.marker(at: point, selectableOnly: false)
+                    let next = layout.marker(at: point, selectableOnly: false, liveSeconds: liveSeconds())
                         .map { Hover(point: point, text: DayTimelineView.hoverText($0.recording)) }
                     if next != hover { hover = next }
                 case .ended:
@@ -390,7 +414,8 @@ private struct TimelineHoverLayer: View {
             .onTapGesture(coordinateSpace: .local) { point in
                 // A recording in progress is still being written: a click on it does nothing, rather than
                 // dropping the selection the listener has.
-                if let hit = layout.marker(at: point, selectableOnly: false), hit.recording.inProgress { return }
+                if let hit = layout.marker(at: point, selectableOnly: false, liveSeconds: liveSeconds()),
+                   hit.recording.inProgress { return }
                 onSelect(layout.marker(at: point, selectableOnly: true)?.recording)
             }
             .overlay(alignment: right ? .topTrailing : .topLeading) {

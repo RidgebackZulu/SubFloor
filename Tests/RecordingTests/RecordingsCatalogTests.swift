@@ -180,6 +180,41 @@ private let am = "SubFloor_20261027_090000Z_6925000Hz_AM.flac"
         #expect(c.recordings(onUTCDay: day(2026, 10, 27)).map(\.file) == [am, usb])
     }
 
+    @Test func theDayFollowsTheLogNotTheName() {
+        // The name says the 27th; the log says the recording began a second before midnight on the 26th.
+        let name = "SubFloor_20261027_000000Z_11175000Hz_USB.flac"
+        var c = RecordingsCatalog(files: [name])
+        #expect(c.recordings(onUTCDay: day(2026, 10, 27)).map(\.file) == [name])
+        c.apply([.autoStarted(file: name, start: utc(2026, 10, 26, 23, 59, 59), frequencyHz: 11_175_000, mode: "USB")])
+        #expect(c.recordings(onUTCDay: day(2026, 10, 27)).isEmpty)
+        #expect(c.recordings(onUTCDay: day(2026, 10, 26)).map(\.file) == [name])
+        c.setFiles([])
+        #expect(c.recordings(onUTCDay: day(2026, 10, 26)).isEmpty)
+        #expect(c.unheardCount == 0)
+        c.setFiles([name])   // back, with its log facts and unheard again
+        #expect(c.recordings(onUTCDay: day(2026, 10, 26)).map(\.file) == [name])
+        #expect(c.unheardFiles == [name])
+    }
+
+    @Test func anUnchangedListingIsNotAChange() {
+        var c = RecordingsCatalog(files: [usb, am])
+        let same = c.setFiles([am, usb]), fewer = c.setFiles([am])
+        #expect(!same)
+        #expect(fewer)
+        #expect(c.files == [am])
+    }
+
+    @Test func aLineAppliedTwiceCountsOnce() {
+        let pop = RecordingLogEntry.pop(at: utc(2026, 10, 27, 1, 0, 0.25), seconds: 0.2, frequencyHz: 7_000_000, mode: "LSB")
+        let rec = RecordingLogEntry.recording(file: usb, start: utc(2026, 10, 27, 18, 32, 19), seconds: 10,
+                                              frequencyHz: 11_175_000, mode: "USB", auto: true)
+        var c = RecordingsCatalog(files: [usb], entries: [pop, rec])
+        c.apply([pop, rec])
+        #expect(c.pops(onUTCDay: day(2026, 10, 27)).count == 1)
+        #expect(c.recordings(onUTCDay: day(2026, 10, 27)).count == 1)
+        #expect(c.unheardCount == 1)
+    }
+
     @Test func allEntriesReadsEveryDay() throws {
         let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
         let log = RecordingLog(folder: dir)
@@ -192,5 +227,31 @@ private let am = "SubFloor_20261027_090000Z_6925000Hz_AM.flac"
         try "not json\n".write(to: log.fileURL(forUTCDay: day(2026, 10, 26)), atomically: true, encoding: .utf8)
         try "ignored".write(to: dir.appendingPathComponent(".subfloor/notes.txt"), atomically: true, encoding: .utf8)
         #expect(try log.allEntries() == [earlier, later])
+    }
+
+    @Test func oneUnreadableDayDoesNotLoseTheOthers() throws {
+        let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let log = RecordingLog(folder: dir)
+        let a = RecordingLogEntry.heard(file: usb, at: utc(2026, 10, 26, 8, 0, 0))
+        let b = RecordingLogEntry.heard(file: am, at: utc(2026, 10, 27, 8, 0, 0))
+        try log.append([a, b])
+        let bad = log.fileURL(forUTCDay: day(2026, 10, 26))
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: bad.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: bad.path) }
+        let read = log.readableEntries()
+        #expect(read.entries == [b])
+        #expect(read.failure != nil)
+        #expect(throws: (any Error).self) { try log.allEntries() }   // the strict read still fails
+    }
+
+    @Test func anEntryAsLoggedMatchesItsLineReadBack() throws {
+        let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let log = RecordingLog(folder: dir)
+        let pop = RecordingLogEntry.pop(at: Date(timeIntervalSince1970: 1_793_100_000.123456789), seconds: 0.2,
+                                        frequencyHz: 7_000_000, mode: "LSB")
+        try log.append([pop])
+        let back = try log.allEntries()
+        #expect(back != [pop])            // the file keeps milliseconds
+        #expect(back == [pop.asLogged])
     }
 }

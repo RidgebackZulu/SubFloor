@@ -35,6 +35,14 @@ public struct RecordingFileName: Equatable, Sendable {
         ["wav", "flac", "m4a"].contains(fileExtension.lowercased()) && label != "IQ"
     }
 
+    /// Made once: a folder of a year of recordings is thousands of names, and a calendar per name was most of
+    /// the cost of reading them.
+    private static let utc: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: "UTC")!
+        return calendar
+    }()
+
     /// `20261027` and `183219Z` as a UTC instant, or nil for anything that is not a real time.
     private static func date(day: Substring, time: Substring) -> Date? {
         guard day.count == 8, time.count == 7, time.hasSuffix("Z"),
@@ -44,8 +52,7 @@ public struct RecordingFileName: Equatable, Sendable {
         let year = n(d, 0..<4), month = n(d, 4..<6), dom = n(d, 6..<8)
         let hour = n(t, 0..<2), minute = n(t, 2..<4), second = n(t, 4..<6)
         guard (1...12).contains(month), (1...31).contains(dom), hour < 24, minute < 60, second < 60 else { return nil }
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(identifier: "UTC")!
+        let calendar = utc
         let parts = DateComponents(year: year, month: month, day: dom, hour: hour, minute: minute, second: second)
         guard let date = calendar.date(from: parts),
               calendar.dateComponents([.month, .day], from: date) == DateComponents(month: month, day: dom)   // not Feb 30 rolled over
@@ -101,7 +108,7 @@ public struct CatalogLane: Equatable, Sendable, Identifiable {
 }
 
 /// A squelch pop too short to record.
-public struct CatalogPop: Equatable, Sendable {
+public struct CatalogPop: Hashable, Sendable {
     public let at: Date, seconds: Double, frequencyHz: Double, mode: String
 
     public init(at: Date, seconds: Double, frequencyHz: Double, mode: String) {
@@ -120,6 +127,10 @@ public struct CatalogPop: Equatable, Sendable {
 /// `recording` entry, its `autoStarted` entry (no length: it was cut short), then its file name (manual).
 /// Only audio names in the listing are recordings, so a file deleted in Finder vanishes whatever the log
 /// says. A recording belongs to the UTC day of its first sample, however long it runs.
+///
+/// The window asks for one day at a time, every second, of a folder that can hold a year of recordings, so
+/// each file's day and unheard state are kept up to date as the sources change: a day's questions cost that
+/// day's recordings, and the unheard count costs nothing.
 public struct RecordingsCatalog: Equatable, Sendable {
     private struct Facts: Equatable, Sendable {
         var start: Date, frequencyHz: Double, mode: String
@@ -133,55 +144,77 @@ public struct RecordingsCatalog: Equatable, Sendable {
     private var finished: [String: Finished] = [:]         // from `recording` entries
     private var started: [String: Facts] = [:]             // from `autoStarted` entries
     private var heard: Set<String> = []
-    private var pops: [CatalogPop] = []
+    /// A set, so a line applied twice (read back from the log after it was applied as written) is one pop.
+    private var popsByDay: [Int: Set<CatalogPop>] = [:]
     private var measured: [String: Double] = [:]
     private var live: LiveRecording?
+    /// The listed recordings (not the live one) by the UTC day they started on, and each one's day.
+    private var filesByDay: [Int: Set<String>] = [:]
+    private var dayOf: [String: Int] = [:]
+    private var unheard: Set<String> = []
 
     public init(files: [String] = [], entries: [RecordingLogEntry] = [], live: LiveRecording? = nil) {
-        setFiles(files)
-        apply(entries)
+        // The log first and every file filed once after, rather than re-filing a file at each of its lines.
+        apply(entries, refiling: false)
         self.live = live
+        setFiles(files)
     }
 
-    /// The folder listing, names only.
-    public mutating func setFiles(_ files: [String]) {
-        listing = Set(files)
-        names = [:]
-        for file in files {
-            if let name = RecordingFileName.parse(file), name.isAudio { names[file] = name }
+    /// The folder listing, names only. Returns false, and changes nothing, when it is the listing already
+    /// held; only names new to it are parsed.
+    @discardableResult
+    public mutating func setFiles(_ files: some Sequence<String>) -> Bool {
+        let next = Set(files)
+        guard next != listing else { return false }
+        let gone = listing.subtracting(next), added = next.subtracting(listing)
+        listing = next
+        for file in gone where names.removeValue(forKey: file) != nil { refresh(file) }
+        for file in added {
+            guard let name = RecordingFileName.parse(file), name.isAudio else { continue }
+            names[file] = name
+            refresh(file)
         }
+        return true
     }
 
-    /// More log lines, in the order written. Applying a line twice does not change the result, except that a
-    /// pop is listed twice, so give each line once.
-    public mutating func apply(_ entries: [RecordingLogEntry]) {
+    /// More log lines, in the order written. Applying a line again does not change the result, so a line
+    /// that was applied as it was written and later read back from the log counts once.
+    public mutating func apply(_ entries: [RecordingLogEntry]) { apply(entries, refiling: true) }
+
+    private mutating func apply(_ entries: [RecordingLogEntry], refiling: Bool) {
         for entry in entries {
             switch entry {
             case .recording(let file, let start, let seconds, let frequencyHz, let mode, let auto):
                 finished[file] = Finished(facts: Facts(start: start, frequencyHz: frequencyHz, mode: mode), seconds: seconds, auto: auto)
+                if refiling { refresh(file) }
             case .autoStarted(let file, let start, let frequencyHz, let mode):
                 started[file] = Facts(start: start, frequencyHz: frequencyHz, mode: mode)
+                if refiling { refresh(file) }
             case .heard(let file, _):
-                heard.insert(file)
+                if heard.insert(file).inserted, refiling { refresh(file) }
             case .pop(let at, let seconds, let frequencyHz, let mode):
-                pops.append(CatalogPop(at: at, seconds: seconds, frequencyHz: frequencyHz, mode: mode))
+                popsByDay[Self.dayNumber(at), default: []].insert(CatalogPop(at: at, seconds: seconds, frequencyHz: frequencyHz, mode: mode))
             case .autoOff:
                 break
             }
         }
     }
 
-    public mutating func setLive(_ live: LiveRecording?) { self.live = live }
+    public mutating func setLive(_ live: LiveRecording?) {
+        let before = self.live?.file
+        self.live = live
+        for file in Set([before, live?.file].compactMap { $0 }) { refresh(file) }
+    }
 
     /// The length of a file the log says nothing about, read from the file itself.
     public mutating func setMeasuredSeconds(_ seconds: Double, for file: String) { measured[file] = seconds }
 
     /// The day's recordings by start time. `day` is any instant in the UTC day.
     public func recordings(onUTCDay day: Date) -> [CatalogRecording] {
-        let start = Self.utcDayStart(day)
-        let end = start.addingTimeInterval(86_400)
-        return allRecordings().filter { $0.start >= start && $0.start < end }
-            .sorted { ($0.start, $0.file) < ($1.start, $1.file) }
+        let d = Self.dayNumber(day)
+        var all = (filesByDay[d] ?? []).compactMap { file in names[file].map { recording(file, $0) } }
+        if let live, Self.dayNumber(live.start) == d { all.append(liveRecording(live)) }   // listed even before the folder shows it
+        return all.sorted { ($0.start, $0.file) < ($1.start, $1.file) }
     }
 
     /// One lane per frequency and mode that has a recording on the day, lowest frequency first.
@@ -197,9 +230,7 @@ public struct RecordingsCatalog: Equatable, Sendable {
 
     /// The day's ignored pops by time.
     public func pops(onUTCDay day: Date) -> [CatalogPop] {
-        let start = Self.utcDayStart(day)
-        let end = start.addingTimeInterval(86_400)
-        return pops.filter { $0.at >= start && $0.at < end }.sorted { $0.at < $1.at }
+        (popsByDay[Self.dayNumber(day)] ?? []).sorted { ($0.at, $0.frequencyHz, $0.mode, $0.seconds) < ($1.at, $1.frequencyHz, $1.mode, $1.seconds) }
     }
 
     public func recording(_ file: String) -> CatalogRecording? {
@@ -212,13 +243,9 @@ public struct RecordingsCatalog: Equatable, Sendable {
     public var files: Set<String> { listing }
 
     /// Finished recordings the log has and the listener has not opened, by name.
-    public var unheardFiles: [String] {
-        names.keys.filter { file in
-            file != live?.file && !heard.contains(file) && (finished[file] != nil || started[file] != nil)
-        }.sorted()
-    }
+    public var unheardFiles: [String] { unheard.sorted() }
 
-    public var unheardCount: Int { unheardFiles.count }
+    public var unheardCount: Int { unheard.count }
 
     /// `11.175 MHz USB`: MHz to three decimals, more (up to six) when the frequency needs them.
     public static func laneTitle(frequencyHz: Double, mode: String) -> String {
@@ -233,21 +260,42 @@ public struct RecordingsCatalog: Equatable, Sendable {
         Date(timeIntervalSince1970: (date.timeIntervalSince1970 / 86_400).rounded(.down) * 86_400)
     }
 
-    private func allRecordings() -> [CatalogRecording] {
-        var all = names.compactMap { file, name in file == live?.file ? nil : recording(file, name) }
-        if let live { all.append(liveRecording(live)) }   // listed even before the folder shows it
-        return all
+    /// The UTC day holding `date`, counted from 1970: the index key. Whole days of `Double`, so a date far out
+    /// of range files under a day rather than trapping.
+    private static func dayNumber(_ date: Date) -> Int {
+        Int(exactly: (date.timeIntervalSince1970 / 86_400).rounded(.down)) ?? 0
+    }
+
+    /// Re-files `file` after any of its sources changed: its day, and whether it counts as unheard.
+    private mutating func refresh(_ file: String) {
+        if let old = dayOf.removeValue(forKey: file) {
+            filesByDay[old]?.remove(file)
+            if filesByDay[old]?.isEmpty == true { filesByDay[old] = nil }
+        }
+        guard let name = names[file] else {
+            unheard.remove(file)
+            return
+        }
+        let day = Self.dayNumber(facts(file, name).start)
+        dayOf[file] = day
+        filesByDay[day, default: []].insert(file)
+        if file != live?.file && !heard.contains(file) && (finished[file] != nil || started[file] != nil) {
+            unheard.insert(file)
+        } else {
+            unheard.remove(file)
+        }
+    }
+
+    private func facts(_ file: String, _ name: RecordingFileName) -> Facts {
+        finished[file]?.facts ?? started[file] ?? Facts(start: name.start, frequencyHz: name.frequencyHz, mode: name.label)
     }
 
     private func recording(_ file: String, _ name: RecordingFileName) -> CatalogRecording {
-        let facts: Facts, seconds: Double?, auto: Bool
+        let facts = facts(file, name), seconds: Double?, auto: Bool
         if let f = finished[file] {
-            (facts, seconds, auto) = (f.facts, f.seconds, f.auto)
-        } else if let s = started[file] {
-            (facts, seconds, auto) = (s, measured[file], true)
+            (seconds, auto) = (f.seconds, f.auto)
         } else {
-            facts = Facts(start: name.start, frequencyHz: name.frequencyHz, mode: name.label)
-            (seconds, auto) = (measured[file], false)
+            (seconds, auto) = (measured[file], started[file] != nil)
         }
         let logged = finished[file] != nil || started[file] != nil
         return CatalogRecording(file: file, start: facts.start, seconds: seconds, frequencyHz: facts.frequencyHz,

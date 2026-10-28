@@ -144,6 +144,22 @@ import Testing
         #expect(l.lanesBottom == l.laneTops[1] + TimelineGeometry.laneHeight)
     }
 
+    @Test func theLiveMarkerGrowsWithoutMovingAnything() {
+        // Finished at 19:00, live from 19:01: stacked under it. Its row is held to the end of the day.
+        let l = layout([68_400, 68_460], seconds: 0.2, live: 1)
+        let live = try! #require(l.live.first)
+        let settled = try! #require(l.settled.first)
+        #expect(live.rect.minY > settled.rect.minY)
+        let grown = try! #require(l.live(at: 1800).first)
+        #expect(grown.rect.minY == live.rect.minY)
+        #expect(grown.rect.width > live.rect.width)
+        #expect(grown.recording.seconds == 1800)
+        // The click and the hover find it at its length now.
+        let farRight = CGPoint(x: grown.rect.maxX - 2, y: grown.rect.midY)
+        #expect(l.marker(at: farRight, selectableOnly: false, liveSeconds: 1800)?.recording.file == "r1.flac")
+        #expect(l.marker(at: farRight, selectableOnly: false, liveSeconds: nil)?.recording.file == nil)
+    }
+
     @Test func nothingStacksBeforeTheWidthIsKnown() {
         let l = TimelineLayout(dayStart: Self.day, width: 0, recordings: layout([0, 60, 120]).settled.map(\.recording),
                                lanes: layout([0]).lanes, pops: [], selection: nil)

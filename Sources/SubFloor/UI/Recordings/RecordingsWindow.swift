@@ -61,7 +61,7 @@ struct RecordingsWindow: View {
             ScrollView(.vertical) {
                 DayTimelineView(dayStart: day, recordings: catalog.recordings(onUTCDay: day), lanes: lanes,
                                 pops: catalog.pops(onUTCDay: day), selection: selection, now: isToday ? now : nil,
-                                onSelect: select)
+                                onSelect: select, liveSeconds: { [library] in library.liveSeconds })
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { timelineHeight = $0 }
             }
             .scrollBounceBehavior(.basedOnSize)

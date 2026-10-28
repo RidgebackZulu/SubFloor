@@ -176,8 +176,124 @@ struct RecordingsLibraryTests {
         library.markHeard(files[0])                    // written and applied meanwhile
         await gate.release()
         await reading.value
-        #expect(await gate.reads == 3)   // the first, the held one and the read again
+        #expect(await gate.reads == 2)   // the line is added to what the held read found, not read again
         #expect(library.unheardCount == 0)
+    }
+
+    /// Holds one read in flight before it reads, so what is written meanwhile is in what it reads.
+    private func gatedBeforeReading(_ library: RecordingsLibrary) -> Gate {
+        let gate = Gate()
+        library.reader = { folder in
+            await gate.pass()
+            return RecordingsLibrary.read(folder)
+        }
+        return gate
+    }
+
+    @Test func aLineTheReadAlsoSawCountsOnce() async throws {
+        let folder = tempFolder()
+        try populate(folder, offsets: [0])
+        let library = RecordingsLibrary(folder: folder)
+        let gate = gatedBeforeReading(library)
+        await gate.arm()
+        let reading = Task { await library.reload() }
+        try await waitUntilHeld(gate)
+        // Written as the app writes it (at full precision in memory, to the millisecond on disk), then read.
+        let pop = RecordingLogEntry.pop(at: Self.base.addingTimeInterval(30.123456), seconds: 0.2, frequencyHz: 146_520_000, mode: "NFM")
+        try RecordingLog(folder: folder).append([pop])
+        library.didLog([pop])
+        await gate.release()
+        await reading.value
+        #expect(library.catalog.pops(onUTCDay: Self.base).count == 1)
+        #expect(await gate.reads == 1)
+    }
+
+    @Test func aListingTakenDuringAReadIsKeptWithoutReadingAgain() async throws {
+        let folder = tempFolder()
+        let files = try populate(folder, offsets: [0, 60])
+        let library = RecordingsLibrary(folder: folder)
+        let gate = gated(library)
+        await library.reload()
+        await gate.arm()
+        let reading = Task { await library.reload() }   // lists both files, then waits
+        try await waitUntilHeld(gate)
+        try FileManager.default.removeItem(at: folder.appendingPathComponent(files[0]))
+        await library.refreshFiles()
+        await gate.release()
+        await reading.value
+        #expect(await gate.reads == 2)   // no read again, however often the listing changes during a slow read
+        #expect(library.catalog.recording(files[0]) == nil)   // the newer listing
+        #expect(library.catalog.recording(files[1]) != nil)
+        #expect(library.unheardCount == 1)
+    }
+
+    @Test func anUnchangedListingChangesNothing() async throws {
+        let folder = tempFolder()
+        try populate(folder, offsets: [0, 60])
+        let library = RecordingsLibrary(folder: folder)
+        await library.reload()
+        var changes = 0
+        library.onChange = { changes += 1 }
+        await library.refreshFiles()
+        #expect(changes == 0)
+    }
+
+    @Test func aListingThatFailsKeepsTheFiles() async throws {
+        let folder = tempFolder()
+        let files = try populate(folder, offsets: [0, 60])
+        let library = RecordingsLibrary(folder: folder)
+        await library.reload()
+        // Searchable but not listable: the files are still there, the listing fails (a share that dropped).
+        try FileManager.default.setAttributes([.posixPermissions: 0o333], ofItemAtPath: folder.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: folder.path) }
+        await library.refreshFiles()
+        #expect(files.allSatisfy { library.catalog.recording($0) != nil })
+        await library.reload()
+        #expect(files.allSatisfy { library.catalog.recording($0) != nil })
+        #expect(library.unheardCount == 2)   // the logs were still read
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: folder.path)
+        try FileManager.default.removeItem(at: folder)   // a folder that is gone is empty, not a failure
+        await library.refreshFiles()
+        #expect(library.catalog.files.isEmpty)
+    }
+
+    @Test func oneUnreadableDayKeepsTheOtherDays() async throws {
+        let folder = tempFolder()
+        let files = try populate(folder, offsets: [0, 86_400])   // two UTC days
+        let day = RecordingLog(folder: folder).fileURL(forUTCDay: Self.base)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: day.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: day.path) }
+        let library = RecordingsLibrary(folder: folder)
+        let errors = Box()
+        library.onError = { errors.messages.append($0) }
+        await library.reload()
+        await library.reload()
+        #expect(library.catalog.recording(files[1])?.heard == false)   // the readable day's log still counts
+        #expect(library.catalog.recording(files[0])?.heard == true)    // the unreadable one's: heard and manual
+        #expect(library.unheardCount == 1)
+        #expect(errors.messages.count == 1)
+    }
+
+    @Test func aGrowingLiveRecordingLeavesTheCatalogAlone() async throws {
+        let folder = tempFolder()
+        try populate(folder, offsets: [0])
+        let library = RecordingsLibrary(folder: folder)
+        await library.reload()
+        var changes = 0
+        library.onChange = { changes += 1 }
+        var live = LiveRecording(file: name(300), start: Self.base.addingTimeInterval(300), seconds: 0.2,
+                                 frequencyHz: 146_520_000, mode: "NFM", auto: true)
+        library.setLive(live)
+        #expect(changes == 1)
+        let catalog = library.catalog
+        live.seconds = 12.4
+        library.setLive(live)
+        #expect(library.liveSeconds == 12.4)
+        #expect(library.catalog == catalog)   // the window's day and the badge are not touched
+        #expect(changes == 1)
+        library.setLive(nil)
+        #expect(library.liveSeconds == nil)
+        #expect(changes == 2)
     }
 
     @Test func refreshFilesDropsDeletedFiles() async throws {

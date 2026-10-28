@@ -30,6 +30,14 @@ public enum RecordingLogEntry: Codable, Equatable, Sendable {
         }
     }
 
+    /// The entry as it reads back from the log: its dates at the log's millisecond precision. A line kept in
+    /// memory as it was written can then be matched with the same line read from the file.
+    public var asLogged: RecordingLogEntry {
+        let encoder = JSONEncoder()
+        guard let data = try? encoder.encode(self), let back = try? JSONDecoder().decode(Self.self, from: data) else { return self }
+        return back
+    }
+
     private enum Kind: String, Codable { case recording, pop, heard, autoStarted, autoOff }
 
     private enum Keys: String, CodingKey {
@@ -165,6 +173,26 @@ public struct RecordingLog: Sendable {
             .filter { $0.pathExtension == "jsonl" }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }   // yyyy-MM-dd sorts as time does
         return try days.flatMap { try Self.decodeLines(of: $0) }
+    }
+
+    /// Every day's entries that can be read, as `allEntries()` orders them, and the first failure. A day file
+    /// that cannot be read (permissions, a disk error) is skipped rather than failing the rest: it would
+    /// otherwise lose every other day's `heard` and auto state.
+    public func readableEntries() -> (entries: [RecordingLogEntry], failure: (any Error)?) {
+        guard FileManager.default.fileExists(atPath: directory.path) else { return ([], nil) }
+        let days: [URL]
+        do {
+            days = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+                .filter { $0.pathExtension == "jsonl" }
+                .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        } catch {
+            return ([], error)
+        }
+        var entries: [RecordingLogEntry] = [], failure: (any Error)?
+        for day in days {
+            do { entries += try Self.decodeLines(of: day) } catch { failure = failure ?? error }
+        }
+        return (entries, failure)
     }
 
     private static func decodeLines(of url: URL) throws -> [RecordingLogEntry] {

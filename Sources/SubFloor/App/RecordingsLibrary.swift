@@ -15,6 +15,10 @@ import Recording
 final class RecordingsLibrary {
     private(set) var folder: URL
     private(set) var catalog: RecordingsCatalog
+    /// How long the recording in progress has run, apart from `catalog`, which holds the recording as it
+    /// began. It grows at every 5 Hz poll; kept here, it redraws the live marker and nothing else (not the
+    /// window's day, not the unheard badge). nil when none is recording.
+    private(set) var liveSeconds: Double?
 
     /// Recordings the listener has not opened. A recording in progress is never counted.
     var unheardCount: Int { catalog.unheardCount }
@@ -27,15 +31,21 @@ final class RecordingsLibrary {
     /// What the catalog is rebuilt from when the logs are read again, since the catalog does not expose them.
     @ObservationIgnored private var live: LiveRecording?
     @ObservationIgnored private var measured: [String: Double] = [:]
-    /// Counts changes to the sources (the log lines applied here, the listing). A read that started before
-    /// one has missed it, so it reads again rather than apply a catalog that is already out of date.
-    @ObservationIgnored private var revision = 0
+    /// The lines applied here while a read is in flight, numbered, so a read that may have missed them adds
+    /// them rather than reading again: a read of a year of logs on a slow disk can take longer than the gap
+    /// between two lines, and reading again each time would never finish.
+    @ObservationIgnored private var linesLogged = 0
+    @ObservationIgnored private var recentLines: [(number: Int, entry: RecordingLogEntry)] = []
+    @ObservationIgnored private var readsInFlight = 0
+    /// Counts listing changes, so a read can tell that the listing it took is older than the one held.
+    @ObservationIgnored private var listingRevision = 0
     @ObservationIgnored private var readFailed = false
     @ObservationIgnored private var writeFailed = false
 
-    /// What one read of a recordings folder finds.
+    /// What one read of a recordings folder finds, as a catalog built off the main actor (a year of logs is
+    /// tens of thousands of lines). `listed` is false when the folder could not be listed.
     struct Snapshot: Sendable {
-        var files: [String], entries: [RecordingLogEntry], failure: String?
+        var catalog: RecordingsCatalog, listed: Bool, failure: String?
     }
 
     /// Test hook: how a folder is read. The default reads off the main actor; a test replaces it to hold a
@@ -56,8 +66,8 @@ final class RecordingsLibrary {
     func setFolder(_ folder: URL) {
         guard folder != self.folder else { return }
         self.folder = folder
-        revision += 1
         live = nil
+        liveSeconds = nil
         measured = [:]
         readFailed = false
         writeFailed = false
@@ -67,37 +77,41 @@ final class RecordingsLibrary {
     }
 
     /// Reads the folder listing and every day log, off the main actor, into a fresh catalog. Never applies
-    /// the logs into the existing catalog: a pop applied twice is listed twice.
+    /// the logs into the existing catalog. What changed while it read is added to what it read rather than
+    /// read again: the lines applied meanwhile (a line it also read counts once), and a newer listing.
     func reload() async {
         let folder = self.folder
-        while true {
-            let seen = revision
-            let read = await reader(folder)
-            guard folder == self.folder else { return }   // setFolder came in while reading
-            guard seen == revision else { continue }      // a line was logged meanwhile: read again
-            if let failure = read.failure {
-                // One unreadable day file fails them all. The files are still listed, and with no log they
-                // all read as heard and manual, which loses nothing.
-                if !readFailed { onError?("Could not read the recordings log: \(failure)") }
-                readFailed = true
-            } else {
-                readFailed = false
-            }
-            var fresh = RecordingsCatalog(files: read.files, entries: read.entries, live: live)
-            for (file, seconds) in measured { fresh.setMeasuredSeconds(seconds, for: file) }
-            catalog = fresh
-            changed()
-            return
+        let firstLine = linesLogged, listingSeen = listingRevision
+        readsInFlight += 1
+        let read = await reader(folder)
+        readsInFlight -= 1
+        defer { if readsInFlight == 0 { recentLines = [] } }
+        guard folder == self.folder else { return }   // setFolder came in while reading
+        if let failure = read.failure {
+            // An unreadable day file is skipped; the other days still count.
+            if !readFailed { onError?("Could not read the recordings log: \(failure)") }
+            readFailed = true
+        } else {
+            readFailed = false
         }
+        var fresh = read.catalog
+        // A listing that failed reads as no files: keep the one held. One taken since the read began is newer.
+        if !read.listed || listingRevision != listingSeen { fresh.setFiles(catalog.files) }
+        fresh.apply(recentLines.filter { $0.number >= firstLine }.map(\.entry))
+        fresh.setLive(live)
+        for (file, seconds) in measured { fresh.setMeasuredSeconds(seconds, for: file) }
+        catalog = fresh
+        changed()
     }
 
-    /// Reads the folder listing only: a file deleted in Finder, or a new recording the listing lacked.
+    /// Reads the folder listing only: a file deleted in Finder, or a new recording the listing lacked. An
+    /// unchanged listing changes nothing; one that cannot be read (a network share that dropped, a disk
+    /// asleep) keeps the one held, so the files do not vanish and the player does not stop.
     func refreshFiles() async {
         let folder = self.folder
-        let files = await Task.detached(priority: .userInitiated) { Self.listing(of: folder) }.value
-        guard folder == self.folder else { return }
-        revision += 1   // a log read that started before this has an older listing
-        catalog.setFiles(files)
+        let files = await Task.detached(priority: .userInitiated) { Self.listing(of: folder).map(Set.init) }.value
+        guard folder == self.folder, let files, catalog.setFiles(files) else { return }
+        listingRevision += 1
         changed()
     }
 
@@ -105,7 +119,11 @@ final class RecordingsLibrary {
     /// sees exactly what is on disk.
     func didLog(_ entries: [RecordingLogEntry]) {
         guard !entries.isEmpty else { return }
-        revision += 1
+        if readsInFlight > 0 {
+            // As they read back from the file, so a line the read also saw is the same line, applied once.
+            recentLines += entries.enumerated().map { (linesLogged + $0, $1.asLogged) }
+        }
+        linesLogged += entries.count
         catalog.apply(entries)
         changed()
         // A recording that has just been logged may be a file the listing has not seen yet.
@@ -118,10 +136,13 @@ final class RecordingsLibrary {
         if unlisted { Task { await refreshFiles() } }
     }
 
-    /// The recording being written, or nil when none is.
+    /// The recording being written, or nil when none is. Its length growing changes only `liveSeconds`.
     func setLive(_ live: LiveRecording?) {
         guard live != self.live else { return }
+        let sameRecording = live.map { Self.identity($0) } == self.live.map { Self.identity($0) }
         self.live = live
+        liveSeconds = live?.seconds
+        guard !sameRecording else { return }
         catalog.setLive(live)
         changed()
     }
@@ -174,19 +195,28 @@ final class RecordingsLibrary {
 
     private func changed() { onChange?() }
 
-    /// The names in the folder (no file attributes: the catalog needs only names); none for a folder that
-    /// does not exist yet.
-    nonisolated private static func listing(of folder: URL) -> [String] {
-        (try? FileManager.default.contentsOfDirectory(atPath: folder.path)) ?? []
+    /// A live recording with its length left out: what the catalog holds of it.
+    private static func identity(_ live: LiveRecording) -> LiveRecording {
+        var live = live
+        live.seconds = 0
+        return live
+    }
+
+    /// The names in the folder (no file attributes: the catalog needs only names): none for a folder that
+    /// does not exist yet, nil for one that cannot be listed.
+    nonisolated private static func listing(of folder: URL) -> [String]? {
+        do {
+            return try FileManager.default.contentsOfDirectory(atPath: folder.path)
+        } catch {
+            return FileManager.default.fileExists(atPath: folder.path) ? nil : []
+        }
     }
 
     nonisolated static func read(_ folder: URL) -> Snapshot {
         let files = listing(of: folder)
-        do {
-            return Snapshot(files: files, entries: try RecordingLog(folder: folder).allEntries(), failure: nil)
-        } catch {
-            return Snapshot(files: files, entries: [], failure: error.localizedDescription)
-        }
+        let log = RecordingLog(folder: folder).readableEntries()
+        return Snapshot(catalog: RecordingsCatalog(files: files ?? [], entries: log.entries), listed: files != nil,
+                        failure: log.failure?.localizedDescription)
     }
 
     nonisolated private static func lengths(of files: [String], in folder: URL) -> [String: Double] {
