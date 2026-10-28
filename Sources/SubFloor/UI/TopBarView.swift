@@ -134,7 +134,11 @@ private struct RecordingsButton: View {
     var body: some View {
         let unheard = model.library.unheardCount
         Button { openWindow(id: "recordings") } label: {
-            RecordButtonLabel(title: "Recordings", on: false, fill: 0, symbol: "waveform")
+            // A full top bar squeezes this label first; the bare symbol beats a clipped "Re…".
+            ViewThatFits(in: .horizontal) {
+                RecordButtonLabel(title: "Recordings", on: false, fill: 0, symbol: "waveform").fixedSize()
+                RecordButtonLabel(title: "", on: false, fill: 0, symbol: "waveform").fixedSize()
+            }
         }
         .buttonStyle(.plain)
         .overlay(alignment: .topTrailing) {
