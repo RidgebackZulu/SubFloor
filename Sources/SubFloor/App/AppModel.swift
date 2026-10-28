@@ -94,8 +94,11 @@ final class AppModel {
     /// The live radio is silent while a recording plays (`RecordingPlayer`). The volume knob keeps its place
     /// and the session keeps saving `volume`; only what the engine is told changes.
     var liveAudioMuted = false { didSet { engine.update(volume: effectiveVolume) } }
+    /// The live radio is also silent the whole time the Recordings window is open, playing or not, so
+    /// listening back is never talked over; it returns when the window closes.
+    var recordingsWindowOpen = false { didSet { engine.update(volume: effectiveVolume) } }
     /// What the engine plays the live radio at.
-    var effectiveVolume: Float { liveAudioMuted ? 0 : volume }
+    var effectiveVolume: Float { liveAudioMuted || recordingsWindowOpen ? 0 : volume }
 
     // MARK: Recording
     /// Recording preferences (Settings). Kept valid; a change to a sample format starts the pre-roll

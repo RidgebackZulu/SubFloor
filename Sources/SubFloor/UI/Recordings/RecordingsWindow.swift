@@ -104,12 +104,14 @@ struct RecordingsWindow: View {
         }
         .onAppear {
             opened()
+            model.recordingsWindowOpen = true
             model.recordingsWindowIsKey = controlActiveState == .key
         }
         .onChange(of: controlActiveState) { _, state in model.recordingsWindowIsKey = state == .key }
         .onChange(of: peaksFailure) { _, url in model.recordingsUnplayableFile = url?.lastPathComponent }
         .onDisappear {
             model.player.pause()
+            model.recordingsWindowOpen = false
             model.recordingsWindowIsKey = false
             model.recordingsUnplayableFile = nil
         }

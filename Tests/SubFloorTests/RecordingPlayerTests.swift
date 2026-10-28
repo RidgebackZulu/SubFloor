@@ -236,6 +236,21 @@ struct RecordingPlayerTests {
         #expect((saved["volume"] as? NSNumber)?.floatValue == 0.4)
     }
 
+    @Test func liveAudioIsSilentWhileTheRecordingsWindowIsOpen() {
+        let dir = tempFolder()
+        let m = AppModel(bookmarkStore: BookmarkStore(url: dir.appendingPathComponent("bookmarks.json")),
+                         defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        m.volume = 0.4
+        m.recordingsWindowOpen = true
+        #expect(m.effectiveVolume == 0)
+        m.liveAudioMuted = true
+        m.liveAudioMuted = false   // playback stopped: still silent while the window is up
+        #expect(m.effectiveVolume == 0)
+        m.recordingsWindowOpen = false
+        #expect(m.effectiveVolume == 0.4)
+        #expect(m.volume == 0.4)
+    }
+
     @Test func thePlayerFollowsTheVolumeKnob() async throws {
         let dir = tempFolder()
         let m = AppModel(bookmarkStore: BookmarkStore(url: dir.appendingPathComponent("bookmarks.json")),
