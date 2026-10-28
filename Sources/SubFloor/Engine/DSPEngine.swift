@@ -249,8 +249,11 @@ final class DSPEngine: @unchecked Sendable {
         pending.withLock { $0.volume = volume }
         modemWorker.update(volume: volume)
     }
-    /// Noise reduction for the speakers. The engine applies it only where the mode allows
-    /// (`NoiseReductionSettings.isAvailable`); recordings and the modem never get it.
+    /// The last setting sent (tests).
+    var noiseReductionRequest: NoiseReductionSettings { noiseReductionSetting.withLock { $0 } }
+    /// Noise reduction for the speakers, as the user set it. The engine applies it only where the
+    /// mode allows (`NoiseReductionSettings.isAvailable`), re-checked on every mode change;
+    /// recordings and the modem never get it.
     func update(noiseReduction: NoiseReductionSettings) {
         noiseReductionSetting.withLock { $0 = noiseReduction }
         pending.withLock { $0.noiseReduction = noiseReduction }

@@ -87,10 +87,12 @@ final class AppModel {
     }
     var squelchDb: Float = -80 { didSet { pushReceiver() } }
     /// Noise reduction on the speakers (not the recordings), persisted. It keeps its setting in the
-    /// modes where it does not apply (`noiseReductionAvailable`); the engine is told the effective one.
+    /// modes where it does not apply (`noiseReductionAvailable`). The engine is sent the setting as it
+    /// is and applies it only where the mode allows, on every mode change however it happens (the
+    /// mode picker, a bookmark, a restored session).
     var noiseReduction = NoiseReductionSettings() {
         didSet {
-            pushNoiseReduction()
+            engine.update(noiseReduction: noiseReduction)
             saveSessionIfChanged()
         }
     }
@@ -98,11 +100,6 @@ final class AppModel {
     func toggleNoiseReduction() {
         guard noiseReductionAvailable else { return }
         noiseReduction.enabled.toggle()
-    }
-    private func pushNoiseReduction() {
-        var effective = noiseReduction
-        effective.enabled = effective.enabled && noiseReductionAvailable
-        engine.update(noiseReduction: effective)
     }
     var agcSpeed: AGCSpeed = .medium { didSet { pushReceiver() } }
     var volume: Float = 0.5 {
@@ -712,7 +709,6 @@ final class AppModel {
         mode = newMode
         bandwidthHz = newMode.defaultBandwidth
         pushReceiver()
-        pushNoiseReduction()
     }
 
     func cycleMode(_ delta: Int) {

@@ -70,6 +70,25 @@ struct NoiseReductionControlTests {
         #expect(m.noiseReduction.strength == 0.7)
     }
 
+    /// The engine is sent the setting as the user made it, not masked by the mode, so it applies the
+    /// setting again whenever the mode changes: here through a bookmark, which does not go through
+    /// `setMode`.
+    @Test func aBookmarkJumpOutOfWFMKeepsTheSettingTheEngineHas() {
+        let (m, _) = makeModel()
+        defer { m.shutdown() }
+        m.setMode(.usb)
+        m.noiseReduction = NoiseReductionSettings(enabled: true, strength: 0.6)
+        m.setMode(.wfm)
+        #expect(!m.noiseReductionAvailable)
+        #expect(m.engine.noiseReductionRequest == NoiseReductionSettings(enabled: true, strength: 0.6),
+                "the engine keeps the user's setting in WFM and gates it itself")
+        m.select(Bookmark(name: "20 m", frequencyHz: 14_200_000, mode: .usb, bandwidthHz: 2_700))
+        #expect(m.mode == .usb)
+        #expect(m.noiseReductionAvailable)
+        #expect(m.noiseReduction.enabled)
+        #expect(m.engine.noiseReductionRequest == NoiseReductionSettings(enabled: true, strength: 0.6))
+    }
+
     // MARK: Engine
 
     @Test func theEngineGetsTheEffectiveSetting() throws {
@@ -84,7 +103,9 @@ struct NoiseReductionControlTests {
         let wfmOn = try run(mode: .wfm, noiseReduction: strong)
         let (c, d) = aligned(wfmOff.speaker, wfmOn.speaker)
         #expect(c.count > 24_000, "captured \(c.count) samples")
-        #expect(maxDifference(c, d) == 0, "NR on in WFM is the same as off")
+        // Not bit-for-bit: the WFM demodulator's float rounding shifts by ~1e-8 with how the IQ is cut
+        // into blocks. NR would move it by ~0.3 (checked by removing the engine's mode gate).
+        #expect(maxDifference(c, d) < 1e-4, "NR on in WFM is the same as off")
     }
 
     @Test func recordingsDoNotGetNR() throws {
@@ -92,7 +113,7 @@ struct NoiseReductionControlTests {
         let on = try run(mode: .usb, noiseReduction: NoiseReductionSettings(enabled: true, strength: 1), recordAudio: true)
         let (a, b) = aligned(off.recorded, on.recorded)
         #expect(a.count > 24_000, "recorded \(a.count) samples")
-        #expect(maxDifference(a, b) == 0, "the recorder has the audio as heard")
+        #expect(maxDifference(a, b) < 1e-4, "the recorder has the audio as heard")
         let (s, t) = aligned(off.speaker, on.speaker)
         #expect(maxDifference(s, t) > 0.01, "and NR was running on the speakers")
     }
