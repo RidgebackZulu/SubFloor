@@ -20,8 +20,9 @@ public final class SpectralNoiseReducer {
     public var strength: Double = 0.5
     /// Samples by which the output lags the input.
     public var latency: Int { Self.frameSize }
-    /// Smoothed (time constant about 1 s) level drop, in dB (≥ 0), that the reducer applied on
-    /// speech frames. 0 until a speech frame is seen.
+    /// Smoothed (time constant about 1 s) level drop, in dB (≥ 0), that the reducer applied to the
+    /// voice on speech frames, measured over the speech-band bins the voice dominates. 0 until a
+    /// speech frame is seen.
     public private(set) var voiceLossDb: Float = 0
 
     // Noise tracker (the spike's): power smoothed per frame, its minimum over 1.5 s, × 1.8. The minimum
@@ -39,6 +40,10 @@ public final class SpectralNoiseReducer {
     private static let silence: Float = 1e-8
     /// Mean a-posteriori SNR over 300–3000 Hz above which a frame is speech (6 dB).
     private static let speechGamma: Float = 4
+    /// A speech-band bin counts towards `voiceLossDb` when its a-posteriori SNR is above this (6 dB
+    /// over the over-estimated noise): noise-only bins reach it with probability e⁻⁴ ≈ 2 % and
+    /// carry little power, while bins the voice owns are far above it.
+    private static let voiceBinGamma: Float = 4
 
     private let bins = frameSize / 2 + 1
     private let log2n = vDSP_Length(frameSize.trailingZeroBitCount)
@@ -229,11 +234,17 @@ public final class SpectralNoiseReducer {
         var meanGamma: Float = 0
         vDSP_meanv(gamma + speechBins.lowerBound, 1, &meanGamma, vDSP_Length(speechBins.count))
         if settled && meanGamma > Self.speechGamma {
+            // Voice loss: the level drop on the bins where the voice dominates, not the hiss the
+            // reducer removed elsewhere (make-up built on that would lift the hiss back up).
             var inPower: Float = 0, outPower: Float = 0
-            vDSP_sve(power, 1, &inPower, count)
-            vDSP_sve(prevClean, 1, &outPower, count)
-            let loss = max(0, 10 * log10(inPower / max(outPower, .leastNormalMagnitude)))
-            voiceLossDb = voiceLossKeep * voiceLossDb + (1 - voiceLossKeep) * loss
+            for k in speechBins where gamma[k] > Self.voiceBinGamma {
+                inPower += power[k]
+                outPower += prevClean[k]
+            }
+            if inPower > 0 {
+                let loss = max(0, 10 * log10(inPower / max(outPower, .leastNormalMagnitude)))
+                voiceLossDb = voiceLossKeep * voiceLossDb + (1 - voiceLossKeep) * loss
+            }
         }
 
         re[0] *= gain[0]

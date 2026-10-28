@@ -30,21 +30,23 @@ private func mix(_ signals: [Float]...) -> [Float] {
     signals.dropFirst().reduce(signals[0]) { zip($0, $1).map { $0 + $1 } }
 }
 
-/// Runs `x` through `reducer` in uneven buffers, as audio threads deliver them.
-private func run(_ reducer: SpectralNoiseReducer, _ x: [Float]) -> [Float] {
+/// Runs `x` through `process` in uneven buffers, as audio threads deliver them.
+private func feed(_ x: [Float], _ process: (UnsafeMutableBufferPointer<Float>) -> Void) -> [Float] {
     var y = x
     let sizes = [480, 37, 1, 1000, 256, 3]
     y.withUnsafeMutableBufferPointer { b in
         var i = 0, k = 0
         while i < b.count {
             let n = min(sizes[k % sizes.count], b.count - i)
-            reducer.process(UnsafeMutableBufferPointer(rebasing: b[i..<(i + n)]))
+            process(UnsafeMutableBufferPointer(rebasing: b[i..<(i + n)]))
             i += n
             k += 1
         }
     }
     return y
 }
+
+private func run(_ reducer: SpectralNoiseReducer, _ x: [Float]) -> [Float] { feed(x, reducer.process) }
 
 private func levelDb(_ x: ArraySlice<Float>) -> Double {
     10 * log10(x.reduce(0.0) { $0 + Double($1) * Double($1) } / Double(x.count))
@@ -171,4 +173,121 @@ private func reductionDb(_ x: [Float], _ y: [Float], latency: Int, from: Double,
     #expect(SpectralNoiseReducer.overEstimate(strength: 0) == 1)
     #expect(SpectralNoiseReducer.overEstimate(strength: 0.5) == 1.5)
     #expect(SpectralNoiseReducer.overEstimate(strength: 1) == 2)
+}
+
+// MARK: - NoiseReducer (on/off, strength ramps, make-up gain)
+
+private func runNR(_ nr: NoiseReducer, _ x: [Float]) -> [Float] { feed(x, nr.process) }
+
+/// Mean power (dB) at `frequency` over the keyed-on stretches of a `syllables` signal that lie in
+/// [from, to) seconds of the input, read from `y` delayed by `latency`. Each stretch is trimmed by
+/// 50 ms at both ends so the reducer's frame-length smearing of the edges doesn't count.
+private func keyedToneDb(_ y: [Float], latency: Int, from: Double, to: Double) -> Double {
+    var total = 0.0, stretches = 0
+    var start = (from / 0.5).rounded(.up) * 0.5
+    while start + 0.5 <= to {
+        let a = Int((start + 0.05) * fs) + latency, b = Int((start + 0.25) * fs) + latency
+        total += TestSignals.power(of: y[a..<b], at: 1000, sampleRate: fs)
+        stretches += 1
+        start += 0.5
+    }
+    return 10 * log10(total / Double(stretches))
+}
+
+@Test func offIsBitExact() {
+    let nr = NoiseReducer()
+    let x = noise(seconds: 0.5, rms: 0.1, seed: 20)
+    let y = runNR(nr, x)
+    #expect(zip(x, y).allSatisfy { $0.bitPattern == $1.bitPattern })
+}
+
+@Test func offAfterOnSettlesToBitExact() {
+    let nr = NoiseReducer()
+    nr.update(NoiseReductionSettings(enabled: true, strength: 0.5))
+    _ = runNR(nr, noise(seconds: 1, rms: 0.1, seed: 21))
+    nr.update(NoiseReductionSettings(enabled: false, strength: 0.5))
+    _ = runNR(nr, noise(seconds: 0.1, rms: 0.1, seed: 22))
+    let x = noise(seconds: 0.5, rms: 0.1, seed: 23)
+    let y = runNR(nr, x)
+    #expect(zip(x, y).allSatisfy { $0.bitPattern == $1.bitPattern })
+}
+
+@Test func togglingHasNoStep() {
+    // Enable at 1 s, disable at 3 s; a steady tone over noise, so the reducer is in the same
+    // state before, during and after each fade.
+    let x = mix(tone(seconds: 4, amplitude: amplitude(10, over: 0.1), frequency: 1000), noise(seconds: 4, rms: 0.1, seed: 24))
+    let nr = NoiseReducer()
+    var y: [Float] = []
+    for (from, to, enabled) in [(0.0, 1.0, false), (1.0, 3.0, true), (3.0, 4.0, false)] {
+        nr.update(NoiseReductionSettings(enabled: enabled, strength: 0.5))
+        y += runNR(nr, Array(x[Int(from * fs)..<Int(to * fs)]))
+    }
+    func largestStep(_ range: Range<Int>) -> Float {
+        range.dropFirst().map { abs(y[$0] - y[$0 - 1]) }.max()!
+    }
+    let fade = Int(0.03 * fs)
+    for toggle in [Int(1.0 * fs), Int(3.0 * fs)] {
+        let around = largestStep((toggle - 10)..<(toggle + fade + 10))
+        let elsewhere = max(largestStep(Int(0.2 * fs)..<(toggle - 100)), largestStep((toggle + fade + 100)..<(toggle + Int(0.5 * fs))))
+        #expect(around <= 1.5 * elsewhere, "toggle at \(Double(toggle) / fs) s: \(around) vs \(elsewhere)")
+    }
+}
+
+@Test func makeUpKeepsTheVoiceLevel() {
+    let nr = NoiseReducer()
+    nr.update(NoiseReductionSettings(enabled: true, strength: 0.5))
+    let x = mix(syllables(seconds: 8, amplitude: amplitude(6, over: 0.1)), noise(seconds: 8, rms: 0.1, seed: 25))
+    let y = runNR(nr, x)
+    let l = SpectralNoiseReducer().latency
+    let change = keyedToneDb(y, latency: l, from: 3, to: 7.5) - keyedToneDb(x, latency: 0, from: 3, to: 7.5)
+    #expect(abs(change) <= 2, "\(change) dB (make-up \(nr.makeupDb) dB)")
+}
+
+@Test func makeUpNeverLiftsTheNoiseBack() {
+    let x = noise(seconds: 6, rms: 0.1, seed: 26)
+    for (strength, limit) in [(0.0, -5.0), (0.5, -10.0), (1.0, -15.0)] {
+        let nr = NoiseReducer()
+        nr.update(NoiseReductionSettings(enabled: true, strength: strength))
+        let y = runNR(nr, x)
+        let l = SpectralNoiseReducer().latency
+        let change = levelDb(y[(3 * Int(fs) + l)..<(5 * Int(fs) + l)]) - levelDb(x[(3 * Int(fs))..<(5 * Int(fs))])
+        #expect(change <= limit, "strength \(strength): \(change) dB")
+    }
+}
+
+@Test func aStrongToneIsNotColoured() {
+    let x = mix(syllables(seconds: 6, amplitude: amplitude(30, over: 0.1)), noise(seconds: 6, rms: 0.1, seed: 27))
+    for strength in [0.0, 0.5, 1.0] {
+        let nr = NoiseReducer()
+        nr.update(NoiseReductionSettings(enabled: true, strength: strength))
+        let y = runNR(nr, x)
+        let l = SpectralNoiseReducer().latency
+        let change = keyedToneDb(y, latency: l, from: 2.5, to: 5.5) - keyedToneDb(x, latency: 0, from: 2.5, to: 5.5)
+        #expect(abs(change) <= 0.5, "strength \(strength): \(change) dB")
+    }
+}
+
+@Test func labelsAndAvailability() {
+    #expect(NoiseReductionSettings(strength: 0.2).label == "Light")
+    #expect(NoiseReductionSettings(strength: 0.5).label == "Medium")
+    #expect(NoiseReductionSettings(strength: 0.9).label == "Strong")
+    for mode in [DemodMode.am, .nfm, .usb, .lsb, .cw] { #expect(NoiseReductionSettings.isAvailable(for: mode)) }
+    #expect(!NoiseReductionSettings.isAvailable(for: .wfm))
+}
+
+@Test func settingsRoundTrip() throws {
+    let settings = NoiseReductionSettings(enabled: true, strength: 0.7)
+    let decoded = try JSONDecoder().decode(NoiseReductionSettings.self, from: JSONEncoder().encode(settings))
+    #expect(decoded == settings)
+    #expect(NoiseReductionSettings() == NoiseReductionSettings(enabled: false, strength: 0.5))
+}
+
+@Test func voiceLossDoesNotCountTheHissRemoved() {
+    // A tone only 3 dB over the noise: the hiss the reducer takes off is most of the frame's power,
+    // but the voice itself loses very little. (Measured over all bins it read 1.7 dB, which make-up
+    // would add to the voice as +1.3 dB.)
+    let reducer = SpectralNoiseReducer()
+    reducer.strength = 0.5
+    _ = run(reducer, mix(syllables(seconds: 8, amplitude: amplitude(3, over: 0.1)), noise(seconds: 8, rms: 0.1, seed: 9)))
+    #expect(reducer.voiceLossDb < 0.5, "\(reducer.voiceLossDb) dB")
 }
