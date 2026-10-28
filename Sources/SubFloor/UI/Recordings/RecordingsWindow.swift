@@ -29,6 +29,7 @@ enum RecordingsTheme {
 /// from Clear and from playing) and the waveform cache.
 struct RecordingsWindow: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.controlActiveState) private var controlActiveState
 
     /// UTC midnight of the day shown.
     @State private var day = RecordingsCatalog.utcDayStart(Date())
@@ -101,8 +102,17 @@ struct RecordingsWindow: View {
             }
             return .handled
         }
-        .onAppear(perform: opened)
-        .onDisappear { model.player.pause() }
+        .onAppear {
+            opened()
+            model.recordingsWindowIsKey = controlActiveState == .key
+        }
+        .onChange(of: controlActiveState) { _, state in model.recordingsWindowIsKey = state == .key }
+        .onChange(of: peaksFailure) { _, url in model.recordingsUnplayableFile = url?.lastPathComponent }
+        .onDisappear {
+            model.player.pause()
+            model.recordingsWindowIsKey = false
+            model.recordingsUnplayableFile = nil
+        }
         .onChange(of: selectedRecording == nil) { _, gone in
             // A file deleted in Finder: the player unloads it itself; the selection goes with it.
             if gone { selection = nil }

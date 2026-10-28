@@ -1,5 +1,6 @@
 import Foundation
 import Recording
+import SubFloorCore
 import Testing
 @testable import SubFloor
 
@@ -141,5 +142,15 @@ struct DialScrubTests {
         var sync = DialScrubSync()
         #expect(sync.lines(for: nil, now: 0) == [])
         #expect(sync.lines(for: nil, now: 1) == [])
+    }
+
+    @MainActor @Test func controllerTargetsNothingWithoutAKeyWindow() {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("SubFloorTests-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let model = AppModel(bookmarkStore: BookmarkStore(url: dir.appendingPathComponent("bookmarks.json")),
+                             defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        let controller = DialController(model: model, defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        #expect(!model.recordingsWindowIsKey)
+        #expect(controller.scrubTarget == nil)
     }
 }

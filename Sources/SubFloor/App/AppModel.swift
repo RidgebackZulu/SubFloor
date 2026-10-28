@@ -168,6 +168,11 @@ final class AppModel {
     /// is why it is not a `let`: its mute closure needs `self`.
     @ObservationIgnored private(set) var player: RecordingPlayer!
 
+    /// Whether the Recordings window is the key window: the dial scrubs the player only while it is.
+    @ObservationIgnored var recordingsWindowIsKey = false
+    /// The file the Recordings window found unplayable (its peaks could not be read), so the dial does not scrub it.
+    @ObservationIgnored var recordingsUnplayableFile: String?
+
     /// Test hook: the free bytes on the volume recordings go to (nil: unknown).
     @ObservationIgnored var freeSpaceProbe: (URL) -> Int64? = { AppModel.freeSpace(at: $0) }
     @ObservationIgnored private var lastDiskCheck: ContinuousClock.Instant?
