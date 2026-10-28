@@ -1,6 +1,7 @@
 import Accelerate
 import AVFoundation
 import Foundation
+import Synchronization
 
 /// The loudness outline of a recording, one byte per 10 ms: what the Recordings window draws as a waveform and
 /// what it finds a click's position in. Reading 1.5 hours of audio takes a while, so it is done off the main
@@ -18,22 +19,51 @@ public struct WaveformPeaks: Equatable, Sendable {
     /// computed (and the cache written). Throws for an unreadable file; throws CancellationError
     /// promptly (checked every second of audio) when the calling task is cancelled.
     public static func load(audioFile: URL, cacheFolder: URL) async throws -> WaveformPeaks {
-        // A detached task keeps the file work off the caller's actor (the main actor, from a view's task);
-        // the handler hands the caller's cancellation on to it.
-        let work = Task.detached(priority: .userInitiated) {
-            try loadSynchronously(audioFile: audioFile, cacheFolder: cacheFolder)
+        try await load(audioFile: audioFile, cacheFolder: cacheFolder, workerExited: {})
+    }
+
+    /// `load`, with `workerExited` called on the worker thread as it finishes, however it finishes: a test
+    /// times how soon a cancel stops the reading by it.
+    ///
+    /// The reading is blocking file work, so it runs on a thread of its own rather than on the cooperative
+    /// pool, where a busy pool (a full test run, other work in the app) can leave it, and the cancel, waiting
+    /// for a thread. A cancel sets a flag the reading checks every second of audio; it then stops and resumes
+    /// the caller at once, without needing a pool thread for the work.
+    static func load(audioFile: URL, cacheFolder: URL,
+                     workerExited: @escaping @Sendable () -> Void) async throws -> WaveformPeaks {
+        let cancelled = CancelFlag()
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let worker = Thread {
+                    let result = Result { try loadSynchronously(audioFile: audioFile, cacheFolder: cacheFolder, cancelled: cancelled) }
+                    workerExited()
+                    continuation.resume(with: result)
+                }
+                worker.name = "WaveformPeaks"
+                worker.qualityOfService = .userInitiated
+                worker.start()
+            }
+        } onCancel: {
+            cancelled.set()   // also called at once, before the body, when the caller is already cancelled
         }
-        return try await withTaskCancellationHandler { try await work.value } onCancel: { work.cancel() }
+    }
+
+    /// Set once by the caller's cancellation, read by the worker.
+    final class CancelFlag: Sendable {
+        private let value = Atomic(false)
+        func set() { value.store(true, ordering: .relaxed) }
+        func check() throws { if value.load(ordering: .relaxed) { throw CancellationError() } }
     }
 
     // MARK: Loading
 
-    private static func loadSynchronously(audioFile: URL, cacheFolder: URL) throws -> WaveformPeaks {
+    private static func loadSynchronously(audioFile: URL, cacheFolder: URL, cancelled: CancelFlag) throws -> WaveformPeaks {
+        try cancelled.check()
         let source = try SourceStamp(audioFile)         // taken before reading: a file that changes meanwhile fails the next match
         let cacheFile = cacheFolder.appendingPathComponent(audioFile.lastPathComponent + ".peaks")
         if let cached = readCache(cacheFile, matching: source) { return cached }
-        let peaks = try compute(audioFile)
-        try Task.checkCancellation()
+        let peaks = try compute(audioFile, cancelled: cancelled)
+        try cancelled.check()
         writeCache(peaks, to: cacheFile, folder: cacheFolder, source: source)   // a speed-up only: failing to write is not failing to load
         return peaks
     }
@@ -41,7 +71,7 @@ public struct WaveformPeaks: Equatable, Sendable {
     /// Frames of audio read per pass, as seconds: also how often cancellation is noticed.
     private static let chunkSeconds = 1.0
 
-    private static func compute(_ audioFile: URL) throws -> WaveformPeaks {
+    private static func compute(_ audioFile: URL, cancelled: CancelFlag) throws -> WaveformPeaks {
         let file = try AVAudioFile(forReading: audioFile)
         let format = file.processingFormat
         let rate = format.sampleRate
@@ -51,7 +81,7 @@ public struct WaveformPeaks: Equatable, Sendable {
         var peaks = [UInt8](repeating: 0, count: binCount(frames: Int(file.length), rate: rate))
         var frame = 0
         while file.framePosition < file.length {      // read(into:) throws, rather than returning nothing, once it is at the end
-            try Task.checkCancellation()
+            try cancelled.check()
             try file.read(into: buffer)
             let n = Int(buffer.frameLength)
             if n == 0 { break }

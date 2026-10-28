@@ -150,7 +150,11 @@ private func writeToneThenSilence(_ url: URL) throws {
         let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
         let wav = dir.appendingPathComponent("long.wav")
         try writeSilentWAV(wav, seconds: 12 * 3600)        // far more than 50 ms of work
-        let task = Task { try await WaveformPeaks.load(audioFile: wav, cacheFolder: dir.appendingPathComponent("cache")) }
+        let exitedAt = Mutex<ContinuousClock.Instant?>(nil)
+        let task = Task {
+            try await WaveformPeaks.load(audioFile: wav, cacheFolder: dir.appendingPathComponent("cache"),
+                                         workerExited: { exitedAt.withLock { $0 = .now } })
+        }
         // A thread of its own, not Task.sleep or a dispatch timer: other suites can keep the cooperative and dispatch
         // pools busy for seconds, and a late cancel would find the load already finished.
         let cancelledAt = Mutex<ContinuousClock.Instant?>(nil)
@@ -162,10 +166,13 @@ private func writeToneThenSilence(_ url: URL) throws {
         timer.qualityOfService = .userInteractive
         timer.start()
         do { _ = try await task.value; Issue.record("load finished instead of being cancelled") }
-        // The load itself stops within a chunk (a few ms; ~1.4 s to read this file uncancelled). The bound is loose
-        // because, with the other suites running, the awaiting task can wait seconds for a cooperative thread.
-        catch is CancellationError { #expect(ContinuousClock.now - cancelledAt.withLock { $0 }! < .seconds(4)) }
+        catch is CancellationError {}
         catch { Issue.record("expected CancellationError, got \(error)") }
+        // What is timed is the reading stopping, on its own thread: within a chunk of a second of audio (tens of
+        // µs here; ~1.4 s to read this file uncancelled). When the awaiting task then resumes depends on the
+        // cooperative pool, which the other suites can keep busy, so it is not timed.
+        let cancelled = try #require(cancelledAt.withLock { $0 }), exited = try #require(exitedAt.withLock { $0 })
+        #expect(exited - cancelled < .seconds(1))
         #expect(!FileManager.default.fileExists(atPath: dir.appendingPathComponent("cache/long.wav.peaks").path))
     }
 
