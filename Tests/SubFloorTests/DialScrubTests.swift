@@ -102,8 +102,37 @@ struct DialScrubTests {
         #expect(sync.lines(for: target(pos: 1.1, playing: true), now: 1) == [])
         #expect(sync.lines(for: target(pos: 2.6, playing: true), now: 2) == [DialProtocol.position(2.6)])
         #expect(DialProtocol.position(2.6) == "POS 2.60")
-        #expect(sync.lines(for: target(pos: 7.6, playing: true), now: 7.1) == [DialProtocol.position(7.6)])
+        // The resync carries the play state too.
+        #expect(sync.lines(for: target(pos: 7.6, playing: true), now: 7.1)
+                == [DialProtocol.playing(true), DialProtocol.position(7.6)])
         #expect(DialProtocol.position(7.6) == "POS 7.60")
+    }
+
+    @Test func pausedResyncsEveryFiveSecondsToo() {
+        // A plain POS the dial dropped (the knob had just moved) is put right within 5 s, paused or not.
+        var sync = DialScrubSync()
+        _ = sync.lines(for: target(pos: 10), now: 0)
+        #expect(sync.lines(for: target(pos: 40), now: 1) == [DialProtocol.position(40)])
+        #expect(sync.lines(for: target(pos: 40), now: 5.9) == [])
+        #expect(sync.lines(for: target(pos: 40), now: 6) == [DialProtocol.playing(false), DialProtocol.position(40)])
+        #expect(sync.lines(for: target(pos: 40), now: 6.1) == [])
+    }
+
+    @Test func aTapOnTheDialAlwaysAnswersThePlayState() {
+        // The window paused the player just before the dial's tap played it again: the state did not change since
+        // it was last sent, but the dial predicted a toggle, so it is told anyway.
+        var sync = DialScrubSync()
+        _ = sync.lines(for: target(pos: 4, playing: true), now: 0)
+        #expect(sync.lines(for: target(pos: 4.5, playing: true), now: 0.5, playToggled: true)
+                == [DialProtocol.playing(true), DialProtocol.position(4.5)])
+        #expect(sync.lines(for: target(pos: 4.6, playing: true), now: 0.6) == [])
+    }
+
+    @Test func jumpAndPlayInOneCall() {
+        var sync = DialScrubSync()
+        _ = sync.lines(for: target(), now: 0)
+        #expect(sync.lines(for: target(pos: 2, playing: true, jump: 5), now: 1)
+                == [DialProtocol.jump(5), DialProtocol.playing(true), DialProtocol.position(2)])
     }
 
     @Test func aSeekInTheWindowSendsPosition() {

@@ -267,7 +267,7 @@ final class DialController {
         case .playToggle:
             guard scrubTarget != nil else { break }
             model.player.togglePlay()
-            for line in scrubSync.lines(for: scrubTarget, now: ProcessInfo.processInfo.systemUptime) { send(line) }
+            sendScrubLines(playToggled: true)
         case .hello, .pong:
             break
         }
@@ -348,7 +348,12 @@ final class DialController {
             send(DialProtocol.signal(model.signalDb))
             sent.signalDb = model.signalDb
         }
-        for line in scrubSync.lines(for: scrubTarget, now: ProcessInfo.processInfo.systemUptime) { send(line) }
+        sendScrubLines()
+    }
+
+    private func sendScrubLines(playToggled: Bool = false) {
+        let lines = scrubSync.lines(for: scrubTarget, now: ProcessInfo.processInfo.systemUptime, playToggled: playToggled)
+        for line in lines { send(line) }
     }
 
     private static let hostName: String = {

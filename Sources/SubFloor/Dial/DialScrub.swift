@@ -41,11 +41,13 @@ struct DialScrubSync {
 
     /// A position that differs from the dial's extrapolation by more than this is sent.
     private static let drift = 0.3
-    /// While playing, the position is re-sent at least this often.
+    /// The play state and position are re-sent at least this often, playing or paused: the dial drops a plain `POS`
+    /// while its knob has just moved, and this puts it right.
     private static let resync = 5.0
 
-    /// Lines to send for this target (nil: tune).
-    mutating func lines(for target: DialScrubTarget?, now: Double) -> [String] {
+    /// Lines to send for this target (nil: tune). `playToggled`: the dial's `PLAY` was just applied; it predicted a
+    /// toggle, so the play state is sent even if it is what the dial was last told.
+    mutating func lines(for target: DialScrubTarget?, now: Double, playToggled: Bool = false) -> [String] {
         guard let target else {
             guard file != nil else { return [] }
             file = nil
@@ -68,12 +70,11 @@ struct DialScrubSync {
             sentJump = target.jump
             lines.append(DialProtocol.jump(target.jump))
         }
-        if target.playing != sentPlaying {
+        if target.playing != sentPlaying || playToggled || now - sentTime >= Self.resync {
             sentPlaying = target.playing
             lines.append(DialProtocol.playing(target.playing))
             lines.append(sendPosition(target.position, now: now))
-        } else if abs(target.position - expected(at: now)) > Self.drift
-                    || (target.playing && now - sentTime >= Self.resync) {
+        } else if abs(target.position - expected(at: now)) > Self.drift {
             lines.append(sendPosition(target.position, now: now))
         }
         return lines
