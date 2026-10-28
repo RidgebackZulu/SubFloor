@@ -139,6 +139,24 @@ final class AppModel {
         return isAutoRecording ? .recording : .armed
     }
 
+    /// Reads the recordings folder for the unheard badge, and lists it again whenever the app comes to the
+    /// front: only the Recordings window lists it otherwise, so a file deleted in Finder while the window is
+    /// closed would stay counted. Internal for tests, which start it on a model pointed at a temp folder.
+    func startLibrary() {
+        guard libraryActivation == nil else { return }
+        libraryActivation = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let library = self?.library else { return }
+                Task { await library.refreshFiles() }
+            }
+        }
+        Task { [library] in await library.reload() }
+    }
+
+    @ObservationIgnored private var libraryActivation: (any NSObjectProtocol)?
+
     /// The log of finished recordings and ignored pops, in the recordings folder.
     var recordingLog: RecordingLog { RecordingLog(folder: recording.folder) }
 
@@ -248,7 +266,12 @@ final class AppModel {
     private var cpu = CPUUsage()
     private var lastSavedSession: Data?
 
-    convenience init() { self.init(bookmarkStore: BookmarkStore(url: BookmarkStore.defaultURL), defaults: .standard) }
+    /// The app's model. Only this one reads the recordings folder at launch: a test's model, made with the
+    /// init below, points the library at its own folder (or none) rather than at the owner's recordings.
+    convenience init() {
+        self.init(bookmarkStore: BookmarkStore(url: BookmarkStore.defaultURL), defaults: .standard)
+        startLibrary()
+    }
 
     /// `openRSP` and `rspOpenTimeout`: tests replace the device and the wait.
     init(bookmarkStore: BookmarkStore, defaults: UserDefaults,
@@ -285,7 +308,6 @@ final class AppModel {
             guard let self else { return }
             player.reconcile(with: library.catalog)
         }
-        Task { [library] in await library.reload() }
         // 10 Hz: the modem drain every tick, the other stats every other one.
         // In the common modes, so it also runs during menu tracking, a modal panel or a live resize:
         // auto-record keeps recording through those, and its log and disk checks ride on this timer.
@@ -443,6 +465,8 @@ final class AppModel {
         saveSessionIfChanged()
         statsTimer?.invalidate()
         statsTimer = nil
+        if let libraryActivation { NotificationCenter.default.removeObserver(libraryActivation) }
+        libraryActivation = nil
     }
 
     func retry() {

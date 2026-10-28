@@ -1,3 +1,4 @@
+import AppKit
 import AVFoundation
 import Foundation
 import Recording
@@ -420,6 +421,24 @@ struct RecordingsLibraryTests {
         #expect(model.library.folder == model.recording.folder)
         await model.library.reload()
         #expect(model.library.catalog.recording(files[0]) != nil)
+    }
+
+    @Test func comingToTheFrontListsTheFolderAgain() async throws {
+        let dir = tempFolder()
+        let model = AppModel(bookmarkStore: BookmarkStore(url: dir.appendingPathComponent("bookmarks.json")),
+                             defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        defer { model.shutdown() }
+        let folder = dir.appendingPathComponent("rec", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let files = try populate(folder, offsets: [0, 60])
+        model.recording.folderPath = folder.path
+        model.startLibrary()
+        await model.library.reload()
+        #expect(model.library.unheardCount == 2)
+        try FileManager.default.removeItem(at: folder.appendingPathComponent(files[0]))   // in Finder, window closed
+        NotificationCenter.default.post(name: NSApplication.didBecomeActiveNotification, object: nil)
+        for _ in 0..<500 where model.library.unheardCount != 1 { try await Task.sleep(for: .milliseconds(10)) }
+        #expect(model.library.unheardCount == 1)
     }
 
     private func writeWAV(_ url: URL, seconds: Double) throws {
