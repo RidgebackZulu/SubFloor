@@ -115,12 +115,33 @@ private func bytes<T>(_ values: [T]) -> [UInt8] { values.withUnsafeBytes { Array
         s.iqSampleFormat = .int24
         s.preRollSeconds = 1000
         s.iqMemoryLimitBytes = 12345
+        s.autoTiming = AutoRecordTiming(startAfter: 40, stopAfter: 7)
         let n = s.normalized()
+        #expect(n.autoTiming == AutoRecordTiming(startAfter: 10, stopAfter: 5))
         #expect(n.audioSampleFormat == .int24)
         #expect(n.iqSampleFormat == .int16)
         #expect(n.preRollSeconds == 120)
         #expect(n.iqMemoryLimitBytes == 2 << 30)
         #expect(RecordingSettings().normalized() == RecordingSettings())
+    }
+
+    @Test func settingsSavedBeforeAutoRecordStillDecode() throws {
+        var s = RecordingSettings()
+        s.preRollSeconds = 45
+        s.audioFormat = .wav
+        s.audioSampleFormat = .float32
+        s.folderPath = "/tmp/somewhere"
+        var json = try #require(try JSONSerialization.jsonObject(with: JSONEncoder().encode(s)) as? [String: Any])
+        #expect(json["autoTiming"] != nil)
+        json["autoTiming"] = nil   // as saved before auto-record
+        let old = try JSONDecoder().decode(RecordingSettings.self, from: JSONSerialization.data(withJSONObject: json))
+        #expect(old.autoTiming == AutoRecordTiming())
+        #expect(old == s)
+        // Every key is optional: an empty object is the defaults.
+        #expect(try JSONDecoder().decode(RecordingSettings.self, from: Data("{}".utf8)) == RecordingSettings())
+        // The timing round-trips.
+        s.autoTiming = AutoRecordTiming(startAfter: 3, stopAfter: 60)
+        #expect(try JSONDecoder().decode(RecordingSettings.self, from: JSONEncoder().encode(s)) == s)
     }
 
     @Test func iqNeverOffers24Bit() {
@@ -139,6 +160,17 @@ private func bytes<T>(_ values: [T]) -> [UInt8] { values.withUnsafeBytes { Array
         let expectedSeconds = Double(2 << 30) / 4 / 10_000_000 - 12
         #expect(abs(bound.effectivePreRollSeconds - expectedSeconds) < 1e-6)
         #expect(bound.marginSeconds == 12)
+    }
+
+    @Test func holdbackGrowsTheRingButNotThePreRoll() {
+        let p = StreamRecorder.plan(sampleRate: 48_000, bytesPerFrame: 3, preRollSeconds: 30, holdbackSeconds: 612, memoryLimitBytes: 256 << 20)
+        #expect(p.preRollBytes == 30 * 48_000 * 3 && p.capacityBytes >= (30 + 612) * 48_000 * 3 && p.effectivePreRollSeconds == 30)
+    }
+
+    @Test func holdbackIsKeptWhenMemoryBindsAndThePreRollShrinks() {
+        let p = StreamRecorder.plan(sampleRate: 48_000, bytesPerFrame: 3, preRollSeconds: 30, holdbackSeconds: 612, memoryLimitBytes: 48_000 * 3 * 640)
+        #expect(p.capacityBytes == 48_000 * 3 * 640)
+        #expect(abs(p.effectivePreRollSeconds - (640 - 612 - p.marginSeconds)) < 1e-6)
     }
 
     @Test func namesFollowTheSDRSharpShape() {
@@ -453,6 +485,195 @@ private enum AppStyleName {
         #expect(r.effectivePreRollSeconds == 5)
     }
 
+    @Test func aRingPlannedForTheLongestPreRollKeepsRecordingWhenThePreRollChanges() throws {
+        let dir = tempDir()
+        let r = StreamRecorder(kind: .audio, rollsOnContextChange: false)
+        defer { r.shutdown() }
+        func setup(preRoll: Double) -> StreamRecorder.Setup {
+            StreamRecorder.Setup(sampleRate: Self.rate, channels: 1, fileFormat: .wav, sampleFormat: .float32, preRollSeconds: preRoll,
+                                 ringPreRollSeconds: 10, memoryLimitBytes: 1 << 30, folder: dir)
+        }
+        r.configure(setup(preRoll: 3))
+        let plan = r.ringPlan
+        #expect(plan?.effectivePreRollSeconds == 10)
+        #expect(r.effectivePreRollSeconds == 3)
+        for b in stride(from: 0, to: 100_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        #expect(r.status.preRollFill == 1)
+        r.start()
+        #expect(waitUntil { r.status.url != nil })
+        r.configure(setup(preRoll: 8))   // only how far the next manual start rewinds
+        #expect(r.ringPlan == plan)
+        #expect(r.effectivePreRollSeconds == 8)
+        for b in stride(from: 100_000, to: 110_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        r.stop(wait: true)
+        let first = r.status
+        #expect(first.error == nil && first.filesWritten == 1)
+        let frames = try wavFrames(first.url!)
+        #expect(frames.first == 70_000 && frames.last == 109_999, "3 s of pre-roll, then on through the change")
+        #expect(zip(frames, frames.dropFirst()).allSatisfy { $1 == $0 + 1 })
+        r.start()
+        #expect(waitUntil { r.status.url != nil && r.status.url != first.url })
+        r.stop(wait: true)
+        let again = try wavFrames(r.status.url!)
+        #expect(again.first == 30_000 && again.last == 109_999, "the next start rewinds the new 8 s")
+    }
+
+    // MARK: Auto sessions
+
+    @Test func autoSessionStartsAtTheRequestedFrameAndEndsAtTheStop() throws {
+        let dir = tempDir()
+        let r = makeRecorder(folder: dir)
+        defer { r.shutdown() }
+        let click = Date(timeIntervalSince1970: 1_792_000_000)
+        r.now = { click }
+        for b in stride(from: 0, to: 100_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        #expect(r.headFrame == 100_000)
+        r.start(fromFrame: 95_000)
+        r.commit(throughFrame: 100_000)
+        #expect(waitUntil { r.status.url != nil })
+        for b in stride(from: 100_000, to: 110_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        r.commit(throughFrame: 104_000)
+        r.stop(atFrame: 104_000)
+        #expect(waitUntil { !r.status.isRecording })
+        let status = r.status
+        #expect(status.error == nil)
+        let frames = try wavFrames(status.url!)
+        #expect(frames.first == 95_000 && frames.last == 103_999 && frames.count == 9_000)
+        #expect(zip(frames, frames.dropFirst()).allSatisfy { $1 == $0 + 1 })
+        #expect(status.isAuto && status.startedAt == click.addingTimeInterval(-0.5))
+        #expect(r.sessionKind == .none)
+    }
+
+    @Test func autoWriterNeverPassesTheCommit() throws {
+        let dir = tempDir()
+        let r = makeRecorder(folder: dir)
+        defer { r.shutdown() }
+        for b in stride(from: 0, to: 100_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        r.start(fromFrame: 95_000)
+        r.commit(throughFrame: 97_000)
+        for b in stride(from: 100_000, to: 120_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        #expect(waitUntil { r.status.framesWritten == 2_000 })
+        Thread.sleep(forTimeInterval: 0.2)
+        #expect(r.status.framesWritten == 2_000)
+        r.commit(throughFrame: 90_000)   // a commit never goes backwards
+        r.commit(throughFrame: 98_000)
+        #expect(waitUntil { r.status.framesWritten == 3_000 })
+    }
+
+    @Test func manualStartTakesOverAnAutoSession() throws {
+        let dir = tempDir()
+        let r = makeRecorder(folder: dir)
+        defer { r.shutdown() }
+        for b in stride(from: 0, to: 100_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        r.start(fromFrame: 95_000)
+        r.commit(throughFrame: 96_000)
+        #expect(waitUntil { r.status.framesWritten == 1_000 })
+        r.start()
+        #expect(r.sessionKind == .manual)
+        r.stop(atFrame: 96_000)   // only an auto session is ended by a frame
+        for b in stride(from: 100_000, to: 110_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        r.stop(wait: true)
+        let status = r.status
+        #expect(status.isAuto == false && status.filesWritten == 1)
+        let frames = try wavFrames(status.url!)
+        #expect(frames.first == 95_000 && frames.last == 109_999)
+        #expect(zip(frames, frames.dropFirst()).allSatisfy { $1 == $0 + 1 })
+    }
+
+    @Test func autoStartBeyondTheRingClampsToTheOldestFrame() throws {
+        let dir = tempDir()
+        let r = makeRecorder(folder: dir)   // 5 s of pre-roll + 2 s margin = 70_000 frames of ring
+        defer { r.shutdown() }
+        for b in stride(from: 0, to: 200_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        r.start(fromFrame: 0)
+        r.commit(throughFrame: 200_000)
+        #expect(waitUntil { r.status.framesWritten >= 70_000 })
+        r.stop(atFrame: 200_000)
+        #expect(waitUntil { !r.status.isRecording })
+        #expect(r.status.error == nil && r.status.overrunBytes == 0)
+        let frames = try wavFrames(r.status.url!)
+        #expect(frames.last == 199_999)
+        #expect(frames.first! >= Float(200_000 - 70_000))
+        #expect(zip(frames, frames.dropFirst()).allSatisfy { $1 == $0 + 1 })
+    }
+
+    @Test func stopAtAFrameAlreadyWrittenClampsToTheWrittenPosition() throws {
+        let dir = tempDir()
+        let r = makeRecorder(folder: dir)
+        defer { r.shutdown() }
+        for b in stride(from: 0, to: 100_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        r.start(fromFrame: 95_000)
+        r.commit(throughFrame: 98_000)
+        #expect(waitUntil { r.status.framesWritten == 3_000 })
+        r.stop(atFrame: 96_000)
+        #expect(waitUntil { !r.status.isRecording })
+        let frames = try wavFrames(r.status.url!)
+        #expect(frames.count == 3_000 && frames.last == 97_999)
+    }
+
+    @Test func sessionKindTracksTheSession() throws {
+        let dir = tempDir()
+        let r = makeRecorder(folder: dir)
+        defer { r.shutdown() }
+        for b in stride(from: 0, to: 20_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        #expect(r.sessionKind == .none)
+        r.start(fromFrame: 10_000)
+        #expect(r.sessionKind == .auto)
+        r.start(fromFrame: 5_000)   // ignored while a session is open
+        #expect(r.sessionKind == .auto)
+        r.start()
+        #expect(r.sessionKind == .manual)
+        r.stop(wait: true)
+        #expect(r.sessionKind == .none)
+        #expect(r.status.filesWritten == 1)
+        r.start()
+        #expect(r.sessionKind == .manual)
+        r.stop(wait: true)
+        #expect(r.sessionKind == .none)
+    }
+
+    @Test func aTakeoverLeavesNoStaleKindBehind() throws {
+        let dir = tempDir()
+        let r = makeRecorder(folder: dir)
+        defer { r.shutdown() }
+        for b in stride(from: 0, to: 20_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        // In order, before the writer has necessarily woken: auto, then taken over.
+        r.start(fromFrame: 10_000)
+        r.start()
+        r.stop(wait: true)
+        #expect(r.sessionKind == .none)
+        // Racing the two starts from two threads: whichever wins, the kind must end at .none.
+        for round in 0..<40 {
+            let racer = Thread { r.start(fromFrame: 10_000) }
+            racer.start()
+            r.start()
+            while !racer.isFinished { Thread.sleep(forTimeInterval: 0.0005) }
+            #expect(waitUntil { r.sessionKind == .manual || r.sessionKind == .auto })
+            r.commit(throughFrame: r.headFrame)
+            r.stop(wait: true)
+            #expect(waitUntil { r.sessionKind == .none }, "round \(round)")
+        }
+        // Auto-record still works afterwards.
+        r.start(fromFrame: 10_000)
+        #expect(r.sessionKind == .auto)
+        r.commit(throughFrame: 20_000)
+        r.stop(atFrame: 20_000)
+        #expect(waitUntil { !r.status.isRecording && r.sessionKind == .none })
+        #expect(r.status.isAuto && r.status.framesWritten == 10_000)
+    }
+
+    @Test func aPlainStopEndsAnAutoSessionAtWhatWasCommitted() throws {
+        let dir = tempDir()
+        let r = makeRecorder(folder: dir)
+        defer { r.shutdown() }
+        for b in stride(from: 0, to: 100_000, by: 1_000) { push(r, frames: b..<(b + 1_000)) }
+        r.start(fromFrame: 95_000)
+        r.commit(throughFrame: 97_000)
+        r.stop(wait: true)
+        #expect(r.sessionKind == .none && !r.status.isRecording)
+        #expect(r.status.framesWritten == 2_000)
+    }
+
     @Test func flacRecordingThroughTheRecorder() throws {
         let dir = tempDir()
         let r = StreamRecorder(kind: .audio, rollsOnContextChange: false)
@@ -479,5 +700,12 @@ private enum AppStyleName {
         #expect(RecordingFormat.elapsed(7.9) == "0:07")
         #expect(RecordingFormat.elapsed(754) == "12:34")
         #expect(RecordingFormat.elapsed(3723) == "1:02:03")
+    }
+
+    @Test func spansReadAsWords() {
+        let shown = AutoRecordTiming.stopAfterChoices.map(RecordingFormat.span)
+        #expect(shown == ["5 s", "10 s", "15 s", "30 s", "45 s", "1 min", "1 min 30 s", "2 min", "3 min", "5 min", "10 min"])
+        #expect(RecordingFormat.span(2.5) == "2.5 s")
+        #expect(RecordingFormat.span(0.5) == "0.5 s")
     }
 }

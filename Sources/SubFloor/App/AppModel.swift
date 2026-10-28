@@ -50,6 +50,10 @@ private struct SessionState: Codable {
     var modemBox: ModemBox?
     var modemSettings: ModemSettings?
     var recording: RecordingSettings?
+    // Optional so that sessions saved before auto-record decode.
+    var autoRecord: Bool?
+    var squelchEnabled: Bool?
+    var squelchDb: Float?
 }
 
 @MainActor @Observable
@@ -66,23 +70,85 @@ final class AppModel {
     private(set) var upconverter = Upconverter()
     private(set) var hardware = SDRplaySettings()
     var cwPitchHz: Double = 700 { didSet { pushReceiver() } }
-    var squelchEnabled = false { didSet { pushReceiver() } }
+    /// Turning it off disables auto-record before the receiver opens the gate, so the DSP thread never
+    /// runs a block with the gate open and the trigger still on (it would commit the whole silent gap).
+    var squelchEnabled = false {
+        didSet {
+            if squelchEnabled {
+                pushReceiver()
+                pushAutoRecord()
+            } else {
+                pushAutoRecord()
+                pushReceiver()
+            }
+        }
+    }
     var squelchDb: Float = -80 { didSet { pushReceiver() } }
     var agcSpeed: AGCSpeed = .medium { didSet { pushReceiver() } }
     var volume: Float = 0.5 { didSet { engine.update(volume: volume) } }
 
     // MARK: Recording
-    /// Recording preferences (Settings). Kept valid; a change to the pre-roll or a sample format
-    /// starts the pre-roll over and ends a recording in progress (`StreamRecorder.configure`).
+    /// Recording preferences (Settings). Kept valid; a change to a sample format starts the pre-roll
+    /// over and ends a recording in progress, and so does a pre-roll change for IQ
+    /// (`StreamRecorder.configure`). The audio ring is planned for the longest pre-roll, so a pre-roll
+    /// change never ends an audio recording.
     var recording = RecordingSettings() {
         didSet {
             let valid = recording.normalized()
             if valid != recording { recording = valid }
-            if recording != oldValue { pushRecording() }
+            if recording != oldValue {
+                pushRecording()
+                pushAutoRecord()
+            }
         }
     }
     /// Each recorder's state, polled at 5 Hz (`refreshStats`); set at once on start.
     private(set) var recordingStatus: [StreamKind: RecordingStatus] = [:]
+
+    /// Auto-record (the Auto button), persisted. It records only while the radio runs on a real
+    /// source with the squelch on; otherwise it waits (`autoRecordState`).
+    var autoRecordEnabled = false {
+        didSet {
+            guard autoRecordEnabled != oldValue else { return }
+            if autoRecordEnabled { lastDiskCheck = nil }   // check the disk at the next refresh
+            pushAutoRecord()
+        }
+    }
+
+    /// `paused`: Auto is on but a manual audio recording owns the recorder; the trigger resumes after it.
+    enum AutoRecordState: Equatable { case off, armed, recording, needsSquelch, needsRadio, demoSource, paused }
+
+    /// What the Auto button shows: why it is waiting, if it is.
+    var autoRecordState: AutoRecordState {
+        if !autoRecordEnabled { return .off }
+        if !isRunning { return .needsRadio }
+        if sourceKind == .synthetic { return .demoSource }
+        if !squelchEnabled { return .needsSquelch }
+        if isRecording(.audio) { return .paused }
+        return isAutoRecording ? .recording : .armed
+    }
+
+    /// The log of finished recordings and ignored pops, in the recordings folder.
+    var recordingLog: RecordingLog { RecordingLog(folder: recording.folder) }
+
+    /// Test hook: the free bytes on the volume recordings go to (nil: unknown).
+    @ObservationIgnored var freeSpaceProbe: (URL) -> Int64? = { AppModel.freeSpace(at: $0) }
+    @ObservationIgnored private var lastDiskCheck: ContinuousClock.Instant?
+    /// Under 500 MB at the last check, so the warning is shown once per crossing.
+    @ObservationIgnored private var diskLow = false
+    /// The VFO and mode the audio recorder was last told: a change cuts an auto recording.
+    @ObservationIgnored private var audioTuning: (hz: Double, mode: String)?
+    /// The VFO and mode when the current audio recording started, for its log entry.
+    @ObservationIgnored private var recordingTuning: (hz: Double, mode: String)?
+    /// The first-sample time of the last audio recording logged, so none is logged twice.
+    @ObservationIgnored private var loggedRecordingStart: Date?
+    /// The first-sample time of the last auto recording whose start was logged.
+    @ObservationIgnored private var loggedAutoStart: Date?
+    /// The last log write failed (its banner has been shown).
+    @ObservationIgnored private var logWriteFailed = false
+    /// Held while Auto is on and the radio runs: the Mac does not idle to sleep, and App Nap does not
+    /// throttle the timer that logs recordings and checks the disk while the window is hidden.
+    @ObservationIgnored private var sleepActivity: (any NSObjectProtocol)?
 
     // MARK: Display
     var spectrum = SpectrumSettings() { didSet { engine.update(spectrum: spectrum) } }
@@ -186,14 +252,20 @@ final class AppModel {
         }
         restoreSession()
         pushRecording()
+        pushRecordingContexts()
+        pushAutoRecord()
         followPassband()
         engine.audio.onError = { [weak self] message in
             Task { @MainActor in self?.show(Banner(kind: .error, message: message, action: .retry)) }
         }
         // 10 Hz: the modem drain every tick, the other stats every other one.
-        statsTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+        // In the common modes, so it also runs during menu tracking, a modal panel or a live resize:
+        // auto-record keeps recording through those, and its log and disk checks ride on this timer.
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.refreshStats() }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        statsTimer = timer
     }
 
     // MARK: Derived
@@ -274,6 +346,7 @@ final class AppModel {
     /// returns; the open's outcome starts the radio (`finishRSPOpen`, `rspOpenTimedOut`).
     func start() {
         stop()
+        defer { pushAutoRecord() }
         var kind = preferredSource
         if kind == .sdrplay && sdrplay == nil {
             switch rspConnection {
@@ -325,6 +398,7 @@ final class AppModel {
         engine.stop()   // finalises any recording
         isRunning = false
         overloaded = false
+        pushAutoRecord()
         refreshRecordingStatus()
     }
 
@@ -333,6 +407,8 @@ final class AppModel {
         isShutDown = true
         engine.stop()
         isRunning = false
+        pushAutoRecord()
+        refreshRecordingStatus()   // logs a recording the stop ended
         sdrplay?.close()
         sdrplay = nil
         saveSessionIfChanged()
@@ -449,6 +525,7 @@ final class AppModel {
             sdrplay = nil
         }
         if isRunning || kind != .sdrplay { start() }
+        pushAutoRecord()
     }
 
     func openIQFile() {
@@ -748,7 +825,10 @@ final class AppModel {
 
     private func recorder(_ kind: StreamKind) -> StreamRecorder { kind == .iq ? engine.iqRecorder : engine.audioRecorder }
 
-    func isRecording(_ kind: StreamKind) -> Bool { recordingStatus[kind]?.isRecording ?? false }
+    /// A manual recording of `kind` (the Audio, IQ and Both buttons); an auto recording is not one.
+    func isRecording(_ kind: StreamKind) -> Bool { recordingStatus[kind].map { $0.isRecording && !$0.isAuto } ?? false }
+    /// Auto-record is writing an audio recording.
+    var isAutoRecording: Bool { recordingStatus[.audio].map { $0.isRecording && $0.isAuto } ?? false }
     var isRecordingAny: Bool { StreamKind.allCases.contains { isRecording($0) } }
     var isRecordingAll: Bool { StreamKind.allCases.allSatisfy { isRecording($0) } }
     /// The IQ ring's size and the pre-roll it gives at the current rate (Settings).
@@ -765,7 +845,8 @@ final class AppModel {
         }
     }
 
-    /// Starts recording `kind` from up to the pre-roll ago. Needs the radio running.
+    /// Starts recording `kind` from up to the pre-roll ago. Needs the radio running. While Auto is
+    /// recording audio, starting audio turns that recording into a manual one (the same file).
     func startRecording(_ kind: StreamKind) {
         guard isRunning else {
             show(Banner(kind: .info, message: "Start the radio before recording."))
@@ -779,9 +860,8 @@ final class AppModel {
             show(Banner(kind: .error, message: "Cannot use the recordings folder \(folder.path): \(error.localizedDescription)"))
             return
         }
-        if let free = try? folder.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage,
-           free < 500_000_000 {
-            show(Banner(kind: .warning, message: "Less than 500 MB free where recordings go."))
+        if let free = freeSpaceProbe(folder), free < Self.lowDiskBytes {
+            show(Banner(kind: .warning, message: Self.lowDiskMessage))
         }
         recorder(kind).start()
         refreshRecordingStatus()
@@ -810,8 +890,10 @@ final class AppModel {
         recording.folderPath = url.path
     }
 
-    /// Both recorders get the stream rates and the preferences (the audio ring is tiny, so its
-    /// memory limit is a formality).
+    /// Both recorders get the stream rates and the preferences. The audio ring always holds the
+    /// longest pre-roll and the longest auto-record holdback, so neither a timing nor a pre-roll change
+    /// rebuilds it (which would end a recording); the pre-roll only sets how far a manual start
+    /// rewinds. That is (120 + 612 + 12) s of 48 kHz audio: 143 MB of float, inside its 256 MB limit.
     private func pushRecording() {
         let r = recording
         engine.iqRecorder.configure(StreamRecorder.Setup(
@@ -819,25 +901,165 @@ final class AppModel {
             preRollSeconds: r.preRollSeconds, memoryLimitBytes: r.iqMemoryLimitBytes, folder: r.folder))
         engine.audioRecorder.configure(StreamRecorder.Setup(
             sampleRate: Receiver.audioRate, channels: StreamKind.audio.channels, fileFormat: r.audioFormat, sampleFormat: r.audioSampleFormat,
-            preRollSeconds: r.preRollSeconds, memoryLimitBytes: 256 << 20, folder: r.folder))
+            preRollSeconds: r.preRollSeconds, holdbackSeconds: AutoRecordTiming.maxHoldbackSeconds,
+            ringPreRollSeconds: RecordingSettings.preRollRange.upperBound, memoryLimitBytes: 256 << 20, folder: r.folder))
     }
 
-    /// File names: the IQ file carries the capture centre (a change rolls it), the audio file the VFO and mode.
+    /// File names: the IQ file carries the capture centre (a change rolls it), the audio file the VFO
+    /// and mode. A new VFO or mode ends an auto recording; a new capture centre alone does not.
     private func pushRecordingContexts() {
         let hardware = activeSource.name
         engine.iqRecorder.setContext(RecordingContext(frequencyHz: centerHz, label: "IQ", hardware: hardware))
         engine.audioRecorder.setContext(RecordingContext(frequencyHz: vfoHz, label: mode.label, hardware: hardware))
+        if let last = audioTuning, last.hz != vfoHz || last.mode != mode.label { engine.autoRecorder.cut() }
+        audioTuning = (vfoHz, mode.label)
     }
 
-    private func refreshRecordingStatus() {
+    /// Polls the recorders, logs an audio recording that ended and the pops heard since the last poll.
+    /// Internal for tests, which drive the status sequence without the timer.
+    func refreshRecordingStatus() {
+        var entries: [RecordingLogEntry] = []
         for kind in StreamKind.allCases {
             let s = recorder(kind).status
-            guard s != recordingStatus[kind] else { continue }
-            if let error = s.error, error != recordingStatus[kind]?.error {
+            let previous = recordingStatus[kind]
+            guard s != previous else { continue }
+            if let error = s.error, error != previous?.error {
                 show(Banner(kind: .error, message: "\(kind.label) recording stopped: \(error)"))
             }
+            if kind == .audio { entries += audioLogEntries(from: previous, to: s) }
             recordingStatus[kind] = s
         }
+        let hz = vfoHz, label = mode.label
+        entries += engine.autoRecorder.drainPops().map { .pop(at: $0.at, seconds: $0.seconds, frequencyHz: hz, mode: label) }
+        appendToLog(entries)
+    }
+
+    /// Notes the tuning when an audio recording is first seen, and logs every recording that has
+    /// ended since the last poll, including one replaced by the next between two polls and one that
+    /// began and ended between them (the poll can be late: the timer is 5 Hz and the main thread may
+    /// be busy). Each is logged once, keyed by its first-sample time.
+    private func audioLogEntries(from previous: RecordingStatus?, to s: RecordingStatus) -> [RecordingLogEntry] {
+        let now = (hz: vfoHz, mode: mode.label)
+        let tuningBefore = recordingTuning
+        var entries: [RecordingLogEntry] = []
+        let continued = previous.map { $0.isRecording && Self.sameRecording($0, s) } ?? false
+        // The recording seen last time has ended, or another has replaced it.
+        if let previous, previous.isRecording, !(s.isRecording && continued) {
+            // Its own ended status has the final length and url; a replaced one only what was last seen.
+            let ended = Self.sameRecording(previous, s) ? s : previous
+            if let entry = logEntry(for: ended, tuning: recordingTuning ?? now) { entries.append(entry) }
+            recordingTuning = nil
+        }
+        if s.isRecording && !continued { recordingTuning = now }
+        // One that started and ended unseen. Its tuning at the start is unknown: the current VFO and
+        // mode are the best there is (a retune would have cut an auto recording anyway).
+        if !s.isRecording, let entry = logEntry(for: s, tuning: now) { entries.append(entry) }
+        // An auto recording's start, logged once when it is first seen with a file, so a crash or a
+        // force-quit mid-recording still leaves a record of it. It goes before this recording's end,
+        // if that is logged in the same poll.
+        if s.isAuto, let url = s.url, let start = s.startedAt, start != loggedAutoStart {
+            loggedAutoStart = start
+            let tuning = s.isRecording ? recordingTuning ?? now : continued ? tuningBefore ?? now : now
+            let entry = RecordingLogEntry.autoStarted(file: url.lastPathComponent, start: start, frequencyHz: tuning.hz, mode: tuning.mode)
+            let end = entries.firstIndex { if case .recording(_, start, _, _, _, _) = $0 { true } else { false } }
+            entries.insert(entry, at: end ?? entries.endIndex)
+        }
+        return entries
+    }
+
+    /// The same recording in two statuses: the same first sample. A status not yet begun (no first
+    /// sample) after one that had begun is a new recording; before it, the same one.
+    private static func sameRecording(_ a: RecordingStatus, _ b: RecordingStatus) -> Bool {
+        guard let first = a.startedAt else { return true }
+        return b.startedAt == first
+    }
+
+    /// The log entry for a recording with a file, unless it has been logged already. Auto or manual
+    /// is what the status says when it was last seen (a takeover by the Audio button is manual).
+    private func logEntry(for status: RecordingStatus, tuning: (hz: Double, mode: String)) -> RecordingLogEntry? {
+        guard let url = status.url, let start = status.startedAt, start != loggedRecordingStart else { return nil }
+        loggedRecordingStart = start
+        return .recording(file: url.lastPathComponent, start: start, seconds: status.duration,
+                          frequencyHz: tuning.hz, mode: tuning.mode, auto: status.isAuto)
+    }
+
+    /// A failed write shows one banner until a write succeeds again; recording carries on.
+    private func appendToLog(_ entries: [RecordingLogEntry]) {
+        guard !entries.isEmpty else { return }
+        do {
+            try recordingLog.append(entries)
+            logWriteFailed = false
+        } catch {
+            guard !logWriteFailed else { return }
+            logWriteFailed = true
+            show(Banner(kind: .error, message: "Could not write the recordings log: \(error.localizedDescription)"))
+        }
+    }
+
+    // MARK: Auto-record
+
+    /// Turns Auto on or off. On with the squelch off, it says so and waits for the squelch.
+    func toggleAutoRecord() {
+        autoRecordEnabled.toggle()
+        if autoRecordEnabled && !squelchEnabled {
+            show(Banner(kind: .info, message: "Auto-record needs the squelch on."))
+        }
+    }
+
+    /// Test hook: the Mac is kept from idle sleep.
+    var isPreventingSleep: Bool { sleepActivity != nil }
+
+    /// Tells the engine whether the squelch may record, and with what timing; holds off idle sleep
+    /// while Auto is on and the radio runs.
+    private func pushAutoRecord() {
+        let config = AutoRecorder.Config(enabled: autoRecordEnabled && isRunning && squelchEnabled && sourceKind != .synthetic,
+                                         timing: recording.autoTiming)
+        if config != engine.autoRecorder.config { engine.autoRecorder.configure(config) }
+        let hold = autoRecordEnabled && isRunning
+        if hold, sleepActivity == nil {
+            sleepActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "Auto-record is listening")
+        } else if !hold, let activity = sleepActivity {
+            ProcessInfo.processInfo.endActivity(activity)
+            sleepActivity = nil
+        }
+    }
+
+    static let lowDiskBytes: Int64 = 500_000_000
+    static let lowDiskMessage = "Less than 500 MB free where recordings go."
+    static let autoOffLowDiskReason = "less than 100 MB free"
+
+    /// Once a minute while Auto is on.
+    private func checkRecordingsDiskSpaceIfDue() {
+        guard autoRecordEnabled else { return }
+        if let last = lastDiskCheck, ContinuousClock.now - last < .seconds(60) { return }
+        checkRecordingsDiskSpace()
+    }
+
+    /// Under 500 MB free where recordings go: a warning, once per crossing. Under 100 MB: Auto turns
+    /// off and ends its recording, rather than fail on every transmission. A manual recording runs on.
+    func checkRecordingsDiskSpace() {
+        guard autoRecordEnabled else { return }
+        lastDiskCheck = .now
+        guard let free = freeSpaceProbe(recording.folder) else { return }
+        if free < 100_000_000 {
+            autoRecordEnabled = false
+            if engine.audioRecorder.sessionKind == .auto { engine.audioRecorder.stop() }
+            // Logged before the banner, so a failed log write cannot replace it.
+            appendToLog([.autoOff(at: Date(), reason: Self.autoOffLowDiskReason)])
+            show(Banner(kind: .error, message: "Auto-record is off: less than 100 MB free where recordings go."))
+        } else if free < Self.lowDiskBytes {
+            if !diskLow { show(Banner(kind: .warning, message: Self.lowDiskMessage)) }
+            diskLow = true
+        } else {
+            diskLow = false
+        }
+    }
+
+    /// Free bytes for important use on the volume of `folder`, or of its nearest existing parent.
+    nonisolated static func freeSpace(at folder: URL) -> Int64? {
+        var url = folder.standardizedFileURL
+        while !FileManager.default.fileExists(atPath: url.path), url.pathComponents.count > 1 { url.deleteLastPathComponent() }
+        return try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]).volumeAvailableCapacityForImportantUsage
     }
 
     // MARK: Multi-signal modem
@@ -924,6 +1146,7 @@ final class AppModel {
     func setSourceKindForTesting(_ kind: SourceKind) {
         sourceKind = kind
         syncModem()
+        pushAutoRecord()
     }
 
     /// Applies `change` to the modem state and brings the engine up to date. The state is written
@@ -1009,6 +1232,7 @@ final class AppModel {
         let cpuNow = cpu.sample()
         if cpuNow.rounded() != cpuPercent.rounded() { cpuPercent = cpuNow }
         refreshRecordingStatus()
+        checkRecordingsDiskSpaceIfDue()
         saveSessionIfChanged()
     }
 
@@ -1017,7 +1241,8 @@ final class AppModel {
                                  hardware: hardware, spectrum: spectrum, dbMin: dbMin, dbMax: dbMax, colormap: colormap,
                                  showBookmarks: showBookmarks, volume: volume, agcSpeed: agcSpeed, cwPitchHz: cwPitchHz,
                                  preferredSource: preferredSource == .file ? .sdrplay : preferredSource,
-                                 modemBox: nil, modemSettings: modem.settings, recording: recording)
+                                 modemBox: nil, modemSettings: modem.settings, recording: recording,
+                                 autoRecord: autoRecordEnabled, squelchEnabled: squelchEnabled, squelchDb: squelchDb)
         guard let data = try? JSONEncoder().encode(state), data != lastSavedSession else { return }
         defaults.set(data, forKey: "session")
         lastSavedSession = data
@@ -1033,6 +1258,9 @@ final class AppModel {
         // The box follows the passband (`followPassband`, after this); a saved box is not used.
         setModem(ModemControl(box: modem.box, settings: s.modemSettings ?? modem.settings))
         if let r = s.recording { recording = r }
+        if let on = s.squelchEnabled { squelchEnabled = on }
+        if let db = s.squelchDb { squelchDb = db }
+        if let on = s.autoRecord { autoRecordEnabled = on }
         lastSavedSession = data
     }
 }

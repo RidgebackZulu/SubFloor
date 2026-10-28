@@ -99,24 +99,28 @@ private struct BandwidthControl: View {
     }
 }
 
-/// Audio · IQ · Both. Red with the elapsed time while recording; idle, a faint red fill shows how
-/// much of the pre-roll is primed, since a recording starts that far before the click.
+/// Audio · IQ · Both · Auto. Red with the elapsed time while recording; idle, a faint red fill shows how
+/// much of the pre-roll is primed, since a recording starts that far before the click. Auto is the
+/// squelch-driven recorder; it stays usable with the radio stopped, so it can be armed first.
 private struct RecordCluster: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
         HStack(spacing: 3) {
-            RecordButton(kind: .audio)
-            RecordButton(kind: .iq)
-            let all = model.isRecordingAll
-            Button { model.toggleRecordingBoth() } label: { RecordButtonLabel(title: "Both", on: all, fill: 0) }
-                .buttonStyle(.plain)
-                .help(all ? "Stop both recordings (⌘⇧R)" : "Record audio and IQ (⌘⇧R)")
+            Group {
+                RecordButton(kind: .audio)
+                RecordButton(kind: .iq)
+                let all = model.isRecordingAll
+                Button { model.toggleRecordingBoth() } label: { RecordButtonLabel(title: "Both", on: all, fill: 0) }
+                    .buttonStyle(.plain)
+                    .help(all ? "Stop both recordings (⌘⇧R)" : "Record audio and IQ (⌘⇧R)")
+            }
+            .opacity(model.isRunning ? 1 : 0.5)
+            .disabled(!model.isRunning)
+            AutoRecordButton()
         }
         .padding(3)
         .background(RoundedRectangle(cornerRadius: 7).fill(Color.white.opacity(0.04)))
-        .opacity(model.isRunning ? 1 : 0.5)
-        .disabled(!model.isRunning)
         .accessibilityLabel("Recording")
     }
 }
@@ -127,24 +131,80 @@ private struct RecordButton: View {
 
     var body: some View {
         let status = model.recordingStatus[kind] ?? RecordingStatus()
+        let on = model.isRecording(kind)   // manual only: an auto recording is the Auto button's
         let preRoll = Int((kind == .iq ? model.iqRingPlan?.effectivePreRollSeconds : model.recording.preRollSeconds) ?? 0)
         let key = kind == .audio ? "⌘⇧A" : "⌘⇧I"
         Button { model.toggleRecording(kind) } label: {
-            RecordButtonLabel(title: status.isRecording ? RecordingFormat.elapsed(status.duration) : kind.label,
-                              on: status.isRecording, fill: status.preRollFill)
+            RecordButtonLabel(title: on ? RecordingFormat.elapsed(status.duration) : kind.label,
+                              on: on, fill: status.preRollFill)
         }
             .buttonStyle(.plain)
-            .help(status.isRecording
+            .help(on
                   ? "Stop recording \(kind.label.lowercased()) (\(key)) — \(RecordingFormat.bytes(status.bytesWritten)) so far"
                   : "Record \(kind.label.lowercased()) (\(key)) — the file starts \(preRoll) s before the click")
     }
 }
 
+/// Squelch auto-record. Off: plain. Armed: a faint red ring. Recording: solid red with the elapsed
+/// time. Waiting (squelch off, radio stopped, demo source) or paused (a manual audio recording runs):
+/// a dashed, dimmed ring and help saying why.
+private struct AutoRecordButton: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        let state = model.autoRecordState
+        let on = state == .recording
+        let ring: RecordButtonLabel.Ring = switch state {
+        case .off, .recording: .none
+        case .armed: .armed
+        case .needsSquelch, .needsRadio, .demoSource, .paused: .waiting
+        }
+        let timing = model.recording.autoTiming
+        let status = model.recordingStatus[.audio] ?? RecordingStatus()
+        Button { model.toggleAutoRecord() } label: {
+            RecordButtonLabel(title: on ? RecordingFormat.elapsed(status.duration) : "Auto",
+                              on: on, fill: 0, ring: ring)
+        }
+        .buttonStyle(.plain)
+        .help(helpText(state, timing))
+        .accessibilityLabel("Auto-record")
+        .accessibilityValue(accessibilityValue(state, duration: status.duration))
+    }
+
+    private func accessibilityValue(_ state: AppModel.AutoRecordState, duration: Double) -> String {
+        switch state {
+        case .off: "off"
+        case .armed: "listening"
+        case .recording: "recording \(RecordingFormat.elapsed(duration))"
+        case .needsSquelch: "waiting for squelch"
+        case .needsRadio: "waiting for the radio"
+        case .demoSource: "demo source"
+        case .paused: "paused"
+        }
+    }
+
+    private func helpText(_ state: AppModel.AutoRecordState, _ timing: AutoRecordTiming) -> String {
+        switch state {
+        case .off:
+            return "Auto-record: records whenever the squelch opens (⌘⇧T)"
+        case .armed, .recording:
+            return "Auto-record: starts after \(RecordingFormat.span(timing.startAfter)) of signal, stops after \(RecordingFormat.span(timing.stopAfter)) of quiet (⌘⇧T)"
+        case .needsSquelch: return "Waiting: turn the squelch on"
+        case .needsRadio: return "Waiting: start the radio"
+        case .demoSource: return "Waiting: auto-record never records the demo source"
+        case .paused: return "Paused while you record audio by hand"
+        }
+    }
+}
+
 private struct RecordButtonLabel: View {
+    enum Ring { case none, armed, waiting }
+
     let title: String
     let on: Bool
     /// 0…1 of the idle button to tint: the pre-roll primed so far.
     let fill: Double
+    var ring: Ring = .none
 
     var body: some View {
         HStack(spacing: 5) {
@@ -166,6 +226,15 @@ private struct RecordButtonLabel: View {
         }
         .clipShape(RoundedRectangle(cornerRadius: 5))
         .overlay { RoundedRectangle(cornerRadius: 5).stroke(on ? Color.red : Color.white.opacity(0.15)) }
+        .overlay {
+            switch ring {
+            case .none: EmptyView()
+            case .armed: RoundedRectangle(cornerRadius: 5).stroke(Color.red.opacity(0.5), lineWidth: 1.5)
+            case .waiting:
+                RoundedRectangle(cornerRadius: 5)
+                    .stroke(Color.red.opacity(0.3), style: StrokeStyle(lineWidth: 1.5, dash: [3, 2]))
+            }
+        }
         .contentShape(Rectangle())
     }
 }

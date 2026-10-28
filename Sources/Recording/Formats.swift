@@ -109,8 +109,29 @@ public struct RecordingSettings: Codable, Equatable, Sendable {
     public var iqMemoryLimitBytes = 2 << 30
     /// nil: `defaultFolder`.
     public var folderPath: String?
+    /// When the squelch starts and ends an auto recording.
+    public var autoTiming = AutoRecordTiming()
 
     public init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case preRollSeconds, audioFormat, audioSampleFormat, iqFormat, iqSampleFormat, iqMemoryLimitBytes, folderPath, autoTiming
+    }
+
+    /// Every key is optional and a missing one keeps its default, so settings saved by an older
+    /// SubFloor (before `autoTiming`, say) still decode instead of losing the whole session.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let d = RecordingSettings()
+        preRollSeconds = try c.decodeIfPresent(Double.self, forKey: .preRollSeconds) ?? d.preRollSeconds
+        audioFormat = try c.decodeIfPresent(FileFormat.self, forKey: .audioFormat) ?? d.audioFormat
+        audioSampleFormat = try c.decodeIfPresent(SampleFormat.self, forKey: .audioSampleFormat) ?? d.audioSampleFormat
+        iqFormat = try c.decodeIfPresent(FileFormat.self, forKey: .iqFormat) ?? d.iqFormat
+        iqSampleFormat = try c.decodeIfPresent(SampleFormat.self, forKey: .iqSampleFormat) ?? d.iqSampleFormat
+        iqMemoryLimitBytes = try c.decodeIfPresent(Int.self, forKey: .iqMemoryLimitBytes) ?? d.iqMemoryLimitBytes
+        folderPath = try c.decodeIfPresent(String.self, forKey: .folderPath) ?? d.folderPath
+        autoTiming = try c.decodeIfPresent(AutoRecordTiming.self, forKey: .autoTiming) ?? d.autoTiming
+    }
 
     public static var defaultFolder: URL {
         FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Music/SubFloor", isDirectory: true)
@@ -130,6 +151,7 @@ public struct RecordingSettings: Codable, Equatable, Sendable {
         s.audioSampleFormat = Self.nearest(s.audioSampleFormat, in: StreamKind.audio.sampleFormats(for: s.audioFormat))
         s.iqSampleFormat = Self.nearest(s.iqSampleFormat, in: StreamKind.iq.sampleFormats(for: s.iqFormat))
         if !Self.memoryLimits.contains(s.iqMemoryLimitBytes) { s.iqMemoryLimitBytes = 2 << 30 }
+        s.autoTiming = s.autoTiming.normalized()
         return s
     }
 
@@ -198,6 +220,15 @@ public enum RecordingFormat {
     public static func elapsed(_ seconds: Double) -> String {
         let s = max(0, Int(seconds.rounded(.down)))
         return s >= 3600 ? String(format: "%d:%02d:%02d", s / 3600, s / 60 % 60, s % 60) : String(format: "%d:%02d", s / 60, s % 60)
+    }
+
+    /// A length of time in words: `5 s`, `2.5 s`, `1 min`, `1 min 30 s`, `10 min`.
+    public static func span(_ seconds: Double) -> String {
+        func secs(_ v: Double) -> String { v == v.rounded() ? "\(Int(v)) s" : String(format: "%.1f s", v) }
+        guard seconds >= 60 else { return secs(max(0, seconds)) }
+        let minutes = Int(seconds / 60)
+        let rest = seconds - Double(minutes * 60)
+        return rest == 0 ? "\(minutes) min" : "\(minutes) min \(secs(rest))"
     }
 
     /// `12 MB`, `1.9 GB` (decimal units, as the Finder shows file sizes).

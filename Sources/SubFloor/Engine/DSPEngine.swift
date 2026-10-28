@@ -96,7 +96,10 @@ final class DSPEngine: @unchecked Sendable {
     /// Receiver's audio before the volume knob and the limiter. Their pre-roll rings run whenever
     /// the engine does; a new run starts them over (`start`), and `stop` finalises any open file.
     let iqRecorder = StreamRecorder(kind: .iq, rollsOnContextChange: true)
-    let audioRecorder = StreamRecorder(kind: .audio, rollsOnContextChange: false)
+    /// The audio goes through auto-record, which pushes it to `audioRecorder` and starts and ends
+    /// auto sessions on it from the squelch gate (when configured on).
+    let autoRecorder = AutoRecorder(recorder: StreamRecorder(kind: .audio, rollsOnContextChange: false))
+    var audioRecorder: StreamRecorder { autoRecorder.recorder }
 
     /// What the DSP thread should do with the box.
     struct ModemBoxState: Equatable, Sendable {
@@ -171,6 +174,7 @@ final class DSPEngine: @unchecked Sendable {
         ring.drain()
         iqRecorder.clearHistory()
         audioRecorder.clearHistory()
+        autoRecorder.reset()
         pending.withLock { $0 = Pending() }
         dropped.store(0, ordering: .relaxed)
         losses.drain()
@@ -434,7 +438,7 @@ final class DSPEngine: @unchecked Sendable {
             audioOut.removeAll(keepingCapacity: true)
             block.withUnsafeBufferPointer { receiver.process(UnsafeBufferPointer(rebasing: $0[0..<n]), audio: &audioOut) }
             guard !audioOut.isEmpty else { continue }
-            audioOut.withUnsafeBufferPointer { audioRecorder.push($0) }
+            audioOut.withUnsafeBufferPointer { autoRecorder.process($0, gateOpen: receiver.isSquelchOpen) }
             audioOut.withUnsafeMutableBufferPointer { a in
                 var gain = volume
                 vDSP_vsmul(a.baseAddress!, 1, &gain, a.baseAddress!, 1, vDSP_Length(a.count))
