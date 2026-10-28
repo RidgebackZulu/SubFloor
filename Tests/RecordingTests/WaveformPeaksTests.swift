@@ -150,10 +150,14 @@ private func writeToneThenSilence(_ url: URL) throws {
         let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
         let wav = dir.appendingPathComponent("long.wav")
         try writeSilentWAV(wav, seconds: 12 * 3600)        // far more than 50 ms of work
-        let exitedAt = Mutex<ContinuousClock.Instant?>(nil)
+        let startedAt = Mutex<ContinuousClock.Instant?>(nil), exitedAt = Mutex<ContinuousClock.Instant?>(nil)
         let task = Task {
-            try await WaveformPeaks.load(audioFile: wav, cacheFolder: dir.appendingPathComponent("cache"),
-                                         workerExited: { exitedAt.withLock { $0 = .now } })
+            try await WaveformPeaks.load(audioFile: wav, cacheFolder: dir.appendingPathComponent("cache")) { event in
+                switch event {
+                case .started: startedAt.withLock { $0 = .now }
+                case .exited: exitedAt.withLock { $0 = .now }
+                }
+            }
         }
         // A thread of its own, not Task.sleep or a dispatch timer: other suites can keep the cooperative and dispatch
         // pools busy for seconds, and a late cancel would find the load already finished.
@@ -168,11 +172,13 @@ private func writeToneThenSilence(_ url: URL) throws {
         do { _ = try await task.value; Issue.record("load finished instead of being cancelled") }
         catch is CancellationError {}
         catch { Issue.record("expected CancellationError, got \(error)") }
-        // What is timed is the reading stopping, on its own thread: within a chunk of a second of audio (tens of
-        // µs here; ~1.4 s to read this file uncancelled). When the awaiting task then resumes depends on the
-        // cooperative pool, which the other suites can keep busy, so it is not timed.
-        let cancelled = try #require(cancelledAt.withLock { $0 }), exited = try #require(exitedAt.withLock { $0 })
-        #expect(exited - cancelled < .seconds(1))
+        // What is timed is the reading stopping, on its own thread, from the cancel or from when the worker began,
+        // whichever came later: within a chunk of a second of audio (tens of µs here; ~1.4 s to read this file
+        // uncancelled). The task that starts the worker, and the one awaiting it, need the cooperative pool, which
+        // the other suites can keep busy for minutes, so neither wait is timed.
+        let cancelled = try #require(cancelledAt.withLock { $0 })
+        let started = try #require(startedAt.withLock { $0 }), exited = try #require(exitedAt.withLock { $0 })
+        #expect(exited - max(cancelled, started) < .seconds(1))
         #expect(!FileManager.default.fileExists(atPath: dir.appendingPathComponent("cache/long.wav.peaks").path))
     }
 

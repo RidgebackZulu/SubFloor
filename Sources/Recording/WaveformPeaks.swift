@@ -19,24 +19,28 @@ public struct WaveformPeaks: Equatable, Sendable {
     /// computed (and the cache written). Throws for an unreadable file; throws CancellationError
     /// promptly (checked every second of audio) when the calling task is cancelled.
     public static func load(audioFile: URL, cacheFolder: URL) async throws -> WaveformPeaks {
-        try await load(audioFile: audioFile, cacheFolder: cacheFolder, workerExited: {})
+        try await load(audioFile: audioFile, cacheFolder: cacheFolder, worker: { _ in })
     }
 
-    /// `load`, with `workerExited` called on the worker thread as it finishes, however it finishes: a test
-    /// times how soon a cancel stops the reading by it.
+    /// What the worker thread reports to a test: that it began, and that it finished, however it finished.
+    enum WorkerEvent: Sendable { case started, exited }
+
+    /// `load`, with `worker` called on the worker thread as it begins and as it finishes: a test times how
+    /// soon a cancel stops the reading by them.
     ///
     /// The reading is blocking file work, so it runs on a thread of its own rather than on the cooperative
     /// pool, where a busy pool (a full test run, other work in the app) can leave it, and the cancel, waiting
     /// for a thread. A cancel sets a flag the reading checks every second of audio; it then stops and resumes
     /// the caller at once, without needing a pool thread for the work.
     static func load(audioFile: URL, cacheFolder: URL,
-                     workerExited: @escaping @Sendable () -> Void) async throws -> WaveformPeaks {
+                     worker report: @escaping @Sendable (WorkerEvent) -> Void) async throws -> WaveformPeaks {
         let cancelled = CancelFlag()
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 let worker = Thread {
+                    report(.started)
                     let result = Result { try loadSynchronously(audioFile: audioFile, cacheFolder: cacheFolder, cancelled: cancelled) }
-                    workerExited()
+                    report(.exited)
                     continuation.resume(with: result)
                 }
                 worker.name = "WaveformPeaks"
