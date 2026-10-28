@@ -121,6 +121,9 @@ struct RadioCommands: Commands {
                 .keyboardShortcut("r", modifiers: [.command, .shift])
             Button(model.autoRecordEnabled ? "Turn Auto-Record Off" : "Turn Auto-Record On") { model.toggleAutoRecord() }
                 .keyboardShortcut("t", modifiers: [.command, .shift])
+            Button(model.noiseReduction.enabled ? "Turn Noise Reduction Off" : "Turn Noise Reduction On") { model.toggleNoiseReduction() }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
+                .disabled(!model.noiseReductionAvailable)
             Button("Recordings…") { openWindow(id: "recordings") }
                 .keyboardShortcut("l", modifiers: [.command, .shift])
             Button("Show Recordings in Finder") { model.revealRecordings() }
