@@ -56,6 +56,8 @@ public final class AutoRecorder: @unchecked Sendable {
     /// The head when the last cut was applied: an auto recording never starts before it, so its lead
     /// never reaches back into audio from before a retune.
     private var startFloor = 0
+    /// Whether the history is being fed the audio from before the squelch gate (see `process`).
+    private var pushesUngated = false
     /// Reused every block so the steady state allocates nothing.
     private var events: [AutoRecordTrigger.Event] = []
 
@@ -122,7 +124,9 @@ public final class AutoRecorder: @unchecked Sendable {
     /// while Auto is on keeps the squelch-open audio too, all of it, pre-roll included, so one file never
     /// mixes the two. With Auto off the history keeps `audio`, as heard.
     public func process(_ audio: UnsafeBufferPointer<Float>, ungated: UnsafeBufferPointer<Float>? = nil, gateOpen: Bool) {
-        recorder.push(applied.enabled ? (ungated ?? audio) : audio)
+        // A manual recording keeps whichever audio it started with, even if Auto is switched mid-way.
+        if recorder.sessionKind != .manual { pushesUngated = applied.enabled }
+        recorder.push(pushesUngated ? (ungated ?? audio) : audio)
         applyPending()
 
         guard applied.enabled else {

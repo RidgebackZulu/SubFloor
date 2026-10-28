@@ -149,7 +149,9 @@ public struct AutoRecordTrigger: Sendable {
                 // Only up to the tail is committed during a gap, so these frames are still ours.
                 let from = silencedThrough ?? lastOpenEnd + frames(AutoRecordTiming.tail)
                 let to = head - frames(AutoRecordTiming.lead)
-                if to > from {
+                // The first piece waits until it can hold the whole fade-out, so the fade never stops short.
+                let least = silencedThrough == nil ? frames(StreamRecorder.silenceFadeSeconds) : 1
+                if to - from >= least {
                     events.append(.silence(fromFrame: from, toFrame: to, fadeOut: silencedThrough == nil, fadeIn: false))
                     silencedThrough = to
                 }
