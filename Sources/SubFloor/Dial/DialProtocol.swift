@@ -4,7 +4,7 @@ import Foundation
 /// The SubFloor Dial's line protocol (one ASCII command per `\n`-terminated line, the same over USB
 /// serial and Bluetooth). See `radiodial/PROTOCOL.md` in the dial's firmware repository.
 enum DialProtocol {
-    static let version = 1
+    static let version = 2
 
     /// What the dial tells SubFloor.
     enum Event: Equatable {
@@ -18,6 +18,12 @@ enum DialProtocol {
         case mode(DemodMode)
         case knob(Knob)
         case pong
+        /// Knob turned on the scrub screen: `jumps` of `jump` seconds. `seq` is echoed with the new position.
+        case scrubMove(seq: Int, jumps: Int, jump: Double)
+        /// The jump size picked on the dial.
+        case jump(seconds: Double)
+        /// Tap on the scrub screen.
+        case playToggle
     }
 
     enum Knob: String, Equatable { case tune, bandwidth = "bw" }
@@ -49,6 +55,15 @@ enum DialProtocol {
         case "KNOB":
             guard let k = args.first.flatMap(Knob.init(rawValue:)) else { return nil }
             return .knob(k)
+        case "J":
+            guard args.count == 3, let seq = Int(args[0]), let jumps = Int(args[1]),
+                  let jump = Double(args[2]), jump > 0 else { return nil }
+            return .scrubMove(seq: seq, jumps: jumps, jump: jump)
+        case "JUMP":
+            guard let s = args.first.flatMap(Double.init), s > 0 else { return nil }
+            return .jump(seconds: s)
+        case "PLAY":
+            return .playToggle
         case "PONG":
             return .pong
         default:
@@ -84,8 +99,40 @@ enum DialProtocol {
     static func mode(_ m: DemodMode) -> String { "M \(m.label)" }
     static func bandwidth(_ bwHz: Double) -> String { "BW \(hz(bwHz))" }
     static func signal(_ db: Float) -> String { String(format: "SIG %.1f", max(db, -200)) }
+
+    /// Scrub mode on: the recording's start (UTC seconds since midnight), length, position, play state, jump size and
+    /// lane title. The title ends the line: the dial shows everything after "title=".
+    static func scrubOn(startSecondOfDay: Double, length: Double, position: Double, playing: Bool, jump: Double,
+                        title: String) -> String {
+        "SCRUB on t0=\(seconds(startSecondOfDay)) len=\(seconds(length)) pos=\(seconds(position)) "
+            + "play=\(playing ? 1 : 0) jump=\(jumpText(jump)) title=\(title.replacingOccurrences(of: "\n", with: " "))"
+    }
+
+    static let scrubOff = "SCRUB off"
+
+    /// The playback position; `seq` when it answers the dial's `J` message of that number.
+    static func position(_ s: Double, seq: Int? = nil) -> String {
+        seq.map { "POS \(seconds(s)) \($0)" } ?? "POS \(seconds(s))"
+    }
+
+    static func playing(_ on: Bool) -> String { "PLAY \(on ? 1 : 0)" }
+    static func jump(_ s: Double) -> String { "JUMP \(jumpText(s))" }
+
+    /// Whether the dial's firmware (the HELLO version, "major.minor[.patch]") knows the scrub lines: 1.1 or later.
+    /// Anything unparsable counts as older.
+    static func supportsScrub(firmware: String) -> Bool {
+        let parts = firmware.split(separator: ".", omittingEmptySubsequences: false).map { Int($0) }
+        guard !parts.contains(where: { $0 == nil }) else { return false }
+        let numbers = parts.compactMap { $0 }
+        let major = numbers[0], minor = numbers.count > 1 ? numbers[1] : 0
+        return major > 1 || (major == 1 && minor >= 1)
+    }
+
     static let ping = "PING"
     static let bye = "BYE"
+
+    private static func seconds(_ v: Double) -> String { String(format: "%.2f", v) }
+    private static func jumpText(_ v: Double) -> String { String(format: "%g", v) }
 
     private static func hz(_ v: Double) -> String { String(Int64(v.rounded())) }
 }

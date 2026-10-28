@@ -253,8 +253,8 @@ final class DialController {
         case .knob(let k):
             knob = k
             noteActivity(k == .bandwidth ? .bandwidth : .tune)
-        case .hello, .pong:
-            break
+        case .hello, .pong, .scrubMove, .jump, .playToggle:
+            break  // the scrub events are handled with the scrub sync (a later task)
         }
     }
 
