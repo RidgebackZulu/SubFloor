@@ -168,4 +168,26 @@ private func writeToneThenSilence(_ url: URL) throws {
         catch { Issue.record("expected CancellationError, got \(error)") }
         #expect(!FileManager.default.fileExists(atPath: dir.appendingPathComponent("cache/long.wav.peaks").path))
     }
+
+    @Test func aCacheWithAnAbsurdHeaderIsRecomputedWithoutTrapping() async throws {
+        let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let wav = dir.appendingPathComponent("a.wav"), cache = dir.appendingPathComponent("cache")
+        try writeToneThenSilence(wav)
+        _ = try await WaveformPeaks.load(audioFile: wav, cacheFolder: cache)
+        let cacheFile = cache.appendingPathComponent("a.wav.peaks")
+        let good = try Data(contentsOf: cacheFile)
+        func header(rate: Double, frames: Int64) -> Data {
+            var bytes = good
+            withUnsafeBytes(of: rate.bitPattern.littleEndian) { bytes.replaceSubrange(24..<32, with: $0) }
+            withUnsafeBytes(of: frames.littleEndian) { bytes.replaceSubrange(32..<40, with: $0) }
+            return bytes
+        }
+        for (rate, frames) in [(Double.leastNonzeroMagnitude, Int64(96_000)), (1, Int64.max), (.infinity, 96_000),
+                               (.nan, 96_000), (-48_000, 96_000), (48_000, -1), (1e300, Int64.max)] {
+            try header(rate: rate, frames: frames).write(to: cacheFile)
+            let p = try await WaveformPeaks.load(audioFile: wav, cacheFolder: cache)
+            #expect(p.peaks.count == 200, "rate \(rate), frames \(frames)")
+            #expect(p.sampleRate == 48_000)
+        }
+    }
 }

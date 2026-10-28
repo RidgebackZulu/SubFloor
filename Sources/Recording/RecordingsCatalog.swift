@@ -309,7 +309,10 @@ public struct RecordingsCatalog: Equatable, Sendable {
                          laneID: Self.laneID(live.frequencyHz, live.mode))
     }
 
+    /// `11175000 USB`. A frequency too large for an `Int` (a damaged log line) keeps its own lane rather
+    /// than trapping.
     private static func laneID(_ frequencyHz: Double, _ mode: String) -> String {
-        "\(Int(frequencyHz.rounded())) \(mode)"
+        if let hz = Int(exactly: frequencyHz.rounded()) { return "\(hz) \(mode)" }
+        return "\(frequencyHz) \(mode)"
     }
 }

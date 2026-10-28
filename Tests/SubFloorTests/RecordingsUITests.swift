@@ -179,6 +179,8 @@ import Testing
         #expect(RecordingsFormat.length(48) == "48 s")
         #expect(RecordingsFormat.length(227) == "3 min 47 s")
         #expect(RecordingsFormat.length(4320) == "1 h 12 min")
+        #expect(RecordingsFormat.length(1e300) == "277777777 h 47 min")   // a damaged log line: no trap
+        #expect(RecordingsFormat.length(-.infinity) == "0.0 s")
     }
 
     @Test func dayTitleFormat() {

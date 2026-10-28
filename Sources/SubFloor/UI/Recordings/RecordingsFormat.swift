@@ -21,7 +21,8 @@ enum RecordingsFormat {
     /// `7.8 s`, `48 s`, `3 min 47 s`, `1 h 12 min`: a tenth under ten seconds, where a squelch break is a
     /// matter of tenths, and coarser as recordings get longer.
     static func length(_ seconds: Double) -> String {
-        let s = seconds.isFinite ? max(seconds, 0) : 0
+        // Kept within what an `Int` holds: a damaged log line's length must not trap the hover.
+        let s = seconds.isFinite ? min(max(seconds, 0), 1e12) : 0
         let tenths = (s * 10).rounded()
         if tenths < 100 { return String(format: "%.1f s", tenths / 10) }
         let total = Int(s.rounded())

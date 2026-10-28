@@ -89,6 +89,8 @@ public struct WaveformPeaks: Equatable, Sendable {
     private static let magic = Data("SFPK".utf8)
     private static let version: UInt32 = 1
     private static let headerSize = 40
+    /// The sample rates a cache entry can hold: anything audio is, with room to spare.
+    private static let rateRange: ClosedRange<Double> = 1...10_000_000
 
     /// What a cache entry must have been made from: the source file's size and modification date.
     private struct SourceStamp {
@@ -108,10 +110,14 @@ public struct WaveformPeaks: Equatable, Sendable {
             T(littleEndian: data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: offset, as: T.self) })
         }
         let rate = Double(bitPattern: field(24, as: UInt64.self))
-        let frames = Int(field(32, as: Int64.self))
+        let storedFrames = field(32, as: Int64.self)
+        // A damaged or hand-made header must not trap: the rate is checked against real audio rates, and the
+        // bin count is worked out in `Double`, before anything is made an `Int`.
         guard field(4, as: UInt32.self) == version, field(8, as: UInt64.self) == source.size,
               Double(bitPattern: field(16, as: UInt64.self)) == source.modified,
-              rate > 0, rate.isFinite, frames >= 0, data.count - headerSize == binCount(frames: frames, rate: rate)
+              rate.isFinite, rateRange.contains(rate), storedFrames >= 0,
+              (Double(storedFrames) * Double(binsPerSecond) / rate).rounded(.up) == Double(data.count - headerSize),
+              let frames = Int(exactly: storedFrames)
         else { return nil }
         return WaveformPeaks(sampleRate: rate, frames: frames, peaks: [UInt8](data.dropFirst(headerSize)))
     }

@@ -8,7 +8,8 @@ import Recording
 /// the only write is the library's `heard` line.
 ///
 /// Playback is `AVAudioPlayer` over the file, so WAV, FLAC and M4A all play. The position is read from the
-/// player at 30 Hz while it plays; nothing runs when it is paused.
+/// player at 30 Hz while it plays; nothing runs when it is paused. The end comes from the player's delegate,
+/// or from that poll if the player stops without calling it.
 @MainActor @Observable
 final class RecordingPlayer {
     /// The seconds one step of the position control moves: the arrow keys now, a hardware dial later.
@@ -36,7 +37,8 @@ final class RecordingPlayer {
     private let library: RecordingsLibrary
     private let setLiveMuted: (Bool) -> Void
 
-    @ObservationIgnored private var audio: AVAudioPlayer?
+    /// Internal for tests, which stop it behind the player's back.
+    @ObservationIgnored private(set) var audio: AVAudioPlayer?
     @ObservationIgnored private var listener: Listener?
     @ObservationIgnored private var timer: Timer?
     /// The folder the file was opened from, so another recordings folder (which may hold a file of the same
@@ -169,6 +171,16 @@ final class RecordingPlayer {
 
     private func tick() {
         guard isPlaying, let audio else { return }
+        guard audio.isPlaying else {
+            // It stopped without a delegate call (an output device that went away can do that): finished, so
+            // the live radio is not left muted. Where it stopped, or the end if it ran out (it rewinds to 0).
+            let at = audio.currentTime
+            stopTimer()
+            isPlaying = false
+            position = at > 0 && at < duration ? at : duration
+            muteLive(false)
+            return
+        }
         position = min(audio.currentTime, duration)
     }
 

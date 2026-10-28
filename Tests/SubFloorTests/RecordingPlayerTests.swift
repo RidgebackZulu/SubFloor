@@ -134,6 +134,22 @@ struct RecordingPlayerTests {
         p.unload()
     }
 
+    @Test func aPlayerThatStopsWithoutSayingSoUnmutes() async throws {
+        let r = try await rig()
+        let p = r.player
+        p.load(try recording(r))
+        p.seek(to: 1)
+        p.play()
+        #expect(r.muted.values.last == true)
+        let audio = try #require(p.audio)
+        audio.stop()   // no delegate call, as when an output device goes away
+        let stoppedAt = audio.currentTime
+        #expect(wait(upTo: 10) { !p.isPlaying })
+        #expect(r.muted.values.last == false)
+        #expect(abs(p.position - stoppedAt) < 0.001)   // where it stopped, inside the file
+        p.unload()
+    }
+
     @Test func unreadableFileShowsAnError() async throws {
         let folder = tempFolder()
         let file = name(0, ext: "flac")

@@ -215,6 +215,17 @@ private let am = "SubFloor_20261027_090000Z_6925000Hz_AM.flac"
         #expect(c.unheardCount == 1)
     }
 
+    @Test func anAbsurdLoggedFrequencyDoesNotTrap() {
+        var c = RecordingsCatalog(files: [usb, am])
+        c.apply([
+            .recording(file: usb, start: utc(2026, 10, 27, 18, 32, 19), seconds: 10, frequencyHz: 1e300, mode: "USB", auto: true),
+            .recording(file: am, start: utc(2026, 10, 27, 9, 0, 0), seconds: 10, frequencyHz: -1e300, mode: "AM", auto: true),
+        ])
+        let lanes = c.lanes(onUTCDay: day(2026, 10, 27))
+        #expect(lanes.count == 2)
+        #expect(Set(lanes.map(\.id)).count == 2)
+    }
+
     @Test func allEntriesReadsEveryDay() throws {
         let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
         let log = RecordingLog(folder: dir)
