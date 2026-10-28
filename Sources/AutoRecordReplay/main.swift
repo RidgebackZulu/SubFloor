@@ -270,7 +270,7 @@ func run() throws {
         for event in events {
             switch event {
             case .start(let frame): recordingStart = frame
-            case .commit: break
+            case .commit, .silence: break
             case .stop(let frame): finish(stopAt: frame, note: note)
             case .pop(let frame, let frames):
                 pops += 1

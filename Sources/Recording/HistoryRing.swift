@@ -74,6 +74,23 @@ public final class HistoryRing: @unchecked Sendable {
         }
     }
 
+    /// Producer: hands `body` the bytes from `from` to `to` that are still held, in place, in at most
+    /// two pieces (the ring wraps), each with its position. Positions are whole frames when the
+    /// arguments are, since the capacity is.
+    public func rewrite(from: Int, to: Int, _ body: (UnsafeMutableRawBufferPointer, Int) -> Void) {
+        withState { s in
+            guard let storage = s.storage, s.capacity > 0 else { return }
+            var position = max(from, s.oldest)
+            let end = min(to, s.head)
+            while position < end {
+                let start = position % s.capacity
+                let n = min(end - position, s.capacity - start)
+                body(UnsafeMutableRawBufferPointer(start: storage + start, count: n), position)
+                position += n
+            }
+        }
+    }
+
     /// The position `bytes` behind the head, no further back than what is available.
     public func rewind(bytes: Int) -> Int {
         withState { s in s.head - min(max(bytes, 0), s.head - max(s.oldest, s.barrier)) }

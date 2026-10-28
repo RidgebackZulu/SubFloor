@@ -58,8 +58,11 @@ final class DialController {
     @ObservationIgnored private var timer: Timer?
     @ObservationIgnored private var ticks = 0
     @ObservationIgnored private var sent = SentState()
+    @ObservationIgnored private var scrubSync = DialScrubSync()
     @ObservationIgnored private var hudTask: Task<Void, Never>?
     @ObservationIgnored private var toastTask: Task<Void, Never>?
+    /// Tests: sees every line sent to the active link (tests open no link). Always nil in the app.
+    @ObservationIgnored var sentLinesForTesting: ((String) -> Void)?
 
     /// What the dial was last told, so only changes are sent.
     private struct SentState {
@@ -183,7 +186,9 @@ final class DialController {
     }
 
     private func send(_ line: String) {
-        if let active { sendOn(active, line) }
+        guard let active else { return }
+        sentLinesForTesting?(line)
+        sendOn(active, line)
     }
 
     private func updateStatus() {
@@ -210,6 +215,9 @@ final class DialController {
 
     // MARK: Dial → SubFloor
 
+    /// Tests: a line from the dial, as the link would deliver it.
+    func receive(_ line: String, on t: Transport) { received(line, on: t) }
+
     private func received(_ line: String, on t: Transport) {
         lastHeard[t] = Date()
         guard let event = DialProtocol.parse(line) else { return }
@@ -223,7 +231,10 @@ final class DialController {
             self.knob = knob
             active = t
             sent = SentState()
+            scrubSync.reset()
             sendState()
+            // At once, not on the next tick: a turn in between would be a T and tune the radio.
+            sendScrubLines()
             updateStatus()
             return
         }
@@ -253,9 +264,34 @@ final class DialController {
         case .knob(let k):
             knob = k
             noteActivity(k == .bandwidth ? .bandwidth : .tune)
+        case .scrubMove(let seq, let jumps, let jump):
+            guard scrubTarget != nil else { break }
+            let player: RecordingPlayer = model.player
+            player.seek(to: player.position + Double(jumps) * jump)
+            send(scrubSync.answer(position: player.position, seq: seq, now: ProcessInfo.processInfo.systemUptime))
+        case .jump(let seconds):
+            guard scrubTarget != nil, RecordingPlayer.jumpSizes.contains(seconds) else { break }
+            model.player.jump = seconds
+            scrubSync.dialChose(jump: seconds)
+        case .playToggle:
+            guard scrubTarget != nil else { break }
+            model.player.togglePlay()
+            sendScrubLines(playToggled: true)
         case .hello, .pong:
             break
         }
+    }
+
+    /// What the dial scrubs now, or nil when it tunes: the key Recordings window's playable selection, on
+    /// firmware that knows the scrub lines.
+    var scrubTarget: DialScrubTarget? {
+        guard DialProtocol.supportsScrub(firmware: firmware) else { return nil }
+        let player: RecordingPlayer = model.player
+        return DialScrubTarget.make(
+            windowIsKey: model.recordingsWindowIsKey, unplayableFile: model.recordingsUnplayableFile,
+            playerFile: player.file, loadError: player.loadError, duration: player.duration,
+            position: player.position, playing: player.isPlaying, jump: player.jump,
+            recording: player.file.flatMap { model.library.catalog.recording($0) })
     }
 
     private func noteActivity(_ action: Action, rotation detents: Double = 0) {
@@ -321,6 +357,12 @@ final class DialController {
             send(DialProtocol.signal(model.signalDb))
             sent.signalDb = model.signalDb
         }
+        sendScrubLines()
+    }
+
+    private func sendScrubLines(playToggled: Bool = false) {
+        let lines = scrubSync.lines(for: scrubTarget, now: ProcessInfo.processInfo.systemUptime, playToggled: playToggled)
+        for line in lines { send(line) }
     }
 
     private static let hostName: String = {

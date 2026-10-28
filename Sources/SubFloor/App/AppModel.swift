@@ -94,8 +94,11 @@ final class AppModel {
     /// The live radio is silent while a recording plays (`RecordingPlayer`). The volume knob keeps its place
     /// and the session keeps saving `volume`; only what the engine is told changes.
     var liveAudioMuted = false { didSet { engine.update(volume: effectiveVolume) } }
+    /// The live radio is also silent the whole time the Recordings window is open, playing or not, so
+    /// listening back is never talked over; it returns when the window closes.
+    var recordingsWindowOpen = false { didSet { engine.update(volume: effectiveVolume) } }
     /// What the engine plays the live radio at.
-    var effectiveVolume: Float { liveAudioMuted ? 0 : volume }
+    var effectiveVolume: Float { liveAudioMuted || recordingsWindowOpen ? 0 : volume }
 
     // MARK: Recording
     /// Recording preferences (Settings). Kept valid; a change to a sample format starts the pre-roll
@@ -167,6 +170,11 @@ final class AppModel {
     /// Plays a recording from the library and mutes the live radio while it does. Set once in `init`, which
     /// is why it is not a `let`: its mute closure needs `self`.
     @ObservationIgnored private(set) var player: RecordingPlayer!
+
+    /// Whether the Recordings window is the key window: the dial scrubs the player only while it is.
+    @ObservationIgnored var recordingsWindowIsKey = false
+    /// The file the Recordings window found unplayable (its peaks could not be read), so the dial does not scrub it.
+    @ObservationIgnored var recordingsUnplayableFile: String?
 
     /// Test hook: the free bytes on the volume recordings go to (nil: unknown).
     @ObservationIgnored var freeSpaceProbe: (URL) -> Int64? = { AppModel.freeSpace(at: $0) }

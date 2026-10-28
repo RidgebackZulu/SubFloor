@@ -38,7 +38,7 @@ struct DialProtocolTests {
         #expect(DialProtocol.bandwidth(8_000) == "BW 8000")
         #expect(DialProtocol.signal(-68.04) == "SIG -68.0")
         #expect(DialProtocol.signal(-.infinity) == "SIG -200.0")
-        #expect(DialProtocol.hello(host: "War's Mac\nPro") == "HELLO SubFloor 1 host=War's Mac Pro")
+        #expect(DialProtocol.hello(host: "War's Mac\nPro") == "HELLO SubFloor 2 host=War's Mac Pro")
     }
 
     @Test func splitsLinesAcrossChunks() {
@@ -46,6 +46,43 @@ struct DialProtocolTests {
         #expect(s.append(Data("HELLO Sub".utf8)).isEmpty)
         #expect(s.append(Data("FloorDial 1.0.0\r\nT 1 2 ".utf8)) == ["HELLO SubFloorDial 1.0.0"])
         #expect(s.append(Data("100\n\nPONG\n".utf8)) == ["T 1 2 100", "PONG"])
+    }
+
+    @Test func parsesTheScrubEvents() {
+        #expect(DialProtocol.parse("J 7 -3 0.5") == .scrubMove(seq: 7, jumps: -3, jump: 0.5))
+        #expect(DialProtocol.parse("JUMP 30") == .jump(seconds: 30))
+        #expect(DialProtocol.parse("PLAY") == .playToggle)
+        #expect(DialProtocol.parse("J 1 2") == nil)
+        #expect(DialProtocol.parse("J 1 2 0") == nil, "a zero jump moves nothing")
+        #expect(DialProtocol.parse("JUMP -1") == nil)
+    }
+
+    @Test func formatsTheScrubLines() {
+        // t0 to the millisecond (a recording's start), so the dial's clock truncates to the same tenth as the window's.
+        #expect(DialProtocol.scrubOn(startSecondOfDay: 28_092.456, length: 312.456, position: 0, playing: false, jump: 1,
+                                     title: "11.175 MHz USB")
+                == "SCRUB on t0=28092.456 len=312.46 pos=0.00 play=0 jump=1 title=11.175 MHz USB")
+        #expect(DialProtocol.scrubOff == "SCRUB off")
+        #expect(DialProtocol.position(12.346) == "POS 12.35")
+        #expect(DialProtocol.position(0, seq: 4) == "POS 0.00 4")
+        #expect(DialProtocol.playing(true) == "PLAY 1")
+        #expect(DialProtocol.jump(0.1) == "JUMP 0.1")
+        #expect(DialProtocol.jump(300) == "JUMP 300")
+    }
+
+    @Test func scrubOnKeepsTheTitleLastAndOnOneLine() {
+        let line = DialProtocol.scrubOn(startSecondOfDay: 0, length: 1, position: 0, playing: true, jump: 5, title: "6.925 MHz\nAM")
+        #expect(line.hasSuffix(" title=6.925 MHz AM"))
+        #expect(!line.contains("\n"))
+    }
+
+    @Test func onlyFirmwareFromOneOneKnowsScrub() {
+        #expect(!DialProtocol.supportsScrub(firmware: "1.0.0"))
+        #expect(DialProtocol.supportsScrub(firmware: "1.1.0"))
+        #expect(DialProtocol.supportsScrub(firmware: "1.10.2"))
+        #expect(DialProtocol.supportsScrub(firmware: "2.0"))
+        #expect(!DialProtocol.supportsScrub(firmware: "?"))
+        #expect(!DialProtocol.supportsScrub(firmware: ""))
     }
 }
 

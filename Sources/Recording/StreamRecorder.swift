@@ -336,6 +336,46 @@ public final class StreamRecorder: @unchecked Sendable {
         _ = committedFrames.max(throughFrame, ordering: .releasing)
     }
 
+    /// How long `silence` fades out and back in, so neither edge of a silenced stretch clicks.
+    static let silenceFadeSeconds = 0.01
+
+    /// Makes frames `fromFrame` to `toFrame` silent in the history. With `fadeOut` the first 10 ms ramp
+    /// down to silence instead of stopping dead; with `fadeIn` the 10 ms after `toFrame` ramp back up.
+    /// Only frames an auto session has not committed are touched: the writer may be reading the ones
+    /// below. Producer side (DSP thread).
+    public func silence(fromFrame: Int, toFrame: Int, fadeOut: Bool, fadeIn: Bool) {
+        producer.withLock { p in
+            guard let setup = p.setup else { return }
+            let bpf = ring.bytesPerFrame, format = setup.sampleFormat, channels = max(setup.channels, 1)
+            let committed = committedFrames.load(ordering: .acquiring)
+            let fade = max(1, Int(setup.sampleRate * Self.silenceFadeSeconds))
+            // Frame f's gain: a ramp down over the fade-out, zero through `toFrame`, a ramp up after it.
+            func gain(_ f: Int) -> Float {
+                if f >= toFrame { return min(1, Float(f - toFrame + 1) / Float(fade + 1)) }
+                if fadeOut, f - fromFrame < fade { return max(0, 1 - Float(f - fromFrame + 1) / Float(fade)) }
+                return 0
+            }
+            let from = max(fromFrame, committed), to = fadeIn ? toFrame + fade : toFrame
+            guard to > from else { return }
+            ring.rewrite(from: from * bpf, to: to * bpf) { bytes, position in
+                guard let base = bytes.baseAddress else { return }
+                let first = position / bpf, count = bytes.count / bpf
+                var i = 0
+                while i < count {
+                    let f = first + i
+                    if gain(f) == 0, f + 1 < toFrame {
+                        let run = min(count - i, toFrame - f)   // the zero stretch, in one go
+                        format.scale(base + i * bpf, count: run * channels, by: 0)
+                        i += run
+                    } else {
+                        format.scale(base + i * bpf, count: channels, by: gain(f))
+                        i += 1
+                    }
+                }
+            }
+        }
+    }
+
     /// Ends an auto session at `atFrame` (at the written position if that is already behind us, at the
     /// head if it is ahead). Ignored unless the session is an auto one.
     public func stop(atFrame: Int) {

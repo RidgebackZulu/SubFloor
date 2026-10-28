@@ -19,6 +19,18 @@ private func feed(_ steps: [(seconds: Double, open: Bool)], timing: AutoRecordTi
 
 private func isStart(_ e: AutoRecordTrigger.Event) -> Bool { if case .start = e { true } else { false } }
 private func isPop(_ e: AutoRecordTrigger.Event) -> Bool { if case .pop = e { true } else { false } }
+private func isSilence(_ e: AutoRecordTrigger.Event) -> Bool { if case .silence = e { true } else { false } }
+/// The silence pieces starting before `frame` (the feeds end in a long shut stretch, which is silenced
+/// too as it goes, and the tests look at the gaps before it).
+private func silences(_ e: [AutoRecordTrigger.Event], before frame: Int = .max) -> [(from: Int, to: Int, fadeOut: Bool, fadeIn: Bool)] {
+    e.compactMap { if case .silence(let a, let b, let o, let i) = $0, a < frame { (a, b, o, i) } else { nil } }
+}
+/// The span a run of silence pieces covers, provided each starts where the last one ended.
+private func covered(_ pieces: [(from: Int, to: Int, fadeOut: Bool, fadeIn: Bool)]) -> Range<Int>? {
+    guard let first = pieces.first, let last = pieces.last else { return nil }
+    for (a, b) in zip(pieces, pieces.dropFirst()) where a.to != b.from { return nil }
+    return first.from..<last.to
+}
 
 @Suite struct AutoRecordTriggerTests {
     @Test func popsShorterThanStartAfterMakeNoRecording() {
@@ -46,6 +58,46 @@ private func isPop(_ e: AutoRecordTrigger.Event) -> Bool { if case .pop = e { tr
         let e = feed([(1, false), (5, true), (20, false), (0.1, true), (40, false)])
         #expect(e.filter(isStart) == [.start(atFrame: 500)])
         #expect(e.last == .stop(atFrame: 28_100))   // last open ends at 26_100, + 2 s tail
+    }
+
+    @Test func gapsUpToKeepGapsUpToPlayThrough() {
+        let e = feed([(1, false), (5, true), (8, false), (2, true), (40, false)])   // an 8 s gap, the default
+        #expect(silences(e, before: 16_000).isEmpty)
+        #expect(e.filter(isStart).count == 1)
+    }
+
+    @Test func longerGapsAreSilencedBetweenTheTailAndTheLead() {
+        let e = feed([(1, false), (5, true), (20, false), (2, true), (40, false)])
+        // Open until 6_000, shut 20 s, open again from 26_000: 2 s of tail and 0.5 s of lead stay as heard.
+        // The gap is silenced as it goes, in pieces that follow on, faded out at the start and in at the end.
+        let pieces = silences(e, before: 28_000)
+        #expect(covered(pieces) == 8_000..<25_500)
+        #expect(pieces.first?.fadeOut == true && pieces.dropFirst().allSatisfy { !$0.fadeOut })
+        #expect(pieces.last?.fadeIn == true && pieces.dropLast().allSatisfy { !$0.fadeIn })
+        #expect(pieces.count > 2, "silenced block by block, not all at the reopen")
+        let lastSilence = e.lastIndex { if case .silence(_, 25_500, _, true) = $0 { true } else { false } }!
+        let commitPast = e.firstIndex { if case .commit(let f) = $0 { f > 8_000 } else { false } }!
+        #expect(lastSilence < commitPast, "silenced before the writer may reach it")
+        #expect(pieces.allSatisfy { $0.to <= 25_500 }, "never into the lead before the next word")
+    }
+
+    @Test func aLongGapIsSilencedUpToALeadBehindTheHead() {
+        // Still shut at the end (no reopen, Stop after not reached): a manual takeover now would find the gap
+        // already silent apart from the last half second.
+        let e = feed([(1, false), (5, true), (20, false)])
+        let pieces = silences(e)
+        #expect(covered(pieces) == 8_000..<25_500)
+        #expect(!pieces.contains { $0.fadeIn })
+    }
+
+    @Test func keepGapsUpToIsConfigurable() {
+        let e = feed([(1, false), (5, true), (6, false), (2, true), (40, false)], timing: .init(keepGapsUpTo: 3))
+        #expect(covered(silences(e, before: 14_000)) == 8_000..<11_500)
+    }
+
+    @Test func aGapJustOverTheLimitWithNoRoomBetweenTailAndLeadSilencesNothing() {
+        let e = feed([(1, false), (5, true), (2.3, false), (2, true), (40, false)], timing: .init(keepGapsUpTo: 2))
+        #expect(silences(e, before: 10_300).isEmpty)
     }
 
     @Test func commitsNeverPassTheStopAndEndOnIt() {
@@ -129,6 +181,9 @@ private func isPop(_ e: AutoRecordTrigger.Event) -> Bool { if case .pop = e { tr
         #expect(AutoRecordTiming(startAfter: 0.1, stopAfter: 40).normalized() == .init(startAfter: 0.5, stopAfter: 45))
         #expect(AutoRecordTiming(startAfter: 20, stopAfter: 7).normalized() == .init(startAfter: 10, stopAfter: 5))
         #expect(AutoRecordTiming().normalized() == AutoRecordTiming())
+        #expect(AutoRecordTiming().keepGapsUpTo == 8)
+        #expect(AutoRecordTiming(keepGapsUpTo: 7).normalized().keepGapsUpTo == 8)
+        #expect(AutoRecordTiming(keepGapsUpTo: 0).normalized().keepGapsUpTo == 1)
         #expect(AutoRecordTiming.maxHoldbackSeconds == 612)
     }
 
@@ -139,7 +194,9 @@ private func isPop(_ e: AutoRecordTrigger.Event) -> Bool { if case .pop = e { tr
                 == AutoRecordTiming(startAfter: 2, stopAfter: 60))
         #expect(try decoder.decode(AutoRecordTiming.self, from: Data(#"{"startAfter":0.1,"stopAfter":40}"#.utf8))
                 == AutoRecordTiming(startAfter: 0.5, stopAfter: 45))
-        let timing = AutoRecordTiming(startAfter: 3, stopAfter: 120)
+        #expect(try decoder.decode(AutoRecordTiming.self, from: Data(#"{"keepGapsUpTo":3}"#.utf8))
+                == AutoRecordTiming(keepGapsUpTo: 3))
+        let timing = AutoRecordTiming(startAfter: 3, stopAfter: 120, keepGapsUpTo: 15)
         #expect(try decoder.decode(AutoRecordTiming.self, from: JSONEncoder().encode(timing)) == timing)
     }
 }

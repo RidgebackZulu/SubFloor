@@ -28,6 +28,9 @@ records lossless audio and IQ that start *before* you press the button.
   ±100 Hz and its IQ.
 - ⏪ **Records the past.** A rolling pre-roll keeps the last 5 to 120 seconds in memory, so a recording
   starts before your click. FLAC, WAV, Apple Lossless or SigMF, and all of it lossless.
+- 🔴 **Records while you're away.** Auto records every transmission the squelch lets through, and the
+  Recordings window lays the day out in lanes, one per frequency, with a player you can scrub from the
+  Dial. [More below](#auto-record).
 - 🎧 **Every voice mode.** AM, NFM, WFM, USB, LSB and CW, with AGC, squelch and drag-to-resize
   passbands.
 - ⬆️ **HamItUp in one click.** Upconverter mode tunes the radio 125 MHz above what you see, so HF and
@@ -100,6 +103,8 @@ always released.
 | Run / Stop | Space or ⌘R |
 | Open IQ recording | ⌘O (stereo I/Q WAV) |
 | Record | Top-bar `Audio` / `IQ` / `Both` (⌘⇧A / ⌘⇧I / ⌘⇧R); red with the elapsed time while recording. See Recording |
+| Auto-record | Top-bar `Auto` (⌘⇧T): records whenever the squelch opens. See Auto-record |
+| Recordings | Top-bar `Recordings` (⌘⇧L), with a red badge counting unheard recordings |
 | Reset zoom | ⌘0 |
 | Step VFO | ← / → (⇧ ×10); with a modem mode on they move the modem cursor instead |
 | Mode | Top bar, or `[` / `]` |
@@ -116,7 +121,8 @@ memory while the radio runs, and a recording starts that far *before* the click,
 already begun is not lost. Idle, the buttons' faint red fill shows how much pre-roll is primed.
 
 - **Audio** is the receiver's output after AGC and squelch and before the volume knob, 48 kHz mono:
-  FLAC 24-bit by default, or WAV (16/24-bit, 32-bit float) or Apple Lossless.
+  FLAC 24-bit by default, or WAV (16/24-bit, 32-bit float) or Apple Lossless. While Auto is on it is
+  taken before the squelch instead, so pauses are kept as heard on air (see Auto-record).
 - **IQ** is the capture at the source rate as stereo I/Q: WAV 16-bit by default (lossless for the
   RSP1B's 14-bit ADC; the name is SDR#-style, so ⌘O reads it back), 32-bit float, or SigMF
   (`.sigmf-data` + `.sigmf-meta` with rate, centre and UTC time). A retune starts a new IQ file; WAV
@@ -125,6 +131,37 @@ already begun is not lost. Idle, the buttons' faint red fill shows how much pre-
   may use, 2 GB by default; at high rates that limit shortens the IQ pre-roll and Settings says by how much).
 - Names: `SubFloor_20261022_143000Z_14074000Hz_USB.flac`, `SubFloor_20261022_143000Z_14100000Hz_IQ.wav`;
   the time is the first sample's. Stopping the radio finalises any open recording.
+
+## Auto-record
+Turn the squelch on, set it just above the noise, and press **Auto** (⌘⇧T). SubFloor then records every
+transmission on its own, so you can leave it on a quiet frequency all day and come back to what it
+caught. The button shows a faint red ring while it listens and turns solid red with the elapsed time
+while it records.
+
+- **Starts** once the squelch has been open for *Auto-record starts after* (Settings, default 2 s, so a lone noise
+  pop doesn't make a file), and the file begins half a second before the signal did.
+- **Keeps the gaps.** Inside a recording, pauses up to *Keep gaps up to* (default 8 s) are recorded as
+  heard on air, squelch open, so the next words aren't clipped. Longer pauses keep 2 s after the last
+  word and half a second before the next, and are silent between.
+- **Stops** once the squelch has stayed shut for *and stops after* (default 30 s), and the file ends 2 s after the signal.
+- Pressing **Audio** during an auto recording takes it over as a manual one. Auto never records the
+  demo source, and while it is on it keeps the Mac awake (the display may sleep).
+
+### Recordings window
+**Recordings** (⌘⇧L) shows one UTC day at a time: a lane per frequency, a glowing marker per recording
+(brighter with a dot until you've played it), and a faint row of the squelch pops Auto ignored. Pick a
+marker to load it into the player underneath: a waveform, the playhead's UTC time to the tenth of a
+second, and jump chips from 0.1 s to 5 min.
+
+| In the Recordings window | Does |
+| --- | --- |
+| Click or drag the waveform | Move the playhead |
+| Space | Play / pause |
+| ← / → | Jump back / forward by the chosen jump |
+| ⇧← / ⇧→ | Previous / next recording that day |
+| Clear | Mark every recording heard |
+
+The live radio is silent while the window is open and comes back when you close it.
 
 ## SubFloor Dial
 <p align="center"><img src="docs/images/dial.png" alt="The SubFloor Dial tuning SubFloor" width="100%"></p>
@@ -141,10 +178,19 @@ underlines the digit the knob tunes, and a HUD shows the knob, step and mode whi
 | Long-press | Settings: Bluetooth, acceleration, direction, brightness, sounds |
 | Tap AM / LSB / USB | Switch mode |
 | Tap a digit · swipe | Tune that digit · coarser / finer step |
+| Tap ◀ / ▶ on the step chip | Finer / coarser step (narrower / wider in bandwidth mode) |
 | Tap the BW line | The knob sets the bandwidth; press to go back to tuning |
 
-**Firmware:** flash `SubFloorDial-<version>.bin` from the release with
-`esptool.py --chip esp32s3 write_flash 0 SubFloorDial-1.0.0.bin`.
+**Scrubbing recordings** (firmware 1.1.0 or later): while the Recordings window is in front with a
+recording picked, the Dial turns pink and scrubs it. Turn to jump the playhead, tap the screen to play
+or pause, and tap ◀ / ▶ on the jump chip (or press, swipe, or hold and turn) to change the jump. The
+screen shows the playhead's UTC time and a progress ring. It goes back to tuning when the window
+closes or loses focus.
+
+**Firmware:** a new Dial takes the full image from the release:
+`esptool.py --chip esp32s3 write_flash 0 SubFloorDial-1.1.0.bin`. To update a Dial that already runs
+SubFloor firmware and keep its settings and Bluetooth pairing, write just the app:
+`esptool.py --chip esp32s3 write_flash 0x10000 SubFloorDial-1.1.0-app.bin`.
 **Pairing:** on the dial, long-press › Bluetooth › Pair new Mac; in SubFloor, click the Dial chip ›
 Pair New Dial (or Settings › SubFloor Dial). Over USB, just plug it in. Code: `Sources/SubFloor/Dial/`.
 
