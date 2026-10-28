@@ -708,4 +708,36 @@ private enum AppStyleName {
         #expect(RecordingFormat.span(2.5) == "2.5 s")
         #expect(RecordingFormat.span(0.5) == "0.5 s")
     }
+
+    @Test func sampleFormatsScaleInPlace() {
+        var i16: [Int16] = [1_000, -1_000, 32_767]
+        i16.withUnsafeMutableBytes { SampleFormat.int16.scale($0.baseAddress!, count: 3, by: 0.5) }
+        #expect(i16 == [500, -500, 16_384])
+        var f32: [Float] = [0.5, -0.25]
+        f32.withUnsafeMutableBytes { SampleFormat.float32.scale($0.baseAddress!, count: 2, by: 0.5) }
+        #expect(f32 == [0.25, -0.125])
+        // -4 and 8_388_607 as little-endian 24-bit.
+        var i24: [UInt8] = [0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F]
+        i24.withUnsafeMutableBytes { SampleFormat.int24.scale($0.baseAddress!, count: 2, by: 0.5) }
+        #expect(i24 == [0xFE, 0xFF, 0xFF, 0x00, 0x00, 0x40])
+        i24.withUnsafeMutableBytes { SampleFormat.int24.scale($0.baseAddress!, count: 2, by: 0) }
+        #expect(i24.allSatisfy { $0 == 0 })
+    }
+
+    @Test func ringRewritesAcrossTheWrap() {
+        let ring = HistoryRing()
+        ring.reset(capacity: 8, bytesPerFrame: 1)
+        let bytes: [UInt8] = Array(1...12)    // positions 0...11; the first four are overwritten
+        bytes.withUnsafeBytes { ring.push($0) }
+        var seen: [Int] = []
+        ring.rewrite(from: 2, to: 11) { piece, position in   // 2 and 3 are gone; 4...10 remain, across the wrap
+            seen.append(position)
+            piece.initializeMemory(as: UInt8.self, repeating: 0)
+        }
+        #expect(seen == [4, 8])
+        var position = 4
+        var out = [UInt8](repeating: 9, count: 8)
+        out.withUnsafeMutableBytes { _ = ring.read(from: &position, into: $0) }
+        #expect(out == [0, 0, 0, 0, 0, 0, 0, 12])
+    }
 }

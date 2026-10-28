@@ -92,8 +92,13 @@ import Testing
         var openBlockStarts = [Int]()
         /// The audio frame count at the end of the last block with the gate open.
         var lastOpenFrame = 0
+        /// The receiver's audio before its squelch gate, when the rig hands that to the auto recorder.
+        var ungated = [Float]()
+        let passesUngated: Bool
 
-        init(timing: AutoRecordTiming = AutoRecordTiming(startAfter: 2, stopAfter: 15), enabled: Bool = true) {
+        init(timing: AutoRecordTiming = AutoRecordTiming(startAfter: 2, stopAfter: 15), enabled: Bool = true,
+             passesUngated: Bool = false) {
+            self.passesUngated = passesUngated
             dir = FileManager.default.temporaryDirectory.appendingPathComponent("AutoRecorderTests-\(UUID().uuidString)", isDirectory: true)
             try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             recorder = StreamRecorder(kind: .audio, rollsOnContextChange: false)
@@ -126,7 +131,14 @@ import Testing
                 if open { openBlockStarts.append(audio.count) }
                 audio += block
                 if open { lastOpenFrame = audio.count }
-                block.withUnsafeBufferPointer { auto.process($0, gateOpen: open) }
+                if passesUngated {
+                    ungated += receiver.ungatedAudio
+                    block.withUnsafeBufferPointer { heard in
+                        receiver.ungatedAudio.withUnsafeBufferPointer { auto.process(heard, ungated: $0, gateOpen: open) }
+                    }
+                } else {
+                    block.withUnsafeBufferPointer { auto.process($0, gateOpen: open) }
+                }
                 i = end
             }
         }
@@ -423,5 +435,49 @@ import Testing
         #expect(file.count > Int(speech.last!.end * Self.audioRate))
         #expect(file.elementsEqual(rig.audio.prefix(file.count)))
         #expect(file.contains { $0 != 0 })
+    }
+
+    @Test func shortGapsKeepTheirRealAudioAndLongOnesAreSilenced() throws {
+        let first = Self.train(from: 3, count: 6)
+        let second = Self.train(from: first.last!.end + 4, count: 6)     // a 4 s gap: kept as heard on air
+        let third = Self.train(from: second.last!.end + 15, count: 6)    // a 15 s gap: silenced in the middle
+        let iq = Self.signal(seconds: third.last!.end + 40, bursts: first + second + third)
+
+        let rig = Rig(timing: AutoRecordTiming(startAfter: 2, stopAfter: 30, keepGapsUpTo: 8), passesUngated: true)
+        rig.run(iq)
+        #expect(rig.waitForWriter())
+        let files = try rig.wavs()
+        #expect(files.count == 1, "\(files.count) files")
+        guard files.count == 1 else { return }
+        let file = try Self.readWAV(files[0])
+
+        // Runs of digital silence in the file.
+        var runs: [Range<Int>] = []
+        var k = 0
+        while k < file.count {
+            guard file[k] == 0 else { k += 1; continue }
+            var e = k
+            while e < file.count, file[e] == 0 { e += 1 }
+            if e - k > Int(0.05 * Self.audioRate) { runs.append(k..<e) }
+            k = e
+        }
+        #expect(runs.count == 1, "only the long gap is silent: \(runs.map { Self.seconds($0.count) })")
+        guard runs.count == 1 else { return }
+        // The 15 s gap keeps 2 s of tail after the gate shut (which lags the burst by ~0.15 s) and 0.5 s
+        // of lead before it opens again; 10 ms fades at each end are not exact zeros.
+        let silent = Self.seconds(runs[0].count)
+        #expect(silent > 15 - 2.5 - 0.3 && silent < 15 - 2.5, "silent \(silent) s")
+
+        // Everything else is the receiver's ungated audio, sample for sample.
+        let probe = Array(file.prefix(64))
+        let start = (0..<(rig.ungated.count - 64)).first { rig.ungated[$0..<$0 + 64].elementsEqual(probe) }
+        #expect(start != nil, "the file begins as a stretch of the ungated audio")
+        guard let start else { return }
+        let fade = Int(StreamRecorder.silenceFadeSeconds * Self.audioRate)
+        let kept = (0..<file.count).filter { $0 < runs[0].lowerBound - fade || $0 >= runs[0].upperBound + fade }
+        #expect(kept.allSatisfy { file[$0] == rig.ungated[start + $0] }, "outside the silenced gap the file is the ungated audio")
+        // The kept 4 s gap really carries the noise between the bursts, not silence.
+        let gapStart = Int(first.last!.end * Self.audioRate) + Int(0.5 * Self.audioRate) - start
+        #expect(file[gapStart..<gapStart + Int(Self.audioRate)].contains { $0 != 0 })
     }
 }

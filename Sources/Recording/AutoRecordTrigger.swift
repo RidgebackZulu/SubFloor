@@ -6,6 +6,10 @@ public struct AutoRecordTiming: Equatable, Sendable, Codable {
     public var startAfter = 2.0
     /// Seconds the squelch must stay shut before the recording ends.
     public var stopAfter = 30.0
+    /// Inside a recording, a squelch gap up to this long keeps its real audio, so the pauses between
+    /// words sound as they did on air. A longer gap keeps `tail` after the last word and `lead` before
+    /// the next, and is silent in between.
+    public var keepGapsUpTo = 8.0
 
     /// A gap this short or shorter does not break a run: speech has syllable gaps.
     public static let bridge = 1.5
@@ -15,16 +19,18 @@ public struct AutoRecordTiming: Equatable, Sendable, Codable {
     public static let tail = 2.0
     public static let startAfterRange = 0.5...10.0
     public static let stopAfterChoices: [Double] = [5, 10, 15, 30, 45, 60, 90, 120, 180, 300, 600]
+    public static let keepGapsUpToChoices: [Double] = [1, 2, 3, 5, 8, 10, 15, 20, 30]
     /// The most the audio ring must hold behind the head for any timing: the longest Stop after, the
     /// longest Start after, the bridge and the lead.
     public static let maxHoldbackSeconds = 600 + 10 + bridge + lead   // 612
 
-    public init(startAfter: Double = 2.0, stopAfter: Double = 30.0) {
+    public init(startAfter: Double = 2.0, stopAfter: Double = 30.0, keepGapsUpTo: Double = 8.0) {
         self.startAfter = startAfter
         self.stopAfter = stopAfter
+        self.keepGapsUpTo = keepGapsUpTo
     }
 
-    private enum CodingKeys: String, CodingKey { case startAfter, stopAfter }
+    private enum CodingKeys: String, CodingKey { case startAfter, stopAfter, keepGapsUpTo }
 
     /// Every key is optional and a missing one keeps its default, so a timing saved by another
     /// SubFloor (with a field added or gone) still decodes instead of losing the whole session.
@@ -32,14 +38,17 @@ public struct AutoRecordTiming: Equatable, Sendable, Codable {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         let d = AutoRecordTiming()
         self = AutoRecordTiming(startAfter: try c.decodeIfPresent(Double.self, forKey: .startAfter) ?? d.startAfter,
-                                stopAfter: try c.decodeIfPresent(Double.self, forKey: .stopAfter) ?? d.stopAfter).normalized()
+                                stopAfter: try c.decodeIfPresent(Double.self, forKey: .stopAfter) ?? d.stopAfter,
+                                keepGapsUpTo: try c.decodeIfPresent(Double.self, forKey: .keepGapsUpTo) ?? d.keepGapsUpTo).normalized()
     }
 
-    /// Clamps Start after into its range and snaps Stop after to the nearest choice (the lower on a tie).
+    /// Clamps Start after into its range and snaps Stop after and Keep gaps up to to their nearest
+    /// choices (the lower on a tie).
     public func normalized() -> AutoRecordTiming {
         let start = min(max(startAfter, Self.startAfterRange.lowerBound), Self.startAfterRange.upperBound)
         let stop = Self.stopAfterChoices.min { abs($0 - stopAfter) < abs($1 - stopAfter) } ?? 30
-        return AutoRecordTiming(startAfter: start, stopAfter: stop)
+        let keep = Self.keepGapsUpToChoices.min { abs($0 - keepGapsUpTo) < abs($1 - keepGapsUpTo) } ?? 8
+        return AutoRecordTiming(startAfter: start, stopAfter: stop, keepGapsUpTo: keep)
     }
 }
 
@@ -54,6 +63,8 @@ public struct AutoRecordTrigger: Sendable {
         case commit(throughFrame: Int)
         /// The file ends before this frame.
         case stop(atFrame: Int)
+        /// A squelch gap longer than Keep gaps up to: these frames, not yet committed, are written silent.
+        case silence(fromFrame: Int, toFrame: Int)
         /// A run of gate activity that never reached Start after: its first open frame and the span from
         /// there to its last open frame (bridged gaps included), which the timeline shows as a length of time.
         case pop(atFrame: Int, frames: Int)
@@ -95,6 +106,7 @@ public struct AutoRecordTrigger: Sendable {
         lastHead = head
         guard head > previous else { return }
 
+        let gapStart = lastOpenEnd
         if gateOpen {
             if phase == .idle {
                 phase = .run
@@ -120,6 +132,11 @@ public struct AutoRecordTrigger: Sendable {
                 phase = .idle
             }
         case .recording:
+            if gateOpen, previous - gapStart > frames(timing.keepGapsUpTo) {
+                // Reopened after a long gap. Only up to the gap's tail is committed, so the rest is still ours.
+                let from = gapStart + frames(AutoRecordTiming.tail), to = previous - frames(AutoRecordTiming.lead)
+                if to > from { events.append(.silence(fromFrame: from, toFrame: to)) }
+            }
             let through = min(head, lastOpenEnd + frames(AutoRecordTiming.tail))
             if through > committed {
                 committed = through

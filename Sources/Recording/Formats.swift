@@ -14,6 +14,29 @@ public enum SampleFormat: String, Codable, CaseIterable, Sendable, Identifiable 
         }
     }
     public var bitsPerSample: Int { bytesPerSample * 8 }
+
+    /// Multiplies `count` samples stored in this format at `bytes` by `gain`, in place.
+    public func scale(_ bytes: UnsafeMutableRawPointer, count: Int, by gain: Float) {
+        guard gain != 1 else { return }
+        guard gain != 0 else { bytes.initializeMemory(as: UInt8.self, repeating: 0, count: count * bytesPerSample); return }
+        for k in 0..<count {
+            let p = bytes + k * bytesPerSample
+            switch self {
+            case .float32:
+                p.storeBytes(of: p.loadUnaligned(as: Float.self) * gain, as: Float.self)
+            case .int16:
+                let v = Float(Int16(littleEndian: p.loadUnaligned(as: Int16.self))) * gain
+                p.storeBytes(of: Int16(v.rounded()).littleEndian, as: Int16.self)
+            case .int24:
+                let b = p.assumingMemoryBound(to: UInt8.self)
+                let raw = Int32(b[0]) | Int32(b[1]) << 8 | Int32(b[2]) << 16
+                let v = Int32((Float((raw << 8) >> 8) * gain).rounded())   // sign-extended from 24 bits
+                b[0] = UInt8(truncatingIfNeeded: v)
+                b[1] = UInt8(truncatingIfNeeded: v >> 8)
+                b[2] = UInt8(truncatingIfNeeded: v >> 16)
+            }
+        }
+    }
     public var isFloat: Bool { self == .float32 }
     public var label: String {
         switch self {

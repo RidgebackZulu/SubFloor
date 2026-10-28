@@ -336,6 +336,41 @@ public final class StreamRecorder: @unchecked Sendable {
         _ = committedFrames.max(throughFrame, ordering: .releasing)
     }
 
+    /// How long `silence` fades out and back in, so neither edge of a silenced stretch clicks.
+    static let silenceFadeSeconds = 0.01
+
+    /// Makes frames `fromFrame` to `toFrame` silent in the history, fading out over the first 10 ms
+    /// and back in over the last 10 ms. Only frames an auto session has not committed are touched: the
+    /// writer may be reading the ones below. Producer side (DSP thread).
+    public func silence(fromFrame: Int, toFrame: Int) {
+        producer.withLock { p in
+            guard let setup = p.setup else { return }
+            let bpf = ring.bytesPerFrame, format = setup.sampleFormat, channels = max(setup.channels, 1)
+            let from = max(fromFrame, committedFrames.load(ordering: .acquiring)), to = toFrame
+            guard to > from else { return }
+            let fade = max(1, min(Int(setup.sampleRate * Self.silenceFadeSeconds), (to - from) / 2))
+            ring.rewrite(from: from * bpf, to: to * bpf) { bytes, position in
+                guard let base = bytes.baseAddress else { return }
+                let first = position / bpf, count = bytes.count / bpf
+                // Pieces: fade-out frames, then all-zero frames, then fade-in frames.
+                var i = 0
+                while i < count {
+                    let f = first + i
+                    let fromStart = f - from, fromEnd = to - 1 - f
+                    if fromStart >= fade && fromEnd >= fade {
+                        let run = min(count - i, to - fade - f)
+                        format.scale(base + i * bpf, count: run * channels, by: 0)
+                        i += run
+                    } else {
+                        let gain = max(0, 1 - Float(min(fromStart, fromEnd) + 1) / Float(fade))
+                        format.scale(base + i * bpf, count: channels, by: gain)
+                        i += 1
+                    }
+                }
+            }
+        }
+    }
+
     /// Ends an auto session at `atFrame` (at the written position if that is already behind us, at the
     /// head if it is ahead). Ignored unless the session is an auto one.
     public func stop(atFrame: Int) {

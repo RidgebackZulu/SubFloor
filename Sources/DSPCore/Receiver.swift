@@ -42,6 +42,9 @@ public final class Receiver: @unchecked Sendable {
     /// Whether the squelch gate is open after the last block: true when no squelch is set. The audio
     /// of that block was gated by it.
     public var isSquelchOpen: Bool { squelchOpen }
+    /// The last block's audio as it was before the squelch gate: what an auto recording keeps through
+    /// the short gaps between words. Reused from block to block, so it allocates nothing once warm.
+    public private(set) var ungatedAudio: [Float] = []
 
     private var nco = NCO()
     private var stages: [ComplexDecimator] = []
@@ -167,6 +170,8 @@ public final class Receiver: @unchecked Sendable {
         let start = audio.count
         filtered.withUnsafeBufferPointer { resampler.process($0, into: &audio) }
         agc.process(&audio, from: start)
+        ungatedAudio.removeAll(keepingCapacity: true)
+        ungatedAudio.append(contentsOf: audio[start...])
         applySquelchGain(&audio, from: start)
     }
 

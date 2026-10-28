@@ -438,7 +438,9 @@ final class DSPEngine: @unchecked Sendable {
             audioOut.removeAll(keepingCapacity: true)
             block.withUnsafeBufferPointer { receiver.process(UnsafeBufferPointer(rebasing: $0[0..<n]), audio: &audioOut) }
             guard !audioOut.isEmpty else { continue }
-            audioOut.withUnsafeBufferPointer { autoRecorder.process($0, gateOpen: receiver.isSquelchOpen) }
+            audioOut.withUnsafeBufferPointer { heard in
+                receiver.ungatedAudio.withUnsafeBufferPointer { autoRecorder.process(heard, ungated: $0, gateOpen: receiver.isSquelchOpen) }
+            }
             audioOut.withUnsafeMutableBufferPointer { a in
                 var gain = volume
                 vDSP_vsmul(a.baseAddress!, 1, &gain, a.baseAddress!, 1, vDSP_Length(a.count))

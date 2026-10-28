@@ -33,7 +33,11 @@ Goals
 - Audio-only auto-record triggered by the existing squelch. **(user: no IQ)**
 - Short squelch breaks never make a file. **(user)**
 - One long recording per transmission, through fades and pauses. **(user)**
-- The squelched stretches inside a recording are silent, as the live audio is today. **(user)**
+- ~~The squelched stretches inside a recording are silent, as the live audio is today.~~ Changed 2026-10-27
+  **(user)**: hard squelch gaps between words sounded awkward and clipped word edges. A recording now
+  keeps the real (squelch-open) audio through gaps up to *Keep gaps up to* (Settings › Recording,
+  default 8 s, 1–30 s); a longer gap keeps 2 s after the last word and 0.5 s before the next and is
+  silent in between, with 10 ms fades.
 - The start of a transmission is never cut off by the decision delay (the rolling buffer). **(user)**
 - A day timeline in a separate window with lanes per frequency, click-to-select markers, mouse
   scrubbing, and Dial scrubbing with jump sizes chosen on the Dial. **(user)**

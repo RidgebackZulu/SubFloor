@@ -73,7 +73,10 @@ private struct RecordingSection: View {
             Picker("and stops after", selection: $model.recording.autoTiming.stopAfter) {
                 ForEach(AutoRecordTiming.stopAfterChoices, id: \.self) { Text(RecordingFormat.span($0)).tag($0) }
             }
-            Text("Auto-record starts when the squelch has been open that long (gaps under 1.5 s don't count against it), begins half a second before the signal, and ends 2 s after the signal once the squelch has stayed shut for the stop time.")
+            Picker("Keep gaps up to", selection: $model.recording.autoTiming.keepGapsUpTo) {
+                ForEach(AutoRecordTiming.keepGapsUpToChoices, id: \.self) { Text(RecordingFormat.span($0)).tag($0) }
+            }
+            Text("Auto-record starts when the squelch has been open that long (gaps under 1.5 s don't count against it), begins half a second before the signal, and ends 2 s after the signal once the squelch has stayed shut for the stop time. Inside a recording, pauses up to the keep time are recorded as heard on air, squelch open; longer ones keep 2 s after the last word and half a second before the next, and are silent between.")
                 .font(.caption).foregroundStyle(.secondary)
             Picker("Audio file", selection: $model.recording.audioFormat) {
                 ForEach(StreamKind.audio.fileFormats) { Text($0.label).tag($0) }

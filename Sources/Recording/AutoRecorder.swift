@@ -115,8 +115,14 @@ public final class AutoRecorder: @unchecked Sendable {
 
     /// One block of mono audio and whether the squelch gate was open over it. The audio always goes to
     /// the recorder's history first, so the trigger sees the head after it.
-    public func process(_ audio: UnsafeBufferPointer<Float>, gateOpen: Bool) {
-        recorder.push(audio)
+    ///
+    /// `ungated` is the same block before the squelch gate. While Auto is on (and no manual recording
+    /// owns the recorder) that is what the history keeps, so a recording carries the real audio through
+    /// the pauses between words and the edges of each word; the trigger then silences only the gaps
+    /// longer than Keep gaps up to. Otherwise the history keeps `audio`, as heard.
+    public func process(_ audio: UnsafeBufferPointer<Float>, ungated: UnsafeBufferPointer<Float>? = nil, gateOpen: Bool) {
+        let keepsGaps = applied.enabled && recorder.sessionKind != .manual
+        recorder.push(keepsGaps ? (ungated ?? audio) : audio)
         applyPending()
 
         guard applied.enabled else {
@@ -182,6 +188,8 @@ public final class AutoRecorder: @unchecked Sendable {
                 recorder.commit(throughFrame: frame)
             case .stop(let frame):
                 recorder.stop(atFrame: frame)
+            case .silence(let from, let to):
+                recorder.silence(fromFrame: from, toFrame: to)
             case .pop(let frame, let frames):
                 let at = recorder.now().addingTimeInterval(-Double(head - frame) / rate)
                 log(IgnoredPop(at: at, seconds: Double(frames) / rate))
