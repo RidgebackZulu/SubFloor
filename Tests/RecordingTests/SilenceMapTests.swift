@@ -42,3 +42,43 @@ private func near(_ actual: Double?, _ expected: Double?) -> Bool {
     #expect(near(loud.skipTarget(from: 0), nil))
     #expect(near(loud.skipTarget(from: 0.5), nil))
 }
+
+@Test func aPartialLastBinEndsTheRunAtTheTrueEnd() {
+    // 1.505 s: 100 loud bins, then 51 silent bins, the last of which holds only 240 frames (5 ms).
+    let bins = [UInt8](repeating: 255, count: 100) + [UInt8](repeating: 0, count: 51)
+    let map = SilenceMap(peaks: WaveformPeaks(sampleRate: 48_000, frames: 150 * 480 + 240, peaks: bins))
+    #expect(near(map.duration, 1.505))
+    #expect(map.runs.count == 1)
+    #expect(map.runs.last?.upperBound == map.duration)   // clamped: the full bin would overrun to 1.51
+    #expect(map.runs.last!.upperBound < 151.0 / 100)
+    #expect(near(map.skipTarget(from: 1.2), map.duration))
+}
+
+@Test func aRunOfExactlyAQuarterSecondIsKept() {
+    let map = SilenceMap(peaks: peaks((100, true), (25, false), (100, true)))
+    #expect(map.runs == [1.0..<1.25])
+}
+
+@Test func aRunOfTwentyFourBinsIsDropped() {
+    let map = SilenceMap(peaks: peaks((100, true), (24, false), (100, true)))
+    #expect(map.runs.isEmpty)
+}
+
+@Test func aPositionAtARunsEndIsOutsideIt() {
+    let map = SilenceMap(peaks: peaks((100, true), (200, false), (100, true)))   // silent 1.0..<3.0
+    #expect(near(map.skipTarget(from: 3.0), nil))
+}
+
+@Test func emptyPeaksHaveNoRuns() {
+    let map = SilenceMap(peaks: WaveformPeaks(sampleRate: 48_000, frames: 0, peaks: []))
+    #expect(map.runs.isEmpty)
+    #expect(map.duration == 0)
+    #expect(near(map.skipTarget(from: 0), nil))
+}
+
+@Test func aGainOfExactlyFiveHundredthsIsKept() {
+    // 0.5 s loud, then 0.55 s silent: the run reaches the end at 1.05 s, so from 1.0 the gain is 0.05.
+    let map = SilenceMap(peaks: peaks((50, true), (55, false)))
+    #expect(near(map.skipTarget(from: 1.0), 1.05))
+    #expect(near(map.skipTarget(from: 1.01), nil))   // 0.04 s gained: not worth the jump
+}
