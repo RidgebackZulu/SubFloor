@@ -38,6 +38,12 @@ public final class SpectralNoiseReducer {
     private static let xiMin: Float = 0.003_162_277_7     // −25 dB
     /// Mean input power (−80 dBFS) below which a frame or hop is digital silence.
     private static let silence: Float = 1e-8
+    /// Mean input power (+120 dBFS) above which, or NaN, a frame is not audio: it passes through
+    /// untouched and updates no state, so one bad sample cannot poison the noise estimate or the
+    /// a-priori SNR. Below it every intermediate stays finite.
+    private static let overload: Float = 1e12
+    /// Cap on E1's argument: its rational branch squares it, which overflows Float past ~1e19.
+    private static let vMax: Float = 1e15
     /// Mean a-posteriori SNR over 300–3000 Hz above which a frame is speech (6 dB).
     private static let speechGamma: Float = 4
     /// A speech-band bin counts towards `voiceLossDb` when its a-posteriori SNR is above this (6 dB
@@ -183,8 +189,9 @@ public final class SpectralNoiseReducer {
         silentHops = (silentHops << 1 | (hopPower < Self.silence ? 1 : 0)) & ((1 << (n / h)) - 1)
         let touchesSilence = silentHops != 0
 
-        if framePower < Self.silence || (touchesSilence && !trackerStarted) {
-            // Digital silence (or no noise estimate yet): out as in, no state updated.
+        if framePower < Self.silence || !(framePower <= Self.overload) || (touchesSilence && !trackerStarted) {
+            // Digital silence, NaN, infinity or overload (or no noise estimate yet): out as in, no
+            // state updated.
             vDSP_vma(input, 1, passThrough, 1, accumulator, 1, accumulator, 1, vDSP_Length(n))
         } else {
             reduce(updatingTracker: !touchesSilence)
@@ -226,7 +233,7 @@ public final class SpectralNoiseReducer {
             let r = xi / (1 + xi)
             gamma[k] = g
             ratio[k] = r
-            v[k] = max(r * g, 1e-8)
+            v[k] = min(max(r * g, 1e-8), Self.vMax)
         }
         exponentialIntegral()
         var halfScale: Float = 0.5

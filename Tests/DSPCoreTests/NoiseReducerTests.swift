@@ -361,3 +361,41 @@ private func rmsDb(_ y: [Float], _ start: Int, _ count: Int = 128) -> Double { l
     let change = toneDb(y[(a + l)..<(b + l)]) - toneDb(x[a..<b])
     #expect(change >= -2, "the syllable after turning NR on again: \(change) dB")
 }
+
+@Test func aNaNOrInfinityInTheInputDoesNotStick() {
+    // A NaN and an infinity in settled noise: the frames holding them come out as they went in, and
+    // once they have passed the output is finite and still reduced.
+    var x = noise(seconds: 6, rms: 0.1, seed: 32)
+    x[3 * Int(fs) + 100] = .nan
+    x[Int(3.2 * fs) + 7] = .infinity
+    let reducer = SpectralNoiseReducer()
+    reducer.strength = 0.5
+    let y = run(reducer, x)
+    let l = reducer.latency
+    let after = Int(3.3 * fs) + l
+    #expect(y[after...].allSatisfy { $0.isFinite })
+    #expect(reducer.voiceLossDb.isFinite)
+    let before = reductionDb(x, y, latency: l, from: 2.5, to: 3), later = reductionDb(x, y, latency: l, from: 3.5, to: 5.9)
+    #expect((-16.0 ... -11.0).contains(later), "reduction \(later) dB after, \(before) dB before")
+
+    let nr = NoiseReducer()
+    nr.update(NoiseReductionSettings(enabled: true, strength: 0.5))
+    let z = runNR(nr, x)
+    #expect(z[after...].allSatisfy { $0.isFinite })
+    #expect(nr.makeupDb.isFinite)
+}
+
+@Test func aHugeToneOverQuietNoiseGivesNoNaNs() {
+    // A 1e6 burst (framed power 5e11) over noise just above digital silence: the a-posteriori SNR
+    // reaches ~1e21, past what the exponential integral's rational approximation can square.
+    let x = mix(noise(seconds: 6, rms: 2e-4, seed: 33),
+                [Float](repeating: 0, count: 3 * Int(fs)) + tone(seconds: 0.2, amplitude: 1e6, frequency: 1000)
+                    + [Float](repeating: 0, count: Int(2.8 * fs)))
+    let reducer = SpectralNoiseReducer()
+    reducer.strength = 0.5
+    let y = run(reducer, x)
+    #expect(y.allSatisfy { $0.isFinite })
+    #expect(reducer.voiceLossDb.isFinite)
+    let later = reductionDb(x, y, latency: reducer.latency, from: 3.6, to: 5.9)
+    #expect((-16.0 ... -11.0).contains(later), "reduction \(later) dB after the burst")
+}
