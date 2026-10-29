@@ -53,6 +53,8 @@ struct TopBarView: View {
                   ? "HamItUp on: radio tuned \(FrequencyFormatter.short(model.upconverter.loHz)) above the display frequency (⌘U)"
                   : "HamItUp off: direct sampling (⌘U turns it on)")
 
+            NoiseReductionButton(settings: Bindable(model).noiseReduction, available: model.noiseReductionAvailable)
+
             RecordCluster()
 
             Button { model.addBookmark() } label: { Image(systemName: "star") }
