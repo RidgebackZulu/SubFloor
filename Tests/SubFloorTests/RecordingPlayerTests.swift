@@ -1,4 +1,5 @@
 import AVFoundation
+import DSPCore
 import Foundation
 import Recording
 import SubFloorCore
@@ -6,8 +7,9 @@ import Testing
 @testable import SubFloor
 
 /// The player that opens a recording from the Recordings window, and the live radio going quiet while it
-/// plays. The WAVs are three seconds of silence: the tests play through the real output device, so they make
-/// no sound, and they wait on bounded conditions, never on real-time pacing.
+/// plays. The tests that play through the real output device use WAVs of silence, so they make no sound, and
+/// they wait on bounded conditions, never on real-time pacing (one position check has a tolerance). The tests
+/// that need sound (noise, tones) render the player's engine offline.
 @MainActor
 @Suite(.serialized)
 struct RecordingPlayerTests {
@@ -19,16 +21,16 @@ struct RecordingPlayerTests {
         return dir
     }
 
-    private func name(_ offset: Double, ext: String = "wav") -> String {
+    private func name(_ offset: Double, ext: String = "wav", mode: String = "NFM") -> String {
         let f = DateFormatter()
         f.locale = Locale(identifier: "en_US_POSIX")
         f.timeZone = TimeZone(identifier: "UTC")
         f.dateFormat = "yyyyMMdd_HHmmss"
-        return "SubFloor_\(f.string(from: Self.base.addingTimeInterval(offset)))Z_146520000Hz_NFM.\(ext)"
+        return "SubFloor_\(f.string(from: Self.base.addingTimeInterval(offset)))Z_146520000Hz_\(mode).\(ext)"
     }
 
-    /// A mono 16-bit PCM WAV of silence.
-    private func writeWAV(_ url: URL, seconds: Double, rate: Int = 48_000) throws {
+    /// A mono 16-bit PCM WAV of silence, or of white noise at about −15 dBFS RMS.
+    private func writeWAV(_ url: URL, seconds: Double, rate: Int = 48_000, noise: Bool = false) throws {
         let frames = Int(seconds * Double(rate))
         var data = Data()
         func u32(_ v: Int) { withUnsafeBytes(of: UInt32(v).littleEndian) { data.append(contentsOf: $0) } }
@@ -36,7 +38,14 @@ struct RecordingPlayerTests {
         data.append(contentsOf: Array("RIFF".utf8)); u32(36 + frames * 2)
         data.append(contentsOf: Array("WAVEfmt ".utf8)); u32(16); u16(1); u16(1); u32(rate); u32(rate * 2); u16(2); u16(16)
         data.append(contentsOf: Array("data".utf8)); u32(frames * 2)
-        data.append(Data(count: frames * 2))
+        if noise {
+            var generator = SystemRandomNumberGenerator()
+            for _ in 0..<frames {
+                withUnsafeBytes(of: Int16.random(in: -10_000...10_000, using: &generator).littleEndian) { data.append(contentsOf: $0) }
+            }
+        } else {
+            data.append(Data(count: frames * 2))
+        }
         try data.write(to: url)
     }
 
@@ -46,14 +55,14 @@ struct RecordingPlayerTests {
         let folder: URL, library: RecordingsLibrary, player: RecordingPlayer, muted: Muted, files: [String]
     }
 
-    /// A folder of `count` three-second recordings, each with a `recording` line so it is unheard, and a
-    /// player over the library once it has read them.
-    private func rig(count: Int = 1) async throws -> Rig {
+    /// A folder of `count` recordings (three seconds of silence unless asked otherwise), each with a `recording`
+    /// line so it is unheard, and a player over the library once it has read them.
+    private func rig(count: Int = 1, seconds: Double = 3, mode: String = "NFM", noise: Bool = false) async throws -> Rig {
         let folder = tempFolder()
-        let files = (0..<count).map { name(Double($0) * 60) }
-        for file in files { try writeWAV(folder.appendingPathComponent(file), seconds: 3) }
+        let files = (0..<count).map { name(Double($0) * 60, mode: mode) }
+        for file in files { try writeWAV(folder.appendingPathComponent(file), seconds: seconds, noise: noise) }
         try RecordingLog(folder: folder).append(files.enumerated().map { i, file in
-            .recording(file: file, start: Self.base.addingTimeInterval(Double(i) * 60), seconds: 3, frequencyHz: 146_520_000, mode: "NFM", auto: true)
+            .recording(file: file, start: Self.base.addingTimeInterval(Double(i) * 60), seconds: seconds, frequencyHz: 146_520_000, mode: mode, auto: true)
         })
         let library = RecordingsLibrary(folder: folder)
         await library.reload()
@@ -136,19 +145,22 @@ struct RecordingPlayerTests {
         p.unload()
     }
 
-    @Test func aPlayerThatStopsWithoutSayingSoUnmutes() async throws {
+    @Test func anEngineThatStopsUnmutes() async throws {
         let r = try await rig()
         let p = r.player
         p.load(try recording(r))
         p.seek(to: 1)
         p.play()
         #expect(r.muted.values.last == true)
-        let audio = try #require(p.audio)
-        audio.stop()   // no delegate call, as when an output device goes away
-        let stoppedAt = audio.currentTime
+        let stoppedAt = p.position
+        p.engine.stop()   // behind the player's back, as when an output device goes away
         #expect(wait(upTo: 10) { !p.isPlaying })
         #expect(r.muted.values.last == false)
         #expect(abs(p.position - stoppedAt) < 0.001)   // where it stopped, inside the file
+        #expect(p.position > 0 && p.position < p.duration)
+        p.play()   // the engine starts again
+        #expect(p.isPlaying)
+        #expect(wait(upTo: 5) { p.position > stoppedAt + 0.05 })
         p.unload()
     }
 
@@ -285,5 +297,160 @@ struct RecordingPlayerTests {
         #expect(m.player.file == nil)
         #expect(!m.player.isPlaying)
         #expect(!m.liveAudioMuted)
+    }
+
+    @Test func seekingWhilePlayingKeepsPlaying() async throws {
+        let r = try await rig()
+        let p = r.player
+        p.load(try recording(r))
+        p.play()
+        #expect(wait(upTo: 5) { p.position > 0.05 })
+        p.seek(to: p.duration / 2)
+        #expect(p.isPlaying)
+        wait(upTo: 0.2) { false }
+        #expect(p.isPlaying)
+        #expect(p.position >= p.duration / 2)
+        #expect(p.position < p.duration)
+        #expect(r.muted.values.last == true)
+        p.unload()
+    }
+
+    @Test func positionFollowsAFileOfKnownLength() async throws {
+        let r = try await rig(seconds: 2)
+        let p = r.player
+        p.load(try recording(r))
+        #expect(abs(p.duration - 2) < 0.001)
+        p.play()
+        wait(upTo: 0.5) { false }
+        #expect(p.isPlaying)
+        print("position \(p.position) s after 0.5 s of playing")
+        #expect(abs(p.position - 0.5) <= 0.15, "position \(p.position) s after 0.5 s")
+        p.unload()
+    }
+
+    @Test func nrSettingReachesTheEffect() async throws {
+        let usb = try await rig(mode: "USB")
+        let p = usb.player
+        #expect(!p.noiseReductionAvailable)   // nothing loaded
+        p.load(try recording(usb))
+        #expect(p.noiseReductionAvailable)
+        p.noiseReduction = NoiseReductionSettings(enabled: true, strength: 0.7)
+        let unit = try #require(p.noiseReductionUnit)
+        #expect(unit.requested.enabled)
+        #expect(abs(unit.requested.strength - 0.7) < 1e-6)
+        p.noiseReduction.enabled = false
+        #expect(!unit.requested.enabled)
+        p.unload()
+        #expect(!p.noiseReductionAvailable)
+
+        let wfm = try await rig(mode: "WFM")
+        wfm.player.noiseReduction = NoiseReductionSettings(enabled: true, strength: 0.7)
+        wfm.player.load(try recording(wfm))
+        #expect(!wfm.player.noiseReductionAvailable)
+        #expect(wfm.player.noiseReductionUnit?.requested.enabled != true)
+        wfm.player.unload()
+
+        let unknown = try await rig(mode: "DRM")
+        unknown.player.noiseReduction = NoiseReductionSettings(enabled: true, strength: 0.7)
+        unknown.player.load(try recording(unknown))
+        #expect(!unknown.player.noiseReductionAvailable)
+        #expect(unknown.player.noiseReductionUnit?.requested.enabled != true)
+        unknown.player.unload()
+    }
+
+    @Test func appModelHandsThePlayerItsNRSetting() {
+        let dir = tempFolder()
+        let m = AppModel(bookmarkStore: BookmarkStore(url: dir.appendingPathComponent("bookmarks.json")),
+                         defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        defer { m.shutdown() }
+        #expect(m.player.noiseReduction == m.noiseReduction)
+        m.noiseReduction = NoiseReductionSettings(enabled: true, strength: 0.9)
+        #expect(m.player.noiseReduction == NoiseReductionSettings(enabled: true, strength: 0.9))
+    }
+
+    /// Offline, through the engine's manual rendering: three seconds of white noise, the last second measured.
+    @Test func playbackThroughNRIsQuieterOnNoise() async throws {
+        let off = try await lastSecondRMS(nr: false)
+        let on = try await lastSecondRMS(nr: true)
+        #expect(off > 0.01)
+        let db = 20 * log10(Double(on) / Double(off))
+        print("NR on vs off over the last second of white noise: \(db) dB")
+        #expect(db <= -10, "NR on is \(db) dB against off")
+    }
+
+    /// WAV at another rate and in stereo, FLAC and M4A: each opens with its length, and plays through the
+    /// effect (converted to 48 kHz mono on the way) at about the level it was written. NR is off: a steady
+    /// tone is exactly what the reducer learns as noise.
+    @Test func otherFormatsPlayThroughTheEffect() async throws {
+        let cases: [(ext: String, format: AudioFormatID, rate: Double, channels: Int)] = [
+            ("wav", kAudioFormatLinearPCM, 44_100, 2), ("flac", kAudioFormatFLAC, 48_000, 1),
+            ("m4a", kAudioFormatMPEG4AAC, 44_100, 2), ("wav", kAudioFormatLinearPCM, 24_000, 1)]
+        for c in cases {
+            let folder = tempFolder()
+            let file = name(0, ext: c.ext, mode: "USB")
+            try writeTone(folder.appendingPathComponent(file), format: c.format, rate: c.rate, channels: c.channels, seconds: 2)
+            try RecordingLog(folder: folder).append([
+                .recording(file: file, start: Self.base, seconds: 2, frequencyHz: 146_520_000, mode: "USB", auto: true)])
+            let library = RecordingsLibrary(folder: folder)
+            await library.reload()
+            let p = RecordingPlayer(library: library, setLiveMuted: { _ in })
+            p.volume = 1
+            let format = try #require(AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1))
+            try p.engine.enableManualRenderingMode(.offline, format: format, maximumFrameCount: 4096)
+            p.load(try #require(library.catalog.recording(file)))
+            #expect(p.loadError == nil, "\(c)")
+            #expect(abs(p.duration - 2) < 0.05, "\(c): \(p.duration) s")
+            #expect(p.noiseReductionAvailable)
+            p.play()
+            let buffer = try #require(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4096))
+            var rendered: [Float] = []
+            while rendered.count < 48_000 * 3 / 2 {
+                guard try p.engine.renderOffline(4096, to: buffer) == .success else { break }
+                rendered += UnsafeBufferPointer(start: buffer.floatChannelData![0], count: Int(buffer.frameLength))
+            }
+            p.unload()
+            let middle = rendered[24_000..<min(rendered.count, 72_000)]
+            let rms = (middle.reduce(0) { $0 + $1 * $1 } / Float(max(middle.count, 1))).squareRoot()
+            print("\(c): rendered RMS \(20 * log10(rms)) dBFS (tone written at −15 dBFS RMS per channel)")
+            #expect(abs(20 * log10(rms) + 15) < 4, "\(c): RMS \(rms)")
+        }
+    }
+
+    /// A 1 kHz sine at 0.25 peak on every channel.
+    private func writeTone(_ url: URL, format: AudioFormatID, rate: Double, channels: Int, seconds: Double) throws {
+        var settings: [String: Any] = [AVFormatIDKey: format, AVSampleRateKey: rate, AVNumberOfChannelsKey: channels]
+        if format == kAudioFormatLinearPCM { settings[AVLinearPCMBitDepthKey] = 16 }
+        if format == kAudioFormatFLAC { settings[AVLinearPCMBitDepthKey] = 24 }
+        let out = try AVAudioFile(forWriting: url, settings: settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+        let frames = AVAudioFrameCount(seconds * rate)
+        let buffer = try #require(AVAudioPCMBuffer(pcmFormat: out.processingFormat, frameCapacity: frames))
+        buffer.frameLength = frames
+        for ch in 0..<channels {
+            let data = buffer.floatChannelData![ch]
+            for i in 0..<Int(frames) { data[i] = 0.25 * sin(2 * .pi * 1_000 * Float(i) / Float(rate)) }
+        }
+        try out.write(from: buffer)
+    }
+
+    private func lastSecondRMS(nr: Bool) async throws -> Float {
+        let r = try await rig(mode: "USB", noise: true)
+        let p = r.player
+        p.volume = 1
+        let format = try #require(AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1))
+        try p.engine.enableManualRenderingMode(.offline, format: format, maximumFrameCount: 4096)
+        p.noiseReduction = NoiseReductionSettings(enabled: nr, strength: 1)
+        p.load(try recording(r))
+        p.play()
+        #expect(p.isPlaying)
+        let buffer = try #require(AVAudioPCMBuffer(pcmFormat: format, frameCapacity: 4096))
+        var rendered: [Float] = []
+        while rendered.count < 3 * 48_000 {
+            guard try p.engine.renderOffline(4096, to: buffer) == .success else { break }
+            rendered += UnsafeBufferPointer(start: buffer.floatChannelData![0], count: Int(buffer.frameLength))
+        }
+        p.unload()
+        #expect(rendered.count >= 3 * 48_000)
+        let last = rendered.suffix(48_000)
+        return (last.reduce(0) { $0 + $1 * $1 } / Float(max(last.count, 1))).squareRoot()
     }
 }

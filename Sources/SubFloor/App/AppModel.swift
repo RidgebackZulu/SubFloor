@@ -93,6 +93,7 @@ final class AppModel {
     var noiseReduction = NoiseReductionSettings() {
         didSet {
             engine.update(noiseReduction: noiseReduction)
+            player?.noiseReduction = noiseReduction
             saveSessionIfChanged()
         }
     }
@@ -321,6 +322,7 @@ final class AppModel {
         }
         restoreSession()
         player.volume = volume
+        player.noiseReduction = noiseReduction
         pushRecording()
         pushRecordingContexts()
         pushAutoRecord()
