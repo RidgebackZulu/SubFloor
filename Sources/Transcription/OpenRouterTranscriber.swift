@@ -124,13 +124,16 @@ public struct OpenRouterTranscriber: Sendable {
     }
 
     /// Sends one chunk and decodes the reply. Throws `TranscriptionError`, or `CancellationError`
-    /// if the task was cancelled.
+    /// if the task was cancelled. A `URLError.cancelled` outside a cancelled task is a dropped
+    /// connection, so it is `.transient`.
     public func transcribe(_ chunk: PreparedChunk) async throws -> WhisperResponse {
         let data: Data
         let http: HTTPURLResponse
         do {
             (data, http) = try await transport.send(try request(for: chunk))
-        } catch let error as URLError where error.code == .cancelled {
+        } catch let error as CancellationError {
+            throw error
+        } catch let error as URLError where error.code == .cancelled && Task.isCancelled {
             throw CancellationError()
         } catch let error as URLError {
             throw TranscriptionError.transient(scrub(error.localizedDescription))
@@ -164,12 +167,30 @@ public struct OpenRouterTranscriber: Sendable {
         case .chunks(let prepared):
             var replies: [TranscriptChunk] = []
             for chunk in prepared {
+                try Task.checkCancellation()
                 replies.append(TranscriptChunk(offsetSeconds: chunk.offsetSeconds, response: try await transcribe(chunk)))
             }
             let costs = replies.compactMap { $0.response.usage?.cost }
             return stored(note: nil, seconds: prepared.reduce(0) { $0 + $1.seconds },
                           cost: costs.isEmpty ? nil : costs.reduce(0, +), chunks: replies)
         }
+    }
+
+    /// The app's transcription: reads and prepares the recording at `url`, then sends it, all on a
+    /// detached task so the blocking decode never runs on the caller's executor (the main actor).
+    /// Arguments: recording file name, its URL, model, language (nil for auto-detect), API key.
+    /// Cancelling the caller cancels the work. A recording that cannot be read is `.badRequest`.
+    public static let liveTranscribe: @Sendable (String, URL, String, String?, String) async throws -> StoredTranscript = {
+        file, url, model, language, apiKey in
+        let work = Task.detached(priority: .utility) { () async throws -> StoredTranscript in
+            let audio: PreparedAudio
+            do { audio = try TranscriptionAudio.prepare(url: url) } catch {
+                throw TranscriptionError.badRequest("Couldn't read the recording: \(error.localizedDescription)")
+            }
+            return try await OpenRouterTranscriber(apiKey: apiKey, model: model, language: language)
+                .transcribe(file: file, audio: audio, now: Date())
+        }
+        return try await withTaskCancellationHandler { try await work.value } onCancel: { work.cancel() }
     }
 
     /// `{"error":{"message":"..."}}`, if the body has that shape.
@@ -181,5 +202,21 @@ public struct OpenRouterTranscriber: Sendable {
     /// Hides the key if a server or system message echoes it.
     private func scrub(_ reason: String) -> String {
         apiKey.isEmpty ? reason : reason.replacingOccurrences(of: apiKey, with: "•••")
+    }
+}
+
+/// The key is held privately, but Swift's default description, `dump` and `Mirror` print private
+/// stored properties. These print it as "•••", so a transcriber in a log or a debugger shows no key.
+extension OpenRouterTranscriber: CustomStringConvertible, CustomDebugStringConvertible, CustomReflectable {
+    public var description: String {
+        "OpenRouterTranscriber(apiKey: •••, model: \(model), language: \(language ?? "auto"))"
+    }
+
+    public var debugDescription: String { description }
+
+    public var customMirror: Mirror {
+        Mirror(self, children: ["apiKey": "•••", "model": model, "language": language as Any,
+                                "transport": String(describing: type(of: transport))],
+               displayStyle: .struct)
     }
 }

@@ -130,6 +130,46 @@ private func failure(_ t: OpenRouterTranscriber) async -> TranscriptionError? {
         #expect(t.message.contains("•••"))
     }
 
+    @Test func descriptionsHideKey() {
+        let key = "sk-or-secret"
+        let t = transcriber(StubTransport(status: 200), key: key)
+        var dumped = ""
+        dump(t, to: &dumped)
+        for text in [String(describing: t), String(reflecting: t), dumped, "\(t)"] {
+            #expect(!text.contains(key))
+            #expect(text.contains("•••"))
+        }
+        #expect(Mirror(reflecting: t).children.contains { $0.label == "model" })
+    }
+
+    @Test func cancellationPassesThrough() async throws {
+        // A transport that throws CancellationError is not a bad request.
+        let t = transcriber(StubTransport([.fail(CancellationError())]))
+        await #expect(throws: CancellationError.self) { _ = try await t.transcribe(chunk()) }
+
+        // URLError(.cancelled) outside a cancelled task is a dropped connection: worth retrying.
+        let dropped = await failure(transcriber(StubTransport([.fail(URLError(.cancelled))])))
+        guard case .transient = dropped else { Issue.record("expected transient, got \(String(describing: dropped))"); return }
+
+        // Inside a cancelled task it is the cancellation.
+        let cancelledURL = transcriber(StubTransport([.fail(URLError(.cancelled))]))
+        let one = Task { () async throws -> WhisperResponse in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await cancelledURL.transcribe(chunk())
+        }
+        await #expect(throws: CancellationError.self) { _ = try await one.value }
+
+        // A cancelled task sends no chunk at all.
+        let stub = StubTransport(status: 200, body: try JSONEncoder().encode(WhisperResponse(text: "hi")))
+        let quiet = transcriber(stub)
+        let whole = Task { () async throws -> StoredTranscript in
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await quiet.transcribe(file: "a.wav", audio: .chunks([chunk(), chunk(offset: 10)]), now: Date())
+        }
+        await #expect(throws: CancellationError.self) { _ = try await whole.value }
+        #expect(stub.requests.isEmpty)
+    }
+
     @Test func silentNeedsNoRequest() async throws {
         let stub = StubTransport(status: 200)
         let s = try await transcriber(stub).transcribe(file: "a.wav", audio: .silent, now: Date(timeIntervalSince1970: 5))
