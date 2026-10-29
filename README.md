@@ -105,6 +105,7 @@ always released.
 | Record | Top-bar `Audio` / `IQ` / `Both` (⌘⇧A / ⌘⇧I / ⌘⇧R); red with the elapsed time while recording. See Recording |
 | Auto-record | Top-bar `Auto` (⌘⇧T): records whenever the squelch opens. See Auto-record |
 | Recordings | Top-bar `Recordings` (⌘⇧L), with a red badge counting unheard recordings |
+| Noise reduction | Top-bar NR (⌘⇧N); its pop-up sets Light to Strong. Also in the Recordings player |
 | Reset zoom | ⌘0 |
 | Step VFO | ← / → (⇧ ×10); with a modem mode on they move the modem cursor instead |
 | Mode | Top bar, or `[` / `]` |
@@ -157,9 +158,12 @@ second, and jump chips from 0.1 s to 5 min.
 | --- | --- |
 | Click or drag the waveform | Move the playhead |
 | Space | Play / pause |
+| Skip silence | Jump silent stretches while playing (on by default) |
 | ← / → | Jump back / forward by the chosen jump |
 | ⇧← / ⇧→ | Previous / next recording that day |
 | Clear | Mark every recording heard |
+
+Noise reduction acts only on what you hear, never on what is recorded or decoded.
 
 The live radio is silent while the window is open and comes back when you close it.
 
