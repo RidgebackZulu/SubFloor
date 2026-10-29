@@ -124,6 +124,8 @@ struct RadioCommands: Commands {
             Button(model.noiseReduction.enabled ? "Turn Noise Reduction Off" : "Turn Noise Reduction On") { model.toggleNoiseReduction() }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
                 .disabled(!model.noiseReductionAvailable)
+            Toggle("Transcribe Recordings", isOn: Binding(get: { model.transcriptionSettings.enabled },
+                                                          set: { model.transcriptionSettings.enabled = $0 }))
             Button("Recordings…") { openWindow(id: "recordings") }
                 .keyboardShortcut("l", modifiers: [.command, .shift])
             Button("Show Recordings in Finder") { model.revealRecordings() }

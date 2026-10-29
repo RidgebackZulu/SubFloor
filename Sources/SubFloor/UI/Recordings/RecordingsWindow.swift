@@ -170,6 +170,7 @@ struct RecordingsWindow: View {
                 .buttonStyle(ChipButtonStyle())
                 .disabled(unheard == 0)
                 .help("Mark every recording heard")
+            TranscribeChip()
             Button("Show in Finder", action: showInFinder)
                 .buttonStyle(ChipButtonStyle())
                 .help(selection == nil ? "Show the recordings folder" : "Show the selected recording")
