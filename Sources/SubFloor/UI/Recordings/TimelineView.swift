@@ -34,6 +34,14 @@ struct DayTimelineView: View {
     /// The recording in progress's length now, or nil to draw it as long as `recordings` says. Read only by
     /// the live layer and the hover, so the 5 Hz growth redraws one marker.
     var liveSeconds: @MainActor () -> Double? = { nil }
+    /// The transcript badge of each recording that has one, by file.
+    var marks: [String: TranscriptMark] = [:]
+    /// Recordings drawn faded because a search leaves them out.
+    var dimmed: Set<String> = []
+    /// Whether the context menu's Transcribe can do anything (a key is saved and transcription is on).
+    var canTranscribe = false
+    /// The context menu's Transcribe or Transcribe Again, with the recording's file.
+    var onTranscribe: (String) -> Void = { _ in }
 
     @State private var width: CGFloat = 0
 
@@ -46,13 +54,14 @@ struct DayTimelineView: View {
     var body: some View {
         // Built once per change of what is shown (or of the width), never per mouse move or per draw.
         let layout = TimelineLayout(dayStart: dayStart, width: width, recordings: recordings, lanes: lanes, pops: pops,
-                                    selection: selection)
+                                    selection: selection, marks: marks, dimmed: dimmed)
         ZStack(alignment: .topLeading) {
             TimelineCanvas(layout: layout).equatable()
             if now != nil || !layout.live.isEmpty {
                 LiveLayer(layout: layout, liveSeconds: liveSeconds, nowX: now.map(layout.x(for:)))
             }
-            TimelineHoverLayer(layout: layout, liveSeconds: liveSeconds, onSelect: onSelect)
+            TimelineHoverLayer(layout: layout, liveSeconds: liveSeconds, canTranscribe: canTranscribe,
+                               onSelect: onSelect, onTranscribe: onTranscribe)
         }
         .frame(height: layout.height, alignment: .topLeading)
         .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = $0 }
@@ -61,12 +70,19 @@ struct DayTimelineView: View {
         .accessibilityValue("\(recordings.count) recordings, \(pops.count) pops")
     }
 
-    /// `18:32:19Z · 7.8 s · 11.175 MHz USB`. The length is left out until it is known.
-    static func hoverText(_ r: CatalogRecording) -> String {
+    /// `18:32:19Z · 7.8 s · 11.175 MHz USB`, then `voice`, `possible noise` or `couldn't transcribe: <reason>`
+    /// for a recording with a transcript mark. The length is left out until it is known.
+    static func hoverText(_ r: CatalogRecording, mark: TranscriptMark? = nil) -> String {
         var parts = [RecordingsFormat.time(r.start)]
         if let seconds = r.seconds { parts.append(RecordingsFormat.length(seconds)) }
         parts.append(RecordingsCatalog.laneTitle(frequencyHz: r.frequencyHz, mode: r.mode))
         if r.inProgress { parts.append("recording") }
+        switch mark {
+        case .voice?: parts.append("voice")
+        case .possibleNoise?: parts.append("possible noise")
+        case .failed(let reason)?: parts.append("couldn't transcribe: \(reason)")
+        case nil: break
+        }
         return parts.joined(separator: " · ")
     }
 }
@@ -87,6 +103,9 @@ struct TimelineLayout: Equatable {
     let laneHeights: [CGFloat]
     let popXs: [CGFloat]
     let selection: String?
+    /// The transcript badges and the faded recordings, which the canvas draws, so a change redraws it.
+    let marks: [String: TranscriptMark]
+    let dimmed: Set<String>
     /// The finished recordings, in drawing order: heard under unheard, and the selected one on top, so the
     /// one the listener picked is never hidden.
     let settled: [Marker]
@@ -98,11 +117,13 @@ struct TimelineLayout: Equatable {
     func markers(liveSeconds: Double?) -> [Marker] { settled + live(at: liveSeconds) }
 
     init(dayStart: Date, width: CGFloat, recordings: [CatalogRecording], lanes: [CatalogLane], pops: [CatalogPop],
-         selection: String?) {
+         selection: String?, marks: [String: TranscriptMark] = [:], dimmed: Set<String> = []) {
         self.dayStart = dayStart
         self.width = width
         self.lanes = lanes
         self.selection = selection
+        self.marks = marks
+        self.dimmed = dimmed
         let g = TimelineGeometry(dayStart: dayStart, width: Self.plotWidth(width))
         popXs = pops.map { DayTimelineView.labelColumn + g.x(for: $0.at) }
         let laneIndex = Dictionary(lanes.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { a, _ in a })
@@ -195,6 +216,7 @@ private struct TimelineCanvas: View, Equatable {
         let (l, r) = (a.layout, b.layout)
         return l.dayStart == r.dayStart && l.width == r.width && l.lanes == r.lanes && l.laneTops == r.laneTops
             && l.laneHeights == r.laneHeights && l.popXs == r.popXs && l.selection == r.selection && l.settled == r.settled
+            && l.marks == r.marks && l.dimmed == r.dimmed
     }
 
     var body: some View {
@@ -249,7 +271,8 @@ private struct TimelineCanvas: View, Equatable {
         for marker in layout.settled {
             let selected = marker.recording.file == layout.selection
             if selected { drawSelectedGlow(marker, in: ctx) }
-            MarkerPaint.draw(marker, selected: selected, in: ctx)
+            MarkerPaint.draw(marker, selected: selected, mark: layout.marks[marker.recording.file],
+                             dimmed: layout.dimmed.contains(marker.recording.file), in: ctx)
         }
     }
 
@@ -260,7 +283,7 @@ private struct TimelineCanvas: View, Equatable {
     /// one path fill ten times slower than one by one.)
     private func drawGlows(in ctx: GraphicsContext) {
         var heard: [Int: Path] = [:], bright: [Int: Path] = [:], dots: [Int: Path] = [:]
-        for m in layout.settled where m.recording.file != layout.selection {
+        for m in layout.settled where m.recording.file != layout.selection && !layout.dimmed.contains(m.recording.file) {
             let r = m.recording
             if r.heard {
                 heard[m.lane, default: Path()].addRoundedRect(in: m.rect, cornerSize: CGSize(width: 6, height: 6))
@@ -302,17 +325,34 @@ private struct TimelineCanvas: View, Equatable {
 }
 
 /// How one marker looks, shared by the day canvas and the live layer.
-private enum MarkerPaint {
+enum MarkerPaint {
     /// The unheard dot, above the pill's leading edge.
     static func dotRect(_ rect: CGRect) -> CGRect {
         CGRect(x: rect.minX, y: rect.minY - 6.5, width: 4.5, height: 4.5)
     }
 
-    static func draw(_ marker: TimelineLayout.Marker, selected: Bool, in ctx: GraphicsContext) {
+    /// The transcript badge, above the pill's trailing edge; right of the unheard dot on a pill too short to
+    /// keep them apart.
+    static func badgeRect(_ rect: CGRect) -> CGRect {
+        CGRect(x: rect.width < 12 ? rect.minX + 6 : rect.maxX - 4.5, y: rect.minY - 6.5, width: 4.5, height: 4.5)
+    }
+
+    /// The badge's green: voice was heard.
+    static let voiceGreen = Color(red: 0x4d / 255, green: 0xdb / 255, blue: 0x78 / 255)
+
+    /// - Parameters:
+    ///   - mark: the recording's transcript badge, nil for none (a recording in progress never has one).
+    ///   - dimmed: a search leaves it out: drawn at 0.2 opacity, over the heard 0.6.
+    static func draw(_ marker: TimelineLayout.Marker, selected: Bool, mark: TranscriptMark? = nil, dimmed: Bool = false,
+                     in ctx: GraphicsContext) {
         let r = marker.recording, rect = marker.rect, c = RecordingsTheme.lane(marker.lane)
         let pill = Path(roundedRect: rect, cornerRadius: min(5, rect.width / 2))
         var ctx = ctx
-        if r.heard && !r.inProgress && !selected { ctx.opacity = 0.6 }
+        if dimmed {
+            ctx.opacity = 0.2
+        } else if r.heard && !r.inProgress && !selected {
+            ctx.opacity = 0.6
+        }
 
         if r.inProgress {
             // Striped: still being written, so it cannot be opened yet. One recording at most, so its own layer.
@@ -344,6 +384,17 @@ private enum MarkerPaint {
                        with: .color(.white), lineWidth: 1.5)
         }
         if !r.heard && !r.inProgress { ctx.fill(Path(ellipseIn: dotRect(rect)), with: .color(c)) }
+        if !r.inProgress, let mark { drawBadge(mark, rect: rect, in: ctx) }
+    }
+
+    /// Green dot for voice, a grey ring for possible noise, an orange dot for a failure.
+    private static func drawBadge(_ mark: TranscriptMark, rect: CGRect, in ctx: GraphicsContext) {
+        let badge = badgeRect(rect)
+        switch mark {
+        case .voice: ctx.fill(Path(ellipseIn: badge), with: .color(voiceGreen))
+        case .possibleNoise: ctx.stroke(Path(ellipseIn: badge.insetBy(dx: 0.5, dy: 0.5)), with: .color(.gray), lineWidth: 1)
+        case .failed: ctx.fill(Path(ellipseIn: badge), with: .color(.orange))
+        }
     }
 }
 
@@ -389,12 +440,16 @@ private struct TimelineHoverLayer: View {
     let layout: TimelineLayout
     /// Read when the mouse moves, not in `body`, so the live length does not redraw this layer.
     let liveSeconds: @MainActor () -> Double?
+    let canTranscribe: Bool
     let onSelect: (CatalogRecording?) -> Void
+    let onTranscribe: (String) -> Void
 
     @State private var hover: Hover?
 
     private struct Hover: Equatable {
         var point: CGPoint, text: String
+        /// The finished recording under the pointer, which the context menu is for; nil over one in progress.
+        var file: String?
     }
 
     var body: some View {
@@ -405,7 +460,11 @@ private struct TimelineHoverLayer: View {
                 switch phase {
                 case .active(let point):
                     let next = layout.marker(at: point, selectableOnly: false, liveSeconds: liveSeconds())
-                        .map { Hover(point: point, text: DayTimelineView.hoverText($0.recording)) }
+                        .map { m in
+                            let file = m.recording.file
+                            return Hover(point: point, text: DayTimelineView.hoverText(m.recording, mark: layout.marks[file]),
+                                         file: m.recording.inProgress ? nil : file)
+                        }
                     if next != hover { hover = next }
                 case .ended:
                     hover = nil
@@ -420,6 +479,14 @@ private struct TimelineHoverLayer: View {
             }
             .overlay(alignment: right ? .topTrailing : .topLeading) {
                 if let hover { label(hover, right: right) }
+            }
+            .contextMenu {
+                // Built when the menu opens, from the recording the pointer is over; over nothing, no menu.
+                if let file = hover?.file {
+                    let transcribed = layout.marks[file].map { if case .failed = $0 { false } else { true } } ?? false
+                    Button(transcribed ? "Transcribe Again" : "Transcribe") { onTranscribe(file) }
+                        .disabled(!canTranscribe)
+                }
             }
     }
 

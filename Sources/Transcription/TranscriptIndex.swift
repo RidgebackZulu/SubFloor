@@ -35,6 +35,9 @@ public struct TranscriptIndex: Equatable, Sendable {
 
     public func contains(_ file: String) -> Bool { summaries[file] != nil }
 
+    /// Every recording that has a transcript.
+    public var files: Dictionary<String, TranscriptSummary>.Keys { summaries.keys }
+
     /// True when the recording has a transcript and every term appears in its text. An empty `terms`
     /// matches any transcribed recording, so a blank query filters nothing; an untranscribed one never matches.
     public func matches(_ file: String, terms: [String]) -> Bool {

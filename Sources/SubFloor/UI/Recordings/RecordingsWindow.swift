@@ -62,7 +62,10 @@ struct RecordingsWindow: View {
             ScrollView(.vertical) {
                 DayTimelineView(dayStart: day, recordings: catalog.recordings(onUTCDay: day), lanes: lanes,
                                 pops: catalog.pops(onUTCDay: day), selection: selection, now: isToday ? now : nil,
-                                onSelect: select, liveSeconds: { [library] in library.liveSeconds })
+                                onSelect: select, liveSeconds: { [library] in library.liveSeconds },
+                                marks: TranscriptMarks.marks(index: library.transcripts, states: model.transcription.states),
+                                dimmed: [], canTranscribe: model.hasAPIKey && model.transcriptionSettings.enabled,
+                                onTranscribe: { [model] in model.retryTranscription($0) })
                     .onGeometryChange(for: CGFloat.self) { $0.size.height } action: { timelineHeight = $0 }
             }
             .scrollBounceBehavior(.basedOnSize)
@@ -76,7 +79,7 @@ struct RecordingsWindow: View {
                         lane: selectedRecording.flatMap { r in lanes.firstIndex { $0.id == r.laneID } } ?? 0,
                         player: model.player, audioURL: selectedRecording.map { library.url(for: $0.file) },
                         cacheFolder: library.folder.appendingPathComponent(".subfloor/peaks", isDirectory: true),
-                        peaksFailure: $peaksFailure)
+                        peaksFailure: $peaksFailure, searchTerms: [])
                 .padding(.horizontal, 18)
                 .padding(.bottom, 18)
         }
