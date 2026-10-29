@@ -29,10 +29,11 @@ let package = Package(
         .target(name: "Modems", dependencies: ["DSPCore", "CFT8"]),
         .target(name: "SubFloorCore", dependencies: ["DSPCore"]),
         .target(name: "Recording", swiftSettings: fastMath),
+        .target(name: "Transcription"),
         .target(name: "SDRplayKit", dependencies: ["CSDRplay", "DSPCore"], linkerSettings: sdrplayLinker),
         .executableTarget(
             name: "SubFloor",
-            dependencies: ["DSPCore", "SubFloorCore", "SDRplayKit", "Modems", "Recording"],
+            dependencies: ["DSPCore", "SubFloorCore", "SDRplayKit", "Modems", "Recording", "Transcription"],
             exclude: ["Info.plist"],
             resources: [.copy("Resources/AppIcon.png")],
             swiftSettings: fastMath,
@@ -45,6 +46,7 @@ let package = Package(
         .testTarget(name: "ModemsTests", dependencies: ["Modems", "DSPCore"]),
         .testTarget(name: "SubFloorCoreTests", dependencies: ["SubFloorCore", "DSPCore"]),
         .testTarget(name: "RecordingTests", dependencies: ["Recording", "DSPCore"]),
+        .testTarget(name: "TranscriptionTests", dependencies: ["Transcription"], resources: [.copy("Fixtures")]),
         .testTarget(name: "SDRplayKitTests", dependencies: ["SDRplayKit", "CSDRplay"], linkerSettings: sdrplayLinker),
         .testTarget(name: "SubFloorTests", dependencies: ["SubFloor"], linkerSettings: sdrplayLinker),
     ]
