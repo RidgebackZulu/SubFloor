@@ -21,6 +21,9 @@ struct NoiseReductionButton: View {
                     .padding(.vertical, 3)
             }
             .buttonStyle(.plain)
+            .accessibilityLabel("Noise reduction")
+            .accessibilityValue(on ? "On, \(settings.label)" : "Off")
+            .accessibilityAddTraits(.isToggle)
 
             Rectangle().fill(on ? Color.black.opacity(0.25) : Color.white.opacity(0.15)).frame(width: 1)
                 .padding(.vertical, 3)
@@ -49,7 +52,6 @@ struct NoiseReductionButton: View {
         .disabled(!available)
         .help(!available ? "Noise reduction is for voice; it's off in WFM"
               : on ? "Noise reduction on (⌘⇧N)" : "Noise reduction off (⌘⇧N)")
-        .accessibilityElement(children: .contain)
     }
 }
 

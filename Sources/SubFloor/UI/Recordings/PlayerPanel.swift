@@ -251,6 +251,8 @@ struct SkipSilenceChip: View {
         .overlay { RoundedRectangle(cornerRadius: 5).stroke(isOn ? Color.green : Color.white.opacity(0.15)) }
         .opacity(isOn ? 1 : 0.6)
         .help("Skip silent stretches while playing")
+        .accessibilityLabel("Skip silence")
         .accessibilityValue(isOn ? "On" : "Off")
+        .accessibilityAddTraits(.isToggle)
     }
 }
