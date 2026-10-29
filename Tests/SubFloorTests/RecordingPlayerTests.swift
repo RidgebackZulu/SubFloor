@@ -448,7 +448,6 @@ struct RecordingPlayerTests {
         }
     }
 
-    /// A 1 kHz sine at 0.25 peak on every channel.
     // MARK: Skip silence
 
     /// One second of tone, two of silence, one of tone: the silence is 1.0 ..< 3.0, a skip lands at 2.8.
@@ -511,7 +510,7 @@ struct RecordingPlayerTests {
         p.play()
         #expect(!p.isPlaying)
         #expect(p.position == p.duration)
-        #expect(r.muted.values.last != true)        // the live radio is never left muted
+        #expect(!r.muted.values.contains(true))     // the live radio is never muted: nothing played
         #expect(r.library.unheardCount == 0)        // and it counts as played
         // The same when it is found while playing: the tone's end is crossed, the rest is skipped.
         p.seek(to: 0.9)
@@ -568,6 +567,7 @@ struct RecordingPlayerTests {
         #expect(!m.player.skipSilence)
     }
 
+    /// A 1 kHz sine at 0.25 peak on every channel.
     private func writeTone(_ url: URL, format: AudioFormatID, rate: Double, channels: Int, seconds: Double) throws {
         var settings: [String: Any] = [AVFormatIDKey: format, AVSampleRateKey: rate, AVNumberOfChannelsKey: channels]
         if format == kAudioFormatLinearPCM { settings[AVLinearPCMBitDepthKey] = 16 }
