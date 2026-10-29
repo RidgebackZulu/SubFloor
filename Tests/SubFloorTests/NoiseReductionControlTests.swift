@@ -34,6 +34,33 @@ struct NoiseReductionControlTests {
         #expect(again.noiseReductionAvailable)
     }
 
+    @Test func skipSilenceIsSavedAndStartsOn() {
+        let defaults = UserDefaults(suiteName: UUID().uuidString)!
+        let (m, dir) = makeModel(defaults: defaults)
+        #expect(m.skipSilence)
+        m.skipSilence = false
+        m.shutdown()
+        let (again, _) = makeModel(defaults: defaults, dir: dir)
+        defer { again.shutdown() }
+        #expect(!again.skipSilence)
+        #expect(!again.player.skipSilence)
+    }
+
+    @Test func olderSessionsStartWithSkipSilenceOn() throws {
+        let defaults = UserDefaults(suiteName: UUID().uuidString)!
+        let (m, dir) = makeModel(defaults: defaults)
+        m.skipSilence = false
+        m.shutdown()
+        let saved = try #require(defaults.data(forKey: "session"))
+        var session = try #require(try JSONSerialization.jsonObject(with: saved) as? [String: Any])
+        #expect(session["skipSilence"] != nil)
+        session["skipSilence"] = nil
+        defaults.set(try JSONSerialization.data(withJSONObject: session), forKey: "session")
+        let (again, _) = makeModel(defaults: defaults, dir: dir)
+        defer { again.shutdown() }
+        #expect(again.skipSilence)
+    }
+
     @Test func olderSessionsStartWithNROffAtMedium() throws {
         let defaults = UserDefaults(suiteName: UUID().uuidString)!
         let (m, dir) = makeModel(defaults: defaults)

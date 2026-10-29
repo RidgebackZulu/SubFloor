@@ -25,6 +25,9 @@ final class RecordingPlayer {
     /// The user's noise-reduction setting, from `AppModel`. It applies only where the loaded recording's mode
     /// allows (`noiseReductionAvailable`).
     var noiseReduction = NoiseReductionSettings() { didSet { pushNoiseReduction() } }
+    /// Jump over silent stretches while playing, from `AppModel`. Seeks never skip, and neither does a
+    /// recording whose peaks have not arrived (`setPeaks`).
+    var skipSilence = true
 
     private(set) var file: String?
     /// The loaded recording's first sample.
@@ -68,6 +71,8 @@ final class RecordingPlayer {
     /// completion handler of a segment that was stopped does nothing.
     @ObservationIgnored private var generation = 0
     @ObservationIgnored private var nrAllowed = false
+    /// The loaded recording's silent stretches, once its peaks have been read.
+    @ObservationIgnored private var silenceMap: SilenceMap?
     @ObservationIgnored private var timer: Timer?
     @ObservationIgnored private var configurationObserver: NotificationObserver?
     /// The folder the file was opened from, so another recordings folder (which may hold a file of the same
@@ -127,8 +132,17 @@ final class RecordingPlayer {
         loadError = nil
         nrAllowed = false
         noiseReductionAvailable = false
+        silenceMap = nil
         pushNoiseReduction()
         muteLive(false)
+    }
+
+    /// The waveform peaks of `file`, which Skip silence finds the silent stretches from. They arrive after
+    /// the file is loaded (a long recording takes seconds to read), so until then nothing is skipped; peaks
+    /// for any file but the loaded one are ignored.
+    func setPeaks(_ peaks: WaveformPeaks, for file: String) {
+        guard file == self.file else { return }
+        silenceMap = SilenceMap(peaks: peaks)
     }
 
     /// Marks the recording heard, silences the live radio and plays from the position. From the end it starts
@@ -136,6 +150,14 @@ final class RecordingPlayer {
     func play() {
         guard let graph, audioFile != nil, let file, !isPlaying else { return }
         if position >= duration { position = 0 }
+        // In a silent stretch, Play starts after it; in the silence at the end, there is nothing to play.
+        if let target = skipTarget() {
+            position = min(target, duration)
+            if position >= duration {
+                library.markHeard(file)
+                return
+            }
+        }
         do {
             // Before the node plays: a player node started in an engine that is not running throws.
             if !engine.isRunning { try engine.start() }
@@ -289,13 +311,25 @@ final class RecordingPlayer {
         timer = nil
     }
 
-    private func tick() {
+    /// Where Skip silence moves the playhead to from where it is, or nil when it is off, the peaks have not
+    /// arrived, or the playhead is not in a silent stretch worth skipping.
+    private func skipTarget() -> Double? {
+        guard skipSilence else { return nil }
+        return silenceMap?.skipTarget(from: position)
+    }
+
+    /// Internal for tests, which drive it without waiting on the timer.
+    func tick() {
         guard isPlaying else { return }
         guard engine.isRunning else { return stoppedBehindOurBack() }
         guard let at = playedSeconds() else { return }
         // The completion handler ends playback; a second past the end without it, the poll does.
         if at >= duration + 1 { return finishedAtTheEnd() }
         position = min(at, duration)
+        // Skipped from here, in the same call that moved the position, so nothing sees the silence's middle.
+        if let target = skipTarget() {
+            if target >= duration { finishedAtTheEnd() } else { seek(to: target) }
+        }
     }
 
     /// A block observer that is removed with its owner.

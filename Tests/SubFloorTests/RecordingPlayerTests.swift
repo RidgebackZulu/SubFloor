@@ -4,6 +4,7 @@ import Foundation
 import Recording
 import SubFloorCore
 import Testing
+@testable import Recording
 @testable import SubFloor
 
 /// The player that opens a recording from the Recordings window, and the live radio going quiet while it
@@ -49,6 +50,32 @@ struct RecordingPlayerTests {
         try data.write(to: url)
     }
 
+    /// A mono WAV of tone (a quiet 1 kHz sine) and digital silence in the given order, and the peaks a waveform
+    /// read of it gives (10 ms bins, 128 where there is tone).
+    private func writePattern(_ url: URL, _ pattern: [(seconds: Double, tone: Bool)], rate: Int = 48_000) throws {
+        var samples: [Int16] = []
+        for part in pattern {
+            let frames = Int(part.seconds * Double(rate))
+            for i in 0..<frames {
+                samples.append(part.tone ? Int16(8_000 * sin(2 * Double.pi * 1_000 * Double(i) / Double(rate))) : 0)
+            }
+        }
+        var data = Data()
+        func u32(_ v: Int) { withUnsafeBytes(of: UInt32(v).littleEndian) { data.append(contentsOf: $0) } }
+        func u16(_ v: Int) { withUnsafeBytes(of: UInt16(v).littleEndian) { data.append(contentsOf: $0) } }
+        data.append(contentsOf: Array("RIFF".utf8)); u32(36 + samples.count * 2)
+        data.append(contentsOf: Array("WAVEfmt ".utf8)); u32(16); u16(1); u16(1); u32(rate); u32(rate * 2); u16(2); u16(16)
+        data.append(contentsOf: Array("data".utf8)); u32(samples.count * 2)
+        for v in samples { withUnsafeBytes(of: v.littleEndian) { data.append(contentsOf: $0) } }
+        try data.write(to: url)
+    }
+
+    private func patternPeaks(_ pattern: [(seconds: Double, tone: Bool)]) -> WaveformPeaks {
+        var bins: [UInt8] = []
+        for part in pattern { bins += Array(repeating: part.tone ? 128 : 0, count: Int((part.seconds * 100).rounded())) }
+        return WaveformPeaks(sampleRate: 48_000, frames: bins.count * 480, peaks: bins)
+    }
+
     private final class Muted { var values: [Bool] = [] }
 
     private struct Rig {
@@ -57,10 +84,15 @@ struct RecordingPlayerTests {
 
     /// A folder of `count` recordings (three seconds of silence unless asked otherwise), each with a `recording`
     /// line so it is unheard, and a player over the library once it has read them.
-    private func rig(count: Int = 1, seconds: Double = 3, mode: String = "NFM", noise: Bool = false) async throws -> Rig {
+    private func rig(count: Int = 1, seconds: Double = 3, mode: String = "NFM", noise: Bool = false,
+                     pattern: [(seconds: Double, tone: Bool)]? = nil) async throws -> Rig {
         let folder = tempFolder()
         let files = (0..<count).map { name(Double($0) * 60, mode: mode) }
-        for file in files { try writeWAV(folder.appendingPathComponent(file), seconds: seconds, noise: noise) }
+        let seconds = pattern.map { $0.reduce(0) { $0 + $1.seconds } } ?? seconds
+        for file in files {
+            if let pattern { try writePattern(folder.appendingPathComponent(file), pattern) }
+            else { try writeWAV(folder.appendingPathComponent(file), seconds: seconds, noise: noise) }
+        }
         try RecordingLog(folder: folder).append(files.enumerated().map { i, file in
             .recording(file: file, start: Self.base.addingTimeInterval(Double(i) * 60), seconds: seconds, frequencyHz: 146_520_000, mode: mode, auto: true)
         })
@@ -417,6 +449,125 @@ struct RecordingPlayerTests {
     }
 
     /// A 1 kHz sine at 0.25 peak on every channel.
+    // MARK: Skip silence
+
+    /// One second of tone, two of silence, one of tone: the silence is 1.0 ..< 3.0, a skip lands at 2.8.
+    private static let gap: [(seconds: Double, tone: Bool)] = [(1, true), (2, false), (1, true)]
+    /// One second of tone, then two of silence to the end.
+    private static let trailing: [(seconds: Double, tone: Bool)] = [(1, true), (2, false)]
+
+    @Test func skipSilenceJumpsAGapWhilePlaying() async throws {
+        let r = try await rig(pattern: Self.gap)
+        let p = r.player
+        p.load(try recording(r))
+        p.setPeaks(patternPeaks(Self.gap), for: r.files[0])
+        p.skipSilence = true
+        p.seek(to: 0.9)
+        p.play()
+        // Position changes only in `tick`, which skips in the same call, so no sample between the ticks ever
+        // sees the silence's middle, however late a tick is.
+        var inTheMiddle = false
+        let landed = wait(upTo: 60) {
+            if p.position > 1.3 && p.position < 2.7 { inTheMiddle = true }
+            return p.position >= 2.75
+        }
+        #expect(landed)
+        #expect(!inTheMiddle)
+        p.unload()
+    }
+
+    @Test func pausedSeeksIntoSilenceStay() async throws {
+        let r = try await rig(pattern: Self.gap)
+        let p = r.player
+        p.load(try recording(r))
+        p.setPeaks(patternPeaks(Self.gap), for: r.files[0])
+        p.seek(to: 1.5)
+        for _ in 0..<9 { p.tick() }
+        wait(upTo: 0.3) { false }
+        #expect(p.position == 1.5)
+        p.move(jumps: 1)       // the arrow keys and the Dial go through `seek` too
+        #expect(abs(p.position - 2.5) < 0.001)
+        p.unload()
+    }
+
+    @Test func playInSilenceJumpsAhead() async throws {
+        let r = try await rig(pattern: Self.gap)
+        let p = r.player
+        p.load(try recording(r))
+        p.setPeaks(patternPeaks(Self.gap), for: r.files[0])
+        p.seek(to: 1.5)
+        p.play()
+        #expect(abs(p.position - 2.8) < 0.001)
+        #expect(p.isPlaying)
+        p.unload()
+    }
+
+    @Test func trailingSilenceEndsPlayback() async throws {
+        let r = try await rig(pattern: Self.trailing)
+        let p = r.player
+        p.load(try recording(r))
+        p.setPeaks(patternPeaks(Self.trailing), for: r.files[0])
+        p.seek(to: 1.2)
+        p.play()
+        #expect(!p.isPlaying)
+        #expect(p.position == p.duration)
+        #expect(r.muted.values.last != true)        // the live radio is never left muted
+        #expect(r.library.unheardCount == 0)        // and it counts as played
+        // The same when it is found while playing: the tone's end is crossed, the rest is skipped.
+        p.seek(to: 0.9)
+        p.play()
+        #expect(wait(upTo: 60) { !p.isPlaying })
+        #expect(p.position == p.duration)
+        #expect(r.muted.values.last == false)
+        p.unload()
+    }
+
+    @Test func skipOffPlaysThroughSilence() async throws {
+        let r = try await rig(pattern: Self.gap)
+        let p = r.player
+        p.load(try recording(r))
+        p.setPeaks(patternPeaks(Self.gap), for: r.files[0])
+        p.skipSilence = false
+        p.seek(to: 1.5)
+        p.play()
+        #expect(abs(p.position - 1.5) < 0.001)       // no jump on Play
+        #expect(wait(upTo: 60) { p.position > 2.0 })
+        #expect(p.position < 2.7)                    // and none while it plays: 0.5 s on, not 1.3
+        p.unload()
+    }
+
+    @Test func peaksForAnotherFileOrNoneSkipNothing() async throws {
+        let r = try await rig(pattern: Self.gap)
+        let p = r.player
+        p.load(try recording(r))
+        p.seek(to: 1.5)
+        p.play()                                      // no map yet: the peaks are still loading
+        #expect(abs(p.position - 1.5) < 0.001)
+        p.pause()
+        p.setPeaks(patternPeaks(Self.gap), for: "SubFloor_other.wav")
+        p.seek(to: 1.5)
+        p.play()
+        #expect(abs(p.position - 1.5) < 0.001)
+        p.pause()
+        p.setPeaks(patternPeaks(Self.gap), for: r.files[0])
+        p.unload()
+        p.load(try recording(r))                      // unload cleared the map
+        p.seek(to: 1.5)
+        p.play()
+        #expect(abs(p.position - 1.5) < 0.001)
+        p.unload()
+    }
+
+    @Test func appModelHandsThePlayerItsSkipSilenceSetting() {
+        let dir = tempFolder()
+        let m = AppModel(bookmarkStore: BookmarkStore(url: dir.appendingPathComponent("bookmarks.json")),
+                         defaults: UserDefaults(suiteName: UUID().uuidString)!)
+        defer { m.shutdown() }
+        #expect(m.player.skipSilence)
+        m.skipSilence = false
+        #expect(!m.player.skipSilence)
+    }
+
     private func writeTone(_ url: URL, format: AudioFormatID, rate: Double, channels: Int, seconds: Double) throws {
         var settings: [String: Any] = [AVFormatIDKey: format, AVSampleRateKey: rate, AVNumberOfChannelsKey: channels]
         if format == kAudioFormatLinearPCM { settings[AVLinearPCMBitDepthKey] = 16 }
