@@ -277,6 +277,8 @@ final class RecordingPlayer {
     private func finishedAtTheEnd() {
         generation += 1
         // Paused rather than left running on silence: the reducer keeps its noise estimate for a replay.
+        // With NR on, the last `latency` (~21 ms) of the file is still inside the reducer when the node
+        // reports it played back, so it is never heard. Accepted: auto recordings end in hiss.
         engine.pause()
         graph?.player.stop()
         stopTimer()
