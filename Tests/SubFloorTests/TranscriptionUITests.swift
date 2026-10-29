@@ -16,4 +16,10 @@ import Testing
         #expect(TranscriptionFormat.keyStatus(hasKey: true) == "Key saved ✓")
         #expect(TranscriptionFormat.keyStatus(hasKey: false) == "No key")
     }
+
+    @Test func blankKeyFieldSavesNothing() {
+        #expect(TranscriptionFormat.keyToSave("") == nil)
+        #expect(TranscriptionFormat.keyToSave("  \n\t ") == nil)
+        #expect(TranscriptionFormat.keyToSave("  sk-test \n") == "sk-test")
+    }
 }

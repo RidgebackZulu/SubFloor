@@ -16,6 +16,13 @@ enum TranscriptionFormat {
 
     /// Whether a key is saved. Never the key itself.
     static func keyStatus(hasKey: Bool) -> String { hasKey ? "Key saved ✓" : "No key" }
+
+    /// What Save (the button or Return) stores: the typed key, trimmed; nil when the field is blank, so a
+    /// stray Return never removes the saved key. Removing is the Remove button's job only.
+    static func keyToSave(_ typed: String) -> String? {
+        let trimmed = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
 }
 
 /// Settings → Transcription: the on/off switch, the OpenRouter key, the model and language, and the button
@@ -39,7 +46,7 @@ struct TranscriptionSection: View {
                     SecureField("OpenRouter API key", text: $keyText)
                         .onSubmit(save)
                     Button("Save", action: save)
-                        .disabled(keyText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                        .disabled(TranscriptionFormat.keyToSave(keyText) == nil)
                     Button("Remove") { run { try model.removeAPIKey() } }
                         .disabled(!model.hasAPIKey)
                     Button("Import from .env…", action: importFromEnv)
@@ -83,8 +90,8 @@ struct TranscriptionSection: View {
     }
 
     private func save() {
-        let text = keyText
-        run { try model.saveAPIKey(text) }
+        guard let key = TranscriptionFormat.keyToSave(keyText) else { return }
+        run { try model.saveAPIKey(key) }
         if keyError == nil { keyText = "" }
     }
 
@@ -121,28 +128,38 @@ struct TranscriptionSection: View {
 }
 
 /// The Recordings header's Transcribe chip, in the Skip silence chip's style: green when on, with the key
-/// status or the reason the queue is blocked as its tooltip.
+/// status or the reason the queue is blocked as its tooltip. When blocked, an orange warning triangle beside
+/// it carries the reason too.
 struct TranscribeChip: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
         let isOn = model.transcriptionSettings.enabled
-        let help = model.transcription.blocked?.message ?? TranscriptionFormat.keyStatus(hasKey: model.hasAPIKey)
-        Button { model.toggleTranscription() } label: {
-            Label("Transcribe", systemImage: "text.bubble")
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
+        let blocked = model.transcription.blocked?.message
+        let help = blocked ?? TranscriptionFormat.keyStatus(hasKey: model.hasAPIKey)
+        HStack(spacing: 6) {
+            Button { model.toggleTranscription() } label: {
+                Label("Transcribe", systemImage: "text.bubble")
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+            }
+            .buttonStyle(.plain)
+            .fixedSize()
+            .foregroundStyle(isOn ? Color.black : Color.secondary)
+            .background { RoundedRectangle(cornerRadius: 5).fill(isOn ? Color.green : Color.white.opacity(0.06)) }
+            .overlay { RoundedRectangle(cornerRadius: 5).stroke(isOn ? Color.green : Color.white.opacity(0.15)) }
+            .opacity(isOn ? 1 : 0.6)
+            .help(help)
+            .accessibilityLabel("Transcribe")
+            .accessibilityValue(isOn ? "On" : "Off")
+            .accessibilityHint(help)
+            .accessibilityAddTraits(.isToggle)
+            if let blocked {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .help(blocked)
+                    .accessibilityLabel(blocked)
+            }
         }
-        .buttonStyle(.plain)
-        .fixedSize()
-        .foregroundStyle(isOn ? Color.black : Color.secondary)
-        .background { RoundedRectangle(cornerRadius: 5).fill(isOn ? Color.green : Color.white.opacity(0.06)) }
-        .overlay { RoundedRectangle(cornerRadius: 5).stroke(isOn ? Color.green : Color.white.opacity(0.15)) }
-        .opacity(isOn ? 1 : 0.6)
-        .help(help)
-        .accessibilityLabel("Transcribe")
-        .accessibilityValue(isOn ? "On" : "Off")
-        .accessibilityHint(help)
-        .accessibilityAddTraits(.isToggle)
     }
 }
