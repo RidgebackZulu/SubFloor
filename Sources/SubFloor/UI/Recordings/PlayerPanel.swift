@@ -118,6 +118,8 @@ struct PlayerPanel: View {
             let built = await Task.detached(priority: .userInitiated) { PeakEnvelope(peaks) }.value
             guard !Task.isCancelled else { return }
             envelope = built
+            // For Skip silence; ignored if the player holds another file by now.
+            player.setPeaks(peaks, for: audioURL.lastPathComponent)
             if peaksFailure == audioURL { peaksFailure = nil }
         } catch is CancellationError {
             return                          // the next selection's read owns the state now
@@ -180,8 +182,10 @@ private struct PlayerWaveform: View {
     }
 }
 
-/// Play/pause, then the jump chips: how far ← and → move.
+/// Play/pause, then the jump chips (how far ← and → move), and at the right end the noise-reduction and
+/// Skip silence chips.
 private struct PlayerControls: View {
+    @Environment(AppModel.self) private var model
     let recording: CatalogRecording
     let player: RecordingPlayer
     let peaksFailed: Bool
@@ -216,11 +220,39 @@ private struct PlayerControls: View {
             }
 
             Spacer(minLength: 12)
+            NoiseReductionButton(settings: Bindable(model).noiseReduction, available: player.noiseReductionAvailable)
+            SkipSilenceChip(isOn: Bindable(model).skipSilence)
             Text("Space play · ← → jump · ⇧← ⇧→ recording · ⌘-scroll zoom")
                 .font(.system(size: 11))
                 .foregroundStyle(RecordingsTheme.muted)
                 .lineLimit(1)
                 .truncationMode(.head)
+                .padding(.leading, 6)
         }
+        .font(.system(size: 12))
+    }
+}
+
+/// The Skip silence chip, in the noise-reduction chip's style (fixed green and black when on, so it looks the
+/// same in the dark Recordings window).
+struct SkipSilenceChip: View {
+    @Binding var isOn: Bool
+
+    var body: some View {
+        Button { isOn.toggle() } label: {
+            Label("Skip silence", systemImage: "forward.end")
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+        }
+        .buttonStyle(.plain)
+        .fixedSize()
+        .foregroundStyle(isOn ? Color.black : Color.secondary)
+        .background { RoundedRectangle(cornerRadius: 5).fill(isOn ? Color.green : Color.white.opacity(0.06)) }
+        .overlay { RoundedRectangle(cornerRadius: 5).stroke(isOn ? Color.green : Color.white.opacity(0.15)) }
+        .opacity(isOn ? 1 : 0.6)
+        .help("Skip silent stretches while playing")
+        .accessibilityLabel("Skip silence")
+        .accessibilityValue(isOn ? "On" : "Off")
+        .accessibilityAddTraits(.isToggle)
     }
 }

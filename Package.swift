@@ -39,6 +39,8 @@ let package = Package(
             linkerSettings: sdrplayLinker + embeddedInfoPlist),
         /// Command-line tool: replays an IQ capture through the receiver and the auto-record trigger.
         .executableTarget(name: "AutoRecordReplay", dependencies: ["DSPCore", "Recording"], swiftSettings: fastMath),
+        /// Command-line tool: runs a recording through the noise reducer to hear and measure it.
+        .executableTarget(name: "NRCheck", dependencies: ["DSPCore"], swiftSettings: fastMath),
         .testTarget(name: "DSPCoreTests", dependencies: ["DSPCore"]),
         .testTarget(name: "ModemsTests", dependencies: ["Modems", "DSPCore"]),
         .testTarget(name: "SubFloorCoreTests", dependencies: ["SubFloorCore", "DSPCore"]),

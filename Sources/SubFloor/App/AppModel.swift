@@ -54,6 +54,10 @@ private struct SessionState: Codable {
     var autoRecord: Bool?
     var squelchEnabled: Bool?
     var squelchDb: Float?
+    // Optional so that sessions saved before noise reduction decode.
+    var noiseReduction: NoiseReductionSettings?
+    // Optional so that sessions saved before Skip silence decode.
+    var skipSilence: Bool?
 }
 
 @MainActor @Observable
@@ -84,6 +88,29 @@ final class AppModel {
         }
     }
     var squelchDb: Float = -80 { didSet { pushReceiver() } }
+    /// Noise reduction on the speakers (not the recordings), persisted. It keeps its setting in the
+    /// modes where it does not apply (`noiseReductionAvailable`). The engine is sent the setting as it
+    /// is and applies it only where the mode allows, on every mode change however it happens (the
+    /// mode picker, a bookmark, a restored session).
+    var noiseReduction = NoiseReductionSettings() {
+        didSet {
+            engine.update(noiseReduction: noiseReduction)
+            player?.noiseReduction = noiseReduction
+            saveSessionIfChanged()
+        }
+    }
+    /// The Recordings player jumps over silent stretches while playing, persisted.
+    var skipSilence = true {
+        didSet {
+            player?.skipSilence = skipSilence
+            saveSessionIfChanged()
+        }
+    }
+    var noiseReductionAvailable: Bool { NoiseReductionSettings.isAvailable(for: mode) }
+    func toggleNoiseReduction() {
+        guard noiseReductionAvailable else { return }
+        noiseReduction.enabled.toggle()
+    }
     var agcSpeed: AGCSpeed = .medium { didSet { pushReceiver() } }
     var volume: Float = 0.5 {
         didSet {
@@ -304,6 +331,8 @@ final class AppModel {
         }
         restoreSession()
         player.volume = volume
+        player.noiseReduction = noiseReduction
+        player.skipSilence = skipSilence
         pushRecording()
         pushRecordingContexts()
         pushAutoRecord()
@@ -1319,7 +1348,8 @@ final class AppModel {
                                  showBookmarks: showBookmarks, volume: volume, agcSpeed: agcSpeed, cwPitchHz: cwPitchHz,
                                  preferredSource: preferredSource == .file ? .sdrplay : preferredSource,
                                  modemBox: nil, modemSettings: modem.settings, recording: recording,
-                                 autoRecord: autoRecordEnabled, squelchEnabled: squelchEnabled, squelchDb: squelchDb)
+                                 autoRecord: autoRecordEnabled, squelchEnabled: squelchEnabled, squelchDb: squelchDb,
+                                 noiseReduction: noiseReduction, skipSilence: skipSilence)
         guard let data = try? JSONEncoder().encode(state), data != lastSavedSession else { return }
         defaults.set(data, forKey: "session")
         lastSavedSession = data
@@ -1338,6 +1368,9 @@ final class AppModel {
         if let on = s.squelchEnabled { squelchEnabled = on }
         if let db = s.squelchDb { squelchDb = db }
         if let on = s.autoRecord { autoRecordEnabled = on }
+        if let on = s.skipSilence { skipSilence = on }
+        // Last: it saves the session, which must be whole by then.
+        if let nr = s.noiseReduction { noiseReduction = nr }
         lastSavedSession = data
     }
 }

@@ -91,6 +91,8 @@ final class DSPEngine: @unchecked Sendable {
 
     /// Test hook: ModemChannels built by the DSP thread.
     let modemChannelBuilds = Atomic<Int>(0)
+    /// Test hook: times the DSP thread reset the speakers' noise reducer.
+    let noiseReducerResets = Atomic<Int>(0)
     let modemWorker: ModemWorker
     /// The recorders, fed on the DSP thread with every block: the IQ as it arrives, and the
     /// Receiver's audio before the volume knob and the limiter. Their pre-roll rings run whenever
@@ -124,6 +126,7 @@ final class DSPEngine: @unchecked Sendable {
         var receiver: Receiver.Config?
         var spectrum: SpectrumSettings?
         var volume: Float?
+        var noiseReduction: NoiseReductionSettings?
         var resetPeak = false
         var modemBox: ModemBoxState?
     }
@@ -132,6 +135,9 @@ final class DSPEngine: @unchecked Sendable {
     private let wake = DispatchSemaphore(value: 0)
     private let running = Atomic<Bool>(false)
     private let pending = Mutex(Pending())
+    /// The last noise-reduction setting sent, as the volume is: `start` begins with it, so a setting
+    /// made while the radio is stopped applies when it runs. The DSP thread gets it through `pending`.
+    private let noiseReductionSetting = Mutex(NoiseReductionSettings())
     private let dropped = Atomic<Int>(0)
     /// IQ the source callback dropped (ring full): `count` samples were lost just before ring-stream
     /// position `position` (samples written into the ring since `start`). The DSP thread marks the
@@ -188,12 +194,13 @@ final class DSPEngine: @unchecked Sendable {
             return r.epoch
         }
         modemWorker.update(volume: volume)
+        let noiseReduction = noiseReductionSetting.withLock { $0 }
         modemWorker.start(epoch: epoch)
         let done = DispatchSemaphore(value: 0)
         exited = done
         running.store(true, ordering: .releasing)
         let thread = Thread { [unowned self] in
-            run(receiver: receiver, spectrum: spectrum, volume: volume, epoch: epoch)
+            run(receiver: receiver, spectrum: spectrum, volume: volume, noiseReduction: noiseReduction, epoch: epoch)
             done.signal()
         }
         thread.name = "SubFloor DSP"
@@ -243,6 +250,15 @@ final class DSPEngine: @unchecked Sendable {
     func update(volume: Float) {
         pending.withLock { $0.volume = volume }
         modemWorker.update(volume: volume)
+    }
+    /// The last setting sent (tests).
+    var noiseReductionRequest: NoiseReductionSettings { noiseReductionSetting.withLock { $0 } }
+    /// Noise reduction for the speakers, as the user set it. The engine applies it only where the
+    /// mode allows (`NoiseReductionSettings.isAvailable`), re-checked on every mode change;
+    /// recordings and the modem never get it.
+    func update(noiseReduction: NoiseReductionSettings) {
+        noiseReductionSetting.withLock { $0 = noiseReduction }
+        pending.withLock { $0.noiseReduction = noiseReduction }
     }
     func resetPeak() { pending.withLock { $0.resetPeak = true } }
 
@@ -296,11 +312,21 @@ final class DSPEngine: @unchecked Sendable {
     }
 
     private func run(receiver config: Receiver.Config, spectrum initial: SpectrumSettings, volume initialVolume: Float,
-                     epoch: UInt64) {
+                     noiseReduction initialNoiseReduction: NoiseReductionSettings, epoch: UInt64) {
         let sampleRate = config.inputRate
         let receiver = Receiver(config: config)
         var settings = initial
         var volume = initialVolume
+        // Owned by this thread; `process` allocates nothing.
+        let reducer = NoiseReducer(sampleRate: Receiver.audioRate)
+        var requestedNoiseReduction = initialNoiseReduction
+        var receiverMode = config.mode
+        func applyNoiseReduction() {
+            var effective = requestedNoiseReduction
+            effective.enabled = effective.enabled && NoiseReductionSettings.isAvailable(for: receiverMode)
+            reducer.update(effective)
+        }
+        applyNoiseReduction()
         var analyzer = SpectrumAnalyzer(size: settings.fftSize, window: settings.window)
         var averager = SpectrumAverager(size: settings.fftSize, alpha: settings.averaging)
         var history = [DSPComplex](repeating: DSPComplex(real: 0, imag: 0), count: settings.fftSize)
@@ -327,7 +353,23 @@ final class DSPEngine: @unchecked Sendable {
                 p = Pending()
                 return c
             }
-            if let r = changes.receiver { receiver.update(r) }
+            if let r = changes.receiver {
+                receiver.update(r)
+                // A new mode makes what the reducer has learnt about the noise wrong; a retune or a
+                // bandwidth change does not reset it. A reset fades NR out and back and restarts the
+                // noise estimate, and a passband drag changes the bandwidth every few ms; minimum
+                // statistics follows a wider or narrower passband by itself (within ~1.7 s).
+                if r.mode != receiverMode {
+                    receiverMode = r.mode
+                    reducer.reset()
+                    noiseReducerResets.add(1, ordering: .relaxed)
+                    applyNoiseReduction()
+                }
+            }
+            if let n = changes.noiseReduction {
+                requestedNoiseReduction = n
+                applyNoiseReduction()
+            }
             if let v = changes.volume { volume = v }
             if let s = changes.spectrum, s != settings {
                 if s.fftSize != settings.fftSize || s.window != settings.window {
@@ -441,6 +483,8 @@ final class DSPEngine: @unchecked Sendable {
             audioOut.withUnsafeBufferPointer { heard in
                 receiver.ungatedAudio.withUnsafeBufferPointer { autoRecorder.process(heard, ungated: $0, gateOpen: receiver.isSquelchOpen) }
             }
+            // The speaker path only: the recorders above and the modem have the audio as heard.
+            audioOut.withUnsafeMutableBufferPointer { reducer.process($0) }
             audioOut.withUnsafeMutableBufferPointer { a in
                 var gain = volume
                 vDSP_vsmul(a.baseAddress!, 1, &gain, a.baseAddress!, 1, vDSP_Length(a.count))
