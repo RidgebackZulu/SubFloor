@@ -91,6 +91,8 @@ final class DSPEngine: @unchecked Sendable {
 
     /// Test hook: ModemChannels built by the DSP thread.
     let modemChannelBuilds = Atomic<Int>(0)
+    /// Test hook: times the DSP thread reset the speakers' noise reducer.
+    let noiseReducerResets = Atomic<Int>(0)
     let modemWorker: ModemWorker
     /// The recorders, fed on the DSP thread with every block: the IQ as it arrives, and the
     /// Receiver's audio before the volume knob and the limiter. Their pre-roll rings run whenever
@@ -319,7 +321,6 @@ final class DSPEngine: @unchecked Sendable {
         let reducer = NoiseReducer(sampleRate: Receiver.audioRate)
         var requestedNoiseReduction = initialNoiseReduction
         var receiverMode = config.mode
-        var receiverBandwidth = config.bandwidthHz
         func applyNoiseReduction() {
             var effective = requestedNoiseReduction
             effective.enabled = effective.enabled && NoiseReductionSettings.isAvailable(for: receiverMode)
@@ -354,12 +355,14 @@ final class DSPEngine: @unchecked Sendable {
             }
             if let r = changes.receiver {
                 receiver.update(r)
-                // A new mode or bandwidth changes what the reducer has learnt about the noise; a
-                // retune alone does not.
-                if r.mode != receiverMode || r.bandwidthHz != receiverBandwidth {
+                // A new mode makes what the reducer has learnt about the noise wrong; a retune or a
+                // bandwidth change does not reset it. A reset fades NR out and back and restarts the
+                // noise estimate, and a passband drag changes the bandwidth every few ms; minimum
+                // statistics follows a wider or narrower passband by itself (within ~1.7 s).
+                if r.mode != receiverMode {
                     receiverMode = r.mode
-                    receiverBandwidth = r.bandwidthHz
                     reducer.reset()
+                    noiseReducerResets.add(1, ordering: .relaxed)
                     applyNoiseReduction()
                 }
             }

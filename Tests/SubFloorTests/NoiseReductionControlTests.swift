@@ -145,6 +145,52 @@ struct NoiseReductionControlTests {
         #expect(maxDifference(s, t) > 0.01, "and NR was running on the speakers")
     }
 
+    /// A retune or a bandwidth change (a passband drag sends one every few ms) leaves the reducer
+    /// running on what it has learnt; only a new mode resets it. A reset fades NR out and back and
+    /// restarts the noise estimate, so resetting on bandwidth would leave a drag's hiss unreduced.
+    @Test func onlyAModeChangeResetsTheReducer() throws {
+        let sink = CaptureSink()
+        let engine = DSPEngine(audioSink: sink)
+        engine.update(noiseReduction: NoiseReductionSettings(enabled: true, strength: 0.5))
+        let rx = Receiver.Config(inputRate: 250_000, offsetHz: 0, mode: .usb, bandwidthHz: 2_700)
+        do {
+            try engine.start(source: ToneInNoiseSource(), receiver: rx, spectrum: SpectrumSettings(fftSize: 2_048), volume: 0.5)
+        } catch {
+            print("engine start failed (tolerated, no audio device): \(error)")
+            engine.stop()
+            return
+        }
+        defer { engine.stop() }
+        func resets() -> Int { engine.noiseReducerResets.load(ordering: .relaxed) }
+        /// Waits until the DSP thread has pushed `blocks` more blocks (480 samples each), so a
+        /// change made before it has been taken.
+        func runOn(_ blocks: Int) -> Bool {
+            let target = sink.count + blocks * 480
+            return waitUntil(30) { sink.count >= target }
+        }
+        #expect(runOn(10))
+
+        var changed = rx
+        changed.offsetHz = 1_000                 // retune
+        engine.update(receiver: changed)
+        #expect(runOn(10))
+        changed.bandwidthHz = 2_400              // a bandwidth step
+        engine.update(receiver: changed)
+        #expect(runOn(10))
+        for hz in stride(from: 2_350.0, through: 1_800, by: -50) {   // a drag
+            changed.bandwidthHz = hz
+            engine.update(receiver: changed)
+            #expect(runOn(1))
+        }
+        #expect(runOn(10))
+        #expect(resets() == 0, "a retune or bandwidth change reset the reducer \(resets()) times")
+
+        changed.mode = .lsb
+        engine.update(receiver: changed)
+        #expect(waitUntil(30) { resets() > 0 })
+        #expect(resets() == 1, "a mode change resets it once")
+    }
+
     // MARK: Harness
 
     private struct Captured {
