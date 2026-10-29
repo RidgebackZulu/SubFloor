@@ -6,6 +6,7 @@ import Recording
 import SDRplayKit
 import SubFloorCore
 import SwiftUI
+import Transcription
 import UniformTypeIdentifiers
 
 enum BannerAction: Equatable { case retry, reduceGain, copyServiceRestart }
@@ -58,6 +59,8 @@ private struct SessionState: Codable {
     var noiseReduction: NoiseReductionSettings?
     // Optional so that sessions saved before Skip silence decode.
     var skipSilence: Bool?
+    // Optional so that sessions saved before transcripts decode.
+    var transcription: TranscriptionSettings?
 }
 
 @MainActor @Observable
@@ -105,6 +108,39 @@ final class AppModel {
             player?.skipSilence = skipSilence
             saveSessionIfChanged()
         }
+    }
+    /// Speech-transcript settings, persisted. Turning `enabled` on stamps `enabledSince` with now, however
+    /// it happens; changing the model or language leaves it. A first launch (no saved settings) starts
+    /// enabled, since the launch time.
+    var transcriptionSettings = TranscriptionSettings(enabledSince: Date()) {
+        didSet {
+            if transcriptionSettings.enabled && !oldValue.enabled {
+                transcriptionSettings.enabledSince = Date()
+            }
+            saveSessionIfChanged()
+        }
+    }
+    func toggleTranscription() { transcriptionSettings.enabled.toggle() }
+    /// The OpenRouter key, read from the key store at launch. Never logged, printed or saved in the session.
+    private(set) var apiKey: String?
+    var hasAPIKey: Bool { !(apiKey ?? "").isEmpty }
+    /// Stores `key` (trimmed) in the key store; an empty or blank key removes it instead.
+    func saveAPIKey(_ key: String) throws {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { try removeAPIKey(); return }
+        try apiKeyStore.save(trimmed)
+        apiKey = trimmed
+    }
+    func removeAPIKey() throws {
+        try apiKeyStore.remove()
+        apiKey = nil
+    }
+    /// Saves the key from the `.env` file at `url`. Throws `APIKeyImportError.noKey` when the file has
+    /// none (the stored key is left alone), or the read error when the file cannot be read.
+    func importAPIKey(fromEnvFileAt url: URL) throws {
+        let contents = try String(contentsOf: url, encoding: .utf8)
+        guard let key = EnvFile.openRouterKey(in: contents) else { throw APIKeyImportError.noKey }
+        try saveAPIKey(key)
     }
     var noiseReductionAvailable: Bool { NoiseReductionSettings.isAvailable(for: mode) }
     func toggleNoiseReduction() {
@@ -295,6 +331,7 @@ final class AppModel {
     private var fileSource: IQFileSource?
     private let bookmarkStore: BookmarkStore
     private let defaults: UserDefaults
+    private let apiKeyStore: any APIKeyStore
     private var bookmarksSaveBlocked = false
     private var statsTimer: Timer?
     private var statsTicks = 0
@@ -304,16 +341,20 @@ final class AppModel {
     /// The app's model. Only this one reads the recordings folder at launch: a test's model, made with the
     /// init below, points the library at its own folder (or none) rather than at the owner's recordings.
     convenience init() {
-        self.init(bookmarkStore: BookmarkStore(url: BookmarkStore.defaultURL), defaults: .standard)
+        self.init(bookmarkStore: BookmarkStore(url: BookmarkStore.defaultURL), defaults: .standard,
+                  apiKeyStore: KeychainAPIKeyStore())
         startLibrary()
     }
 
     /// `openRSP` and `rspOpenTimeout`: tests replace the device and the wait.
     init(bookmarkStore: BookmarkStore, defaults: UserDefaults,
+         apiKeyStore: any APIKeyStore = MemoryAPIKeyStore(),
          openRSP: @escaping @Sendable () throws -> SDRplayDevice = { try SDRplayDevice.open() },
          rspOpenTimeout: Duration = .seconds(10)) {
         self.bookmarkStore = bookmarkStore
         self.defaults = defaults
+        self.apiKeyStore = apiKeyStore
+        apiKey = apiKeyStore.load()
         self.openRSP = openRSP
         self.rspOpenTimeout = rspOpenTimeout
         library = RecordingsLibrary(folder: RecordingSettings().folder)   // the folder `restoreSession` may replace
@@ -1349,7 +1390,8 @@ final class AppModel {
                                  preferredSource: preferredSource == .file ? .sdrplay : preferredSource,
                                  modemBox: nil, modemSettings: modem.settings, recording: recording,
                                  autoRecord: autoRecordEnabled, squelchEnabled: squelchEnabled, squelchDb: squelchDb,
-                                 noiseReduction: noiseReduction, skipSilence: skipSilence)
+                                 noiseReduction: noiseReduction, skipSilence: skipSilence,
+                                 transcription: transcriptionSettings)
         guard let data = try? JSONEncoder().encode(state), data != lastSavedSession else { return }
         defaults.set(data, forKey: "session")
         lastSavedSession = data
@@ -1369,6 +1411,7 @@ final class AppModel {
         if let db = s.squelchDb { squelchDb = db }
         if let on = s.autoRecord { autoRecordEnabled = on }
         if let on = s.skipSilence { skipSilence = on }
+        if let t = s.transcription { transcriptionSettings = t }
         // Last: it saves the session, which must be whole by then.
         if let nr = s.noiseReduction { noiseReduction = nr }
         lastSavedSession = data
