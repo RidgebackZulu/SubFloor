@@ -1,6 +1,7 @@
 import Foundation
 import SubFloorCore
 import Testing
+import Transcription
 @testable import SubFloor
 
 /// The transcription settings (saved with the session) and the OpenRouter key (kept in a key store,
@@ -14,7 +15,8 @@ struct TranscriptionSettingsTests {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let m = AppModel(bookmarkStore: BookmarkStore(url: dir.appendingPathComponent("bookmarks.json")),
                          defaults: defaults ?? UserDefaults(suiteName: UUID().uuidString)!,
-                         apiKeyStore: store)
+                         apiKeyStore: store,
+                         transcribe: { _, _, _, _, _ in throw TranscriptionError.badRequest("no transcription in these tests") })
         m.recording.folderPath = dir.appendingPathComponent("rec").path
         return (m, dir)
     }

@@ -4,6 +4,7 @@ import Foundation
 import Recording
 import SubFloorCore
 import Testing
+import Transcription
 @testable import SubFloor
 
 /// The library of recordings the Recordings window shows: the folder listing, every day log and the recording
@@ -179,6 +180,41 @@ struct RecordingsLibraryTests {
         await reading.value
         #expect(await gate.reads == 2)   // the line is added to what the held read found, not read again
         #expect(library.unheardCount == 0)
+    }
+
+    private func transcript(_ file: String) -> StoredTranscript {
+        StoredTranscript(file: file, model: "m", language: "en", createdAt: Date(timeIntervalSince1970: 0),
+                         durationSeconds: 5, costUSD: nil, note: "silent", chunks: [])
+    }
+
+    @Test func reloadReadsSidecarsAndSetFolderClearsThem() async throws {
+        let a = tempFolder(), b = tempFolder()
+        let files = try populate(a, offsets: [0, 60])
+        try TranscriptStore.write(transcript(files[0]), in: a)
+        let library = RecordingsLibrary(folder: a)
+        await library.reload()
+        #expect(library.transcripts.contains(files[0]))
+        #expect(!library.transcripts.contains(files[1]))
+        #expect(library.untranscribed().map(\.file) == [files[1]])
+        library.setFolder(b)
+        #expect(!library.transcripts.contains(files[0]))   // at once, before B is read
+        library.didTranscribe(transcript(files[1]), folder: a)   // a job from A landing late
+        #expect(!library.transcripts.contains(files[1]))
+    }
+
+    @Test func aTranscriptLandingWhileAReadIsInFlightIsNotLost() async throws {
+        let folder = tempFolder()
+        let files = try populate(folder, offsets: [0])
+        let library = RecordingsLibrary(folder: folder)
+        let gate = gated(library)
+        await gate.arm()
+        let reading = Task { await library.reload() }   // lists the sidecars before this one exists, then waits
+        try await waitUntilHeld(gate)
+        try TranscriptStore.write(transcript(files[0]), in: folder)
+        library.didTranscribe(transcript(files[0]), folder: folder)
+        await gate.release()
+        await reading.value
+        #expect(library.transcripts.contains(files[0]))
     }
 
     /// Holds one read in flight before it reads, so what is written meanwhile is in what it reads.

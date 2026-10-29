@@ -114,15 +114,18 @@ final class AppModel {
     /// enabled, since the launch time.
     var transcriptionSettings = TranscriptionSettings(enabledSince: Date()) {
         didSet {
-            if transcriptionSettings.enabled && !oldValue.enabled {
-                transcriptionSettings.enabledSince = Date()
-            }
+            let turnedOn = transcriptionSettings.enabled && !oldValue.enabled
+            if turnedOn { transcriptionSettings.enabledSince = Date() }
+            transcription.settings = transcriptionSettings
+            if !transcriptionSettings.enabled && oldValue.enabled { transcription.dropQueued() }
+            if turnedOn { queueRecentRecordings() }
             saveSessionIfChanged()
         }
     }
     func toggleTranscription() { transcriptionSettings.enabled.toggle() }
     /// The OpenRouter key, read from the key store at launch. Never logged, printed or saved in the session.
-    private(set) var apiKey: String?
+    /// Saving a key, even the same one, also unblocks the transcription queue.
+    private(set) var apiKey: String? { didSet { transcription.apiKey = apiKey } }
     var hasAPIKey: Bool { !(apiKey ?? "").isEmpty }
     /// Stores `key` (trimmed) in the key store; an empty or blank key removes it instead.
     func saveAPIKey(_ key: String) throws {
@@ -218,10 +221,57 @@ final class AppModel {
                 Task { await library.refreshFiles() }
             }
         }
-        Task { [library] in await library.reload() }
+        Task { [weak self, library] in
+            await library.reload()
+            self?.queueRecentRecordings()
+        }
     }
 
     @ObservationIgnored private var libraryActivation: (any NSObjectProtocol)?
+
+    // MARK: Transcription
+
+    /// Sends finished recordings for transcription and saves their transcripts beside them.
+    let transcription: TranscriptionQueue
+
+    /// The relaunch rule: queues the folder's audio recordings that have a length and no transcript and
+    /// started within the last 24 hours, at or after transcription was last turned on. Run after the
+    /// library's first read and whenever transcription is turned on. The older backlog is never queued
+    /// here; only `transcribeOlderRecordings` spends money on it. Internal for tests, which pass `now`.
+    func queueRecentRecordings(now: Date = Date()) {
+        guard transcriptionSettings.enabled, hasAPIKey else { return }
+        let since = transcriptionSettings.enabledSince ?? now
+        // Oldest first: each goes to the front, so the newest is sent first.
+        for file in library.recentUntranscribed(since: since, now: now).reversed() {
+            transcription.enqueue(file, folder: library.folder)
+        }
+    }
+
+    /// "Transcribe older recordings": every audio recording in the folder without a transcript, newest first.
+    func transcribeOlderRecordings() {
+        transcription.enqueueBacklog(library.untranscribed().map(\.file), folder: library.folder)
+    }
+
+    /// The marker's "Transcribe" or "Transcribe again": sends one recording again, failed or transcribed.
+    func retryTranscription(_ file: String) {
+        transcription.retry(file, folder: library.folder)
+    }
+
+    /// What "Transcribe older recordings" would send: how many recordings, and the cost at the model's
+    /// per-second price (nil when the model has none). Recordings already queued are not counted; one whose
+    /// length is unknown counts towards the number but adds nothing to the cost.
+    var olderRecordingsEstimate: (count: Int, dollars: Double?) {
+        let files = library.untranscribed().filter { transcription.states[$0.file] == nil }
+        let seconds = files.reduce(0) { $0 + ($1.seconds ?? 0) }
+        return (files.count, OpenRouterTranscriber.pricePerSecond[transcriptionSettings.model].map { $0 * seconds })
+    }
+
+    /// Queues the recordings that `entries` finished.
+    private func queueFinishedRecordings(_ entries: [RecordingLogEntry]) {
+        for entry in entries {
+            if case .recording(let file, _, _, _, _, _) = entry { transcription.enqueue(file, folder: library.folder) }
+        }
+    }
 
     /// The log of finished recordings and ignored pops, in the recordings folder.
     var recordingLog: RecordingLog { RecordingLog(folder: recording.folder) }
@@ -346,9 +396,10 @@ final class AppModel {
         startLibrary()
     }
 
-    /// `openRSP` and `rspOpenTimeout`: tests replace the device and the wait.
+    /// `openRSP`, `rspOpenTimeout` and `transcribe`: tests replace the device, the wait and the transcription.
     init(bookmarkStore: BookmarkStore, defaults: UserDefaults,
          apiKeyStore: any APIKeyStore = MemoryAPIKeyStore(),
+         transcribe: @escaping TranscribeFunction = OpenRouterTranscriber.liveTranscribe,
          openRSP: @escaping @Sendable () throws -> SDRplayDevice = { try SDRplayDevice.open() },
          rspOpenTimeout: Duration = .seconds(10)) {
         self.bookmarkStore = bookmarkStore
@@ -358,6 +409,7 @@ final class AppModel {
         self.openRSP = openRSP
         self.rspOpenTimeout = rspOpenTimeout
         library = RecordingsLibrary(folder: RecordingSettings().folder)   // the folder `restoreSession` may replace
+        transcription = TranscriptionQueue(transcribe: transcribe)
         player = RecordingPlayer(library: library, setLiveMuted: { [weak self] muted in self?.liveAudioMuted = muted })
         let (loaded, result) = bookmarkStore.load()
         bookmarks = loaded
@@ -381,6 +433,10 @@ final class AppModel {
         engine.audio.onError = { [weak self] message in
             Task { @MainActor in self?.show(Banner(kind: .error, message: message, action: .retry)) }
         }
+        transcription.settings = transcriptionSettings
+        transcription.apiKey = apiKey
+        transcription.isTranscribed = { [library] file in library.transcripts.contains(file) }
+        transcription.onTranscript = { [library] t, folder in library.didTranscribe(t, folder: folder) }
         library.onError = { [weak self] message in self?.show(Banner(kind: .error, message: message)) }
         library.onChange = { [weak self] in
             guard let self else { return }
@@ -1129,13 +1185,15 @@ final class AppModel {
                           frequencyHz: tuning.hz, mode: tuning.mode, auto: status.isAuto)
     }
 
-    /// A failed write shows one banner until a write succeeds again; recording carries on.
-    private func appendToLog(_ entries: [RecordingLogEntry]) {
+    /// A failed write shows one banner until a write succeeds again; recording carries on. A finished
+    /// recording is queued for transcription once its line is on disk. Internal for tests.
+    func appendToLog(_ entries: [RecordingLogEntry]) {
         guard !entries.isEmpty else { return }
         do {
             try recordingLog.append(entries)
             logWriteFailed = false
             library.didLog(entries)   // only what is on disk
+            queueFinishedRecordings(entries)
         } catch {
             guard !logWriteFailed else { return }
             logWriteFailed = true
