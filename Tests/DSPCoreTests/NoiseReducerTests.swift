@@ -340,3 +340,24 @@ private func rmsDb(_ y: [Float], _ start: Int, _ count: Int = 128) -> Double { l
     let low = stride(from: at, to: at + Int(0.03 * fs) + l, by: 128).map { rmsDb(y, $0) }.min()!
     #expect(low >= floorDb, "lowest 128-sample level \(low) dB vs floor \(floorDb) dB (before the reset \(wetBefore) dB)")
 }
+
+@Test func turningOnAgainKeepsTheNoiseEstimate() {
+    // A tone 6 dB over the noise, keyed in syllables. NR on for 4 s, off for 1 s, then on again
+    // 50 ms into a syllable (5.0–5.3 s). A cold noise tracker takes the first frames' power, voice
+    // and all, for noise and ducks the rest of that syllable.
+    let x = mix(syllables(seconds: 7, amplitude: amplitude(6, over: 0.1)), noise(seconds: 7, rms: 0.1, seed: 31))
+    let nr = NoiseReducer()
+    let on = NoiseReductionSettings(enabled: true, strength: 0.5), off = NoiseReductionSettings(enabled: false, strength: 0.5)
+    let offAt = 4 * Int(fs), onAt = Int(5.05 * fs)
+    nr.update(on)
+    var y = runNR(nr, Array(x[0..<offAt]))
+    nr.update(off)
+    y += runNR(nr, Array(x[offAt..<onAt]))
+    nr.update(on)
+    y += runNR(nr, Array(x[onAt...]))
+    let l = SpectralNoiseReducer().latency
+    // The rest of the syllable once the wet path is fully in (latency + 30 ms fade, + 10 ms).
+    let a = onAt + Int(0.04 * fs), b = Int(5.28 * fs)
+    let change = toneDb(y[(a + l)..<(b + l)]) - toneDb(x[a..<b])
+    #expect(change >= -2, "the syllable after turning NR on again: \(change) dB")
+}

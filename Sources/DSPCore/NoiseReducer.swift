@@ -66,9 +66,13 @@ public final class NoiseReducer {
         let target = min(max(new.strength, 0), 1)
         let idle = !settings.enabled && wetMix == 0
         if new.enabled && idle {
-            // Coming on from idle: the reducer holds stale audio and a stale noise estimate.
-            // Its output is silence for `latency` samples, so stay dry until that has passed.
-            restartReducer()
+            // Coming on from idle: the reducer holds stale audio, which goes. Its noise estimate
+            // stays: a stale one is corrected within ~1.7 s, while a cold one would take the voice
+            // being spoken for noise and duck it. After the flush the reducer's output is silence
+            // for `latency` samples, so stay dry until that has passed.
+            reducer.flushAudio()
+            resetPending = false
+            priming = reducer.latency
         }
         if idle {
             currentStrength = target                 // not running, nothing to ramp

@@ -130,23 +130,30 @@ public final class SpectralNoiseReducer {
 
     /// Clears all state; keeps `strength`.
     public func reset() {
-        let n = Self.frameSize
-        input.update(repeating: 0, count: n)
-        accumulator.update(repeating: 0, count: n)
-        ready.update(repeating: 0, count: Self.hop)
+        flushAudio()
         smoothed.update(repeating: 0, count: bins)
         noise.update(repeating: 0, count: bins)
-        prevClean.update(repeating: 0, count: bins)
         runningMin.update(repeating: .greatestFiniteMagnitude, count: bins)
         storedMin.update(repeating: .greatestFiniteMagnitude, count: bins)
         storedMins.update(repeating: .greatestFiniteMagnitude, count: Self.subWindows * bins)
-        filled = 0
-        silentHops = (1 << (n / Self.hop)) - 1     // before the first sample counts as silence
         trackerStarted = false
         subWindowCount = 0
         nextStored = 0
         storedCount = 0
         voiceLossDb = 0
+    }
+
+    /// Clears the audio in flight (the input frame, the overlap-add, the decision-directed a-priori
+    /// SNR) but keeps the noise estimate and `voiceLossDb`: for picking up again after a gap in the
+    /// audio. As after `reset()`, the output is silence for `latency` samples. Does not allocate.
+    public func flushAudio() {
+        let n = Self.frameSize
+        input.update(repeating: 0, count: n)
+        accumulator.update(repeating: 0, count: n)
+        ready.update(repeating: 0, count: Self.hop)
+        prevClean.update(repeating: 0, count: bins)
+        filled = 0
+        silentHops = (1 << (n / Self.hop)) - 1     // before the first sample counts as silence
     }
 
     /// In place, any count; output delayed by `latency`.
