@@ -127,12 +127,15 @@ final class AppModel {
     /// Saving a key, even the same one, also unblocks the transcription queue.
     private(set) var apiKey: String? { didSet { transcription.apiKey = apiKey } }
     var hasAPIKey: Bool { !(apiKey ?? "").isEmpty }
-    /// Stores `key` (trimmed) in the key store; an empty or blank key removes it instead.
+    /// Stores `key` (trimmed) in the key store and queues today's recordings that were waiting for one; an
+    /// empty or blank key removes it instead.
     func saveAPIKey(_ key: String) throws {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { try removeAPIKey(); return }
         try apiKeyStore.save(trimmed)
         apiKey = trimmed
+        // Recordings made today before the key was added start now, as if it had been there.
+        queueRecentRecordings()
     }
     func removeAPIKey() throws {
         try apiKeyStore.remove()

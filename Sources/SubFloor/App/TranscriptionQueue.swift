@@ -38,10 +38,12 @@ final class TranscriptionQueue {
     private(set) var blocked: TranscriptionError?
     /// How far "Transcribe older recordings" has got; nil unless it is running.
     private(set) var backlogProgress: (done: Int, total: Int)?
-    /// The key requests are sent with; nil sends nothing. Setting it, even to the same key, clears `blocked`
-    /// and resumes: saving the key again is how the owner says "try again" after topping up the account.
-    var apiKey: String? {
+    /// The key requests are sent with; nil sends nothing, and an empty key counts as nil. Setting it, even to
+    /// the same key, clears `blocked` and resumes: saving the key again is how the owner says "try again"
+    /// after topping up the account. Not observed: no view shows the key, and the UI reads `hasAPIKey`.
+    @ObservationIgnored var apiKey: String? {
         didSet {
+            if apiKey?.isEmpty == true { apiKey = nil }
             blocked = nil
             pump()
         }

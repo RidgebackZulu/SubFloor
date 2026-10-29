@@ -397,6 +397,52 @@ struct TranscriptionQueueTests {
         #expect(m.library.recentUntranscribed(since: now.addingTimeInterval(-7 * 86_400), now: now).isEmpty)
     }
 
+    @Test func savingAKeyQueuesTodaysRecordings() async throws {
+        let stub = ScriptedTranscriber()
+        let (m, folder) = await makeModel(stub, key: nil)
+        defer { m.shutdown() }
+        // Made earlier today while there was no key; transcription has been on since long before.
+        let start = Date().addingTimeInterval(-3 * 3600)
+        let file = name(start)
+        FileManager.default.createFile(atPath: folder.appendingPathComponent(file).path, contents: Data())
+        try RecordingLog(folder: folder).append([finished(file, start: start)])
+        await m.library.reload()
+        m.transcriptionSettings.enabledSince = Date().addingTimeInterval(-7 * 86_400)
+        m.appendToLog([finished(file, start: start)])
+        #expect(m.transcription.states.isEmpty)
+
+        try m.saveAPIKey("sk-test")
+        await m.transcription.waitUntilIdle()
+        #expect(stub.calls == [file])
+        #expect(sidecarExists(file, in: folder))
+    }
+
+    @Test func importingAKeyQueuesTodaysRecordings() async throws {
+        let stub = ScriptedTranscriber()
+        let (m, folder) = await makeModel(stub, key: nil)
+        defer { m.shutdown() }
+        let start = Date().addingTimeInterval(-3600)
+        let file = name(start)
+        FileManager.default.createFile(atPath: folder.appendingPathComponent(file).path, contents: Data())
+        try RecordingLog(folder: folder).append([finished(file, start: start)])
+        await m.library.reload()
+        m.transcriptionSettings.enabledSince = Date().addingTimeInterval(-7 * 86_400)
+        let env = tempFolder().appendingPathComponent(".env")
+        try "OPENROUTER_API_KEY=sk-test\n".write(to: env, atomically: true, encoding: .utf8)
+        try m.importAPIKey(fromEnvFileAt: env)
+        await m.transcription.waitUntilIdle()
+        #expect(stub.calls == [file])
+    }
+
+    @Test func emptyQueueKeyCountsAsNoKey() async throws {
+        let stub = ScriptedTranscriber()
+        let q = makeQueue(stub)
+        q.apiKey = ""
+        #expect(q.apiKey == nil)
+        q.enqueue("SubFloor_20261029_120000Z_11175000Hz_USB.flac", folder: tempFolder())
+        #expect(q.states.isEmpty)
+    }
+
     @Test func turningOnQueuesRecent() async throws {
         let stub = ScriptedTranscriber()
         let (m, folder) = await makeModel(stub)
