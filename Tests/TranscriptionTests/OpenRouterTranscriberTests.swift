@@ -2,8 +2,8 @@ import Foundation
 import Testing
 @testable import Transcription
 
-/// Records every request and answers from a script; never touches the network.
-private final class StubTransport: HTTPTransport, @unchecked Sendable {
+/// Records every request and answers from a script; never touches the network. Shared with the store tests.
+final class StubTransport: HTTPTransport, @unchecked Sendable {
     enum Step { case reply(Int, Data), fail(Error) }
     private let lock = NSLock()
     private var steps: [Step]
@@ -28,7 +28,8 @@ private final class StubTransport: HTTPTransport, @unchecked Sendable {
     }
 }
 
-private func fixtureData(_ name: String) throws -> Data {
+/// A real saved reply, as the bytes the server would send. Shared with the store tests.
+func fixtureData(_ name: String) throws -> Data {
     let url = try #require(Bundle.module.url(forResource: name, withExtension: "json", subdirectory: "Fixtures"))
     return try Data(contentsOf: url)
 }
