@@ -24,18 +24,22 @@ struct TranscriptionSettingsTests {
         let (m, dir) = makeModel(defaults: defaults)
         m.transcriptionSettings.model = "other/model"
         m.transcriptionSettings.language = nil
+        let stamped = m.transcriptionSettings.enabledSince
+        #expect(stamped != nil)
         m.shutdown()   // saves the session
         let (again, _) = makeModel(defaults: defaults, dir: dir)
         defer { again.shutdown() }
         #expect(again.transcriptionSettings.model == "other/model")
         #expect(again.transcriptionSettings.language == nil)
         #expect(again.transcriptionSettings.enabled)
-        #expect(again.transcriptionSettings.enabledSince != nil)
+        // The saved stamp comes back; a relaunch does not re-stamp it.
+        #expect(again.transcriptionSettings.enabledSince == stamped)
     }
 
     @Test func oldSessionDecodes() throws {
         let defaults = UserDefaults(suiteName: UUID().uuidString)!
         let (m, dir) = makeModel(defaults: defaults)
+        m.skipSilence = false   // a non-default field: it comes back only if the whole session decodes
         m.shutdown()
         // A session saved before transcripts: the same JSON without the `transcription` field.
         let saved = try #require(defaults.data(forKey: "session"))
@@ -45,11 +49,12 @@ struct TranscriptionSettingsTests {
         let before = Date()
         let (again, _) = makeModel(defaults: defaults, dir: dir)
         defer { again.shutdown() }
+        #expect(!again.skipSilence)   // the rest of the old session was restored, not dropped
         #expect(again.transcriptionSettings.enabled)
         #expect(again.transcriptionSettings.model == TranscriptionSettings().model)
         #expect(again.transcriptionSettings.language == "en")
         let since = try #require(again.transcriptionSettings.enabledSince)
-        #expect(since >= before.addingTimeInterval(-60) && since <= Date())
+        #expect(since >= before && since <= Date())
     }
 
     @Test func firstLaunchStampsEnabledSince() throws {
