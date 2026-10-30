@@ -99,6 +99,21 @@ final class SleepLog: @unchecked Sendable {
     var function: @Sendable (Duration) async throws -> Void { { [self] d in lock.withLock { _durations.append(d) } } }
 }
 
+/// A sleep that holds every caller until `gate` opens, and counts the callers: a retry delay that does not end
+/// until the test says so.
+final class GatedSleep: @unchecked Sendable {
+    let gate = TestGate()
+    private let lock = NSLock()
+    private var _count = 0
+    var count: Int { lock.withLock { _count } }
+    var function: @Sendable (Duration) async throws -> Void {
+        { [self] _ in
+            lock.withLock { _count += 1 }
+            await gate.wait()
+        }
+    }
+}
+
 /// The transcription queue and its wiring: finished recordings are queued, sent at most two at a time,
 /// retried, blocked by a bad key, saved as sidecars and indexed. The transcribe function is scripted and
 /// keys are fake; nothing reaches the network or the Keychain.
@@ -549,6 +564,101 @@ struct TranscriptionQueueTests {
         m.retryTranscription(files[2])
         await m.transcription.waitUntilIdle()
         #expect(stub.calls.filter { $0 == files[2] }.count == 1)
+    }
+
+    /// A recording that failed is offered again by "Transcribe older recordings": counted in the estimate and
+    /// queued by the backlog. One queued or being sent is left as it is.
+    @Test func failedRecordingsComeBackWithTheBacklog() async throws {
+        let stub = ScriptedTranscriber()
+        let (m, folder) = await makeModel(stub)
+        defer { m.shutdown() }
+        let base = Date(timeIntervalSince1970: 1_792_000_000)
+        let files = (0..<2).map { name(base.addingTimeInterval(Double($0) * 60)) }
+        for (i, file) in files.enumerated() {
+            FileManager.default.createFile(atPath: folder.appendingPathComponent(file).path, contents: Data())
+            try RecordingLog(folder: folder).append([finished(file, start: base.addingTimeInterval(Double(i) * 60), seconds: 100)])
+        }
+        await m.library.reload()
+        stub.answer(files[0], [.error(.badRequest("bad audio")), .voice])
+        m.transcribeOlderRecordings()
+        await m.transcription.waitUntilIdle()
+        #expect(m.transcription.states[files[0]] == .failed("bad audio"))
+        #expect(m.transcription.states[files[1]] == nil)   // transcribed
+
+        let estimate = m.olderRecordingsEstimate
+        #expect(estimate.count == 1)
+        #expect(abs((estimate.dollars ?? 0) - 100 * 0.000008) < 1e-12)
+        m.transcribeOlderRecordings()
+        #expect(m.transcription.backlogProgress?.total == 1)
+        await m.transcription.waitUntilIdle()
+        #expect(stub.calls.filter { $0 == files[0] }.count == 2)
+        #expect(m.transcription.states[files[0]] == nil)
+        #expect(m.library.transcripts.contains(files[0]))
+
+        // The backlog never takes over a recording already queued or being sent.
+        let q = makeQueue(stub)
+        let other = tempFolder()
+        let busy = name(base.addingTimeInterval(600))
+        let gate = stub.hold(busy)
+        q.enqueue(busy, folder: other)
+        await until("running") { q.states[busy] == .running }
+        q.enqueueBacklog([busy], folder: other)
+        #expect(q.backlogProgress == nil)
+        #expect(q.states[busy] == .running)
+        gate.open()
+        await q.waitUntilIdle()
+        #expect(stub.calls.filter { $0 == busy }.count == 1)
+    }
+
+    /// While a recording is resting after the network looked down, nothing new is started: an outage costs the
+    /// recordings already in flight a retry each, not the whole queue its retries. A busy server holds nothing.
+    @Test func anOutageHoldsTheQueueUntilTheFirstRetry() async throws {
+        let stub = ScriptedTranscriber()
+        stub.fallback = .error(.transient("The Internet connection appears to be offline.", offline: true))
+        let sleeps = GatedSleep()
+        let q = TranscriptionQueue(transcribe: stub.function, sleep: sleeps.function)
+        q.settings = TranscriptionSettings(enabledSince: Date())
+        q.apiKey = "sk-test"
+        let folder = tempFolder()
+        let files = (0..<5).map { name(Date(timeIntervalSince1970: 1_792_000_000 + Double($0) * 60)) }
+        for file in files { q.enqueue(file, folder: folder) }
+        await until("both resting") { sleeps.count >= TranscriptionQueue.maxInFlight }
+        try await Task.sleep(for: .milliseconds(50))   // more would have started by now
+        #expect(stub.calls.count == TranscriptionQueue.maxInFlight)
+        #expect(q.states.values.filter { $0 == .queued }.count == 5)
+        sleeps.gate.open()
+        await q.waitUntilIdle()
+        #expect(stub.calls.count == 5 * 4)
+        #expect(files.allSatisfy { q.states[$0] == .failed("The Internet connection appears to be offline.") })
+
+        // A busy server: the next recordings start while the first ones rest.
+        let busy = ScriptedTranscriber()
+        busy.fallback = .error(.transient("OpenRouter is busy (HTTP 503)"))
+        let busySleeps = GatedSleep()
+        let b = TranscriptionQueue(transcribe: busy.function, sleep: busySleeps.function)
+        b.settings = TranscriptionSettings(enabledSince: Date())
+        b.apiKey = "sk-test"
+        for file in files { b.enqueue(file, folder: folder) }
+        await until("all resting") { busySleeps.count == 5 }
+        #expect(busy.calls.count == 5)
+        busySleeps.gate.open()
+        await b.waitUntilIdle()
+    }
+
+    /// A recording that started while transcription was off is never sent, even when its line is logged after
+    /// it was turned on.
+    @Test func aRecordingStartedBeforeTurningOnIsNotQueued() async throws {
+        let stub = ScriptedTranscriber()
+        let (m, _) = await makeModel(stub)
+        defer { m.shutdown() }
+        let now = Date()
+        m.transcriptionSettings.enabledSince = now
+        let before = name(now.addingTimeInterval(-120)), after = name(now.addingTimeInterval(60))
+        m.appendToLog([finished(before, start: now.addingTimeInterval(-120)), finished(after, start: now.addingTimeInterval(60))])
+        #expect(m.transcription.states[before] == nil)
+        #expect(m.transcription.states[after] != nil)
+        await m.transcription.waitUntilIdle()
+        #expect(stub.calls == [after])
     }
 
     @Test func folderChangeDiscardsIndexing() async throws {

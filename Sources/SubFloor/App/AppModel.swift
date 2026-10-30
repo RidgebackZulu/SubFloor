@@ -261,18 +261,23 @@ final class AppModel {
     }
 
     /// What "Transcribe older recordings" would send: how many recordings, and the cost at the model's
-    /// per-second price (nil when the model has none). Recordings already queued are not counted; one whose
-    /// length is unknown counts towards the number but adds nothing to the cost.
+    /// per-second price (nil when the model has none). Recordings already queued or being sent are not counted;
+    /// failed ones are, since it sends them again. One whose length is unknown counts towards the number but adds
+    /// nothing to the cost.
     var olderRecordingsEstimate: (count: Int, dollars: Double?) {
-        let files = library.untranscribed().filter { transcription.states[$0.file] == nil }
+        let files = library.untranscribed().filter { !transcription.isPending($0.file) }
         let seconds = files.reduce(0) { $0 + ($1.seconds ?? 0) }
         return (files.count, OpenRouterTranscriber.pricePerSecond[transcriptionSettings.model].map { $0 * seconds })
     }
 
-    /// Queues the recordings that `entries` finished.
+    /// Queues the recordings that `entries` finished, except one that started before transcription was turned
+    /// on: what was recorded while it was off is never sent.
     private func queueFinishedRecordings(_ entries: [RecordingLogEntry]) {
+        let since = transcriptionSettings.enabledSince ?? .distantPast
         for entry in entries {
-            if case .recording(let file, _, _, _, _, _) = entry { transcription.enqueue(file, folder: library.folder) }
+            if case .recording(let file, let start, _, _, _, _) = entry, start >= since {
+                transcription.enqueue(file, folder: library.folder)
+            }
         }
     }
 

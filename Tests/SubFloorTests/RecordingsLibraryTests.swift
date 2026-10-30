@@ -202,6 +202,16 @@ struct RecordingsLibraryTests {
         #expect(!library.transcripts.contains(files[1]))
     }
 
+    /// The read classifies the sidecars itself, off the main actor: what it hands back is already an index.
+    @Test func theReadBuildsTheTranscriptIndex() async throws {
+        let folder = tempFolder()
+        let files = try populate(folder, offsets: [0])
+        try TranscriptStore.write(transcript(files[0]), in: folder)
+        let snapshot = await Task.detached { RecordingsLibrary.read(folder) }.value
+        let index: TranscriptIndex = snapshot.transcripts
+        #expect(index.summary(files[0])?.verdict == .possibleNoise)
+    }
+
     @Test func aTranscriptLandingWhileAReadIsInFlightIsNotLost() async throws {
         let folder = tempFolder()
         let files = try populate(folder, offsets: [0])

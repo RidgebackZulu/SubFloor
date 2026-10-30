@@ -50,11 +50,11 @@ final class RecordingsLibrary {
     @ObservationIgnored private var recentTranscripts: [StoredTranscript] = []
 
     /// What one read of a recordings folder finds, as a catalog built off the main actor (a year of logs is
-    /// tens of thousands of lines), with the folder's transcript sidecars. `listed` is false when the folder
-    /// could not be listed.
+    /// tens of thousands of lines), with the folder's transcript sidecars already classified into an index
+    /// (also off the main actor). `listed` is false when the folder could not be listed.
     struct Snapshot: Sendable {
         var catalog: RecordingsCatalog, listed: Bool, failure: String?
-        var transcripts: [String: StoredTranscript] = [:]
+        var transcripts = TranscriptIndex()
     }
 
     /// Test hook: how a folder is read. The default reads off the main actor; a test replaces it to hold a
@@ -112,7 +112,7 @@ final class RecordingsLibrary {
         fresh.setLive(live)
         for (file, seconds) in measured { fresh.setMeasuredSeconds(seconds, for: file) }
         catalog = fresh
-        var index = TranscriptIndex(read.transcripts)
+        var index = read.transcripts
         for t in recentTranscripts { index.set(t) }
         transcripts = index
         changed()
@@ -258,7 +258,8 @@ final class RecordingsLibrary {
         let files = listing(of: folder)
         let log = RecordingLog(folder: folder).readableEntries()
         return Snapshot(catalog: RecordingsCatalog(files: files ?? [], entries: log.entries), listed: files != nil,
-                        failure: log.failure?.localizedDescription, transcripts: TranscriptStore.readAll(in: folder))
+                        failure: log.failure?.localizedDescription,
+                        transcripts: TranscriptIndex(TranscriptStore.readAll(in: folder)))
     }
 
     nonisolated private static func lengths(of files: [String], in folder: URL) -> [String: Double] {

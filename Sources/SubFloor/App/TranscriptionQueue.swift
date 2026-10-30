@@ -21,6 +21,8 @@ enum TranscriptionJobState: Equatable {
 /// beside its recording. New recordings go to the front of the line and the older-recordings backlog to the
 /// back. A dropped connection or a busy server is retried after each of `retryDelays`, then the recording is
 /// marked failed; a rejected key or an empty account blocks the whole queue until the key is saved again.
+/// While a recording rests after the network looked down, nothing new starts: an outage costs the recordings
+/// in flight their retries, not every recording in the line.
 ///
 /// Nothing here runs on the DSP or audio threads, and nothing blocks the main actor: the transcribe function
 /// does its own work off it, and the sidecar is written on a detached task. Failures are never written to
@@ -68,6 +70,8 @@ final class TranscriptionQueue {
         let backlog: Int?
         /// Transient failures so far.
         var retries = 0
+        /// Set while it rests after a failure that meant the network was down; holds the queue until it wakes.
+        var heldByOutage = false
     }
 
     @ObservationIgnored private let transcribe: TranscribeFunction
@@ -98,10 +102,11 @@ final class TranscriptionQueue {
     }
 
     /// Queues older recordings at the back of the line, in the order given (newest first, as the library
-    /// lists them), and counts them in `backlogProgress`. Files `enqueue` would refuse are left out.
+    /// lists them), and counts them in `backlogProgress`. A recording that failed is queued again; files
+    /// `enqueue` would refuse for any other reason (one queued or being sent among them) are left out.
     func enqueueBacklog(_ files: [String], folder: URL) {
         var seen: Set<String> = []
-        let wanted = files.filter { accepts($0) && seen.insert($0).inserted }
+        let wanted = files.filter { accepts($0, replacingFailure: true) && seen.insert($0).inserted }
         guard !wanted.isEmpty else { return }
         if backlogProgress == nil { backlogRun += 1 }
         for file in wanted {
@@ -139,6 +144,14 @@ final class TranscriptionQueue {
         pump()
     }
 
+    /// True for a recording that is queued, resting or being sent: one the backlog would not queue again.
+    func isPending(_ file: String) -> Bool {
+        switch states[file] {
+        case .queued?, .running?: true
+        case .failed?, nil: false
+        }
+    }
+
     /// Returns once nothing is being sent, waiting out a retry delay, or able to start: every job is done,
     /// failed, or held by `blocked` or a missing key. For tests.
     func waitUntilIdle() async {
@@ -148,17 +161,24 @@ final class TranscriptionQueue {
 
     // MARK: Private
 
-    private func accepts(_ file: String) -> Bool {
-        settings.enabled && apiKey != nil && states[file] == nil && !isTranscribed(file) && isAudio(file)
+    /// Whether `file` may be queued: transcription on, a key, an audio recording with no transcript and not
+    /// known to the queue, or, with `replacingFailure`, known only as failed.
+    private func accepts(_ file: String, replacingFailure: Bool = false) -> Bool {
+        let free = replacingFailure ? !isPending(file) : states[file] == nil
+        return settings.enabled && apiKey != nil && free && !isTranscribed(file) && isAudio(file)
     }
 
     private func isAudio(_ file: String) -> Bool { RecordingFileName.parse(file)?.isAudio == true }
 
-    private var canStart: Bool { blocked == nil && apiKey != nil && settings.enabled }
+    /// False while the queue is blocked, off, keyless, or resting after an outage.
+    private var canStart: Bool {
+        blocked == nil && apiKey != nil && settings.enabled && !resting.values.contains(where: \.heldByOutage)
+    }
 
     private var isIdle: Bool { inFlight == 0 && resting.isEmpty && (pending.isEmpty || !canStart) }
 
-    /// Removes the queued and resting jobs that match; their states go with them.
+    /// Removes the queued and resting jobs that match; their states go with them. A dropped job that was
+    /// holding the queue after an outage no longer holds it.
     private func drop(where matches: (Job) -> Bool) {
         for job in pending where matches(job) { states[job.file] = nil }
         pending.removeAll(where: matches)
@@ -166,7 +186,7 @@ final class TranscriptionQueue {
             resting[file] = nil
             states[file] = nil
         }
-        settle()
+        pump()
     }
 
     /// Starts queued jobs while there is a free slot and nothing holds the queue.
@@ -203,7 +223,7 @@ final class TranscriptionQueue {
                 if key == apiKey { blocked = error }
                 requeue(job)
             case .transient where job.retries < Self.retryDelays.count:
-                rest(job, for: Self.retryDelays[job.retries])
+                rest(job, for: Self.retryDelays[job.retries], outage: error.isOffline)
             default:
                 finish(job, .failed(error.message))
             }
@@ -241,17 +261,19 @@ final class TranscriptionQueue {
     }
 
     /// Waits out a retry delay off the slot, then goes back to the front of the line. While the queue is
-    /// blocked it waits there with the rest.
-    private func rest(_ job: Job, for delay: Duration) {
+    /// blocked it waits there with the rest. After an `outage` nothing new starts until it wakes.
+    private func rest(_ job: Job, for delay: Duration, outage: Bool) {
         guard stillWanted(job) else { states[job.file] = nil; return }
         var job = job
         job.retries += 1
+        job.heldByOutage = outage
         states[job.file] = .queued
         resting[job.file] = job
         Task { [sleep] in
             try? await sleep(delay)
             guard resting[job.file]?.id == job.id else { return }   // dropped meanwhile
             resting[job.file] = nil
+            job.heldByOutage = false
             pending.insert(job, at: 0)
             pump()
         }
