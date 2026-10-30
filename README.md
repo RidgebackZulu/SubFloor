@@ -179,12 +179,13 @@ noise"), and one that failed gets an orange dot.
   spoken. Click a word to jump there.
 - **Search.** ⌘F in the Recordings header. Recordings without the text fade, "N matches" counts across
   all days, and ◀ ▶ (or Return) step through the matches across days. Clear the field or press Esc to
-  restore everything.
+  restore everything; Esc in an empty field hands the keys back to the player.
 - **Set up.** Settings → Transcription → *Import from .env…* and pick a file with an `OPENROUTER=` (or
   `OPENROUTER_API_KEY=`) line, or paste the key and Save. The key lives in the macOS Keychain. A copy
   you build yourself (ad-hoc signed) asks once per build for Keychain access: choose *Always Allow*.
 - **Cost.** About 3 cents per hour of audio ($0.000008 per second). *Transcribe older recordings* in
-  Settings shows the count and estimated cost before you start, and can be stopped.
+  Settings shows the count and estimated cost before you start, sends failed recordings again, and can
+  be stopped.
 - **Privacy.** Recordings are sent to OpenRouter and the model's provider for transcription. Turn
   transcription off before recording digital modes if you don't want them sent.
 
