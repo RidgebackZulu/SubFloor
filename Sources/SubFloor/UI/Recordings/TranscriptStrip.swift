@@ -73,7 +73,9 @@ enum TranscriptStripContent: Equatable {
     /// otherwise a transcript wins over a queued retry, and a failure shows only for a recording with none.
     static func decide(summary: TranscriptSummary?, state: TranscriptionJobState?) -> Self {
         if state == .running { return .transcribing }
-        if let summary { return summary.words.isEmpty ? .noise : .words(summary.words, text: summary.text) }
+        // The verdict, as the badge has it: a transcript with under 3 kept words is possible noise, whatever
+        // words it holds (they stay in the index for search).
+        if let summary { return summary.verdict == .possibleNoise ? .noise : .words(summary.words, text: summary.text) }
         switch state {
         case .failed(let reason)?: return .failed(reason)
         case .queued?, .running?: return .transcribing
@@ -110,6 +112,8 @@ struct TranscriptStrip: View {
     let position: Double
     let duration: Double
     let zoom: WaveformZoom
+    /// The playhead when a waveform drag began, which holds the range still; nil otherwise.
+    var dragAnchor: Double?
     /// The search's normalized terms; empty lights nothing.
     let terms: [String]
     /// Whether "Transcribe" can do anything, and if not, why.
@@ -165,7 +169,7 @@ struct TranscriptStrip: View {
 
     private func wordsView(_ words: [TranscriptWord]) -> some View {
         // The waveform's own span: its width is the view's, and it draws from the left edge.
-        let range = zoom.visibleRange(duration: duration, playhead: position)
+        let range = zoom.shownRange(duration: duration, position: position, anchor: dragAnchor)
         let placed = TranscriptStripLayout.place(words, visible: range, width: width, measure: Self.measure)
         return ZStack(alignment: .topLeading) {
             ForEach(placed, id: \.index) { p in

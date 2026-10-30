@@ -52,6 +52,8 @@ struct PlayerPanel: View {
     @State private var envelope: PeakEnvelope?
     @State private var loadingPeaks = false
     @State private var zoom = WaveformZoom()
+    /// The playhead when a waveform drag began: the span the waveform and the transcript strip both hold to.
+    @State private var dragAnchor: Double?
 
     /// `0.1 s` … `30 s`, `5 min`: what a jump chip says.
     nonisolated static func jumpTitle(_ seconds: Double) -> String {
@@ -66,9 +68,9 @@ struct PlayerPanel: View {
                 titleLine(r)
                 let peaksFailed = audioURL != nil && peaksFailure == audioURL
                 PlayerWaveform(recording: r, player: player, envelope: envelope, loading: loadingPeaks,
-                               peaksFailed: peaksFailed, color: color, zoom: $zoom)
+                               peaksFailed: peaksFailed, color: color, zoom: $zoom, dragAnchor: $dragAnchor)
                 PlayerTranscript(recording: r, player: player, envelope: envelope, peaksFailed: peaksFailed,
-                                 zoom: zoom, terms: searchTerms)
+                                 zoom: zoom, dragAnchor: dragAnchor, terms: searchTerms)
                 PlayerControls(recording: r, player: player, peaksFailed: peaksFailed, color: color)
             } else {
                 Text("Pick a recording on the timeline")
@@ -118,6 +120,7 @@ struct PlayerPanel: View {
     private func loadPeaks() async {
         envelope = nil
         zoom = WaveformZoom()                // a new recording starts whole
+        dragAnchor = nil
         guard let audioURL else {
             loadingPeaks = false
             return
@@ -169,6 +172,7 @@ private struct PlayerWaveform: View {
     let peaksFailed: Bool
     let color: Color
     @Binding var zoom: WaveformZoom
+    @Binding var dragAnchor: Double?
 
     var body: some View {
         let loaded = player.file == recording.file
@@ -180,6 +184,7 @@ private struct PlayerWaveform: View {
         let player = player
         WaveformView(envelope: display.drawsPeaks ? envelope : nil, loading: loading && display.message == nil,
                      color: color, duration: duration, position: loaded ? player.position : 0, zoom: $zoom,
+                     dragAnchor: $dragAnchor,
                      onSeek: display.seekable ? { player.seek(to: $0) } : nil)
             .overlay {
                 if let error = display.message {
@@ -201,6 +206,7 @@ private struct PlayerTranscript: View {
     let envelope: PeakEnvelope?
     let peaksFailed: Bool
     let zoom: WaveformZoom
+    let dragAnchor: Double?
     let terms: [String]
 
     var body: some View {
@@ -215,7 +221,7 @@ private struct PlayerTranscript: View {
             // The waveform's own extent and position, so a word sits above the signal it was spoken in.
             position: loaded ? player.position : 0,
             duration: display.shownDuration(playerDuration: loaded ? player.duration : 0, envelopeDuration: envelope?.duration),
-            zoom: zoom, terms: terms, canTranscribe: canTranscribe,
+            zoom: zoom, dragAnchor: dragAnchor, terms: terms, canTranscribe: canTranscribe,
             cannotTranscribeReason: !model.hasAPIKey ? "Save an OpenRouter key in Settings first"
                 : "Turn on Transcribe in the Recordings header first",
             onSeek: { if display.seekable { player.seek(to: $0) } },

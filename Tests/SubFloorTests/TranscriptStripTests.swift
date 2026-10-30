@@ -101,6 +101,30 @@ import Transcription
         #expect(C.decide(summary: voice, state: .queued) == .words([word("hi", 1)], text: "hi"))
     }
 
+    @Test func fewWordsAreStillPossibleNoise() {
+        // The classifier needs 3 kept words for Voice: two words are Possible noise, as the badge says.
+        let two = TranscriptSummary(verdict: .possibleNoise, words: [word("hi", 1), word("there", 2)], text: "hi there")
+        #expect(TranscriptStripContent.decide(summary: two, state: nil) == .noise)
+        #expect(TranscriptStripContent.decide(summary: two, state: .running) == .transcribing)
+    }
+
+    @Test func stripAndWaveformShareTheScrubbingRange() {
+        var zoom = WaveformZoom()
+        zoom.scale = 10
+        // A scrub holds the range at the playhead from when it began, wherever the playhead has got to.
+        let held = zoom.shownRange(duration: 100, position: 60, anchor: 20)
+        #expect(held == zoom.visibleRange(duration: 100, playhead: 20))
+        #expect(held != zoom.visibleRange(duration: 100, playhead: 60))
+        #expect(zoom.shownRange(duration: 100, position: 60, anchor: nil) == zoom.visibleRange(duration: 100, playhead: 60))
+        // The same words land at the same x on either side of a position change while anchored.
+        let words = [word("a", 17), word("b", 22)]
+        func xs(position: Double) -> [CGFloat] {
+            TranscriptStripLayout.place(words, visible: zoom.shownRange(duration: 100, position: position, anchor: 20),
+                                        width: 1000) { _ in 10 }.map(\.x)
+        }
+        #expect(xs(position: 20) == xs(position: 60))
+    }
+
     @Test func stripCopy() {
         #expect(TranscriptStripContent.noise.message == "Possible noise — no clear speech")
         #expect(TranscriptStripContent.failed("no network").message == "Couldn't transcribe — no network")
