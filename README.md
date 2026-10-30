@@ -106,6 +106,7 @@ always released.
 | Auto-record | Top-bar `Auto` (⌘⇧T): records whenever the squelch opens. See Auto-record |
 | Recordings | Top-bar `Recordings` (⌘⇧L), with a red badge counting unheard recordings |
 | Noise reduction | Top-bar NR (⌘⇧N); its pop-up sets Light to Strong. Also in the Recordings player |
+| Transcripts | Optional speech-to-text for recordings: Settings → Transcription, Radio → Transcribe Recordings, or the `Transcribe` chip in the Recordings header. See Transcripts |
 | Reset zoom | ⌘0 |
 | Step VFO | ← / → (⇧ ×10); with a modem mode on they move the modem cursor instead |
 | Mode | Top bar, or `[` / `]` |
@@ -161,11 +162,31 @@ second, and jump chips from 0.1 s to 5 min.
 | Skip silence | Jump silent stretches while playing (on by default) |
 | ← / → | Jump back / forward by the chosen jump |
 | ⇧← / ⇧→ | Previous / next recording that day |
+| ⌘F | Search transcripts (see Transcripts) |
 | Clear | Mark every recording heard |
 
 Noise reduction acts only on what you hear, never on what is recorded or decoded.
 
 The live radio is silent while the window is open and comes back when you close it.
+
+### Transcripts
+When transcription is on, every finished audio recording is sent to Whisper Large V3 on OpenRouter and
+comes back as a transcript. Nothing is ever deleted. On the Recordings timeline a recording with clear
+words gets a small green dot on its marker, one with no usable speech gets a grey ring ("possible
+noise"), and one that failed gets an orange dot.
+
+- **Read along.** Select a recording and its words appear under the waveform, each at the time it was
+  spoken. Click a word to jump there.
+- **Search.** ⌘F in the Recordings header. Recordings without the text fade, "N matches" counts across
+  all days, and ◀ ▶ (or Return) step through the matches across days. Clear the field or press Esc to
+  restore everything.
+- **Set up.** Settings → Transcription → *Import from .env…* and pick a file with an `OPENROUTER=` (or
+  `OPENROUTER_API_KEY=`) line, or paste the key and Save. The key lives in the macOS Keychain. A copy
+  you build yourself (ad-hoc signed) asks once per build for Keychain access: choose *Always Allow*.
+- **Cost.** About 3 cents per hour of audio ($0.000008 per second). *Transcribe older recordings* in
+  Settings shows the count and estimated cost before you start, and can be stopped.
+- **Privacy.** Recordings are sent to OpenRouter and the model's provider for transcription. Turn
+  transcription off before recording digital modes if you don't want them sent.
 
 ## SubFloor Dial
 <p align="center"><img src="docs/images/dial.png" alt="The SubFloor Dial tuning SubFloor" width="100%"></p>
