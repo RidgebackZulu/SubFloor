@@ -23,6 +23,7 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
             RecordingSection()
+            TranscriptionSection()
             Section("SubFloor Dial") {
                 @Bindable var dial = dial
                 Toggle("Connect over Bluetooth", isOn: $dial.useBluetooth)

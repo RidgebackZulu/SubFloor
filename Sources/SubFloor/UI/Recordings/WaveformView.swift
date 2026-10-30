@@ -63,17 +63,18 @@ struct WaveformView: View {
     /// Seconds into the file.
     let position: Double
     @Binding var zoom: WaveformZoom
+    /// The playhead when a drag began. Zoomed in, the range holds still under the mouse until the drag ends,
+    /// rather than sliding away as the playhead follows it. The player panel's, so the transcript strip
+    /// holds still with it.
+    @Binding var dragAnchor: Double?
     /// Nil when the file cannot be played: then a click does nothing.
     var onSeek: ((Double) -> Void)?
 
     @State private var width: CGFloat = 0
-    /// The playhead when a drag began. Zoomed in, the range holds still under the mouse until the drag ends,
-    /// rather than sliding away as the playhead follows it.
-    @State private var dragAnchor: Double?
     @State private var lastMagnification: CGFloat?
 
     var body: some View {
-        let range = zoom.visibleRange(duration: duration, playhead: dragAnchor ?? position)
+        let range = zoom.shownRange(duration: duration, position: position, anchor: dragAnchor)
         ZStack(alignment: .topLeading) {
             RoundedRectangle(cornerRadius: 8).fill(RecordingsTheme.background)
             if let envelope {

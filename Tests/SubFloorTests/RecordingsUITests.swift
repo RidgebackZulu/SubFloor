@@ -166,6 +166,44 @@ import Testing
         #expect(l.laneHeights == [TimelineGeometry.laneHeight])
     }
 
+    // MARK: Transcript badges
+
+    @Test func layoutCarriesMarks() {
+        let base = layout([21_600, 32_400])
+        let rs = base.settled.map(\.recording)
+        func make(marks: [String: TranscriptMark] = [:], dimmed: Set<String> = []) -> TimelineLayout {
+            TimelineLayout(dayStart: Self.day, width: base.width, recordings: rs, lanes: base.lanes, pops: [], selection: nil,
+                           marks: marks, dimmed: dimmed)
+        }
+        #expect(make() == base)
+        #expect(make(marks: ["r0.flac": .voice]) != make())
+        #expect(make(marks: ["r0.flac": .voice]) != make(marks: ["r0.flac": .possibleNoise]))
+        #expect(make(marks: ["r0.flac": .failed("a")]) != make(marks: ["r0.flac": .failed("b")]))
+        #expect(make(dimmed: ["r0.flac"]) != make())
+    }
+
+    @Test func hoverTextNamesVerdict() {
+        let r = CatalogRecording(file: "r.flac", start: at(18, 32, 19), seconds: 7.8, frequencyHz: 11_175_000, mode: "USB",
+                                 auto: true, heard: false, inProgress: false, laneID: "x")
+        let plain = DayTimelineView.hoverText(r)
+        #expect(plain == "18:32:19Z · 7.8 s · 11.175 MHz USB")
+        #expect(DayTimelineView.hoverText(r, mark: nil) == plain)
+        #expect(DayTimelineView.hoverText(r, mark: .voice) == plain + " · voice")
+        #expect(DayTimelineView.hoverText(r, mark: .possibleNoise) == plain + " · possible noise")
+        #expect(DayTimelineView.hoverText(r, mark: .failed("no network")) == plain + " · couldn't transcribe: no network")
+    }
+
+    @Test func badgeSitsAboveTheTrailingEdgeAndClearsTheUnheardDot() {
+        let wide = CGRect(x: 100, y: 40, width: 80, height: 20)
+        #expect(MarkerPaint.badgeRect(wide) == CGRect(x: 175.5, y: 33.5, width: 4.5, height: 4.5))
+        // A pill under 12 pt would put the badge on the unheard dot: it moves right of it.
+        let narrow = CGRect(x: 100, y: 40, width: 6, height: 20)
+        #expect(MarkerPaint.badgeRect(narrow) == CGRect(x: 106, y: 33.5, width: 4.5, height: 4.5))
+        #expect(!MarkerPaint.badgeRect(narrow).intersects(MarkerPaint.dotRect(narrow)))
+        let edge = CGRect(x: 100, y: 40, width: 12, height: 20)
+        #expect(MarkerPaint.badgeRect(edge).minX == 107.5)
+    }
+
     @Test func clockFormat() {
         #expect(RecordingsFormat.clock(at(7, 48, 12.46)) == "07:48:12.4Z")
         #expect(RecordingsFormat.clock(at(23, 59, 59.99)) == "23:59:59.9Z")

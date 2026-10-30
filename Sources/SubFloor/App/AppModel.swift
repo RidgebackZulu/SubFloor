@@ -6,6 +6,7 @@ import Recording
 import SDRplayKit
 import SubFloorCore
 import SwiftUI
+import Transcription
 import UniformTypeIdentifiers
 
 enum BannerAction: Equatable { case retry, reduceGain, copyServiceRestart }
@@ -58,6 +59,8 @@ private struct SessionState: Codable {
     var noiseReduction: NoiseReductionSettings?
     // Optional so that sessions saved before Skip silence decode.
     var skipSilence: Bool?
+    // Optional so that sessions saved before transcripts decode.
+    var transcription: TranscriptionSettings?
 }
 
 @MainActor @Observable
@@ -105,6 +108,45 @@ final class AppModel {
             player?.skipSilence = skipSilence
             saveSessionIfChanged()
         }
+    }
+    /// Speech-transcript settings, persisted. Turning `enabled` on stamps `enabledSince` with now, however
+    /// it happens; changing the model or language leaves it. A first launch (no saved settings) starts
+    /// enabled, since the launch time.
+    var transcriptionSettings = TranscriptionSettings(enabledSince: Date()) {
+        didSet {
+            let turnedOn = transcriptionSettings.enabled && !oldValue.enabled
+            if turnedOn { transcriptionSettings.enabledSince = Date() }
+            transcription.settings = transcriptionSettings
+            if !transcriptionSettings.enabled && oldValue.enabled { transcription.dropQueued() }
+            if turnedOn { queueRecentRecordings() }
+            saveSessionIfChanged()
+        }
+    }
+    func toggleTranscription() { transcriptionSettings.enabled.toggle() }
+    /// The OpenRouter key, read from the key store at launch. Never logged, printed or saved in the session.
+    /// Saving a key, even the same one, also unblocks the transcription queue.
+    private(set) var apiKey: String? { didSet { transcription.apiKey = apiKey } }
+    var hasAPIKey: Bool { !(apiKey ?? "").isEmpty }
+    /// Stores `key` (trimmed) in the key store and queues today's recordings that were waiting for one; an
+    /// empty or blank key removes it instead.
+    func saveAPIKey(_ key: String) throws {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { try removeAPIKey(); return }
+        try apiKeyStore.save(trimmed)
+        apiKey = trimmed
+        // Recordings made today before the key was added start now, as if it had been there.
+        queueRecentRecordings()
+    }
+    func removeAPIKey() throws {
+        try apiKeyStore.remove()
+        apiKey = nil
+    }
+    /// Saves the key from the `.env` file at `url`. Throws `APIKeyImportError.noKey` when the file has
+    /// none (the stored key is left alone), or the read error when the file cannot be read.
+    func importAPIKey(fromEnvFileAt url: URL) throws {
+        let contents = try String(contentsOf: url, encoding: .utf8)
+        guard let key = EnvFile.openRouterKey(in: contents) else { throw APIKeyImportError.noKey }
+        try saveAPIKey(key)
     }
     var noiseReductionAvailable: Bool { NoiseReductionSettings.isAvailable(for: mode) }
     func toggleNoiseReduction() {
@@ -182,10 +224,62 @@ final class AppModel {
                 Task { await library.refreshFiles() }
             }
         }
-        Task { [library] in await library.reload() }
+        Task { [weak self, library] in
+            await library.reload()
+            self?.queueRecentRecordings()
+        }
     }
 
     @ObservationIgnored private var libraryActivation: (any NSObjectProtocol)?
+
+    // MARK: Transcription
+
+    /// Sends finished recordings for transcription and saves their transcripts beside them.
+    let transcription: TranscriptionQueue
+
+    /// The relaunch rule: queues the folder's audio recordings that have a length and no transcript and
+    /// started within the last 24 hours, at or after transcription was last turned on. Run after the
+    /// library's first read and whenever transcription is turned on. The older backlog is never queued
+    /// here; only `transcribeOlderRecordings` spends money on it. Internal for tests, which pass `now`.
+    func queueRecentRecordings(now: Date = Date()) {
+        guard transcriptionSettings.enabled, hasAPIKey else { return }
+        let since = transcriptionSettings.enabledSince ?? now
+        // Oldest first: each goes to the front, so the newest is sent first.
+        for file in library.recentUntranscribed(since: since, now: now).reversed() {
+            transcription.enqueue(file, folder: library.folder)
+        }
+    }
+
+    /// "Transcribe older recordings": every audio recording in the folder without a transcript, newest first.
+    func transcribeOlderRecordings() {
+        transcription.enqueueBacklog(library.untranscribed().map(\.file), folder: library.folder)
+    }
+
+    /// The marker's "Transcribe" or "Transcribe again": sends one recording again, failed or transcribed.
+    func retryTranscription(_ file: String) {
+        transcription.retry(file, folder: library.folder)
+    }
+
+    /// What "Transcribe older recordings" would send: how many recordings, and the cost at the model's
+    /// per-second price (nil when the model has none). Recordings already queued or being sent are not counted;
+    /// failed ones are, since it sends them again. One whose length is unknown counts towards the number but adds
+    /// nothing to the cost.
+    var olderRecordingsEstimate: (count: Int, dollars: Double?) {
+        let files = library.untranscribed().filter { !transcription.isPending($0.file) }
+        let seconds = files.reduce(0) { $0 + ($1.seconds ?? 0) }
+        return (files.count, OpenRouterTranscriber.pricePerSecond[transcriptionSettings.model].map { $0 * seconds })
+    }
+
+    /// Queues the recordings that `entries` finished, except one that started before transcription was turned
+    /// on: what was recorded while it was off is never sent.
+    private func queueFinishedRecordings(_ entries: [RecordingLogEntry]) {
+        let since = transcriptionSettings.enabledSince ?? .distantPast
+        for entry in entries {
+            if case .recording(let file, let start, _, _, _, _) = entry, start >= since {
+                transcription.enqueue(file, folder: library.folder)
+            }
+        }
+    }
 
     /// The log of finished recordings and ignored pops, in the recordings folder.
     var recordingLog: RecordingLog { RecordingLog(folder: recording.folder) }
@@ -295,6 +389,7 @@ final class AppModel {
     private var fileSource: IQFileSource?
     private let bookmarkStore: BookmarkStore
     private let defaults: UserDefaults
+    private let apiKeyStore: any APIKeyStore
     private var bookmarksSaveBlocked = false
     private var statsTimer: Timer?
     private var statsTicks = 0
@@ -304,19 +399,25 @@ final class AppModel {
     /// The app's model. Only this one reads the recordings folder at launch: a test's model, made with the
     /// init below, points the library at its own folder (or none) rather than at the owner's recordings.
     convenience init() {
-        self.init(bookmarkStore: BookmarkStore(url: BookmarkStore.defaultURL), defaults: .standard)
+        self.init(bookmarkStore: BookmarkStore(url: BookmarkStore.defaultURL), defaults: .standard,
+                  apiKeyStore: KeychainAPIKeyStore())
         startLibrary()
     }
 
-    /// `openRSP` and `rspOpenTimeout`: tests replace the device and the wait.
+    /// `openRSP`, `rspOpenTimeout` and `transcribe`: tests replace the device, the wait and the transcription.
     init(bookmarkStore: BookmarkStore, defaults: UserDefaults,
+         apiKeyStore: any APIKeyStore = MemoryAPIKeyStore(),
+         transcribe: @escaping TranscribeFunction = OpenRouterTranscriber.liveTranscribe,
          openRSP: @escaping @Sendable () throws -> SDRplayDevice = { try SDRplayDevice.open() },
          rspOpenTimeout: Duration = .seconds(10)) {
         self.bookmarkStore = bookmarkStore
         self.defaults = defaults
+        self.apiKeyStore = apiKeyStore
+        apiKey = apiKeyStore.load()
         self.openRSP = openRSP
         self.rspOpenTimeout = rspOpenTimeout
         library = RecordingsLibrary(folder: RecordingSettings().folder)   // the folder `restoreSession` may replace
+        transcription = TranscriptionQueue(transcribe: transcribe)
         player = RecordingPlayer(library: library, setLiveMuted: { [weak self] muted in self?.liveAudioMuted = muted })
         let (loaded, result) = bookmarkStore.load()
         bookmarks = loaded
@@ -340,6 +441,10 @@ final class AppModel {
         engine.audio.onError = { [weak self] message in
             Task { @MainActor in self?.show(Banner(kind: .error, message: message, action: .retry)) }
         }
+        transcription.settings = transcriptionSettings
+        transcription.apiKey = apiKey
+        transcription.isTranscribed = { [library] file in library.transcripts.contains(file) }
+        transcription.onTranscript = { [library] t, folder in library.didTranscribe(t, folder: folder) }
         library.onError = { [weak self] message in self?.show(Banner(kind: .error, message: message)) }
         library.onChange = { [weak self] in
             guard let self else { return }
@@ -1088,13 +1193,15 @@ final class AppModel {
                           frequencyHz: tuning.hz, mode: tuning.mode, auto: status.isAuto)
     }
 
-    /// A failed write shows one banner until a write succeeds again; recording carries on.
-    private func appendToLog(_ entries: [RecordingLogEntry]) {
+    /// A failed write shows one banner until a write succeeds again; recording carries on. A finished
+    /// recording is queued for transcription once its line is on disk. Internal for tests.
+    func appendToLog(_ entries: [RecordingLogEntry]) {
         guard !entries.isEmpty else { return }
         do {
             try recordingLog.append(entries)
             logWriteFailed = false
             library.didLog(entries)   // only what is on disk
+            queueFinishedRecordings(entries)
         } catch {
             guard !logWriteFailed else { return }
             logWriteFailed = true
@@ -1349,7 +1456,8 @@ final class AppModel {
                                  preferredSource: preferredSource == .file ? .sdrplay : preferredSource,
                                  modemBox: nil, modemSettings: modem.settings, recording: recording,
                                  autoRecord: autoRecordEnabled, squelchEnabled: squelchEnabled, squelchDb: squelchDb,
-                                 noiseReduction: noiseReduction, skipSilence: skipSilence)
+                                 noiseReduction: noiseReduction, skipSilence: skipSilence,
+                                 transcription: transcriptionSettings)
         guard let data = try? JSONEncoder().encode(state), data != lastSavedSession else { return }
         defaults.set(data, forKey: "session")
         lastSavedSession = data
@@ -1369,6 +1477,7 @@ final class AppModel {
         if let db = s.squelchDb { squelchDb = db }
         if let on = s.autoRecord { autoRecordEnabled = on }
         if let on = s.skipSilence { skipSilence = on }
+        if let t = s.transcription { transcriptionSettings = t }
         // Last: it saves the session, which must be whole by then.
         if let nr = s.noiseReduction { noiseReduction = nr }
         lastSavedSession = data

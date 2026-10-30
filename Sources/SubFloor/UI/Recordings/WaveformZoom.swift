@@ -16,6 +16,12 @@ struct WaveformZoom: Equatable {
         return lower...(lower + span)
     }
 
+    /// The span the waveform and anything laid along it show: centred on `anchor` while a drag holds the range
+    /// still, otherwise on the playhead. One rule for both, so words never slide under the signal.
+    func shownRange(duration: Double, position: Double, anchor: Double?) -> ClosedRange<Double> {
+        visibleRange(duration: duration, playhead: anchor ?? position)
+    }
+
     /// The second of the file under `x` (0 at the leading edge), with x kept on the view.
     func seconds(atX x: CGFloat, width: CGFloat, duration: Double, playhead: Double) -> Double {
         let range = visibleRange(duration: duration, playhead: playhead)

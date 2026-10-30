@@ -31,6 +31,8 @@ records lossless audio and IQ that start *before* you press the button.
 - 🔴 **Records while you're away.** Auto records every transmission the squelch lets through, and the
   Recordings window lays the day out in lanes, one per frequency, with a player you can scrub from the
   Dial. [More below](#auto-record).
+- 🗣️ **Finds the voices for you.** Each recording is transcribed by Whisper, marked green when someone
+  is talking, and searchable by what was said. [Set it up](#-transcripts-in-three-steps).
 - 🎧 **Every voice mode.** AM, NFM, WFM, USB, LSB and CW, with AGC, squelch and drag-to-resize
   passbands.
 - ⬆️ **HamItUp in one click.** Upconverter mode tunes the radio 125 MHz above what you see, so HF and
@@ -75,6 +77,27 @@ click, because the save buffer never stops running. Press **Audio**, **IQ** or *
 You need an Apple Silicon Mac with macOS 15 or later. No radio yet? SubFloor runs a built-in demo
 signal around 14.1 MHz, so you can explore everything first.
 
+## 🗣️ Transcripts in three steps
+
+Transcripts are optional. They need an [OpenRouter](https://openrouter.ai) key; Whisper costs about
+3 cents per hour of audio.
+
+1. **Get a key.** Sign in at [openrouter.ai/keys](https://openrouter.ai/keys), create a key and add a
+   little credit. The key starts with `sk-or-`.
+2. **Put it in a `.env` file.** A plain-text file named `.env` holding one line:
+   ```
+   OPENROUTER=sk-or-v1-your-key-here
+   ```
+   `OPENROUTER_API_KEY=` works too. In TextEdit, choose Format → Make Plain Text first, and say
+   *Use "."* when it asks about the name.
+3. **Import it.** In SubFloor, open Settings (⌘,) → Transcription → **Import from .env…** and pick the
+   file. In the file picker, ⌘⇧. shows hidden files like `.env`. It says **Key saved ✓** when it's in.
+
+The key is kept in the macOS Keychain, so you can delete the `.env` file afterwards. Pasting the key
+into the key field and pressing **Save** does the same thing. From then on every new recording is
+transcribed once it closes; *Transcribe older recordings* in the same panel sends the ones you
+already have, and shows the cost first. [What you get](#transcripts).
+
 ## Build from source
 You need macOS 15 or later on Apple Silicon, Xcode 26 (Swift 6.2), and the
 [SDRplay API 3.15](https://www.sdrplay.com/api/) installed at `/usr/local/lib/libsdrplay_api.dylib`.
@@ -106,6 +129,7 @@ always released.
 | Auto-record | Top-bar `Auto` (⌘⇧T): records whenever the squelch opens. See Auto-record |
 | Recordings | Top-bar `Recordings` (⌘⇧L), with a red badge counting unheard recordings |
 | Noise reduction | Top-bar NR (⌘⇧N); its pop-up sets Light to Strong. Also in the Recordings player |
+| Transcripts | Optional speech-to-text for recordings: Settings → Transcription, Radio → Transcribe Recordings, or the `Transcribe` chip in the Recordings header. See Transcripts |
 | Reset zoom | ⌘0 |
 | Step VFO | ← / → (⇧ ×10); with a modem mode on they move the modem cursor instead |
 | Mode | Top bar, or `[` / `]` |
@@ -161,11 +185,32 @@ second, and jump chips from 0.1 s to 5 min.
 | Skip silence | Jump silent stretches while playing (on by default) |
 | ← / → | Jump back / forward by the chosen jump |
 | ⇧← / ⇧→ | Previous / next recording that day |
+| ⌘F | Search transcripts (see Transcripts) |
 | Clear | Mark every recording heard |
 
 Noise reduction acts only on what you hear, never on what is recorded or decoded.
 
 The live radio is silent while the window is open and comes back when you close it.
+
+### Transcripts
+When transcription is on, every finished audio recording is sent to Whisper Large V3 on OpenRouter and
+comes back as a transcript. Nothing is ever deleted. On the Recordings timeline a recording with clear
+words gets a small green dot on its marker, one with no usable speech gets a grey ring ("possible
+noise"), and one that failed gets an orange dot.
+
+- **Read along.** Select a recording and its words appear under the waveform, each at the time it was
+  spoken. Click a word to jump there.
+- **Search.** ⌘F in the Recordings header. Recordings without the text fade, "N matches" counts across
+  all days, and ◀ ▶ (or Return) step through the matches across days. Clear the field or press Esc to
+  restore everything; Esc in an empty field hands the keys back to the player.
+- **Set up.** See [Transcripts in three steps](#-transcripts-in-three-steps). The key lives in the
+  macOS Keychain. A copy you build yourself (ad-hoc signed) asks once per build for Keychain access:
+  choose *Always Allow*.
+- **Cost.** About 3 cents per hour of audio ($0.000008 per second). *Transcribe older recordings* in
+  Settings shows the count and estimated cost before you start, sends failed recordings again, and can
+  be stopped.
+- **Privacy.** Recordings are sent to OpenRouter and the model's provider for transcription. Turn
+  transcription off before recording digital modes if you don't want them sent.
 
 ## SubFloor Dial
 <p align="center"><img src="docs/images/dial.png" alt="The SubFloor Dial tuning SubFloor" width="100%"></p>

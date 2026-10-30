@@ -1,0 +1,1 @@
+{"text":"","usage":{"seconds":17.195,"cost":0.0001289625},"task":"transcribe","language":"en","duration":17.195,"segments":[{"id":0,"seek":0,"start":0,"end":17.195,"text":"","tokens":[],"temperature":0,"avg_logprob":0,"compression_ratio":0,"no_speech_prob":1}]}

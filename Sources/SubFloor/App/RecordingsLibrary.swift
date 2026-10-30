@@ -2,6 +2,7 @@ import AVFoundation
 import Foundation
 import Observation
 import Recording
+import Transcription
 
 /// The recordings the Recordings window shows, and the one owner of what it has heard. It merges the folder
 /// listing, every day log and the recording in progress into a `RecordingsCatalog`, and keeps that current
@@ -19,6 +20,8 @@ final class RecordingsLibrary {
     /// began. It grows at every 5 Hz poll; kept here, it redraws the live marker and nothing else (not the
     /// window's day, not the unheard badge). nil when none is recording.
     private(set) var liveSeconds: Double?
+    /// The folder's transcripts, read from its sidecars at every `reload` and added to as each one lands.
+    private(set) var transcripts = TranscriptIndex()
 
     /// Recordings the listener has not opened. A recording in progress is never counted.
     var unheardCount: Int { catalog.unheardCount }
@@ -42,10 +45,16 @@ final class RecordingsLibrary {
     @ObservationIgnored private var readFailed = false
     @ObservationIgnored private var writeFailed = false
 
+    /// Transcripts that landed while a read was in flight: the read may have listed the sidecars before they
+    /// were written, so they are added to what it read.
+    @ObservationIgnored private var recentTranscripts: [StoredTranscript] = []
+
     /// What one read of a recordings folder finds, as a catalog built off the main actor (a year of logs is
-    /// tens of thousands of lines). `listed` is false when the folder could not be listed.
+    /// tens of thousands of lines), with the folder's transcript sidecars already classified into an index
+    /// (also off the main actor). `listed` is false when the folder could not be listed.
     struct Snapshot: Sendable {
         var catalog: RecordingsCatalog, listed: Bool, failure: String?
+        var transcripts = TranscriptIndex()
     }
 
     /// Test hook: how a folder is read. The default reads off the main actor; a test replaces it to hold a
@@ -72,6 +81,8 @@ final class RecordingsLibrary {
         readFailed = false
         writeFailed = false
         catalog = RecordingsCatalog()
+        transcripts = TranscriptIndex()
+        recentTranscripts = []
         changed()
         Task { await reload() }
     }
@@ -85,7 +96,7 @@ final class RecordingsLibrary {
         readsInFlight += 1
         let read = await reader(folder)
         readsInFlight -= 1
-        defer { if readsInFlight == 0 { recentLines = [] } }
+        defer { if readsInFlight == 0 { recentLines = []; recentTranscripts = [] } }
         guard folder == self.folder else { return }   // setFolder came in while reading
         if let failure = read.failure {
             // An unreadable day file is skipped; the other days still count.
@@ -101,6 +112,9 @@ final class RecordingsLibrary {
         fresh.setLive(live)
         for (file, seconds) in measured { fresh.setMeasuredSeconds(seconds, for: file) }
         catalog = fresh
+        var index = read.transcripts
+        for t in recentTranscripts { index.set(t) }
+        transcripts = index
         changed()
     }
 
@@ -135,6 +149,33 @@ final class RecordingsLibrary {
             }
         }
         if unlisted { Task { await refreshFiles() } }
+    }
+
+    /// A transcript the queue saved in `folder`: indexed at once, unless the folder is no longer this one
+    /// (its sidecar is there, and is read in if that folder is chosen again).
+    func didTranscribe(_ t: StoredTranscript, folder: URL) {
+        guard folder == self.folder else { return }
+        if readsInFlight > 0 { recentTranscripts.append(t) }
+        transcripts.set(t)
+    }
+
+    /// Recordings the relaunch rule queues: finished audio recordings with a length and no transcript that
+    /// started within the last 24 hours and at or after `since` (when transcription was turned on). Newest first.
+    func recentUntranscribed(since: Date, now: Date) -> [String] {
+        let from = max(since, now.addingTimeInterval(-86_400))
+        return untranscribedRecordings().filter { $0.seconds != nil && $0.start >= from }.map(\.file)
+    }
+
+    /// Every finished audio recording in the folder without a transcript, newest first, with its length when
+    /// known: what "Transcribe older recordings" offers.
+    func untranscribed() -> [(file: String, seconds: Double?)] {
+        untranscribedRecordings().map { ($0.file, $0.seconds) }
+    }
+
+    private func untranscribedRecordings() -> [CatalogRecording] {
+        catalog.files.compactMap { catalog.recording($0) }
+            .filter { !$0.inProgress && !transcripts.contains($0.file) }
+            .sorted { ($0.start, $0.file) > ($1.start, $1.file) }
     }
 
     /// The recording being written, or nil when none is. Its length growing changes only `liveSeconds`.
@@ -217,7 +258,8 @@ final class RecordingsLibrary {
         let files = listing(of: folder)
         let log = RecordingLog(folder: folder).readableEntries()
         return Snapshot(catalog: RecordingsCatalog(files: files ?? [], entries: log.entries), listed: files != nil,
-                        failure: log.failure?.localizedDescription)
+                        failure: log.failure?.localizedDescription,
+                        transcripts: TranscriptIndex(TranscriptStore.readAll(in: folder)))
     }
 
     nonisolated private static func lengths(of files: [String], in folder: URL) -> [String: Double] {
