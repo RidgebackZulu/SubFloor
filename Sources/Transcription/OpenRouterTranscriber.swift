@@ -25,16 +25,23 @@ public enum TranscriptionError: Error, Equatable, Sendable {
     case outOfCredit
     /// Another 4xx, or a reply that could not be read. Retrying the same audio will fail the same way.
     case badRequest(String)
-    /// A busy server or a dropped connection. Worth trying again later.
-    case transient(String)
+    /// A busy server or a dropped connection. Worth trying again later. `offline` marks a failure that means
+    /// the network itself is down (no connection, no DNS, a timeout), so other recordings would fail the same way.
+    case transient(String, offline: Bool = false)
 
     /// The reason to show the user.
     public var message: String {
         switch self {
         case .rejectedKey: "OpenRouter rejected the key"
         case .outOfCredit: "OpenRouter account is out of credit"
-        case .badRequest(let reason), .transient(let reason): reason
+        case .badRequest(let reason), .transient(let reason, _): reason
         }
+    }
+
+    /// Whether the network looked down: the queue starts nothing new until this one's retry.
+    public var isOffline: Bool {
+        if case .transient(_, offline: true) = self { return true }
+        return false
     }
 
     /// Whether the queue should retry later.
@@ -127,6 +134,11 @@ public struct OpenRouterTranscriber: Sendable {
     /// if the task was cancelled. A `URLError.cancelled` outside a cancelled task is a dropped
     /// connection, so it is `.transient`.
     public func transcribe(_ chunk: PreparedChunk) async throws -> WhisperResponse {
+        try await reply(to: chunk).response
+    }
+
+    /// Sends one chunk and keeps the reply whole, timed from the chunk's offset. Throws as `transcribe(_:)`.
+    public func reply(to chunk: PreparedChunk) async throws -> TranscriptChunk {
         let data: Data
         let http: HTTPURLResponse
         do {
@@ -136,13 +148,15 @@ public struct OpenRouterTranscriber: Sendable {
         } catch let error as URLError where error.code == .cancelled && Task.isCancelled {
             throw CancellationError()
         } catch let error as URLError {
-            throw TranscriptionError.transient(scrub(error.localizedDescription))
+            throw TranscriptionError.transient(scrub(error.localizedDescription), offline: Self.offlineCodes.contains(error.code))
         } catch {
             throw TranscriptionError.badRequest(scrub("Could not send the request"))
         }
         switch http.statusCode {
         case 200:
-            do { return try JSONDecoder().decode(WhisperResponse.self, from: data) } catch {
+            do {
+                return try TranscriptChunk(offsetSeconds: chunk.offsetSeconds, raw: JSONDecoder().decode(JSONValue.self, from: data))
+            } catch {
                 throw TranscriptionError.badRequest("Unreadable reply from OpenRouter")
             }
         case 401, 403: throw TranscriptionError.rejectedKey
@@ -168,7 +182,7 @@ public struct OpenRouterTranscriber: Sendable {
             var replies: [TranscriptChunk] = []
             for chunk in prepared {
                 try Task.checkCancellation()
-                replies.append(TranscriptChunk(offsetSeconds: chunk.offsetSeconds, response: try await transcribe(chunk)))
+                replies.append(try await reply(to: chunk))
             }
             let costs = replies.compactMap { $0.response.usage?.cost }
             return stored(note: nil, seconds: prepared.reduce(0) { $0 + $1.seconds },
@@ -192,6 +206,10 @@ public struct OpenRouterTranscriber: Sendable {
         }
         return try await withTaskCancellationHandler { try await work.value } onCancel: { work.cancel() }
     }
+
+    /// The connection failures that mean the network is down, rather than one request going wrong.
+    static let offlineCodes: Set<URLError.Code> = [.notConnectedToInternet, .networkConnectionLost, .timedOut,
+                                                   .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed]
 
     /// `{"error":{"message":"..."}}`, if the body has that shape.
     private func errorMessage(in data: Data) -> String? {

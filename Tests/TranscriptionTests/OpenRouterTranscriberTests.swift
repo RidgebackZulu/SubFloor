@@ -108,6 +108,22 @@ private func failure(_ t: OpenRouterTranscriber) async -> TranscriptionError? {
         guard case .transient = offline else { Issue.record("expected transient, got \(String(describing: offline))"); return }
     }
 
+    /// The connection failures that mean the network is down are told apart from a busy server, so the queue
+    /// can hold off starting more recordings until the first retry.
+    @Test func connectivityFailuresAreMarkedOffline() async {
+        let down: [URLError.Code] = [.notConnectedToInternet, .networkConnectionLost, .timedOut, .cannotFindHost,
+                                     .cannotConnectToHost, .dnsLookupFailed]
+        for code in down {
+            let e = await failure(transcriber(StubTransport([.fail(URLError(code))])))
+            #expect(e?.isOffline == true, "\(code)")
+            #expect(e?.isRetryable == true, "\(code)")
+        }
+        #expect(await failure(transcriber(StubTransport([.fail(URLError(.badServerResponse))])))?.isOffline == false)
+        #expect(await failure(transcriber(StubTransport(status: 503)))?.isOffline == false)
+        #expect(!TranscriptionError.transient("x").isOffline)
+        #expect(!TranscriptionError.rejectedKey.isOffline)
+    }
+
     @Test func retryability() {
         #expect(TranscriptionError.transient("x").isRetryable)
         #expect(!TranscriptionError.rejectedKey.isRetryable)

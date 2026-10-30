@@ -126,6 +126,37 @@ private func reply(text: String, start: Double = 0, end: Double = 5, avgLogprob:
         #expect(t.verdict == .possibleNoise)
     }
 
+    /// Whisper splits an annotation into words (" *car", " engine", " noise*"). Inside a segment that passes the
+    /// confidence checks, the words between the marks are dropped with the marks, so "engine noise" never counts
+    /// towards Voice.
+    @Test func annotationWordsInsideAKeptSegmentAreDropped() {
+        let words = [WhisperResponse.Word(word: " *car", start: 0, end: 0.5), .init(word: " engine", start: 0.5, end: 1),
+                     .init(word: " noise*", start: 1, end: 1.5), .init(word: " Roger.", start: 2, end: 2.5),
+                     .init(word: " (static", start: 3, end: 3.5), .init(word: " hiss)", start: 3.5, end: 4),
+                     .init(word: " [music", start: 4, end: 4.2), .init(word: " playing]", start: 4.2, end: 4.6)]
+        let r = reply(text: " *car engine noise* Roger. (static hiss) [music playing]", avgLogprob: -0.3, words: words)
+        let t = TranscriptClassifier.classify([TranscriptChunk(offsetSeconds: 0, response: r)])
+        #expect(t.words.map(\.text) == ["Roger."])
+        #expect(t.verdict == .possibleNoise)
+
+        // The same without word timing: the segment's own words are filtered the same way.
+        let pseudo = reply(text: " *car engine noise* Roger, this is kilo.", avgLogprob: -0.3)
+        #expect(TranscriptClassifier.classify([.init(offsetSeconds: 0, response: pseudo)]).words.map(\.text)
+                == ["Roger,", "this", "is", "kilo."])
+
+        // A span never runs into the next segment.
+        let two = WhisperResponse(text: "", segments: [
+            .init(start: 0, end: 1, text: " *Humming", avgLogprob: -0.3), .init(start: 1, end: 3, text: " one two three", avgLogprob: -0.3)])
+        #expect(TranscriptClassifier.classify([.init(offsetSeconds: 0, response: two)]).words.map(\.text) == ["one", "two", "three"])
+    }
+
+    /// A stock phrase behind an annotation is still a stock phrase.
+    @Test func stockPhraseBehindAnAnnotationIsDropped() {
+        let r = reply(text: " *music* Thank you.", avgLogprob: -0.3,
+                      words: [.init(word: " *music*", start: 0, end: 1), .init(word: " Thank", start: 1, end: 2), .init(word: " you.", start: 2, end: 3)])
+        #expect(TranscriptClassifier.classify([.init(offsetSeconds: 0, response: r)]).words.isEmpty)
+    }
+
     @Test func whisperResponseDecodesSnakeCaseKeys() throws {
         let json = #"{"text":"a","segments":[{"id":0,"start":1,"end":2,"text":"a","avg_logprob":-0.5,"no_speech_prob":0.1,"compression_ratio":1.2}]}"#
         let r = try JSONDecoder().decode(WhisperResponse.self, from: Data(json.utf8))

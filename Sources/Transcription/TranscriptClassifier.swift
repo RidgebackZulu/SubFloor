@@ -68,7 +68,12 @@ public enum TranscriptClassifier {
 
     /// True when nothing is left of `s` once its `*…*`, `[…]` and `(…)` spans and punctuation are removed.
     public static func isAnnotation(_ s: String) -> Bool {
-        normalize(s.replacing(/\*[^*]*\*|\[[^\]]*\]|\([^)]*\)/, with: " ")).isEmpty
+        normalize(withoutAnnotations(s)).isEmpty
+    }
+
+    /// `s` with its closed `*…*`, `[…]` and `(…)` spans replaced by spaces.
+    static func withoutAnnotations(_ s: String) -> String {
+        s.replacing(/\*[^*]*\*|\[[^\]]*\]|\([^)]*\)/, with: " ")
     }
 
     /// Drops the segments that look like invented text, keeps the words that fall inside the rest,
@@ -91,34 +96,63 @@ public enum TranscriptClassifier {
         }
     }
 
-    /// A segment survives when every signal it carries is within bounds, and its text is neither
-    /// empty, an annotation, nor a stock phrase. A signal it does not carry is not checked.
+    /// A segment survives when every signal it carries is within bounds, and its text, once its annotations
+    /// are taken out, is neither empty nor a stock phrase. A signal it does not carry is not checked.
     private static func keeps(_ seg: WhisperResponse.Segment) -> Bool {
         if let p = seg.noSpeechProb, p > maxNoSpeechProb { return false }
         if let lp = seg.avgLogprob, lp < minAvgLogprob { return false }
         if let r = seg.compressionRatio, r > maxCompressionRatio { return false }
-        let n = normalize(seg.text)
-        return !n.isEmpty && !isAnnotation(seg.text) && !stockPhrases.contains(n)
+        let n = normalize(withoutAnnotations(seg.text))
+        return !n.isEmpty && !stockPhrases.contains(n)
     }
 
+    /// The kept segments' words, each word given to the first kept segment its middle falls in. Whisper splits
+    /// an annotation into words (" *car", " engine", " noise*"), so a `*`, `(` or `[` opened in one word is
+    /// followed across the segment's words, and every word from the opening mark to the closing one is
+    /// dropped. A span never runs past its segment.
     private static func keptWords(in chunk: TranscriptChunk) -> [TranscriptWord] {
         let kept = (chunk.response.segments ?? []).filter(keeps)
         guard !kept.isEmpty else { return [] }
         let offset = chunk.offsetSeconds
-        let timed: [WhisperResponse.Word]
+        let timed: [(segment: Int, word: WhisperResponse.Word)]
         if let words = chunk.response.words, !words.isEmpty {
-            timed = words.filter { w in
+            timed = words.compactMap { w in
                 let mid = (w.start + w.end) / 2
-                return kept.contains { mid >= $0.start && mid <= $0.end }
+                return kept.firstIndex { mid >= $0.start && mid <= $0.end }.map { ($0, w) }
             }
         } else {
-            timed = kept.flatMap(pseudoWords)   // a model without word timing: spread each segment's text
+            // A model without word timing: spread each segment's text.
+            timed = kept.enumerated().flatMap { i, seg in pseudoWords(of: seg).map { (i, $0) } }
         }
-        return timed.compactMap { w in
+        var segment = -1
+        var closer: Character?   // the mark that ends the open span, if one is open
+        return timed.compactMap { seg, w in
+            if seg != segment { segment = seg; closer = nil }
             let text = w.word.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !normalize(text).isEmpty, !isAnnotation(text) else { return nil }
+            let wasInSpan = closer != nil
+            closer = spanCloser(after: text, from: closer)
+            guard !wasInSpan, closer == nil, !normalize(text).isEmpty, !isAnnotation(text) else { return nil }
             return TranscriptWord(text: text, start: w.start + offset, end: w.end + offset)
         }
+    }
+
+    /// The closing mark still awaited once `text` is read, starting with `closer` awaited: nil when no
+    /// annotation is left open.
+    private static func spanCloser(after text: String, from closer: Character?) -> Character? {
+        var closer = closer
+        for ch in text {
+            if let c = closer {
+                if ch == c { closer = nil }
+            } else {
+                switch ch {
+                case "*": closer = "*"
+                case "(": closer = ")"
+                case "[": closer = "]"
+                default: break
+                }
+            }
+        }
+        return closer
     }
 
     /// The segment's words, each given an equal share of the segment's time span.

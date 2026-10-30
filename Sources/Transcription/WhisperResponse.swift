@@ -2,8 +2,8 @@ import Foundation
 
 /// An OpenRouter `verbose_json` speech-to-text reply, as Whisper returns it. Only the fields the
 /// classifier and the word strip use are modelled; the rest (`id`, `seek`, `tokens`, `temperature`,
-/// `task`) is ignored on decode. The reply is stored whole in the sidecar, so a better classifier
-/// can re-run over it later without paying to transcribe again.
+/// `task`) is ignored on decode. The sidecar keeps the reply whole as a `JSONValue` (see
+/// `TranscriptChunk.raw`), so a better classifier can re-run over it later without paying to transcribe again.
 public struct WhisperResponse: Codable, Equatable, Sendable {
     public var text: String
     public var language: String?
@@ -76,12 +76,41 @@ public struct WhisperResponse: Codable, Equatable, Sendable {
 
 /// The reply for one piece of a recording, and where that piece starts in the whole file. A short
 /// recording is one chunk at offset 0; a long one is cut into pieces that are sent separately.
+///
+/// The reply is stored exactly as it came (`raw`, saved under `"response"`), and read through `response`,
+/// which is decoded from it. A sidecar whose reply does not decode as a `WhisperResponse` is unreadable.
 public struct TranscriptChunk: Codable, Equatable, Sendable {
     public var offsetSeconds: Double
-    public var response: WhisperResponse
+    /// The reply as OpenRouter sent it, every field kept.
+    public let raw: JSONValue
+    /// The reply as the classifier and the strip read it.
+    public let response: WhisperResponse
 
+    /// A chunk from a reply as it came. Throws when it is not a Whisper reply.
+    public init(offsetSeconds: Double, raw: JSONValue) throws {
+        self.offsetSeconds = offsetSeconds
+        self.raw = raw
+        self.response = try raw.decode(WhisperResponse.self)
+    }
+
+    /// A chunk from a decoded reply, keeping only what `WhisperResponse` models (tests and hand-built replies).
     public init(offsetSeconds: Double, response: WhisperResponse) {
         self.offsetSeconds = offsetSeconds
+        // Encoding fails only for a NaN or infinite time, which no reply carries; such a chunk saves no reply.
+        self.raw = (try? JSONValue(encoding: response)) ?? .null
         self.response = response
+    }
+
+    private enum CodingKeys: String, CodingKey { case offsetSeconds, response }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(offsetSeconds: c.decode(Double.self, forKey: .offsetSeconds), raw: c.decode(JSONValue.self, forKey: .response))
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(offsetSeconds, forKey: .offsetSeconds)
+        try c.encode(raw, forKey: .response)
     }
 }
