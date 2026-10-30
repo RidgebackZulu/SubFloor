@@ -83,19 +83,46 @@ import Transcription
     @Test func steppingStartsFromTheSelectionOrTheShownDay() {
         let m = RecordingsSearch(query: "dust").matches(catalog: catalog, index: index)   // a on day 1, c on day 2
         func go(_ selected: String?, _ day: Date, forward: Bool) -> String? {
-            let origin = RecordingsSearch.stepOrigin(m, selected: selected, dayStart: day, forward: forward)
+            let origin = RecordingsSearch.stepOrigin(m, selected: selected.flatMap { catalog.recording($0) }, dayStart: day,
+                                                     forward: forward)
             return RecordingsSearch.step(m, from: origin, forward: forward)?.file
         }
         // A selected match: step from it.
         #expect(go(Self.a, Self.day2, forward: true) == Self.c)
         #expect(go(Self.c, Self.day1, forward: false) == Self.a)
-        // Nothing selected, or a selection that is no match: the shown day decides.
+        // Nothing selected: the shown day decides.
         #expect(go(nil, Self.day2, forward: true) == Self.c)     // first match from that day on
-        #expect(go(Self.b, Self.day2, forward: true) == Self.c)
-        #expect(go(nil, Self.day2, forward: false) == Self.a)    // last match before that day
+        #expect(go(nil, Self.day2, forward: false) == Self.c)    // the shown day's last match
         #expect(go(nil, Self.day1, forward: true) == Self.a)
-        #expect(go(nil, Self.day1, forward: false) == Self.c)    // none before: wraps to the last
+        #expect(go(nil, Self.day1, forward: false) == Self.a)    // the shown day's last match, not the one after it
         #expect(go(nil, Self.day2.addingTimeInterval(86_400), forward: true) == Self.a)   // none from then on: wraps
+    }
+
+    /// ◀ with nothing selected lands on the shown day's last match; with no match on or before that day it
+    /// wraps to the last of all.
+    @Test func backwardWithNothingSelectedLandsOnTheShownDaysLastMatch() {
+        let m = RecordingsSearch(query: "dust").matches(catalog: catalog, index: index)   // a on day 1, c on day 2
+        func back(_ day: Date) -> String? {
+            RecordingsSearch.step(m, from: RecordingsSearch.stepOrigin(m, selected: nil, dayStart: day, forward: false),
+                                  forward: false)?.file
+        }
+        #expect(back(Self.day1) == Self.a)
+        #expect(back(Self.day2) == Self.c)
+        #expect(back(Self.day2.addingTimeInterval(86_400)) == Self.c)   // a later day with none: the last before it
+        #expect(back(Self.day1.addingTimeInterval(-86_400)) == Self.c)  // before every match: wraps to the last
+    }
+
+    /// A selected recording that does not match: the step goes from its time, whatever day is shown.
+    @Test func aNonMatchingSelectionStepsFromItsTime() {
+        let m = RecordingsSearch(query: "dust").matches(catalog: catalog, index: index)   // a 06:00 day 1, c 03:00 day 2
+        let b = catalog.recording(Self.b)!                                                 // 09:00 day 1
+        func go(forward: Bool) -> String? {
+            RecordingsSearch.step(m, from: RecordingsSearch.stepOrigin(m, selected: b, dayStart: Self.day1, forward: forward),
+                                  forward: forward)?.file
+        }
+        #expect(RecordingsSearch.stepOrigin(m, selected: b, dayStart: Self.day1, forward: true)?.file == Self.b)
+        #expect(go(forward: true) == Self.c)    // the next match after b, not the first on b's day
+        #expect(go(forward: false) == Self.a)
     }
 
     @Test func noMatchesDisablesStepping() {

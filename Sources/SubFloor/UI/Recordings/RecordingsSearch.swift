@@ -48,12 +48,14 @@ struct RecordingsSearch: Equatable {
         return matches.last { ($0.start, $0.file) < key } ?? matches.last
     }
 
-    /// Where a step starts: the selected recording when it is a match, otherwise the shown day's edge, so
-    /// → goes to the first match from that day on and ← to the last before it.
-    static func stepOrigin(_ matches: [CatalogRecording], selected: String?, dayStart: Date, forward: Bool) -> CatalogRecording? {
-        if let selected, let current = matches.first(where: { $0.file == selected }) { return current }
+    /// Where a step starts: the selected recording, match or not (`step` goes from a non-match by its time).
+    /// With nothing selected, the shown day's edges: → goes to the first match from that day on, and ← to the
+    /// shown day's last match (the last before the next day starts).
+    static func stepOrigin(_ matches: [CatalogRecording], selected: CatalogRecording?, dayStart: Date, forward: Bool) -> CatalogRecording? {
+        if let selected { return matches.first { $0.file == selected.file } ?? selected }
         if forward { return matches.last { $0.start < dayStart } }
-        return matches.first { $0.start >= dayStart }
+        let nextDay = dayStart.addingTimeInterval(86_400)
+        return matches.first { $0.start >= nextDay }
     }
 
     /// "1 match", "2 matches", "0 matches".

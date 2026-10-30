@@ -45,19 +45,43 @@ enum TranscriptStripLayout {
     /// The words that start inside `visible`, at their time across `width`. A word that would run into the
     /// last one on line 0 goes to line 1; one that would run into both is left out, so text never overlaps.
     /// Zooming in spreads the words apart and brings the hidden ones back.
+    ///
+    /// The `priority` words (by index: the search's matches) are placed first, by the same rule among
+    /// themselves, so a match is not the word left out. The rest then fit around them: a word also may not run
+    /// into a priority word on its line. The result is in word order.
     static func place(_ words: [TranscriptWord], visible: ClosedRange<Double>, width: CGFloat,
-                      measure: (String) -> CGFloat) -> [PlacedWord] {
+                      measure: (String) -> CGFloat, priority: (Int) -> Bool = { _ in false }) -> [PlacedWord] {
         let span = visible.upperBound - visible.lowerBound
         guard span > 0, width > 0 else { return [] }
-        var ends: [CGFloat] = [-.infinity, -.infinity]
-        var placed: [PlacedWord] = []
+        var shown: [(index: Int, x: CGFloat, end: CGFloat, first: Bool)] = []
         for (index, word) in words.enumerated() where visible.contains(word.start) {
             let x = CGFloat((word.start - visible.lowerBound) / span) * width
-            guard let line = ends.firstIndex(where: { x >= $0 }) else { continue }
-            ends[line] = x + measure(word.text) + gap
-            placed.append(PlacedWord(index: index, x: x, line: line))
+            shown.append((index, x, x + measure(word.text) + gap, priority(index)))
         }
-        return placed
+        var placed: [PlacedWord] = []
+        // Where each line's priority words sit, left to right: the spans the other words keep out of.
+        var reserved: [[(x: CGFloat, end: CGFloat)]] = [[], []]
+        var ends: [CGFloat] = [-.infinity, -.infinity]
+        for w in shown where w.first {
+            guard let line = ends.firstIndex(where: { w.x >= $0 }) else { continue }
+            ends[line] = w.end
+            reserved[line].append((w.x, w.end))
+            placed.append(PlacedWord(index: w.index, x: w.x, line: line))
+        }
+        guard placed.count < shown.count else { return placed }
+        ends = [-.infinity, -.infinity]
+        var next = [0, 0]   // per line, the first reserved span that does not end before the current word
+        for w in shown where !w.first {
+            let line = (0..<2).first { line in
+                guard w.x >= ends[line] else { return false }
+                while next[line] < reserved[line].count, reserved[line][next[line]].end <= w.x { next[line] += 1 }
+                return next[line] == reserved[line].count || reserved[line][next[line]].x >= w.end
+            }
+            guard let line else { continue }
+            ends[line] = w.end
+            placed.append(PlacedWord(index: w.index, x: w.x, line: line))
+        }
+        return placed.sorted { $0.index < $1.index }
     }
 }
 
@@ -71,13 +95,15 @@ enum TranscriptStripContent: Equatable {
 
     /// A recording being sent right now says so even when it has an old transcript (Transcribe Again);
     /// otherwise a transcript wins over a queued retry, and a failure shows only for a recording with none.
-    static func decide(summary: TranscriptSummary?, state: TranscriptionJobState?) -> Self {
+    /// A queued one in a `blocked` queue is going nowhere until the key is saved again, so it gives the reason.
+    static func decide(summary: TranscriptSummary?, state: TranscriptionJobState?, blocked: TranscriptionError? = nil) -> Self {
         if state == .running { return .transcribing }
         // The verdict, as the badge has it: a transcript with under 3 kept words is possible noise, whatever
         // words it holds (they stay in the index for search).
         if let summary { return summary.verdict == .possibleNoise ? .noise : .words(summary.words, text: summary.text) }
         switch state {
         case .failed(let reason)?: return .failed(reason)
+        case .queued? where blocked != nil: return .failed(blocked?.message ?? "")
         case .queued?, .running?: return .transcribing
         case nil: return .notTranscribed
         }
@@ -170,7 +196,12 @@ struct TranscriptStrip: View {
     private func wordsView(_ words: [TranscriptWord]) -> some View {
         // The waveform's own span: its width is the view's, and it draws from the left edge.
         let range = zoom.shownRange(duration: duration, position: position, anchor: dragAnchor)
-        let placed = TranscriptStripLayout.place(words, visible: range, width: width, measure: Self.measure)
+        // The search's matches are placed first, so their highlight shows even where most words are left out.
+        let terms = terms
+        let placed = terms.isEmpty
+            ? TranscriptStripLayout.place(words, visible: range, width: width, measure: Self.measure)
+            : TranscriptStripLayout.place(words, visible: range, width: width, measure: Self.measure,
+                                          priority: { TranscriptSearch.wordMatches(words[$0].text, terms: terms) })
         return ZStack(alignment: .topLeading) {
             ForEach(placed, id: \.index) { p in
                 let word = words[p.index]

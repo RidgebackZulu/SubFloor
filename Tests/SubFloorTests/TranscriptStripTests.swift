@@ -48,6 +48,29 @@ import Transcription
         #expect(place([word("a", 0), word("b", 0.5)]).map(\.line) == [0, 0])
     }
 
+    /// At whole-file zoom a search match is placed before everything else, so its green highlight shows: the
+    /// other words fit around it, on either line, or are left out.
+    @Test func aMatchIsPlacedFirst() {
+        let words = [word("a", 0), word("b", 1), word("match", 2)]   // at x 0, 4 and 8 across 40 pt
+        // Without priority the third word is hidden: both lines are taken.
+        #expect(place(words, width: 40).map(\.index) == [0, 1])
+        let placed = TranscriptStripLayout.place(words, visible: 0...10, width: 40, measure: { _ in 40 }, priority: { $0 == 2 })
+        #expect(placed == [PlacedWord(index: 0, x: 0, line: 1), PlacedWord(index: 2, x: 8, line: 0)])
+
+        // Around a match at x 50 (4 wide + 6 gap): a word that ends before it still goes on line 0, one that would
+        // run into it goes to line 1, and one that would run into both lines' words is left out.
+        let spread = [word("a", 0), word("b", 0.3), word("c", 0.45), word("d", 0.47), word("match", 0.5)]
+        let around = TranscriptStripLayout.place(spread, visible: 0...10, width: 1000, measure: { _ in 4 },
+                                                 priority: { $0 == 4 })
+        #expect(around.map { [$0.index, $0.line] } == [[0, 0], [1, 0], [2, 1], [4, 0]])
+
+        // Matches crowd only each other: two on top of each other take both lines, a third is left out.
+        let crowd = [word("x", 0), word("y", 0.1), word("z", 0.2), word("w", 5)]
+        let matches = TranscriptStripLayout.place(crowd, visible: 0...10, width: 1000, measure: { _ in 40 },
+                                                  priority: { _ in true })
+        #expect(matches.map { [$0.index, $0.line] } == [[0, 0], [1, 1], [3, 0]])
+    }
+
     @Test func placeWithNothingVisibleIsEmpty() {
         #expect(place([word("a", 1)], visible: 0...0).isEmpty)
         #expect(place([word("a", 1)], width: 0).isEmpty)
@@ -99,6 +122,20 @@ import Transcription
         // Transcribe Again on a transcribed recording: running wins over the old words, queued does not.
         #expect(C.decide(summary: voice, state: .running) == .transcribing)
         #expect(C.decide(summary: voice, state: .queued) == .words([word("hi", 1)], text: "hi"))
+    }
+
+    /// A recording waiting in a blocked queue is not being transcribed: it says why, as the chip does.
+    @Test func aQueuedRecordingInABlockedQueueSaysWhy() {
+        typealias C = TranscriptStripContent
+        let voice = TranscriptSummary(verdict: .voice, words: [word("hi", 1)], text: "hi")
+        #expect(C.decide(summary: nil, state: .queued, blocked: .rejectedKey) == .failed("OpenRouter rejected the key"))
+        #expect(C.decide(summary: nil, state: .queued, blocked: .outOfCredit) == .failed("OpenRouter account is out of credit"))
+        #expect(C.decide(summary: nil, state: .queued, blocked: .outOfCredit).message
+                == "Couldn't transcribe — OpenRouter account is out of credit")
+        #expect(C.decide(summary: nil, state: .queued, blocked: nil) == .transcribing)
+        #expect(C.decide(summary: nil, state: .running, blocked: .rejectedKey) == .transcribing)
+        #expect(C.decide(summary: voice, state: .queued, blocked: .rejectedKey) == .words([word("hi", 1)], text: "hi"))
+        #expect(C.decide(summary: nil, state: nil, blocked: .rejectedKey) == .notTranscribed)
     }
 
     @Test func fewWordsAreStillPossibleNoise() {

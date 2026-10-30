@@ -223,10 +223,15 @@ struct RecordingsWindow: View {
                     .font(.system(size: 12))
                     .frame(width: 130)
                     .focused($searchFocused)
-                    .onSubmit { stepMatch(forward: true) }
+                    .onSubmit { stepMatch(forward: true, fromField: true) }
                     .onKeyPress(.escape) {
-                        guard !query.isEmpty else { return .ignored }
-                        query = ""
+                        // The first Esc clears the query; Esc in an empty field hands the keys back to the player.
+                        if query.isEmpty {
+                            searchFocused = false
+                            keysFocused = true
+                        } else {
+                            query = ""
+                        }
                         return .handled
                     }
             }
@@ -242,11 +247,11 @@ struct RecordingsWindow: View {
                     .foregroundStyle(matches.isEmpty ? RecordingsTheme.muted : RecordingsTheme.text)
                     .fixedSize()
             }
-            Button { stepMatch(forward: false) } label: { Image(systemName: "chevron.left").frame(width: 14) }
+            Button { stepMatch(forward: false, fromField: false) } label: { Image(systemName: "chevron.left").frame(width: 14) }
                 .buttonStyle(ChipButtonStyle())
                 .disabled(matches.isEmpty)
                 .help("Previous match")
-            Button { stepMatch(forward: true) } label: { Image(systemName: "chevron.right").frame(width: 14) }
+            Button { stepMatch(forward: true, fromField: false) } label: { Image(systemName: "chevron.right").frame(width: 14) }
                 .buttonStyle(ChipButtonStyle())
                 .disabled(matches.isEmpty)
                 .help("Next match")
@@ -298,12 +303,14 @@ struct RecordingsWindow: View {
     }
 
     /// ◀ ▶ and Return in the field: the next or previous match, on whatever day it falls. The day is set first,
-    /// then the match is picked as a click on it would. From the field, focus stays there so Return keeps stepping.
-    private func stepMatch(forward: Bool) {
-        let origin = RecordingsSearch.stepOrigin(matches, selected: selection, dayStart: day, forward: forward)
+    /// then the match is picked as a click on it would. From the field (Return), focus stays there so Return
+    /// keeps stepping; a click on ◀ ▶ hands the keys to the player, as a click on a marker does.
+    private func stepMatch(forward: Bool, fromField: Bool) {
+        let origin = RecordingsSearch.stepOrigin(matches, selected: selectedRecording, dayStart: day, forward: forward)
         guard let target = RecordingsSearch.step(matches, from: origin, forward: forward) else { return }
         day = RecordingsCatalog.utcDayStart(target.start)
-        select(target, takeFocus: !searchFocused)
+        if !fromField { searchFocused = false }
+        select(target, takeFocus: !fromField)
     }
 
     private func step(_ days: Int) {

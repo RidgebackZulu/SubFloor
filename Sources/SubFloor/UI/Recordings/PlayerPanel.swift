@@ -217,7 +217,8 @@ private struct PlayerTranscript: View {
         let file = recording.file, model = model
         let canTranscribe = model.hasAPIKey && model.transcriptionSettings.enabled
         TranscriptStrip(
-            content: .decide(summary: model.library.transcripts.summary(file), state: model.transcription.states[file]),
+            content: .decide(summary: model.library.transcripts.summary(file), state: model.transcription.states[file],
+                             blocked: model.transcription.blocked),
             // The waveform's own extent and position, so a word sits above the signal it was spoken in.
             position: loaded ? player.position : 0,
             duration: display.shownDuration(playerDuration: loaded ? player.duration : 0, envelopeDuration: envelope?.duration),
