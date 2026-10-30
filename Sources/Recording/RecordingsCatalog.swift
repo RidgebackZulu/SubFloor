@@ -219,6 +219,14 @@ public struct RecordingsCatalog: Equatable, Sendable {
         return all.sorted { ($0.start, $0.file) < ($1.start, $1.file) }
     }
 
+    /// Every listed audio recording on every day by start time, and the one in progress. A search walks these
+    /// across days; a window shows one day at a time through `recordings(onUTCDay:)`.
+    public var allRecordings: [CatalogRecording] {
+        var all = names.compactMap { file, name in file == live?.file ? nil : recording(file, name) }
+        if let live { all.append(liveRecording(live)) }   // listed even before the folder shows it
+        return all.sorted { ($0.start, $0.file) < ($1.start, $1.file) }
+    }
+
     /// One lane per frequency and mode that has a recording on the day, lowest frequency first.
     public func lanes(onUTCDay day: Date) -> [CatalogLane] {
         var seen: Set<String> = []

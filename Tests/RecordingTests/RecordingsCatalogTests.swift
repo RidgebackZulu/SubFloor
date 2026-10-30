@@ -23,6 +23,16 @@ private let usb = "SubFloor_20261027_183219Z_11175000Hz_USB.flac"
 private let am = "SubFloor_20261027_090000Z_6925000Hz_AM.flac"
 
 @Suite struct RecordingsCatalogTests {
+    @Test func allRecordingsListsEveryDay() {
+        let nextDay = "SubFloor_20261028_010000Z_6925000Hz_AM.flac"
+        let live = LiveRecording(file: "SubFloor_20261029_120000Z_7000000Hz_LSB.flac", start: utc(2026, 10, 29, 12, 0, 0),
+                                 seconds: 4, frequencyHz: 7_000_000, mode: "LSB", auto: false)
+        let c = RecordingsCatalog(files: [usb, am, nextDay, "notes.txt"], live: live)
+        #expect(c.allRecordings.map(\.file) == [am, usb, nextDay, live.file])   // sorted by start, every day, audio only
+        #expect(c.allRecordings.last?.inProgress == true)
+        #expect(RecordingsCatalog().allRecordings.isEmpty)
+    }
+
     @Test func parsesRecordingNames() {
         let n = RecordingFileName.parse("SubFloor_20261027_183219Z_11175000Hz_USB.flac")!
         #expect(n.start == utc(2026, 10, 27, 18, 32, 19)); #expect(n.frequencyHz == 11_175_000)
