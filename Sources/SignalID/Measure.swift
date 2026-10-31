@@ -9,17 +9,26 @@ import Foundation
 /// `bandwidthHz` place the signal relative to the capture centre (from `Extent.find` or an agent).
 ///
 /// **Window.** That extent is only a seed: at 10 dB an AM signal's extent is just its carrier, and an FM
-/// signal's skirts lie under the noise. The measurer cuts a window 3 × the seed wide (at least 24 kHz, the
-/// widest AM it names; at most 80% of the capture and not past its edge) and finds the signal's extent there:
-/// - an averaged spectrum (1024 bins across the window, 75%-overlapped Blackman-Harris frames) gives the noise:
-///   first from the 20th percentile of all its bins, then from the bins outside the signal (`SpectrumView`);
+/// signal's skirts lie under the noise. The measurer cuts a window 3 × the seed wide (at least 40 kHz: the
+/// widest AM it names with room for noise beside neighbours 9 kHz either side; at most 80% of the capture
+/// and not past its edge) and finds the signal's extent there:
+/// - an averaged spectrum (2048 bins across the window, 75%-overlapped Blackman-Harris frames) gives the noise:
+///   anchored on the 10th percentile of the bins (first all of them, then those outside the signal), so a
+///   crowded band's neighbours don't lift it (`SpectrumView.estimateNoise`);
 /// - the signal is the bins of the seed standing 4 σ over the noise (σ: a noise bin's spread, smoothed over
 ///   5 bins), grown outwards while they stay there; nothing in the seed 5 σ over the noise (summed over its
 ///   bins) is noise;
 /// - when its strongest bin is a carrier line (15 dB over the bins 3 either side), it also takes in
 ///   sidebands that sit symmetrically about the line: min(left, right), smoothed over ±100 Hz, 4 σ over the
-///   noise, starting within 10 widths or 1 kHz of the line and running out to where they end, if every bin
-///   of them is at least 6 dB under the line (a neighbour as strong as the line is not a sideband).
+///   noise, starting within 10 widths or 5 kHz of the line (AM audio reaches 4.5 kHz) and running out to
+///   where they end. Every bin of them must sit at least 5 dB under the line (a 100% sine AM's sit 6 dB
+///   under). Where something stronger appears on both sides, beyond 5 kHz it is other stations (a crowded
+///   band) and the sidebands end halfway to them, with no margin beyond; on one side only, the sidebands
+///   end short of it. The growth itself also stops halfway to other lines as strong as this one 5 kHz or
+///   more away, and the margin the measurement adds stops short of the next other signal;
+/// - a symmetric pair within 5 kHz, beyond the strongest bin's skirt, no more than 5 dB under it (stronger
+///   than any AM's sidebands) makes that bin one of a comb, an FM tone's Bessel lines (APT seen on its
+///   centre line): if the measurement finds a line there, it is never `am` or `carrier`.
 ///
 /// **Bandwidth and SNR.** On a second spectrum about 64 bins across the signal (zoomed in on narrow ones,
 /// coarser for wide ones, at least 4 / seconds), the noise is subtracted and:
@@ -30,7 +39,7 @@ import Foundation
 ///   mean density over its occupied width (total power / occupied width), levels averaged over ±1% of it;
 /// - `offsetHz` is the carrier line when there is one in the middle of the band (AM, CW, a carrier, FM with
 ///   pauses), otherwise the middle of the occupied band;
-/// - `snrDb` is the signal's power over the noise power within the occupied band (for bursty signals the
+/// - `snrDb` is the signal's power within the occupied band over the noise power there (for bursty signals the
 ///   mean over the capture, as the averaged spectrum sees it).
 ///
 /// **Family.** The signal is cut out at 1.25 × its occupied width (`Channel.extract`, centred as above, from
@@ -46,8 +55,8 @@ import Foundation
 ///    burst rules are Task 4's).
 /// 3. **am:** a carrier line (15 dB over the continuum beside it) holding ≥ 50% of the power (a 100% sine
 ///    AM's holds 2/3), sidebands holding ≥ 2%, and modulation in phase with the carrier: `inPhase` (in-phase
-///    over quadrature variance, less one) ≥ 0.25.
-/// 4. **carrier:** a line holding ≥ 97% of the power (FM with long pauses holds about 90%).
+///    over quadrature variance, less one) ≥ 0.25. Not a line of a comb.
+/// 4. **carrier:** a line holding ≥ 97% of the power (FM with long pauses holds about 90%), not of a comb.
 /// 5. **fm / wfm:** a constant envelope (20 ms block CV within 2 × what noise alone gives, + 0.1, and
 ///    E|s|⁴/(E|s|²)² ≤ 1.1 with the noise taken out), a frequency spread ≥ 0.15 of half the occupied width,
 ///    and width × seconds ≥ 1000 independent samples. A distribution with separate peaks or a kurtosis
@@ -69,14 +78,14 @@ import Foundation
 public enum SignalMeasurer {
     static let minimumSeconds = 0.2
     static let windowFactor = 3.0
-    static let minimumWindowHz = 24_000.0
-    static let coarseBins = 1024.0
+    static let minimumWindowHz = 40_000.0
+    static let coarseBins = 2048.0
     static let measureBins = 64.0
     static let detectSigma = 5.0
     static let edgeSigma = 4.0
     static let lineContrastDb = 15.0
-    static let sidebandBelowLineDb = 6.0
-    static let sidebandSearchHz = 1000.0
+    static let sidebandBelowLineDb = 5.0
+    static let sidebandSearchHz = 5000.0
     static let channelFactor = 1.25
     static let mirrorSmoothingHz = 100.0
     static let maxConstantM4 = 1.1
@@ -90,6 +99,8 @@ public enum SignalMeasurer {
     static let minFMSamples = 1000.0
     static let maxFeatureSamples = 1 << 21
     static let twinSearchHz = 3000.0
+    static let combMaxHz = 5000.0
+    static let combBelowLineDb = 5.0
     static let twinBelowDb = 10.0
     static let maxTwinCorrelation = -0.3
 
@@ -151,8 +162,13 @@ public enum SignalMeasurer {
         let mapped = view.bin(coarse.hz(Double(signalRegion.bins.lowerBound)) - viewCentre)...view.bin(
             coarse.hz(Double(signalRegion.bins.upperBound)) - viewCentre)
         view.estimateNoise(excluding: widened(mapped, by: 0.1, in: view))
+        // The margin beyond the signal stops short of anything else.
+        let room = view.bin(coarse.hz(Double(signalRegion.room.lowerBound)) - viewCentre)...view.bin(
+            coarse.hz(Double(signalRegion.room.upperBound)) - viewCentre)
         let margin = max(3, mapped.count * 15 / 100)
-        let slice = max(0, mapped.lowerBound - margin)...min(view.count - 1, mapped.upperBound + margin)
+        let sliceLow = max(0, room.lowerBound + 1, mapped.lowerBound - margin)
+        let sliceHigh = min(view.count - 1, room.upperBound - 1, mapped.upperBound + margin)
+        let slice = sliceLow <= sliceHigh ? sliceLow...sliceHigh : mapped
         let signal = view.signal(slice)
         let width = OccupiedWidth.fixedPoint(signal, binHz: view.binHz, start: regionHz,
                                              noiseSigma: view.noise * view.spread)
@@ -165,7 +181,8 @@ public enum SignalMeasurer {
         }
         let occupied = (slice.lowerBound + occupiedLocal.lowerBound)...(slice.lowerBound + occupiedLocal.upperBound)
         let occupiedHz = Double(occupied.count) * view.binHz
-        let line = Line(view, occupied: occupied, total: view.signal(occupied).reduce(0, +))
+        let inBand = view.signal(occupied).reduce(0, +)
+        let line = Line(view, occupied: occupied, total: inBand)
         // A carrier line in the middle of the band is its centre (and the channel's, so the in-phase test
         // isn't spoiled by a residual offset).
         let middleHz = viewCentre + view.hz(Double(occupied.lowerBound + occupied.upperBound) / 2)
@@ -175,7 +192,7 @@ public enum SignalMeasurer {
         let reach = max(1, Int((0.01 * occupiedHz / view.binHz).rounded()))
         let six = OccupiedWidth.span(OccupiedWidth.prefixSums(signal), reach: reach,
                                      threshold: total / Double(occupied.count) / 4)
-        let signalPower = total / SpectrumView.enbw
+        let signalPower = inBand / SpectrumView.enbw
         let noiseDensity = view.noise / (SpectrumView.enbw * view.binHz)
         result.offsetHz = offsetHz + centreHz
         result.occupiedBandwidthHz = occupiedHz
@@ -200,14 +217,15 @@ public enum SignalMeasurer {
             : keyedTwin(window, coarse, region: signalRegion.bins, centreHz: centreHz, channelHz: channelHz,
                         occupiedHz: occupiedHz)
         classify(&result, line: line, envelope: envelope, frequency: frequency, sidebands: sidebands,
-                 keyedTwinHz: twin)
+                 keyedTwinHz: twin, comb: signalRegion.comb)
         return result
     }
 
     // MARK: Decision
 
     static func classify(_ m: inout SignalMeasurement, line: Line, envelope: EnvelopeFeatures,
-                         frequency: FrequencyFeatures, sidebands: SidebandFeatures, keyedTwinHz: Double? = nil) {
+                         frequency: FrequencyFeatures, sidebands: SidebandFeatures, keyedTwinHz: Double? = nil,
+                         comb: Bool = false) {
         let steady = envelope.blockCV <= 2 * envelope.steadyCV + 0.1
         let constant = envelope.amplitudeM4 <= maxConstantM4
         let voice = envelope.blockCV >= 0.5 && envelope.pauseFraction >= 0.05 && envelope.keying == nil
@@ -237,8 +255,10 @@ public enum SignalMeasurer {
             m.envelope = .bursty
             m.notes.append("On/off envelope without a carrier line")
         }
+        // A line of a comb is part of a wider signal (an FM tone, APT): neither AM nor a carrier.
+        if comb && line.isLine { m.notes.append("A line among equally strong lines: part of a wider signal") }
         // 3. AM.
-        if line.isLine && line.fraction >= minAMCarrierFraction && line.sidebandFraction >= minSidebandFraction
+        if !comb && line.isLine && line.fraction >= minAMCarrierFraction && line.sidebandFraction >= minSidebandFraction
             && envelope.inPhase >= minInPhase {
             m.family = .am
             m.envelope = amVoice ? .voice : .steady
@@ -249,7 +269,7 @@ public enum SignalMeasurer {
             return
         }
         // 4. Carrier.
-        if line.isLine && line.fraction >= minCarrierFraction {
+        if !comb && line.isLine && line.fraction >= minCarrierFraction {
             m.family = .carrier
             m.envelope = .steady
             m.familyConfidence = score(line.fraction, minCarrierFraction, 0.99)
@@ -271,7 +291,7 @@ public enum SignalMeasurer {
                             score(maxConstantM4 - envelope.amplitudeM4, 0, 0.1))
             if m.occupiedBandwidthHz >= 100_000 || (pilot != nil && m.occupiedBandwidthHz >= 60_000) {
                 m.family = .wfm
-                m.familyConfidence = max(shape, pilot != nil ? 0.9 : score(m.occupiedBandwidthHz, 100_000, 150_000))
+                m.familyConfidence = min(shape, pilot != nil ? 1 : score(m.occupiedBandwidthHz, 100_000, 150_000))
                 m.notes.append(pilot != nil ? "Wide FM with a 19 kHz stereo pilot" : "Wide FM")
             } else {
                 m.family = .fm
@@ -303,6 +323,11 @@ public enum SignalMeasurer {
 
     struct Region {
         var bins: ClosedRange<Int>
+        /// The line is one of a comb: lines at ±Δ (Δ < 5 kHz) as strong as it (an FM tone's Bessel lines).
+        var comb = false
+        /// How far the signal may reach: up to the next other signal beyond a gap, or the region itself when
+        /// it was cut halfway to its neighbours (a crowded band).
+        var room: ClosedRange<Int>
     }
 
     /// The signal around `seed` in the coarse view (see the type's notes), or nil when nothing there stands
@@ -321,14 +346,39 @@ public enum SignalMeasurer {
         while lo > 0 && (es[lo - 1] >= edge || (lo > 1 && es[lo - 2] >= edge)) { lo -= 1 }
         while hi < view.count - 1 && (es[hi + 1] >= edge || (hi < view.count - 2 && es[hi + 2] >= edge)) { hi += 1 }
         var bins = lo...hi
+        // Up to the next other signal (standing clearly out: 2 × the edge level) beyond a gap, short of its
+        // smoothed skirt.
+        func room(_ bins: ClosedRange<Int>) -> ClosedRange<Int> {
+            var a = bins.lowerBound, b = bins.upperBound
+            while a > 0 && es[a - 1] < 2 * edge { a -= 1 }
+            while b < view.count - 1 && es[b + 1] < 2 * edge { b += 1 }
+            if a > 0 { a = min(bins.lowerBound, a + smoothing + 1) }
+            if b < view.count - 1 { b = max(bins.upperBound, b - smoothing - 1) }
+            return a...b
+        }
 
-        // A carrier line: symmetric sidebands about it belong to it.
-        let top = bins.max { view.power[$0] < view.power[$1] }!
+        // A carrier line (the seed's own peak): symmetric sidebands about it belong to it.
+        let top = seed.clamped(to: bins).max { view.power[$0] < view.power[$1] }!
         let s = 3
         guard top - s >= 0, top + s < view.count,
               view.power[top] >= max(view.power[top - s], view.power[top + s]) * pow(10, lineContrastDb / 10)
-        else { return Region(bins: bins) }
+        else { return Region(bins: bins, comb: isComb(view, line: top), room: room(bins)) }
         let limit = min(top, view.count - 1 - top)
+        // Other lines as strong as this one (within 5 dB) 5 kHz or more away are other stations (MW at 9 or
+        // 10 kHz, airband 8.33, HF 5): the growth stops halfway to them. Nearer ones stay (an FSK's tones; a
+        // comb is caught below).
+        let strong = view.power[top] * pow(10, -sidebandBelowLineDb / 10)
+        func isStrongLine(_ k: Int) -> Bool {
+            k - s >= 0 && k + s < view.count && view.power[k] >= strong
+                && view.power[k] >= max(view.power[k - s], view.power[k + s]) * pow(10, lineContrastDb / 10)
+        }
+        let near = Int(combMaxHz / view.binHz)
+        if let left = stride(from: top - near, through: bins.lowerBound, by: -1).first(where: isStrongLine) {
+            bins = max(bins.lowerBound, (left + top + 1) / 2)...bins.upperBound
+        }
+        if let right = stride(from: top + near, through: bins.upperBound, by: 1).first(where: isStrongLine) {
+            bins = bins.lowerBound...min(bins.upperBound, (right + top) / 2)
+        }
         // Mirrored about the line, smoothed over ±100 Hz (at least the 5 bins above) for weak, wide sidebands.
         let wide = max(smoothing, Int(mirrorSmoothingHz / view.binHz))
         let ew = view.smoothedExcess(reach: wide)
@@ -343,7 +393,9 @@ public enum SignalMeasurer {
             if mirrored(d) >= mirrorEdge && mirrored(d + 1) >= mirrorEdge { start = d; break }
             d += 1
         }
-        guard let sidebandStart = start else { return Region(bins: bins) }
+        guard let sidebandStart = start else {
+            return Region(bins: bins, comb: isComb(view, line: top), room: room(bins))
+        }
         var outer = sidebandStart
         var k = outer + 1
         while k <= limit {
@@ -351,12 +403,37 @@ public enum SignalMeasurer {
             guard k - outer <= max(3, outer / 10) else { break }
             k += 1
         }
+        // Strong symmetric neighbours: within 5 kHz, an FM tone's comb; farther out, other stations, so
+        // this one's sidebands end halfway to them. A neighbour on one side only ends them short of it.
         let ceiling = view.power[top] * pow(10, -sidebandBelowLineDb / 10)
         for d in sidebandStart...outer where view.power[top - d] > ceiling || view.power[top + d] > ceiling {
-            return Region(bins: bins)
+            let left = (d - 2...d + 2).map { view.power[top - min($0, limit)] }.max()!
+            let right = (d - 2...d + 2).map { view.power[top + min($0, limit)] }.max()!
+            guard min(left, right) > ceiling else {
+                outer = d - s - wide - 1
+                break
+            }
+            if Double(d) * view.binHz < combMaxHz { return Region(bins: bins, comb: true, room: room(bins)) }
+            outer = d / 2
+            bins = min(bins.lowerBound, top - outer)...max(bins.upperBound, top + outer)
+            return Region(bins: bins, room: bins)
         }
+        guard outer >= sidebandStart else { return Region(bins: bins, comb: isComb(view, line: top), room: room(bins)) }
         bins = min(bins.lowerBound, top - outer)...max(bins.upperBound, top + outer)
-        return Region(bins: bins)
+        return Region(bins: bins, comb: isComb(view, line: top), room: room(bins))
+    }
+
+    /// A line with a symmetric pair of components within `combMaxHz`, beyond its skirt (8 bins out or more),
+    /// each at most `combBelowLineDb` under it: stronger than any AM's sidebands (a 100% sine's are 6 dB
+    /// under the carrier), so the line is one of a comb, an FM tone's Bessel lines. Powers are summed over
+    /// ±2 bins.
+    static func isComb(_ view: SpectrumView, line top: Int) -> Bool {
+        func lobe(_ k: Int) -> Double { (k - 2...k + 2).reduce(0) { $0 + max(0, view.power[$1] - view.noise) } }
+        let limit = min(top, view.count - 1 - top) - 2
+        let first = 8, last = min(limit, Int(combMaxHz / view.binHz))
+        guard first <= last else { return false }
+        let floor = lobe(top) * pow(10, -combBelowLineDb / 10)
+        return (first...last).contains { min(lobe(top - $0), lobe(top + $0)) >= floor }
     }
 
     /// A keyed signal's FSK twin: the strongest other signal in the window within ±max(3 kHz, 10 widths),

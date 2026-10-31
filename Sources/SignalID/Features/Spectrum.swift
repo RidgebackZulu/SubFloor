@@ -88,22 +88,17 @@ struct SpectrumView {
     func bin(_ hz: Double) -> Int { min(count - 1, max(0, Int(((hz - firstHz) / binHz).rounded()))) }
     func hz(_ bin: Double) -> Double { firstHz + bin * binHz }
 
-    /// Sets the noise level: the mean of the bins outside `excluding` that lie under 3 × their median (so
-    /// other signals in the band don't lift it). With no exclusion yet (the signal's extent unknown), from
-    /// the 20th percentile of all the bins instead, which stays on the noise while signals fill up to
-    /// about 70% of the band: the percentile of a noise bin is noise × (1 − 0.84 spread).
+    /// Sets the noise level from the bins outside `excluding` (all of them when nil or fewer than 16 remain):
+    /// anchored on their 10th percentile, which is a noise bin's noise × (1 − 1.28 spread) while signals
+    /// fill up to about 85% of them, then the mean of the bins up to 4 spreads over that anchor (so the
+    /// mean isn't biased, and other signals, a crowded band's neighbours included, don't lift it).
     mutating func estimateNoise(excluding: ClosedRange<Int>?) {
-        guard let excluding else {
-            let sorted = power.sorted()
-            noise = max(sorted[sorted.count / 5] / max(1 - 0.8416 * spread, 0.2), 1e-30)
-            return
-        }
-        var values = power.indices.filter { !excluding.contains($0) }.map { power[$0] }
+        var values = power.indices.filter { excluding?.contains($0) != true }.map { power[$0] }
         if values.count < 16 { values = power }
         values.sort()
-        let median = values[values.count / 2]
-        let kept = values.filter { $0 <= 3 * median }
-        noise = max(kept.isEmpty ? median : kept.reduce(0, +) / Double(kept.count), 1e-30)
+        let anchor = max(values[values.count / 10] / max(1 - 1.2816 * spread, 0.2), 1e-30)
+        let kept = values.filter { $0 <= anchor * (1 + 4 * spread) }
+        noise = max(kept.isEmpty ? anchor : kept.reduce(0, +) / Double(kept.count), 1e-30)
     }
 
     /// Power over the noise, as a multiple of the noise (0 = noise only).

@@ -119,6 +119,47 @@ import Testing
         }
     }
 
+    /// MW broadcast in a crowded band: equal-strength stations 9 or 10 kHz either side (noise-free, so the
+    /// SNR is the middle one's). The middle one is still AM, its width its own.
+    @Test(arguments: [20.0, 10.0])
+    func crowdedMediumWaveIsStillAM(snr: Double) {
+        let fs = 48_000.0
+        for (index, spacing) in [9000.0, 10_000].enumerated() {
+            for seed in UInt64(1)...2 {
+                let base = UInt64(40 + 10 * index) + 3 * seed
+                var iq = SignalSynth.make(.amBroadcast, sampleRate: fs, seconds: 3, snrDb: snr, seed: base)
+                for (k, offset) in [-spacing, spacing].enumerated() {
+                    let neighbour = SignalSynth.make(.amBroadcast, sampleRate: fs, seconds: 3, snrDb: .infinity,
+                                                     offsetHz: offset, seed: base + UInt64(k + 1))
+                    vDSP_vadd(iq, 1, neighbour, 1, &iq, 1, vDSP_Length(iq.count))
+                }
+                let size = 4096
+                let binHz = fs / Double(size)
+                guard let extent = Extent.find(spectrumDb: PowerSpectrum.average(iq, size: size), binHz: binHz,
+                                               nearBin: size / 2, searchBins: 4) else {
+                    Issue.record("\(spacing) Hz, seed \(seed): no extent")
+                    continue
+                }
+                let width = Double(extent.upperBin - extent.lowerBin + 1) * binHz
+                let centre = (Double(extent.lowerBin + extent.upperBin) / 2 - Double(size / 2)) * binHz
+                let m = SignalMeasurer.measure(iq, sampleRate: fs, offsetHz: centre, bandwidthHz: width, seconds: 3)
+                #expect(m.family == .am, "\(spacing) Hz spacing, seed \(seed): \(m.family) \(m.notes)")
+                #expect(Self.within(m.occupiedBandwidthHz, SynthSpec.amBroadcast.occupiedBandwidthHz, 0.15),
+                        "\(spacing) Hz spacing, seed \(seed): \(m.occupiedBandwidthHz) Hz")
+            }
+        }
+    }
+
+    /// NOAA APT pointed at its centre: the extent takes one line of a comb of Bessel lines 2.4 kHz apart, whose
+    /// amplitude moves with the image. Neither AM nor a carrier.
+    @Test(arguments: [20.0, 10.0])
+    func aptCentreLineIsNotAM(snr: Double) {
+        for seed in UInt64(1)...6 {
+            let m = Self.measured(.noaaAPT, sampleRate: 96_000, snr: snr, seed: seed)
+            #expect(m.family != .am && m.family != .carrier, "seed \(seed): \(m.family) \(m.notes)")
+        }
+    }
+
     /// Task 4's families must not be taken for these: `unknown`, or at worst a weak `fm` for a constant
     /// envelope FSK.
     @Test(arguments: [20.0, 10.0])
@@ -130,6 +171,8 @@ import Testing
             (.stanag4285, 48_000, 0), (.drm, 48_000, 0), (.p25, 48_000, 0), (.ysf, 48_000, 0), (.dstar, 48_000, 0),
             (.ale, 48_000, 0), (.olivia(), 48_000, 0), (.mfsk16, 48_000, 0), (.ft8(), 48_000, 0), (.dmr, 48_000, 0),
             (.ais, 96_000, 0),
+            // NOAA APT pointed at its centre: the extent takes one Bessel line of a ±17 kHz FM.
+            (.noaaAPT, 96_000, 0),
         ]
         for (index, (spec, fs, point)) in cases.enumerated() {
             let seed = UInt64(20 + index)
@@ -138,7 +181,10 @@ import Testing
             let binHz = fs / Double(size)
             let db = PowerSpectrum.average(iq, size: size)
             let near = size / 2 + Int(((3000 + point) / binHz).rounded())
-            guard let extent = Extent.find(spectrumDb: db, binHz: binHz, nearBin: near, searchBins: 4) else { continue }
+            guard let extent = Extent.find(spectrumDb: db, binHz: binHz, nearBin: near, searchBins: 4) else {
+                Issue.record("\(spec) at \(snr) dB, seed \(seed): no extent")
+                continue
+            }
             let width = Double(extent.upperBin - extent.lowerBin + 1) * binHz
             let centre = (Double(extent.lowerBin + extent.upperBin) / 2 - Double(size / 2)) * binHz
             let m = SignalMeasurer.measure(iq, sampleRate: fs, offsetHz: centre, bandwidthHz: width, seconds: 3)
