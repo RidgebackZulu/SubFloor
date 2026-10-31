@@ -39,6 +39,22 @@ public struct RecordingStatus: Equatable, Sendable {
     public init() {}
 }
 
+/// The newest IQ the recorder's pre-roll ring holds, as floats, for analysis off the DSP thread.
+public struct IQSnapshot: Sendable {
+    /// Interleaved I, Q, in [-1, 1].
+    public var samples: [Float]
+    public var sampleRate: Double
+    public var frames: Int { samples.count / 2 }
+    /// When the last frame was heard.
+    public var endTime: Date
+
+    public init(samples: [Float], sampleRate: Double, endTime: Date) {
+        self.samples = samples
+        self.sampleRate = sampleRate
+        self.endTime = endTime
+    }
+}
+
 public enum RecordingNames {
     /// `SubFloor_20261022_143000Z_14074000Hz_USB` — SDR#'s shape, so other software (and SubFloor's
     /// own IQ file source) read the frequency out of the name.
@@ -406,6 +422,32 @@ public final class StreamRecorder: @unchecked Sendable {
             s.preRollFill = min(1, Double(ring.available) / Double(preRollBytes))
         }
         return s
+    }
+
+    /// The newest frames, up to `lastSeconds`, never from before the last retune (`setContext`) or
+    /// `clearHistory`. nil when the recorder is not set up for IQ or has heard nothing since. Any thread:
+    /// it blocks `push` for one memcpy of what it takes, and converts after letting go.
+    public func snapshot(lastSeconds: Double) -> IQSnapshot? {
+        let (setup, plan) = producer.withLock { ($0.setup, $0.plan) }
+        guard lastSeconds > 0, let setup, let plan, setup.channels == 2 else { return nil }
+        let layout = setup.layout, bpf = layout.bytesPerFrame
+        let frames = Int(min(lastSeconds * setup.sampleRate, Double(plan.capacityBytes / bpf)).rounded())
+        guard frames > 0 else { return nil }
+        let bytes = UnsafeMutableRawBufferPointer.allocate(byteCount: frames * bpf, alignment: 16)
+        defer { bytes.deallocate() }
+        // Under the producer lock, so a reconfigure cannot change what the bytes mean before they are copied.
+        let (n, now) = producer.withLock { p -> (Int, @Sendable () -> Date) in
+            guard p.setup?.layout == layout, p.plan == plan else { return (0, p.now) }
+            return (ring.copyNewest(into: bytes), p.now)
+        }
+        guard n > 0, let base = bytes.baseAddress else { return nil }
+        let end = now()
+        let count = n / layout.sampleFormat.bytesPerSample
+        let samples = [Float](unsafeUninitializedCapacity: count) { out, initialized in
+            layout.sampleFormat.decode(base, count: count, into: out.baseAddress!)
+            initialized = count
+        }
+        return IQSnapshot(samples: samples, sampleRate: setup.sampleRate, endTime: end)
     }
 
     private func enqueue(_ c: Command) {
