@@ -1,4 +1,5 @@
 import Foundation
+import Recording
 import SubFloorCore
 import Transcription
 
@@ -35,10 +36,14 @@ final class SubFloorTools: MCPToolProvider {
     private let registry: [String: SubFloorTool]
     private var radioBusy = false
     private var radioWaiters: [CheckedContinuation<Void, Never>] = []
+    /// The recordings agents started that may still run, each with the task that stops it (`start_recording`).
+    var agentRecordings: [StreamKind: AgentRecording] = [:]
+    /// The Auto an agent turned on for a while, and the task that turns it off (`set_auto_record`).
+    var agentAuto: AgentAuto?
 
     init(model: AppModel) {
         self.model = model
-        let all = Self.radioTools + Self.bookmarkTools
+        let all = Self.radioTools + Self.bookmarkTools + Self.recordingTools + Self.decodeTools
         tools = all.map(\.descriptor)
         registry = Dictionary(all.map { ($0.descriptor.name, $0) }, uniquingKeysWith: { first, _ in first })
     }
@@ -84,6 +89,11 @@ final class SubFloorTools: MCPToolProvider {
     /// Fails unless the radio runs.
     func requireRunning() throws {
         guard model.isRunning else { throw ToolError("The radio is stopped: call start_radio first.") }
+    }
+
+    /// Runs `work` off the main actor: file reads and blocking queries never hold up the app.
+    func offMain<T: Sendable>(_ work: @escaping @Sendable () -> T) async -> T {
+        await Task.detached(priority: .userInitiated, operation: work).value
     }
 }
 

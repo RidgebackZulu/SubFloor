@@ -143,6 +143,8 @@ final class AppModel {
     /// Saving a key, even the same one, also unblocks the transcription queue.
     private(set) var apiKey: String? { didSet { transcription.apiKey = apiKey } }
     var hasAPIKey: Bool { !(apiKey ?? "").isEmpty }
+    /// The key to transcribe with, or nil when none is saved (an agent's `listen`).
+    var transcriptionKey: String? { hasAPIKey ? apiKey : nil }
     /// Stores `key` (trimmed) in the key store and queues today's recordings that were waiting for one; an
     /// empty or blank key removes it instead.
     func saveAPIKey(_ key: String) throws {
@@ -203,16 +205,24 @@ final class AppModel {
     }
     /// Each recorder's state, polled at 5 Hz (`refreshStats`); set at once on start.
     private(set) var recordingStatus: [StreamKind: RecordingStatus] = [:]
+    /// The manual recordings started of each kind (taking over an auto recording counts), so an agent tells the
+    /// recording it started from one started after it.
+    @ObservationIgnored private(set) var recordingStarts: [StreamKind: Int] = [:]
 
     /// Auto-record (the Auto button), persisted. It records only while the radio runs on a real
     /// source with the squelch on; otherwise it waits (`autoRecordState`).
     var autoRecordEnabled = false {
         didSet {
             guard autoRecordEnabled != oldValue else { return }
+            autoRecordChanges += 1
             if autoRecordEnabled { lastDiskCheck = nil }   // check the disk at the next refresh
             pushAutoRecord()
         }
     }
+
+    /// Counts every change to `autoRecordEnabled`, however it was made: an agent's timed Auto (`set_auto_record`)
+    /// turns it off at its deadline only if nothing has changed it since.
+    @ObservationIgnored private(set) var autoRecordChanges = 0
 
     /// `paused`: Auto is on but a manual audio recording owns the recorder; the trigger resumes after it.
     enum AutoRecordState: Equatable { case off, armed, recording, needsSquelch, needsRadio, demoSource, paused }
@@ -252,6 +262,8 @@ final class AppModel {
 
     /// Sends finished recordings for transcription and saves their transcripts beside them.
     let transcription: TranscriptionQueue
+    /// What turns a recording into a transcript (the queue's, and an agent's `listen`).
+    let transcribeFunction: TranscribeFunction
 
     /// The relaunch rule: queues the folder's audio recordings that have a length and no transcript and
     /// started within the last 24 hours, at or after transcription was last turned on. Run after the
@@ -442,6 +454,7 @@ final class AppModel {
         decodeHistory = DecodeHistory(folder: decodeHistoryFolder ?? DecodeHistory.defaultFolder)
         library = RecordingsLibrary(folder: RecordingSettings().folder)   // the folder `restoreSession` may replace
         transcription = TranscriptionQueue(transcribe: transcribe)
+        transcribeFunction = transcribe
         player = RecordingPlayer(library: library, setLiveMuted: { [weak self] muted in self?.liveAudioMuted = muted })
         let (loaded, result) = bookmarkStore.load()
         bookmarks = loaded
@@ -1175,6 +1188,7 @@ final class AppModel {
             show(Banner(kind: .warning, message: Self.lowDiskMessage))
         }
         recorder(kind).start()
+        recordingStarts[kind, default: 0] += 1
         refreshRecordingStatus()
     }
 
@@ -1323,6 +1337,59 @@ final class AppModel {
             logWriteFailed = true
             show(Banner(kind: .error, message: "Could not write the recordings log: \(error.localizedDescription)"))
         }
+    }
+
+    /// Keeps an agent's `listen` clip (mono `rate` Hz audio whose first sample was at `start`) as a manual
+    /// recording: written in the audio recording format to the recordings folder, named for the VFO and mode,
+    /// and logged, so it shows in Recordings. The file is written and listed off the main actor. `transcript`,
+    /// the one `listen` made of the clip, if any, is saved beside it and indexed before the log line queues the
+    /// clip, so it is not sent again. Returns the file name.
+    func saveListenClip(_ samples: [Float], rate: Double, start: Date, transcript: StoredTranscript? = nil) async throws -> String {
+        let folder = recording.folder, format = recording.audioFormat, sampleFormat = recording.audioSampleFormat
+        let hz = vfoHz, label = mode.label, hardware = activeSource.name
+        let file = try await Task.detached(priority: .userInitiated) {
+            try Self.writeClip(samples, rate: rate, start: start, folder: folder, format: format, sampleFormat: sampleFormat,
+                               frequencyHz: hz, label: label, hardware: hardware)
+        }.value
+        if var t = transcript {
+            t.file = file
+            let saved = t
+            // Indexed even if the sidecar can't be written: the clip is kept either way, and not sent again today.
+            try? await Task.detached(priority: .utility) { try TranscriptStore.write(saved, in: folder) }.value
+            library.didTranscribe(saved, folder: folder)
+        }
+        appendToLog([.recording(file: file, start: start, seconds: Double(samples.count) / rate,
+                                frequencyHz: hz, mode: label, auto: false)])
+        await library.refreshFiles()   // listed now, so it is in Recordings when the agent hears back
+        return file
+    }
+
+    /// Writes `samples` as a new recording in `folder`; returns its file name.
+    nonisolated private static func writeClip(_ samples: [Float], rate: Double, start: Date, folder: URL, format: FileFormat,
+                                              sampleFormat: SampleFormat, frequencyHz: Double, label: String,
+                                              hardware: String) throws -> String {
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let name = RecordingNames.base(firstSample: start, frequencyHz: frequencyHz, label: label)
+        let base = RecordingNames.unique(folder.appendingPathComponent(name), extension: format.fileExtension)
+        let layout = StreamLayout(sampleRate: rate, channels: StreamKind.audio.channels, sampleFormat: sampleFormat)
+        let metadata = RecordingMetadata(frequencyHz: frequencyHz, firstSample: start, hardware: hardware,
+                                         description: "SubFloor audio clip (\(label))")
+        let file = try RecordingFiles.open(format, base: base, layout: layout, metadata: metadata)
+        let converter = SampleConverter(format: sampleFormat)
+        let block = 48_000
+        let bytes = UnsafeMutableRawBufferPointer.allocate(byteCount: block * sampleFormat.bytesPerSample, alignment: 16)
+        defer { bytes.deallocate() }
+        try samples.withUnsafeBufferPointer { all in
+            var from = 0
+            while from < all.count {
+                let n = min(block, all.count - from)
+                converter.convert(UnsafeBufferPointer(rebasing: all[from..<(from + n)]), into: bytes)
+                try file.write(UnsafeRawBufferPointer(rebasing: bytes[0..<(n * sampleFormat.bytesPerSample)]))
+                from += n
+            }
+        }
+        try file.finalize()
+        return file.url.lastPathComponent
     }
 
     // MARK: Auto-record

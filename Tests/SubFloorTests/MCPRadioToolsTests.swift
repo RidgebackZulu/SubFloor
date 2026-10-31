@@ -69,9 +69,10 @@ struct MCPRadioToolsTests {
         let names = tools.map(\.name)
         #expect(Set(names).count == names.count)
         let readers = Set(tools.filter(\.readOnly).map(\.name))
-        #expect(readers == ["get_status", "get_cursor", "get_spectrum", "list_bookmarks"])
+        #expect(readers == ["get_status", "get_cursor", "get_spectrum", "list_bookmarks", "list_recordings",
+                            "get_transcript", "search_transcripts", "get_decodes", "get_ft8_stations"])
         for name in ["start_radio", "stop_radio", "tune", "set_squelch", "add_bookmark", "update_bookmark",
-                     "delete_bookmark"] {
+                     "delete_bookmark", "listen", "start_recording", "stop_recording", "set_auto_record", "set_decoder"] {
             #expect(names.contains(name))
         }
     }
