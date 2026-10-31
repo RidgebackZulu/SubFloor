@@ -40,6 +40,7 @@ records lossless audio and IQ that start *before* you press the button.
 - 🎛️ **A real tuning knob.** The SubFloor Dial (an M5Stack Dial) tunes from 1 Hz to 1 MHz a step,
   switches AM/LSB/USB with a tap, and connects over Bluetooth or USB. [More below](#subfloor-dial).
 - 🔖 **Bookmarks on the spectrum.** Flags float above the signals; click one to tune, right-click to edit.
+  Groups, notes, and a manager window (⌥⌘B) for the whole list.
 - 🛟 **Calm when the radio isn't.** No RSP or a stuck SDRplay service? SubFloor falls back to a built-in
   demo signal and tells you how to fix it.
 
@@ -135,10 +136,11 @@ always released.
 | Mode | Top bar, or `[` / `]` |
 | Zoom / pan | Pinch or ⌥-scroll / two-finger scroll or drag — never retunes the radio |
 | Bandwidth | Drag a passband edge (in SSB, the far one; the near one is the tuning line) |
-| Bookmarks | ⌘D add · ⌘B show on spectrum · sidebar list |
+| Bookmarks | ⌘D add · ⌘B show on spectrum · sidebar list · ⌥⌘B the bookmark manager |
 | HamItUp | Top-bar button (green when on) or ⌘U (LO set in Settings, default 125 MHz) |
 | Tune a bookmark | Click its flag above the spectrum: frequency, mode, passband width and HamItUp, at the current zoom |
-| Edit a bookmark | Right-click (or ⌃-click) its flag: name, frequency, mode, bandwidth, group, HamItUp; Use Current Tuning, Tune or Delete |
+| Edit a bookmark | Right-click (or ⌃-click) its flag: name, frequency, mode, bandwidth, group (pick one or type a new one), HamItUp, notes; Use Current Tuning, Tune or Delete |
+| Manage bookmarks | Radio › Bookmarks… (⌥⌘B): every bookmark in a sortable table, filtered by group or search (notes too). Double-click tunes, ⌫ deletes, drag rows onto a group or select several to move them together. Bookmarks an AI agent saved are marked **MCP** |
 
 ## Recording
 The save buffer is always running: each stream keeps its last 5–120 s (Settings, default 30 s) in

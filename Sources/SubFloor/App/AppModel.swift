@@ -330,6 +330,8 @@ final class AppModel {
     // MARK: Bookmarks, modems, UI
     private(set) var bookmarks: [Bookmark] = []
     var showBookmarks = true
+    /// The bookmarks selected in the bookmark manager (set before opening it to show one).
+    var bookmarkManagerSelection = Set<Bookmark.ID>()
     /// The multi-signal modem's box, settings and cursor (see `ModemControl`). Not observed: it also
     /// changes with the cursor's tracking and the engine bookkeeping several times a second, which
     /// would re-render every view reading any part of it (the modem strip's segmented pickers among
@@ -1011,10 +1013,43 @@ final class AppModel {
         return b
     }
 
-    func addBookmark() {
-        bookmarks.append(Bookmark(name: "\(FrequencyFormatter.short(vfoHz)) \(mode.label)", frequencyHz: vfoHz, mode: mode,
-                                  bandwidthHz: bandwidthHz, upconverter: upconverter.enabled, group: "Saved"))
+    /// Bookmarks the current tuning in the "Saved" group; returns its id.
+    @discardableResult
+    func addBookmark() -> Bookmark.ID {
+        addBookmark(Bookmark(name: "\(FrequencyFormatter.short(vfoHz)) \(mode.label)", frequencyHz: vfoHz, mode: mode,
+                             bandwidthHz: bandwidthHz, upconverter: upconverter.enabled, group: "Saved"))
+    }
+
+    /// Adds `bookmark` (its group spelled like an existing one, `created` stamped if unset); returns its id.
+    @discardableResult
+    func addBookmark(_ bookmark: Bookmark) -> Bookmark.ID {
+        var b = bookmark
+        b.group = BookmarkGroups.normalized(b.group, existing: bookmarkGroups)
+        if b.created == nil { b.created = Date() }
+        bookmarks.append(b)
         saveBookmarks()
+        return b.id
+    }
+
+    /// The groups in use, for the group pickers.
+    var bookmarkGroups: [String] { BookmarkGroups.names(bookmarks) }
+
+    /// Deletes every bookmark in `ids`.
+    func deleteBookmarks(_ ids: Set<Bookmark.ID>) {
+        guard !ids.isEmpty else { return }
+        bookmarks.removeAll { ids.contains($0.id) }
+        saveBookmarks()
+    }
+
+    /// Moves every bookmark in `ids` to `group` (nil: ungrouped).
+    func moveBookmarks(_ ids: Set<Bookmark.ID>, toGroup group: String?) {
+        let g = BookmarkGroups.normalized(group, existing: bookmarkGroups)
+        var changed = false
+        for i in bookmarks.indices where ids.contains(bookmarks[i].id) && bookmarks[i].group != g {
+            bookmarks[i].group = g
+            changed = true
+        }
+        if changed { saveBookmarks() }
     }
 
     func deleteBookmark(_ id: Bookmark.ID) {

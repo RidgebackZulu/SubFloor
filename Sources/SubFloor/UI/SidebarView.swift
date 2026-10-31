@@ -168,6 +168,7 @@ private struct SignalMeter: View {
 
 private struct BookmarksSection: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.openWindow) private var openWindow
     @State private var search = ""
 
     var body: some View {
@@ -186,6 +187,7 @@ private struct BookmarksSection: View {
                 .help("Show bookmarks on the spectrum (⌘B)")
                 Menu {
                     Button("Add Current Frequency") { model.addBookmark() }
+                    Button("Manage Bookmarks…") { openWindow(id: "bookmarks") }
                     Divider()
                     Button("Import…") { model.importBookmarks() }
                     Button("Export…") { model.exportBookmarks() }
@@ -207,6 +209,7 @@ private struct BookmarksSection: View {
 
 private struct BookmarkRow: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.openWindow) private var openWindow
     let bookmark: Bookmark
     @State private var hovering = false
 
@@ -220,6 +223,7 @@ private struct BookmarkRow: View {
                         .font(.caption).monospacedDigit().foregroundStyle(.secondary)
                 }
                 Spacer()
+                if let agent = bookmark.addedBy { AgentBadge(name: agent) }
                 if bookmark.upconverter {
                     Image(systemName: "arrow.up.arrow.down").font(.caption2).foregroundStyle(.orange).help("Uses HamItUp")
                 }
@@ -231,7 +235,12 @@ private struct BookmarkRow: View {
         }
         .buttonStyle(.plain)
         .onHover { hovering = $0 }
+        .help(bookmark.notes ?? "")
         .contextMenu {
+            Button("Edit…") {
+                model.bookmarkManagerSelection = [bookmark.id]
+                openWindow(id: "bookmarks")
+            }
             Button("Delete", role: .destructive) { model.deleteBookmark(bookmark.id) }
         }
     }
