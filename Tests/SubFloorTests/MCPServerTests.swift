@@ -1,5 +1,6 @@
 import Foundation
 import Network
+import Security
 import Testing
 import Transcription
 @testable import SubFloor
@@ -275,12 +276,71 @@ struct MCPServerTests {
         #expect(MCPSettings.load(defaults) == MCPSettings())
     }
 
+    /// A token store whose reads are scripted, counting every read and save.
+    private final class ScriptedTokenStore: APIKeyStore {
+        var result: APIKeyLoadResult
+        private(set) var reads = 0
+        private(set) var saved: [String] = []
+        init(_ result: APIKeyLoadResult) { self.result = result }
+        func load() -> String? {
+            if case .found(let key) = loadResult() { return key }
+            return nil
+        }
+        func loadResult() -> APIKeyLoadResult {
+            reads += 1
+            return result
+        }
+        func save(_ key: String) throws { saved.append(key) }
+        func remove() throws {}
+    }
+
+    @Test func theKeychainIsNotTouchedWhileOff() async {
+        let store = ScriptedTokenStore(.failed(errSecAuthFailed))
+        let server = makeServer(store: store)
+        await server.apply(MCPSettings(enabled: false, port: 0))
+        #expect(store.reads == 0)
+        #expect(store.saved.isEmpty)
+        #expect(server.state == .off)
+    }
+
+    @Test func anUnreadableTokenIsNotReplaced() async {
+        let store = ScriptedTokenStore(.failed(errSecAuthFailed))
+        let server = makeServer(store: store)
+        defer { server.stop() }
+        await server.apply(MCPSettings(enabled: true, port: 0))
+        #expect(store.saved.isEmpty)
+        #expect(server.state == .failed("Could not read the token from the Keychain"))
+        #expect(server.boundPort == nil)
+        #expect(server.log.events.contains { $0.kind == .error && $0.summary.contains("Keychain") })
+        // Readable again (the owner allowed access): the saved token is used, still not replaced.
+        store.result = .found("saved-token")
+        await server.apply(MCPSettings(enabled: true, port: 0))
+        #expect(server.boundPort != nil)
+        #expect(server.token == "saved-token")
+        #expect(store.saved.isEmpty)
+    }
+
+    @Test func aMissingTokenIsCreatedOnFirstStart() async {
+        let store = ScriptedTokenStore(.notFound)
+        let server = makeServer(store: store)
+        defer { server.stop() }
+        #expect(store.saved.isEmpty)
+        await server.apply(MCPSettings(enabled: true, port: 0))
+        #expect(store.saved.count == 1)
+        #expect(server.token.count == 43)
+        #expect(store.saved.first == server.token)
+        #expect(server.boundPort != nil)
+    }
+
     @Test func tokenSurvivesRestart() {
         let store = MemoryAPIKeyStore()
         let first = makeServer(store: store)
+        #expect(first.token.isEmpty)   // read only when needed
+        #expect(first.loadToken())
         #expect(first.token.count == 43)
         #expect(store.load() == first.token)
         let second = makeServer(store: store)
+        #expect(second.loadToken())
         #expect(second.token == first.token)
     }
 }

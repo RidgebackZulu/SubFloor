@@ -21,8 +21,9 @@ enum MCPState: Equatable, Sendable {
 final class MCPServer {
     private(set) var state: MCPState = .off
     private(set) var settings: MCPSettings
-    /// Created and saved on first use if the store has none.
-    private(set) var token: String
+    /// The bearer token: empty until `loadToken` reads it (when the server first starts, or the MCP window
+    /// opens), so the Keychain is never asked while the server is off.
+    private(set) var token = ""
     /// Goes up by one for every request answered, so the button can flash.
     private(set) var pulse = 0
     /// The port actually listened on (an ephemeral one for port 0), or nil when not listening.
@@ -54,6 +55,8 @@ final class MCPServer {
     /// `start` callers waiting for `closing` to empty.
     @ObservationIgnored private var closedWaiters: [CheckedContinuation<Void, Never>] = []
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
+    /// Whether `token` holds the stored token (or a new one, saved).
+    @ObservationIgnored private var tokenLoaded = false
 
     init(provider: MCPToolProvider, defaults: UserDefaults = .standard,
          tokenStore: APIKeyStore = KeychainAPIKeyStore(service: "app.subfloor.SubFloor.mcp", account: "token"),
@@ -63,12 +66,29 @@ final class MCPServer {
         self.tokenStore = tokenStore
         self.log = log
         settings = MCPSettings.load(defaults)
-        if let saved = tokenStore.load(), !saved.isEmpty {
+    }
+
+    /// Reads the token from the store, once; a new one is made and saved only when the store has none. When
+    /// the store cannot be read (access denied at the Keychain prompt, a locked keychain) the stored token is
+    /// left alone, so the agents configured with it keep working once it can be read: the state says so, and
+    /// the next call tries again. Returns whether `token` is ready.
+    @discardableResult
+    func loadToken() -> Bool {
+        if tokenLoaded { return true }
+        switch tokenStore.loadResult() {
+        case .found(let saved) where !saved.isEmpty:
             token = saved
-        } else {
+        case .found, .notFound:
             token = MCPAuth.generateToken()
             saveToken()
+        case .failed(let status):
+            state = .failed("Could not read the token from the Keychain")
+            log.add(.error, client: nil, "Could not read the token from the Keychain (OSStatus \(status)): "
+                    + "it was left as it is")
+            return false
         }
+        tokenLoaded = true
+        return true
     }
 
     /// Saves `s`, then starts the server, restarts it on a port change, or stops it. A server that failed
@@ -82,6 +102,7 @@ final class MCPServer {
             state = .failed("Port \(s.port) is not allowed (1024–65535)")
             return
         }
+        guard loadToken() else { return }   // never listening yet: a listener starts only with a token
         if listener != nil, listenerPort == s.port {
             if boundPort == nil { await withCheckedContinuation { startWaiters.append($0) } }
             return
@@ -92,6 +113,7 @@ final class MCPServer {
     /// A new token, saved; the server restarts so connections made with the old one close.
     func newToken() {
         token = MCPAuth.generateToken()
+        tokenLoaded = true
         saveToken()
         log.add(.server, client: nil, "New token: agents need the new one")
         guard listener != nil, let port = listenerPort else { return }

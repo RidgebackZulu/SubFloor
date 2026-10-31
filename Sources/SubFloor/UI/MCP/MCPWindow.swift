@@ -73,7 +73,10 @@ struct MCPSetupTab: View {
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(16)
-        .onAppear { portText = String(server.settings.port) }
+        .onAppear {
+            portText = String(server.settings.port)
+            server.loadToken()
+        }
         .alert("Make a new token?", isPresented: $confirmNewToken) {
             Button("New Token", role: .destructive) { server.newToken() }
             Button("Cancel", role: .cancel) {}
