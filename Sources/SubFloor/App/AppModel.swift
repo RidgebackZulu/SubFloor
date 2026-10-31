@@ -354,6 +354,8 @@ final class AppModel {
     /// The rows as the engine's output arrives (10 Hz); not observed.
     @ObservationIgnored private var liveLog = DecodeLog()
     @ObservationIgnored private var liveLogChanged = false
+    /// Every FT8/WSPR message decoded, kept for 30 days.
+    let decodeHistory: DecodeHistory
     /// The live rows' audio frequencies, for the ruler's ticks: assigned only when a tick would move
     /// (to the nearest hertz), so the rows' text doesn't redraw the ruler.
     private(set) var modemTrackAudioHz: [Double] = []
@@ -412,13 +414,15 @@ final class AppModel {
          apiKeyStore: any APIKeyStore = MemoryAPIKeyStore(),
          transcribe: @escaping TranscribeFunction = OpenRouterTranscriber.liveTranscribe,
          openRSP: @escaping @Sendable () throws -> SDRplayDevice = { try SDRplayDevice.open() },
-         rspOpenTimeout: Duration = .seconds(10)) {
+         rspOpenTimeout: Duration = .seconds(10),
+         decodeHistoryFolder: URL? = nil) {
         self.bookmarkStore = bookmarkStore
         self.defaults = defaults
         self.apiKeyStore = apiKeyStore
         apiKey = apiKeyStore.load()
         self.openRSP = openRSP
         self.rspOpenTimeout = rspOpenTimeout
+        decodeHistory = DecodeHistory(folder: decodeHistoryFolder ?? DecodeHistory.defaultFolder)
         library = RecordingsLibrary(folder: RecordingSettings().folder)   // the folder `restoreSession` may replace
         transcription = TranscriptionQueue(transcribe: transcribe)
         player = RecordingPlayer(library: library, setLiveMuted: { [weak self] muted in self?.liveAudioMuted = muted })
@@ -1490,6 +1494,13 @@ final class AppModel {
             if outcomes != slotOutcomes { slotOutcomes = outcomes }
         }
         setModem(m)
+        recordSlotDecodes(batch.slotDecodes)
+    }
+
+    /// Adds FT8/WSPR decodes to the 30-day history, at the RF frequency of the box they were heard in.
+    func recordSlotDecodes(_ decodes: [SlotDecode]) {
+        guard !decodes.isEmpty else { return }
+        decodeHistory.append(decodes.map { HeardDecode.from($0, rfHz: modemBox.rfHz(forAudio: $0.frequencyHz)) })
     }
 
     /// Shows `liveLog` (when it changed since last shown).
