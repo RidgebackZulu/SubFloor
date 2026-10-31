@@ -11,10 +11,8 @@ struct SubFloorTool {
     init(_ name: String, title: String, readOnly: Bool, description: String,
          properties: [String: JSONValue] = [:], required: [String] = [],
          run: @escaping @MainActor (SubFloorTools, ToolArguments, _ client: String) async throws -> [String: JSONValue]) {
-        let schema: JSONValue = .object(["type": .string("object"), "properties": .object(properties),
-                                         "required": .array(required.map { .string($0) }),
-                                         "additionalProperties": .bool(false)])
-        descriptor = MCPToolDescriptor(name: name, title: title, description: description, inputSchema: schema,
+        descriptor = MCPToolDescriptor(name: name, title: title, description: description,
+                                       inputSchema: .inputSchema(properties: properties, required: required),
                                        readOnly: readOnly)
         self.run = run
     }
@@ -193,12 +191,23 @@ extension JSONValue {
     /// An ISO 8601 time (UTC).
     static func time(_ d: Date) -> JSONValue { .string(d.formatted(.iso8601)) }
 
-    // Schema fragments for the descriptors.
+    // Schema fragments for the descriptors. The rules (`MCPRadioToolsTests.schemasSuitStrictClients`) keep to
+    // what strict clients accept, since some reject the whole tool list over one schema: an object at the top,
+    // no `additionalProperties` (unknown arguments are ignored anyway), no empty `required`, and a single
+    // `type` per property (`anyOf` for a choice of types).
+
+    /// A tool's arguments: `required` is left out when empty.
+    static func inputSchema(properties: [String: JSONValue], required: [String]) -> JSONValue {
+        var schema: [String: JSONValue] = ["type": .string("object"), "properties": .object(properties)]
+        if !required.isEmpty { schema["required"] = .array(required.map { .string($0) }) }
+        return .object(schema)
+    }
     static func schema(_ type: String, _ description: String, extra: [String: JSONValue] = [:]) -> JSONValue {
         .object(["type": .string(type), "description": .string(description)].merging(extra) { a, _ in a })
     }
     static func frequencySchema(_ description: String) -> JSONValue {
-        .object(["type": .array([.string("number"), .string("string")]), "description": .string(description)])
+        .object(["anyOf": .array([.object(["type": .string("number")]), .object(["type": .string("string")])]),
+                 "description": .string(description)])
     }
     static func enumSchema(_ values: [String], _ description: String) -> JSONValue {
         .object(["type": .string("string"), "enum": .array(values.map { .string($0) }),

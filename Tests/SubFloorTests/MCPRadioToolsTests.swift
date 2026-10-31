@@ -76,6 +76,36 @@ struct MCPRadioToolsTests {
         }
     }
 
+    /// Strict clients refuse a whole tool list over one schema they don't take.
+    @Test func schemasSuitStrictClients() {
+        /// Every `additionalProperties` key and array-valued `type`, anywhere in `v`.
+        func offences(_ v: JSONValue, at path: String) -> [String] {
+            switch v {
+            case .object(let o):
+                var found: [String] = []
+                if o["additionalProperties"] != nil { found.append("\(path).additionalProperties") }
+                if case .array? = o["type"] { found.append("\(path).type is an array") }
+                for (k, child) in o { found += offences(child, at: "\(path).\(k)") }
+                return found
+            case .array(let a): return a.enumerated().flatMap { offences($1, at: "\(path)[\($0)]") }
+            default: return []
+            }
+        }
+        for tool in SubFloorTools(model: makeModel()).tools {
+            let schema = tool.inputSchema
+            #expect(schema["type"]?.string == "object", "\(tool.name)")
+            #expect(offences(schema, at: tool.name) == [])
+            if let required = schema["required"] { #expect(required.array?.isEmpty == false, "\(tool.name)") }
+            for (key, property) in schema["properties"]?.object ?? [:] {
+                #expect(property["type"] != nil || property["anyOf"] != nil, "\(tool.name).\(key)")
+            }
+        }
+        // A frequency still takes a number or a string.
+        let tune = SubFloorTools(model: makeModel()).tools.first { $0.name == "tune" }!
+        #expect(tune.inputSchema["properties"]?["frequency"]?["anyOf"]?.array?.count == 2)
+        #expect(tune.inputSchema["required"]?.array == [.string("frequency")])
+    }
+
     @Test func tuneAcceptsStringsAndModes() async {
         let m = makeModel()
         let tools = SubFloorTools(model: m)
