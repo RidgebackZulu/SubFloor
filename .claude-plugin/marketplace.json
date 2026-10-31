@@ -1,0 +1,20 @@
+{
+  "name": "subfloor",
+  "owner": {
+    "name": "RidgebackZulu"
+  },
+  "metadata": {
+    "description": "SubFloor: a native macOS receiver for the SDRplay RSP1B. The plugin connects agents to SubFloor's MCP server and teaches them to work the radio.",
+    "version": "1.0.0"
+  },
+  "plugins": [
+    {
+      "name": "subfloor",
+      "source": "./plugins/subfloor",
+      "description": "Drive the SubFloor SDR receiver from an AI agent: tune, listen, check signal against noise, record, decode FT8 and log bookmarks through SubFloor's MCP server.",
+      "version": "1.0.0",
+      "category": "productivity",
+      "keywords": ["sdr", "radio", "shortwave", "ft8", "mcp", "rsp1b"]
+    }
+  ]
+}

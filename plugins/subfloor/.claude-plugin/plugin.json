@@ -1,0 +1,11 @@
+{
+  "name": "subfloor",
+  "version": "1.0.0",
+  "description": "Drive the SubFloor SDR receiver through its MCP server, with a skill for tuning, listening, recording, hunting and logging.",
+  "author": {
+    "name": "RidgebackZulu"
+  },
+  "homepage": "https://github.com/RidgebackZulu/SubFloor",
+  "repository": "https://github.com/RidgebackZulu/SubFloor",
+  "keywords": ["sdr", "radio", "shortwave", "ft8", "mcp"]
+}

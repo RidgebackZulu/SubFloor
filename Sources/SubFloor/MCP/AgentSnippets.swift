@@ -60,7 +60,8 @@ enum AgentSnippets {
                 ])),
             AgentSnippet(
                 id: "claude-code-plugin", name: "Claude Code plugin",
-                whereItGoes: "Type the two /plugin lines in Claude Code. Add the ~/.zshenv lines to that file in a "
+                whereItGoes: "Paste the two /plugin lines into Claude Code one at a time, pressing Return after "
+                    + "each. Add the ~/.zshenv lines to that file in a "
                     + "text editor (not at a prompt), then start Claude Code from a new Terminal. The plugin brings "
                     + "the SubFloor skill too.",
                 text: """
@@ -111,7 +112,9 @@ enum AgentSnippets {
                 extra: .init(copyLabel: "Copy ~/.hermes/.env line", text: "MCP_SUBFLOOR_API_KEY=\(token)")),
             AgentSnippet(
                 id: "codex", name: "Codex CLI",
-                whereItGoes: "~/.codex/config.toml. Restart Codex sessions after the change.",
+                whereItGoes: "~/.codex/config.toml. Restart Codex sessions after the change. Codex asks before each "
+                    + "tool that changes the radio, and codex exec cancels them: add default_tools_approval_mode = "
+                    + "\"approve\" to the block to allow them.",
                 text: """
                     [mcp_servers.subfloor]
                     url = "\(url)"

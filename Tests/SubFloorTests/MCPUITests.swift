@@ -24,6 +24,8 @@ import Testing
                 // Typed in Claude Code; the token only in the ~/.zshenv lines, never run in a shell.
                 #expect(!s.text.contains("tok123"))
                 #expect(s.extra?.text.contains("SUBFLOOR_MCP_TOKEN=tok123") == true)
+                // Claude Code takes one slash command per prompt.
+                #expect(s.whereItGoes.contains("one at a time"))
             case "Hermes Agent":
                 // Hermes asks for the token itself: the text is the command alone.
                 #expect(s.text == "hermes mcp add subfloor --url \(Self.url) --auth header")
