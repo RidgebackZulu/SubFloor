@@ -174,38 +174,13 @@ public enum Extent {
 
 /// Averaged power spectra of IQ, as Signal ID reads them.
 public enum PowerSpectrum {
-    /// The average (in power) of non-overlapping windowed FFT frames of `size` (a power of two), in dB,
-    /// FFT-shifted: index 0 is −rate/2, `size / 2` is 0 Hz. A unit complex tone reads 0 dB.
-    /// Frames beyond `maxFrames` are skipped (spread evenly over the input). Fewer than `size` samples
-    /// give a zero-padded single frame.
+    /// The average (in power) of windowed FFT frames of `size` (a power of two), in dB, FFT-shifted: index 0
+    /// is −rate/2, `size / 2` is 0 Hz. A unit complex tone reads 0 dB. Frames start every `hop` samples
+    /// (default `size`: no overlap); frames beyond `maxFrames` are skipped (spread evenly over the input).
+    /// Fewer than `size` samples give a zero-padded single frame.
     public static func average(_ samples: [DSPComplex], size: Int, window: WindowKind = .blackmanHarris,
-                               maxFrames: Int = 256) -> [Float] {
-        let analyzer = SpectrumAnalyzer(size: size, window: window)
-        var frame = [Float](repeating: 0, count: size)
-        var sum = [Float](repeating: 0, count: size)
-        var input = samples
-        if input.count < size {
-            input += [DSPComplex](repeating: DSPComplex(real: 0, imag: 0), count: size - input.count)
-        }
-        let available = input.count / size
-        let frames = min(available, max(1, maxFrames))
-        input.withUnsafeBufferPointer { x in
-            for i in 0..<frames {
-                let start = (i * available / frames) * size
-                frame.withUnsafeMutableBufferPointer { f in
-                    analyzer.process(UnsafeBufferPointer(rebasing: x[start..<(start + size)]), into: f)
-                    // Back to power to average.
-                    var count = Int32(size)
-                    var ten: Float = 0.1
-                    vDSP_vsmul(f.baseAddress!, 1, &ten, f.baseAddress!, 1, vDSP_Length(size))
-                    var base = [Float](repeating: 10, count: size)
-                    vvpowf(f.baseAddress!, f.baseAddress!, &base, &count)
-                }
-                vDSP_vadd(sum, 1, frame, 1, &sum, 1, vDSP_Length(size))
-            }
-        }
-        var scale = 1 / Float(frames)
-        vDSP_vsmul(sum, 1, &scale, &sum, 1, vDSP_Length(size))
+                               maxFrames: Int = 256, hop: Int? = nil) -> [Float] {
+        var sum = averagePower(samples, size: size, window: window, maxFrames: maxFrames, hop: hop)
         var floor: Float = 1e-30
         vDSP_vthr(sum, 1, &floor, &sum, 1, vDSP_Length(size))
         var reference: Float = 1
@@ -215,14 +190,49 @@ public enum PowerSpectrum {
 
     /// The same, from interleaved IQ.
     public static func average(_ iq: [Float], size: Int, window: WindowKind = .blackmanHarris,
-                               maxFrames: Int = 256) -> [Float] {
+                               maxFrames: Int = 256, hop: Int? = nil) -> [Float] {
         let n = iq.count / 2
-        guard n > 0 else { return average([DSPComplex](), size: size, window: window, maxFrames: maxFrames) }
+        guard n > 0 else {
+            return average([DSPComplex](), size: size, window: window, maxFrames: maxFrames, hop: hop)
+        }
         let samples = iq.withUnsafeBufferPointer { raw in
             raw.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: n) {
                 Array(UnsafeBufferPointer(start: $0, count: n))
             }
         }
-        return average(samples, size: size, window: window, maxFrames: maxFrames)
+        return average(samples, size: size, window: window, maxFrames: maxFrames, hop: hop)
+    }
+
+    /// `average` in linear power (not floored).
+    static func averagePower(_ samples: [DSPComplex], size: Int, window: WindowKind = .blackmanHarris,
+                             maxFrames: Int = 256, hop: Int? = nil) -> [Float] {
+        let analyzer = SpectrumAnalyzer(size: size, window: window)
+        var frame = [Float](repeating: 0, count: size)
+        var sum = [Float](repeating: 0, count: size)
+        var input = samples
+        if input.count < size {
+            input += [DSPComplex](repeating: DSPComplex(real: 0, imag: 0), count: size - input.count)
+        }
+        let step = max(1, hop ?? size)
+        let available = (input.count - size) / step + 1
+        let frames = min(available, max(1, maxFrames))
+        var base = [Float](repeating: 10, count: size)
+        input.withUnsafeBufferPointer { x in
+            for i in 0..<frames {
+                let start = (i * available / frames) * step
+                frame.withUnsafeMutableBufferPointer { f in
+                    analyzer.process(UnsafeBufferPointer(rebasing: x[start..<(start + size)]), into: f)
+                    // Back to power to average.
+                    var count = Int32(size)
+                    var ten: Float = 0.1
+                    vDSP_vsmul(f.baseAddress!, 1, &ten, f.baseAddress!, 1, vDSP_Length(size))
+                    vvpowf(f.baseAddress!, f.baseAddress!, &base, &count)
+                }
+                vDSP_vadd(sum, 1, frame, 1, &sum, 1, vDSP_Length(size))
+            }
+        }
+        var scale = 1 / Float(frames)
+        vDSP_vsmul(sum, 1, &scale, &sum, 1, vDSP_Length(size))
+        return sum
     }
 }

@@ -51,28 +51,8 @@ enum OccupiedBandwidth {
         return found
     }
 
-    /// The fixed point B = span{ bins ≥ ΣP · binHz / (100 B) } of a power spectrum in dB, its levels averaged
-    /// over ±1% of B (at least ±1 bin), so the answer doesn't hang on the resolution or on single bins.
+    /// The occupied width of a power spectrum in dB (see `OccupiedWidth.fixedPoint`).
     static func width(_ spectrumDb: [Float], binHz: Double, start: Double) -> Double {
-        let p = spectrumDb.map { pow(10, Double($0) / 10) }
-        let n = p.count
-        var prefix = [Double](repeating: 0, count: n + 1)
-        for k in 0..<n { prefix[k + 1] = prefix[k] + p[k] }
-        let total = prefix[n]
-        var b = start
-        for _ in 0..<40 {
-            let reach = max(1, Int((0.01 * b / binHz).rounded()))
-            let threshold = total * binHz / (100 * b)
-            func level(_ k: Int) -> Double {
-                let lo = max(0, k - reach), hi = min(n - 1, k + reach)
-                return (prefix[hi + 1] - prefix[lo]) / Double(hi - lo + 1)
-            }
-            guard let lo = (0..<n).first(where: { level($0) >= threshold }),
-                  let hi = (0..<n).last(where: { level($0) >= threshold }) else { return b }
-            let next = Double(hi - lo + 1) * binHz
-            if abs(next - b) < binHz / 2 { return next }
-            b = next
-        }
-        return b
+        OccupiedWidth.fixedPoint(spectrumDb.map { pow(10, Double($0) / 10) }, binHz: binHz, start: start).widthHz
     }
 }

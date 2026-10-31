@@ -10,27 +10,21 @@ import Foundation
 /// signal; the last is the channel filter: flat to ±bandwidth/2, stopping from ±0.75 × bandwidth
 /// (Blackman-Harris windowed sinc, at most 4095 taps). Every stage's delay is taken out, so output sample k
 /// is input time k × the decimation.
+///
+/// With `sharp` false the last stage is only an anti-alias stage too: ±bandwidth/2 is kept clean, but what
+/// lies beyond it up to the output's Nyquist frequency is left in. Far cheaper at high input rates, for a
+/// view that only reads its middle band (Signal ID's analysis window).
 public struct Channel {
     /// The lowest output rate.
     public static let minimumRate = 8000.0
     static let maxTaps = 4095
 
     /// Interleaved IQ in, complex baseband out (`rate` is the output sample rate).
-    public static func extract(_ iq: [Float], sampleRate: Double, offsetHz: Double,
-                               bandwidthHz: Double) -> (samples: [DSPComplex], rate: Double) {
+    public static func extract(_ iq: [Float], sampleRate: Double, offsetHz: Double, bandwidthHz: Double,
+                               sharp: Bool = true) -> (samples: [DSPComplex], rate: Double) {
         let n = iq.count / 2
         guard n > 0, sampleRate > 0 else { return ([], sampleRate) }
-        let bandwidth = min(max(bandwidthHz, 1), sampleRate)
-        let factors = DecimationPlan.stages(inputRate: sampleRate, minimumRate: max(4 * bandwidth, minimumRate))
-        var stages: [Stage] = []
-        var rate = sampleRate
-        for (i, f) in factors.enumerated() {
-            stages.append(i == factors.count - 1
-                          ? .channel(rate: rate, factor: f, bandwidth: bandwidth)
-                          : .antiAlias(rate: rate, factor: f, bandwidth: bandwidth))
-            rate /= Double(f)
-        }
-        if stages.isEmpty { stages.append(.channel(rate: rate, factor: 1, bandwidth: bandwidth)) }
+        let (stages, rate) = plan(sampleRate: sampleRate, bandwidthHz: bandwidthHz, sharp: sharp)
 
         // The first stage mixes and filters block by block, so the full-rate signal is never copied whole.
         var mixer = BlockMixer(frequency: -offsetHz, sampleRate: sampleRate)
@@ -58,6 +52,36 @@ public struct Channel {
             }
         }
         return (samples, rate)
+    }
+
+    /// Equivalent noise bandwidth of the (sharp) channel `extract` cuts: white noise of density N0 comes out
+    /// at N0 × this. It is the last stage's (the earlier ones are flat across the band).
+    public static func noiseBandwidthHz(sampleRate: Double, bandwidthHz: Double) -> Double {
+        let (stages, rate) = plan(sampleRate: sampleRate, bandwidthHz: bandwidthHz)
+        let taps = stages.last!.taps.map(Double.init)
+        let sum = taps.reduce(0, +)
+        let squares = taps.reduce(0) { $0 + $1 * $1 }
+        return rate * Double(stages.last!.factor) * squares / (sum * sum)
+    }
+
+    /// The stages and the output rate.
+    private static func plan(sampleRate: Double, bandwidthHz: Double,
+                             sharp: Bool = true) -> (stages: [Stage], rate: Double) {
+        let bandwidth = min(max(bandwidthHz, 1), sampleRate)
+        let factors = DecimationPlan.stages(inputRate: sampleRate, minimumRate: max(4 * bandwidth, minimumRate))
+        var stages: [Stage] = []
+        var rate = sampleRate
+        for (i, f) in factors.enumerated() {
+            stages.append(i == factors.count - 1 && sharp
+                          ? .channel(rate: rate, factor: f, bandwidth: bandwidth)
+                          : .antiAlias(rate: rate, factor: f, bandwidth: bandwidth))
+            rate /= Double(f)
+        }
+        if stages.isEmpty {
+            stages.append(sharp ? .channel(rate: rate, factor: 1, bandwidth: bandwidth)
+                                : .antiAlias(rate: rate, factor: 1, bandwidth: bandwidth))
+        }
+        return (stages, rate)
     }
 
     /// One decimating FIR with its delay compensated: taps = 2 × factor × m + 1, so the delay is m outputs.
