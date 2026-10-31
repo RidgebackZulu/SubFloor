@@ -95,9 +95,11 @@ func bin(_ hz: Double, binHz: Double, size: Int) -> Int { size / 2 + Int((hz / b
     }
 
     @Test func amIsOneSignalAndFSKTonesAreTheirOwn() {
-        // Pointing at an AM carrier takes in its symmetric sidebands, across the voice's low-cut gap too.
-        for (index, spec) in [SynthSpec.amBroadcast, .amVoice].enumerated() {
-            let fs = 48_000.0, size = 4096
+        // Pointing at an AM carrier takes in its symmetric sidebands, across the voice's low-cut gap too, at
+        // 11.7 and 23.4 Hz bins.
+        for (index, (spec, fs)) in [(SynthSpec.amBroadcast, 48_000.0), (.amVoice, 48_000), (.amBroadcast, 96_000),
+                                    (.amVoice, 96_000)].enumerated() {
+            let size = 4096
             let binHz = fs / Double(size)
             let iq = SignalSynth.make(spec, sampleRate: fs, seconds: 4, snrDb: 20, seed: UInt64(500 + index))
             let found = Extent.find(spectrumDb: PowerSpectrum.average(iq, size: size), binHz: binHz,
@@ -132,8 +134,13 @@ func bin(_ hz: Double, binHz: Double, size: Int) -> Int { size / 2 + Int((hz / b
             #expect(found != nil, "\(label)")
             guard let found else { return }
             let width = Double(found.upperBin - found.lowerBin + 1) * binHz
-            #expect(abs(width - expectHz) <= 0.1 * expectHz + 4 * binHz, "\(label): \(width) Hz, expected \(expectHz)")
+            // The hand-built shoulders and the smoothing add up to 3 bins a side.
+            #expect(abs(width - expectHz) <= 0.1 * expectHz + 6 * binHz, "\(label): \(width) Hz, expected \(expectHz)")
             #expect((found.lowerBin...found.upperBin).contains(pointBin), "\(label)")
+            for (i, other) in signals.enumerated() where i != point {
+                let otherBin = Int((other.centreHz / binHz).rounded())
+                #expect(!(found.lowerBin...found.upperBin).contains(otherBin), "\(label): took in \(other.centreHz) Hz")
+            }
         }
         // Three FT8-like 50 Hz signals at 1000, 1200 and 1500 Hz.
         let ft8 = [(1000.0, 50.0, -80.0), (1200, 50, -80), (1500, 50, -80)]
@@ -144,10 +151,27 @@ func bin(_ hz: Double, binHz: Double, size: Int) -> Int { size / 2 + Int((hz / b
         // Two 7.5 kHz NFM signals in adjacent 12.5 kHz channels.
         let nfm = [(25_000.0, 7500.0, -80.0), (37_500, 7500, -80)]
         for i in 0..<2 { check(nfm, binHz: 50, point: i, expectHz: 7500, "NFM \(i)") }
-        // A weak carrier 400 Hz below an SSB signal (650–3350 Hz): pointing at either gives just that one.
-        let ssb = [(2000.0, 2700.0, -80.0), (250, 0, -76)]
+        // Near-symmetric FT8-like neighbours about the pointed-at one, at coarse resolutions where a 50 Hz
+        // signal is only a few bins wide: 1000/1200/1400–1460 Hz and 900/1200/1500–1560 Hz, pointing at 1200.
+        for binHz in [11.72, 23.4] {
+            for third in stride(from: 1400.0, through: 1460, by: 20) {
+                check([(1000, 50, -80), (1200, 50, -80), (third, 50, -80)], binHz: binHz, point: 1, expectHz: 50,
+                      "FT8 1000/1200/\(third) at \(binHz) Hz bins")
+            }
+            for third in stride(from: 1500.0, through: 1560, by: 20) {
+                check([(900, 50, -80), (1200, 50, -80), (third, 50, -80)], binHz: binHz, point: 1, expectHz: 50,
+                      "FT8 900/1200/\(third) at \(binHz) Hz bins")
+            }
+        }
+        // A weak carrier 400 Hz below an SSB signal (5650–8350 Hz), far from the array's edges, so the mirror
+        // rule (not the edge) is what keeps them apart: pointing at either gives just that one.
+        let ssb = [(7000.0, 2700.0, -80.0), (5250, 0, -76)]
         check(ssb, binHz: 5, point: 0, expectHz: 2700, "SSB beside a carrier")
         check(ssb, binHz: 5, point: 1, expectHz: 25, "carrier beside SSB")
+        // The same carrier with symmetric neighbours as strong as itself (two more carriers 400 Hz either
+        // side): still the carrier alone.
+        let triple = [(5250.0, 0.0, -76.0), (4850, 0, -76), (5650, 0, -76)]
+        check(triple, binHz: 5, point: 0, expectHz: 25, "carrier between equal carriers")
     }
 
     @Test func noiseAndSplatterAreNotNamed() {

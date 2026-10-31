@@ -46,8 +46,8 @@ enum SynthModulators {
     private static let words = ["CQ", "DE", "TEST", "K", "PSE", "QTH", "NAME", "RST", "599", "TU", "73", "UR",
                                 "ES", "HR", "WX", "RIG", "ANT", "FB", "OM", "BK", "QRZ", "AGN", "GM", "5NN"]
 
-    /// 0…1 key of random Morse text at `wpm`, starting at a random point of the text, with raised-cosine
-    /// edges 15 ms long (half a dot above 40 WPM).
+    /// 0…1 key of random Morse text at `wpm`, starting at a random point of the text, smoothed by a Hann
+    /// kernel 15 ms long (half a dot above 40 WPM): raised-cosine edges, 10–90% rise about 7 ms.
     static func morseKey(wpm: Double, rate: Double, count n: Int, random: inout SynthRandom) -> [Float] {
         let unit = MorseCode.dotSeconds(wpm: wpm)
         let skip = random.uniform(0...2)

@@ -9,15 +9,21 @@ import Foundation
 /// stays at least 3 dB over the local noise. The local noise is the median of the bins within ±10 × the
 /// signal's width, the signal's own bins left out; it starts from the spectrum's 10th percentile and is
 /// found again after each growth until it settles. Levels are smoothed over 3 bins for the climbing, the
-/// growing and the 6 dB test. `lowerBin…upperBin` is inclusive; `peakBin` is its strongest (unsmoothed) bin.
+/// growing and the 6 dB test, but two raw bins in a row under noise + 3 dB still end the growth, so the
+/// smoothing never joins neighbours. `lowerBin…upperBin` is inclusive; `peakBin` is its strongest
+/// (unsmoothed) bin.
 ///
-/// When the peak's own region is a carrier line (at most 30 Hz, or 10 bins: a Blackman-Harris main lobe and
-/// the smoothing), growth also takes in sidebands that sit symmetrically about it (AM whose audio has a
-/// low-cut leaves a gap beside the carrier): the level mirrored about the line, min(left, right) over 5
-/// bins, must rise 6 dB over the noise within 10 line widths or 600 Hz of it, and the extent runs out to
-/// where that mirrored level stays below noise + 3 dB. A neighbour on one side only is never taken in.
-/// Separate signals side by side are never merged otherwise: two equal tones (a wide-shift FSK) are two
-/// extents here, and pairing them is the FSK measurement's job (the instantaneous-frequency histogram).
+/// When the peak is a carrier line, growth also takes in sidebands that sit symmetrically about it (AM whose
+/// audio has a low-cut leaves a gap beside the carrier). A line is told by its shape, whatever the
+/// resolution: its strongest bin stands 15 dB over the bins 3 either side (a Blackman-Harris main lobe is
+/// ≥ 22 dB down there even for a tone between bins; a signal several bins wide is not). The level mirrored
+/// about the line, min(left, right) over 5 bins, must rise 6 dB over the noise beyond the line's own skirt
+/// and within 10 line widths or 600 Hz of it; the extent runs out to where that mirrored level stays below
+/// noise + 3 dB; and every bin of those sidebands, on either side, must sit at least 6 dB below the line
+/// (AM's sidebands always do; neighbours of equal strength never do). A neighbour on one side only is never
+/// taken in. Separate signals side by side are never merged otherwise: two equal tones (a wide-shift FSK)
+/// are two extents here, and pairing them is the FSK measurement's job (the instantaneous-frequency
+/// histogram).
 ///
 /// It returns nil when:
 /// - nothing within `searchBins` stands 6 dB above the local noise;
@@ -31,8 +37,9 @@ public enum Extent {
     static let edgeDb = 3.0
     static let skirtDb = 20.0
     static let noiseWidths = 10
-    static let lineMaxHz = 30.0
-    static let lineMaxBins = 10
+    static let lineContrastDb = 15.0
+    static let lineShoulderBins = 3
+    static let sidebandBelowLineDb = 6.0
     static let sidebandGapWidths = 10
     static let sidebandGapHz = 600.0
     static let mirrorSmoothing = 2
@@ -60,7 +67,7 @@ public enum Extent {
         var extent = top...top
         for _ in 0..<4 {
             guard noise > 0 else { return nil }
-            let grown = grow(level, from: top, noise: noise, binHz: binHz)
+            let grown = grow(level, raw: raw, from: top, noise: noise, binHz: binHz)
             let width = grown.count
             let centre = (grown.lowerBound + grown.upperBound) / 2
             let next = median(raw, around: centre, halfWidth: noiseWidths * width, excluding: grown)
@@ -87,12 +94,17 @@ public enum Extent {
     // MARK: Growth
 
     /// The region around `top` at ≥ noise + 3 dB, and a line's symmetric sidebands.
-    private static func grow(_ level: [Double], from top: Int, noise: Double, binHz: Double) -> ClosedRange<Int> {
+    private static func grow(_ level: [Double], raw: [Double], from top: Int, noise: Double,
+                             binHz: Double) -> ClosedRange<Int> {
         let edge = noise * pow(10, edgeDb / 10)
         let detect = noise * pow(10, detectDb / 10)
         let n = level.count
-        let core = region(level, from: top, above: edge)
-        guard Double(core.count) * binHz <= max(lineMaxHz, Double(lineMaxBins) * binHz) else { return core }
+        let core = region(level, raw: raw, from: top, above: edge)
+        // A line: the strongest raw bin near the top stands well over the raw bins 3 either side of it.
+        let s = lineShoulderBins
+        guard top - 1 - s >= 0, top + 1 + s < n else { return core }
+        let peak = (top - 1...top + 1).max { raw[$0] < raw[$1] }!
+        guard raw[peak] >= max(raw[peak - s], raw[peak + s]) * pow(10, lineContrastDb / 10) else { return core }
         // Mirrored about the line: both sides must carry signal at the same distance.
         let half = max(top - core.lowerBound, core.upperBound - top)
         let limit = min(top, n - 1 - top)
@@ -107,13 +119,15 @@ public enum Extent {
             return min(left, right) / Double(max(count, 1))
         }
         let reach = half + max(sidebandGapWidths * core.count, Int(sidebandGapHz / binHz))
-        var d = half + 1
+        // Sidebands start beyond the line's own skirt: its shoulders, the smoothing and the mirror's average.
+        var d = max(half, lineShoulderBins + 1 + mirrorSmoothing) + 1
         var start: Int?
         while d + 1 <= min(reach, limit) {
             if mirrored(d) >= detect && mirrored(d + 1) >= detect { start = d; break }
             d += 1
         }
-        guard var outer = start else { return core }
+        guard let first = start else { return core }
+        var outer = first
         // Out to where the mirrored level stays below noise + 3 dB (dips shorter than 3 bins or 10% bridged).
         var k = outer + 1
         while k <= limit {
@@ -122,14 +136,26 @@ public enum Extent {
             guard k - outer <= tolerance else { break }
             k += 1
         }
+        // Sidebands sit well below their carrier; a neighbour as strong as the line is not a sideband.
+        let ceiling = level[top] * pow(10, -sidebandBelowLineDb / 10)
+        for d in first...outer {
+            guard level[top - d] <= ceiling && level[top + d] <= ceiling else { return core }
+        }
         return min(core.lowerBound, top - outer)...max(core.upperBound, top + outer)
     }
 
-    /// The contiguous bins around `bin` at or above `threshold` (at least `bin` itself).
-    private static func region(_ level: [Double], from bin: Int, above threshold: Double) -> ClosedRange<Int> {
+    /// The contiguous bins around `bin` whose smoothed level is at or above `threshold` (at least `bin`
+    /// itself). Two raw bins in a row under it end the region even where the smoothing carries on, so
+    /// smoothing never joins neighbours across a gap.
+    private static func region(_ level: [Double], raw: [Double], from bin: Int,
+                               above threshold: Double) -> ClosedRange<Int> {
+        let n = level.count
+        func gap(_ k: Int, _ step: Int) -> Bool {
+            raw[k] < threshold && (k + step < 0 || k + step >= n || raw[k + step] < threshold)
+        }
         var lo = bin, hi = bin
-        while lo > 0 && level[lo - 1] >= threshold { lo -= 1 }
-        while hi < level.count - 1 && level[hi + 1] >= threshold { hi += 1 }
+        while lo > 0 && level[lo - 1] >= threshold && !gap(lo - 1, -1) { lo -= 1 }
+        while hi < n - 1 && level[hi + 1] >= threshold && !gap(hi + 1, 1) { hi += 1 }
         return lo...hi
     }
 

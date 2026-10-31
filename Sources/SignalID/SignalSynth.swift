@@ -13,7 +13,8 @@ public enum SynthSpec: Sendable, Hashable {
     case noise
     /// Unmodulated carrier.
     case carrier
-    /// Morse at `wpm` (PARIS timing, random text, 15 ms raised-cosine key edges, half a dot above 40 WPM).
+    /// Morse at `wpm` (PARIS timing, random text). The key is smoothed by a Hann kernel 15 ms long (half a dot
+    /// above 40 WPM): raised-cosine edges with a 10–90% rise of about 7 ms.
     case cw(wpm: Double)
     /// Double-sideband AM with full carrier; `depth` is the peak modulation (0…1).
     case am(Audio, depth: Double)
