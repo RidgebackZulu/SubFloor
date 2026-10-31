@@ -3,6 +3,7 @@ import Foundation
 import Modems
 import Recording
 import SubFloorCore
+import Synchronization
 import Testing
 import Transcription
 @testable import SubFloor
@@ -343,6 +344,38 @@ struct MCPListenRecordingToolsTests {
         })
     }
 
+    @Test func anAgentsRecordingStopsWhenTheDiskIsNearlyFull() async {
+        let (m, _) = makeModel()
+        defer { m.shutdown() }
+        guard runDemo(m) else { return }
+        let tools = SubFloorTools(model: m)
+        tools.recordingDiskCheckInterval = .milliseconds(100)
+        tools.log = MCPLog(fileURL: nil)
+        let r = await call(tools, "start_recording", ["kind": .string("audio"), "max_minutes": .number(10)])
+        #expect(!r.isError, "\(r.content)")
+        #expect(m.isRecording(.audio))
+        m.freeSpaceProbe = { _ in AppModel.autoOffDiskBytes - 1 }
+        #expect(await eventually(5) {
+            m.refreshRecordingStatus()
+            return !m.isRecording(.audio)
+        })
+        #expect(tools.agentRecordings[.audio] == nil)
+        #expect(m.banner?.message == "Stopped test-agent 1.0's recording: the disk is nearly full.")
+        #expect(tools.log?.events.contains { $0.kind == .error && $0.client == "test-agent 1.0" } == true)
+    }
+
+    @Test func anAgentsRecordingDoesNotStartOnANearlyFullDisk() async {
+        let (m, _) = makeModel()
+        defer { m.shutdown() }
+        guard runDemo(m) else { return }
+        m.freeSpaceProbe = { _ in AppModel.autoOffDiskBytes - 1 }
+        let r = await call(SubFloorTools(model: m), "start_recording", ["kind": .string("both")])
+        #expect(r.isError)
+        #expect(r.content.contains("nearly full"), "\(r.content)")
+        m.refreshRecordingStatus()
+        #expect(!m.isRecordingAny)
+    }
+
     @Test func recordingNeedsTheRadio() async {
         let (m, _) = makeModel()
         defer { m.shutdown() }
@@ -529,8 +562,10 @@ struct MCPListenRecordingToolsTests {
         await m.library.reload()
         let tools = SubFloorTools(model: m)
 
+        SubFloorTools.recordingRowsBuiltOnMain.withLock { $0 = 0 }
         let all = await call(tools, "list_recordings")
         #expect(!all.isError, "\(all.content)")
+        #expect(SubFloorTools.recordingRowsBuiltOnMain.withLock { $0 } == 0, "rows are built off the main actor")
         #expect(all.structured?["recordings"]?.array?.compactMap { $0["file"]?.string } == [am, hiss, clock])
 
         let near = await call(tools, "list_recordings", ["frequency": .string("11.178 MHz")])

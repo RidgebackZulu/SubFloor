@@ -603,7 +603,7 @@ final class AppModel {
     }
 
     /// Shows `new` unless it would hide a more severe banner that is already up (error > warning > info).
-    private func show(_ new: Banner) {
+    func show(_ new: Banner) {
         func rank(_ k: Banner.Kind) -> Int { switch k { case .info: 0; case .warning: 1; case .error: 2 } }
         if let current = banner, rank(new.kind) < rank(current.kind) { return }
         banner = new
@@ -1457,6 +1457,8 @@ final class AppModel {
     }
 
     static let lowDiskBytes: Int64 = 500_000_000
+    /// Under this free where recordings go, Auto turns off and an agent's recording stops.
+    static let autoOffDiskBytes: Int64 = 100_000_000
     static let lowDiskMessage = "Less than 500 MB free where recordings go."
     static let autoOffLowDiskReason = "less than 100 MB free"
 
@@ -1473,7 +1475,7 @@ final class AppModel {
         guard autoRecordEnabled else { return }
         lastDiskCheck = .now
         guard let free = freeSpaceProbe(recording.folder) else { return }
-        if free < 100_000_000 {
+        if free < Self.autoOffDiskBytes {
             autoRecordEnabled = false
             if engine.audioRecorder.sessionKind == .auto { engine.audioRecorder.stop() }
             // Logged before the banner, so a failed log write cannot replace it.
@@ -1486,6 +1488,9 @@ final class AppModel {
             diskLow = false
         }
     }
+
+    /// Free bytes where recordings go, or nil when unknown.
+    var recordingsFreeSpace: Int64? { freeSpaceProbe(recording.folder) }
 
     /// Free bytes for important use on the volume of `folder`, or of its nearest existing parent.
     nonisolated static func freeSpace(at folder: URL) -> Int64? {

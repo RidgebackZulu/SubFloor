@@ -1,6 +1,7 @@
 import DSPCore
 import Foundation
 import Recording
+import Synchronization
 import SubFloorCore
 import Transcription
 
@@ -8,14 +9,17 @@ import Transcription
 @MainActor
 final class AgentRecording {
     let kind: StreamKind
+    /// The agent that started it ("name version").
+    let client: String
     /// `AppModel.recordingStarts[kind]` once it had started: a later start, the owner's, is another recording.
     let number: Int
     /// Read by the task at every wake, so a second `start_recording` moves it.
     var stopsAt: Date
     var task: Task<Void, Never>?
 
-    init(kind: StreamKind, number: Int, stopsAt: Date) {
+    init(kind: StreamKind, client: String, number: Int, stopsAt: Date) {
         self.kind = kind
+        self.client = client
         self.number = number
         self.stopsAt = stopsAt
     }
@@ -47,13 +51,14 @@ extension SubFloorTools {
             SubFloorTool("start_recording", title: "Start recording", readOnly: false, description: """
                 Record the radio: kind "audio" (what is heard, before the squelch fades it), "iq" (the whole \
                 capture) or "both", starting the pre-roll ago. It stops by itself after max_minutes (default 30, \
-                at most 240), or earlier if the owner stops it; a second call moves the time limit of your own \
-                recording. A recording the owner started is left alone. Needs the radio running. \
+                at most 240), or earlier if the owner stops it or the disk is nearly full (under 100 MB free, \
+                when it is also refused); a second call moves the time limit of your own recording. A recording \
+                the owner started is left alone. Needs the radio running. \
                 Returns {started, stops_at, note?}.
                 """, properties: [
                     "kind": .enumSchema(["audio", "iq", "both"], "What to record."),
                     "max_minutes": .schema("number", "Stop after this many minutes (default 30, at most 240)."),
-                ], required: ["kind"]) { t, args, _ in try t.startRecording(args) },
+                ], required: ["kind"]) { t, args, client in try t.startRecording(args, client: client) },
 
             SubFloorTool("stop_recording", title: "Stop recording", readOnly: false, description: """
                 Stop the recordings agents started: kind "audio", "iq" or "both" (default). The owner's own \
@@ -243,11 +248,15 @@ extension SubFloorTools {
         return model.recordingStarts[entry.kind] == entry.number && s.isRecording && !s.isAuto
     }
 
-    func startRecording(_ args: ToolArguments) throws -> [String: JSONValue] {
+    func startRecording(_ args: ToolArguments, client: String) throws -> [String: JSONValue] {
         let kinds = try Self.streamKinds(args, required: true)
         let minutes = try args.double("max_minutes", default: 30, in: Self.maxRecordingMinutes)
         try requireRunning()
         let m = model
+        guard !diskNearlyFull else {
+            throw ToolError("The disk where recordings go is nearly full (under 100 MB free): nothing was recorded. "
+                            + "Only the owner can free space.")
+        }
         m.refreshRecordingStatus()
         let stopsAt = Date().addingTimeInterval(minutes * 60)
         var started: [JSONValue] = [], notes: [String] = []
@@ -266,7 +275,7 @@ extension SubFloorTools {
             guard m.isRecording(kind) else {
                 throw ToolError("The \(kind.label) recording did not start: \(m.banner?.message ?? "no reason given").")
             }
-            watch(AgentRecording(kind: kind, number: m.recordingStarts[kind] ?? 0, stopsAt: stopsAt))
+            watch(AgentRecording(kind: kind, client: client, number: m.recordingStarts[kind] ?? 0, stopsAt: stopsAt))
             started.append(.string(kind.rawValue))
         }
         var r: [String: JSONValue] = ["started": .array(started), "stops_at": .time(stopsAt)]
@@ -274,20 +283,37 @@ extension SubFloorTools {
         return r
     }
 
-    /// Follows `entry` until it stops for another reason, or stops it at its time.
+    /// Whether less than Auto's floor (`AppModel.autoOffDiskBytes`) is free where recordings go.
+    var diskNearlyFull: Bool {
+        model.recordingsFreeSpace.map { $0 < AppModel.autoOffDiskBytes } ?? false
+    }
+
+    /// Follows `entry` until it stops for another reason, or stops it at its time or when the disk is nearly
+    /// full (checked every `recordingDiskCheckInterval`).
     private func watch(_ entry: AgentRecording) {
         agentRecordings[entry.kind]?.task?.cancel()
         agentRecordings[entry.kind] = entry
         entry.task = Task { [weak self] in
+            var diskChecked = ContinuousClock.now, diskFull = false
             while true {
                 let left = entry.stopsAt.timeIntervalSinceNow
                 if left <= 0 { break }
                 do { try await Task.sleep(for: .milliseconds(Int(min(left, 0.25) * 1000) + 1)) } catch { return }
                 guard let self, self.isRunning(entry) else { self?.forget(entry); return }
+                if ContinuousClock.now - diskChecked >= self.recordingDiskCheckInterval {
+                    diskChecked = .now
+                    if self.diskNearlyFull { diskFull = true; break }
+                }
             }
             guard let self else { return }
             self.forget(entry)
             guard self.isRunning(entry) else { return }
+            if diskFull {
+                self.log?.add(.error, client: entry.client,
+                              "Stopped the agent's \(entry.kind.label) recording: less than 100 MB free where recordings go")
+                self.model.show(Banner(kind: .error,
+                                       message: "Stopped \(entry.client)'s recording: the disk is nearly full."))
+            }
             self.model.refreshRecordingStatus()
             self.model.stopRecording(entry.kind)
             // Show the stop as soon as the file is finished, rather than at the next status poll.
@@ -369,8 +395,16 @@ extension SubFloorTools {
         text.count <= limit ? text : String(text.prefix(limit)) + "…"
     }
 
+    #if DEBUG
+    /// `list_recordings` rows built on the main thread (tests: there must be none).
+    nonisolated static let recordingRowsBuiltOnMain = Mutex(0)
+    #endif
+
     nonisolated static func recordingJSON(_ r: CatalogRecording, _ summary: TranscriptSummary?) -> JSONValue {
-        .object([
+        #if DEBUG
+        if Thread.isMainThread { recordingRowsBuiltOnMain.withLock { $0 += 1 } }
+        #endif
+        return .object([
             "file": .string(r.file), "start": .time(r.start), "seconds": r.seconds.map { .num(tenths($0)) }.orNull,
             "frequency_hz": .hz(r.frequencyHz), "mode": .string(r.mode), "auto": .bool(r.auto), "heard": .bool(r.heard),
             "in_progress": .bool(r.inProgress),
@@ -388,8 +422,9 @@ extension SubFloorTools {
         let voiceOnly = try args.bool("voice_only", default: false)
         let limit = try args.int("limit", default: 50, in: 1...500)
         let catalog = model.library.catalog, index = model.library.transcripts
-        let rows = await offMain {
-            catalog.allRecordings.reversed().lazy
+        // Built in full off the main actor: a lazy sequence returned from here would filter and build on it.
+        let rows: [JSONValue] = await offMain {
+            Array(catalog.allRecordings.reversed().lazy
                 .filter { r in
                     if let since, r.start < since { return false }
                     if let until, r.start > until { return false }
@@ -397,9 +432,9 @@ extension SubFloorTools {
                     return !voiceOnly || index.summary(r.file)?.verdict == .voice
                 }
                 .prefix(limit)
-                .map { Self.recordingJSON($0, index.summary($0.file)) }
+                .map { Self.recordingJSON($0, index.summary($0.file)) })
         }
-        return ["recordings": .array(Array(rows))]
+        return ["recordings": .array(rows)]
     }
 
     func transcript(_ args: ToolArguments) throws -> [String: JSONValue] {

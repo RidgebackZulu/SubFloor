@@ -60,6 +60,10 @@ final class SubFloorTools: MCPToolProvider {
     var agentRecordings: [StreamKind: AgentRecording] = [:]
     /// The last change an agent's call made to the tuning, mode or running state.
     private(set) var lastRadioChange: RadioChange?
+    /// How often an agent's recording checks the free disk space (tests shorten it).
+    var recordingDiskCheckInterval: Duration = .seconds(2)
+    /// The MCP event log, for what the tools do on their own (set by the app from `MCPServer.log`).
+    var log: MCPLog?
 
     /// `extraTools`: a test's own tools, offered beside SubFloor's.
     init(model: AppModel, extraTools: [SubFloorTool] = []) {

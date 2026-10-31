@@ -55,6 +55,7 @@ struct SubFloorApp: App {
         let tools = SubFloorTools(model: model)
         let mcp = MCPServer(provider: tools)
         tools.connectedClients = { [weak mcp] in mcp?.connectedClients ?? [] }
+        tools.log = mcp.log
         _mcp = State(initialValue: mcp)
     }
 

@@ -11,7 +11,9 @@ Conventions:
 - **Levels are dBFS** (0 is full scale; the noise on HF is typically −120 to −90).
 - **Times are ISO 8601, UTC.**
 - Results are JSON with `"ok": true`. A failed precondition or bad argument is a tool error whose text says what
-  to do, e.g. "The radio is stopped: call start_radio first." Out-of-range numbers are clamped, not refused.
+  to do, e.g. "The radio is stopped: call start_radio first." Out-of-range bandwidths, levels, counts and
+  durations are clamped, not refused; a frequency or spectrum range the radio cannot reach is refused with an
+  error.
 - Tools that change the radio run one at a time, in the order called. Read-only tools (`get_*`, `list_*`,
   `search_transcripts`) answer at once, even during a `listen`.
 - Modes: `am`, `nfm`, `wfm`, `usb`, `lsb`, `cw`. Default bandwidths and ranges (Hz): AM 8000 (2000–20000),
@@ -128,8 +130,9 @@ otherwise. Only the owner can turn transcription on.
 ### `start_recording`
 
 Records the radio, starting the pre-roll ago (the owner's setting, 5–120 s), so the start of what you just heard
-is kept. It stops by itself after `max_minutes`, or earlier if the owner stops it. A second call moves the time
-limit of your own recording. A recording the owner started is left alone. Needs the radio running.
+is kept. It stops by itself after `max_minutes`, or earlier if the owner stops it or the disk where recordings go
+is nearly full (under 100 MB free; a start is refused then too). A second call moves the time limit of your own
+recording. A recording the owner started is left alone. Needs the radio running.
 
 | Argument | Type | Description |
 |---|---|---|
