@@ -61,9 +61,10 @@ final class SubFloorTools: MCPToolProvider {
     /// The last change an agent's call made to the tuning, mode or running state.
     private(set) var lastRadioChange: RadioChange?
 
-    init(model: AppModel) {
+    /// `extraTools`: a test's own tools, offered beside SubFloor's.
+    init(model: AppModel, extraTools: [SubFloorTool] = []) {
         self.model = model
-        let all = Self.radioTools + Self.bookmarkTools + Self.recordingTools + Self.decodeTools
+        let all = Self.radioTools + Self.bookmarkTools + Self.recordingTools + Self.decodeTools + extraTools
         tools = all.map(\.descriptor)
         registry = Dictionary(all.map { ($0.descriptor.name, $0) }, uniquingKeysWith: { first, _ in first })
     }
@@ -72,10 +73,12 @@ final class SubFloorTools: MCPToolProvider {
         guard let tool = registry[name] else { return .failure("Unknown tool \(name)") }
         let args = ToolArguments(arguments)
         let run = { () async -> MCPToolResult in
-            let before = self.radioState
+            // Only a tool that changes the radio, run under the lock, can be the change: whatever else changed
+            // while a read or a listen was waiting was someone else's doing.
+            let before = tool.locksRadio ? self.radioState : nil
             defer {
                 let after = self.radioState
-                if after != before { self.lastRadioChange = RadioChange(client: client, at: Date(), state: after) }
+                if let before, after != before { self.lastRadioChange = RadioChange(client: client, at: Date(), state: after) }
             }
             do {
                 var fields = try await tool.run(self, args, client)

@@ -1374,14 +1374,15 @@ final class AppModel {
         }
     }
 
-    /// Keeps an agent's `listen` clip (mono `rate` Hz audio whose first sample was at `start`) as a manual
-    /// recording: written in the audio recording format to the recordings folder, named for the VFO and mode,
-    /// and logged, so it shows in Recordings. The file is written and listed off the main actor. `transcript`,
+    /// Keeps an agent's `listen` clip (mono `rate` Hz audio whose first sample was at `start`, heard at
+    /// `frequencyHz` in `mode`: the tuning when it began, which may have changed since) as a manual recording:
+    /// written in the audio recording format to the recordings folder, named for that tuning, and logged, so it shows in Recordings. The file is written and listed off the main actor. `transcript`,
     /// the one `listen` made of the clip, if any, is saved beside it and indexed before the log line queues the
     /// clip, so it is not sent again. Returns the file name.
-    func saveListenClip(_ samples: [Float], rate: Double, start: Date, transcript: StoredTranscript? = nil) async throws -> String {
+    func saveListenClip(_ samples: [Float], rate: Double, start: Date, frequencyHz hz: Double, mode: DemodMode,
+                        transcript: StoredTranscript? = nil) async throws -> String {
         let folder = recording.folder, format = recording.audioFormat, sampleFormat = recording.audioSampleFormat
-        let hz = vfoHz, label = mode.label, hardware = activeSource.name
+        let label = mode.label, hardware = activeSource.name
         let file = try await Task.detached(priority: .userInitiated) {
             try Self.writeClip(samples, rate: rate, start: start, folder: folder, format: format, sampleFormat: sampleFormat,
                                frequencyHz: hz, label: label, hardware: hardware)

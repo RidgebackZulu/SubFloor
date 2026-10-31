@@ -187,7 +187,8 @@ extension SubFloorTools {
 
         if keep {
             guard !samples.isEmpty else { throw ToolError("No audio came through to keep: is the radio running? Try listen again.") }
-            r["file"] = .string(try await m.saveListenClip(samples, rate: tap.rate, start: start, transcript: stored))
+            r["file"] = .string(try await m.saveListenClip(samples, rate: tap.rate, start: start, frequencyHz: vfo,
+                                                           mode: mode, transcript: stored))
         }
         return r
     }

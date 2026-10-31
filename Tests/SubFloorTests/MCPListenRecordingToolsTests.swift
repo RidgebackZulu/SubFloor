@@ -10,7 +10,11 @@ import Transcription
 /// A `TranscribeFunction` for `listen`: answers with the saved reply of the "clock" voice recording and notes
 /// each call and the size of the file it was given. Never touches the network.
 final class ListenTranscriber: @unchecked Sendable {
+    /// How long each call takes, as a slow network would.
+    let delay: Duration
     private let lock = NSLock()
+
+    init(delay: Duration = .zero) { self.delay = delay }
     private var _calls: [(file: String, bytes: Int, model: String, language: String?)] = []
     var calls: Int { lock.withLock { _calls.count } }
     var lastBytes: Int { lock.withLock { _calls.last?.bytes ?? 0 } }
@@ -23,6 +27,7 @@ final class ListenTranscriber: @unchecked Sendable {
         { [self] file, url, model, language, _ in
             let bytes = (try? Data(contentsOf: url).count) ?? 0
             lock.withLock { _calls.append((file, bytes, model, language)) }
+            if delay > .zero { try await Task.sleep(for: delay) }
             let reply = try JSONDecoder().decode(WhisperResponse.self, from: try Data(contentsOf: Self.voiceFixture))
             return StoredTranscript(file: file, model: model, language: language, createdAt: Date(),
                                     durationSeconds: reply.duration ?? 0, costUSD: reply.usage?.cost, note: nil,
@@ -174,6 +179,35 @@ struct MCPListenRecordingToolsTests {
         #expect(await again.value.structured?["interrupted"]?.string?.hasSuffix("by the owner") == true)
     }
 
+    /// A listen that ends, and a read that ends, are not changes: two listens interrupted by the owner both say so.
+    @Test func onlyAnAgentsChangeIsCreditedToIt() async throws {
+        let (m, _) = makeModel()
+        defer { m.shutdown() }
+        guard runDemo(m) else { return }
+        // A read the test holds open while the owner retunes.
+        let release = AsyncStream<Void>.makeStream()
+        let slowRead = SubFloorTool("slow_read", title: "Slow read", readOnly: true, description: "Waits.") { _, _, _ in
+            for await _ in release.stream { break }
+            return [:]
+        }
+        let tools = SubFloorTools(model: m, extraTools: [slowRead])
+
+        let a = Task { @MainActor in await call(tools, "listen", ["seconds": .number(10)], client: "agent-a 1.0") }
+        let c = Task { @MainActor in await call(tools, "listen", ["seconds": .number(10)], client: "agent-c 1.0") }
+        try await Task.sleep(for: .milliseconds(400))
+        m.tune(to: 7_200_000)
+        #expect(await a.value.structured?["interrupted"]?.string == "retuned to \(FrequencyFormatter.short(7_200_000)) by the owner")
+        #expect(await c.value.structured?["interrupted"]?.string == "retuned to \(FrequencyFormatter.short(7_200_000)) by the owner")
+
+        let listening = Task { @MainActor in await call(tools, "listen", ["seconds": .number(10)], client: "agent-a 1.0") }
+        let read = Task { @MainActor in await call(tools, "slow_read", client: "agent-b 1.0") }
+        try await Task.sleep(for: .milliseconds(400))
+        m.tune(to: 7_250_000)          // the owner, while agent-b's read waits
+        release.continuation.yield()   // the read ends straight after
+        _ = await read.value
+        #expect(await listening.value.structured?["interrupted"]?.string == "retuned to \(FrequencyFormatter.short(7_250_000)) by the owner")
+    }
+
     @Test func listenStopsWhenTheModeChangesOrTheRadioStops() async throws {
         let (m, _) = makeModel()
         defer { m.shutdown() }
@@ -212,6 +246,37 @@ struct MCPListenRecordingToolsTests {
         #expect(FileManager.default.fileExists(atPath: TranscriptStore.url(for: file, in: folder).path))
         try? await Task.sleep(for: .milliseconds(300))
         #expect(fake.calls == 1)
+    }
+
+    /// A clip kept after the radio moved on (here during a slow transcription) is filed under where it was heard.
+    @Test func aKeptClipKeepsTheTuningItWasHeardAt() async throws {
+        let fake = ListenTranscriber(delay: .seconds(1))
+        let (m, folder) = makeModel(transcriber: fake)
+        defer { m.shutdown() }
+        guard runDemo(m) else { return }
+        m.transcriptionSettings.enabled = true
+        m.setMode(.usb)
+        m.tune(to: 11_175_000)
+        let tools = SubFloorTools(model: m)
+        let listening = Task { @MainActor in await call(tools, "listen", ["seconds": .number(2), "keep": .bool(true)]) }
+        #expect(await eventually(10) { fake.calls == 1 })   // listening is over; the transcript is on its way
+        _ = await call(tools, "tune", ["frequency": .string("7.2 MHz"), "mode": .string("lsb")], client: "agent-b 1.0")
+        #expect(m.vfoHz == 7_200_000)
+        let r = await listening.value
+        #expect(!r.isError, "\(r.content)")
+        #expect(r.structured?["interrupted"] == nil)
+        let file = try #require(r.structured?["file"]?.string)
+        #expect(RecordingFileName.parse(file)?.frequencyHz == 11_175_000)
+        #expect(RecordingFileName.parse(file)?.label == "USB")
+        let rec = try #require(m.library.catalog.recording(file))
+        #expect(rec.frequencyHz == 11_175_000)
+        #expect(rec.mode == "USB")
+        let logged = try RecordingLog(folder: folder).allEntries().contains {
+            if case .recording(file, _, _, 11_175_000, "USB", false) = $0 { true } else { false }
+        }
+        #expect(logged)
+        let near = await call(tools, "list_recordings", ["frequency": .string("11.175 MHz"), "tolerance_hz": .number(100)])
+        #expect(near.structured?["recordings"]?.array?.compactMap { $0["file"]?.string } == [file])
     }
 
     // MARK: Recording
