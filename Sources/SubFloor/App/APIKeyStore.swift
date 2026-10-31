@@ -1,7 +1,8 @@
 import Foundation
 import Security
 
-/// Where the OpenRouter key lives. The key is kept out of `UserDefaults`, the session and every log.
+/// Where a secret lives (the OpenRouter key, the MCP token). It is kept out of `UserDefaults`, the session and
+/// every log.
 protocol APIKeyStore: AnyObject {
     /// The stored key, or nil when there is none.
     func load() -> String?
@@ -22,15 +23,25 @@ struct KeychainError: Error, Equatable {
     let status: OSStatus
 }
 
-/// The key as a generic password in the user's login Keychain.
+/// The key as a generic password in the user's login Keychain, under `service` and `account`.
 final class KeychainAPIKeyStore: APIKeyStore {
-    static let service = "app.subfloor.SubFloor.openrouter"
-    static let account = "api-key"
+    static let openRouterService = "app.subfloor.SubFloor.openrouter"
+    static let openRouterAccount = "api-key"
+
+    let service: String
+    let account: String
+
+    /// The defaults are the OpenRouter key's item.
+    init(service: String = KeychainAPIKeyStore.openRouterService,
+         account: String = KeychainAPIKeyStore.openRouterAccount) {
+        self.service = service
+        self.account = account
+    }
 
     private var query: [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
-         kSecAttrService as String: Self.service,
-         kSecAttrAccount as String: Self.account]
+         kSecAttrService as String: service,
+         kSecAttrAccount as String: account]
     }
 
     func load() -> String? {

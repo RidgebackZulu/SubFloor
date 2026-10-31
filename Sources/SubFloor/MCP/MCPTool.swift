@@ -45,3 +45,13 @@ protocol MCPToolProvider: AnyObject {
     /// Runs tool `name` for `client` (its "name version"). An unknown name is a failure result.
     func call(_ name: String, arguments: [String: JSONValue], client: String) async -> MCPToolResult
 }
+
+/// No tools: every call is an unknown tool. The server runs with it until the SubFloor tools exist.
+@MainActor
+final class EmptyToolProvider: MCPToolProvider {
+    let tools: [MCPToolDescriptor] = []
+
+    func call(_ name: String, arguments: [String: JSONValue], client: String) async -> MCPToolResult {
+        .failure("Unknown tool \(name)")
+    }
+}

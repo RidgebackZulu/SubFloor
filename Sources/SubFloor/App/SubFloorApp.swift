@@ -5,6 +5,8 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: AppModel?
     weak var dial: DialController?
+    /// The MCP server, handed over once the main window appears; stopped on quit.
+    var mcp: MCPServer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         MainActor.assumeIsolated {
@@ -28,6 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         MainActor.assumeIsolated {
+            mcp?.stop()
             dial?.shutdown()
             model?.shutdown()
         }
@@ -41,6 +44,7 @@ struct SubFloorApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var model: AppModel
     @State private var dial: DialController
+    @State private var mcp: MCPServer
     @AppStorage("appearance") private var appearance = "dark"
 
     init() {
@@ -48,6 +52,7 @@ struct SubFloorApp: App {
         let model = AppModel()
         _model = State(initialValue: model)
         _dial = State(initialValue: DialController(model: model))
+        _mcp = State(initialValue: MCPServer(provider: EmptyToolProvider()))
     }
 
     private var scheme: ColorScheme? {
@@ -63,11 +68,16 @@ struct SubFloorApp: App {
             ContentView()
                 .environment(model)
                 .environment(dial)
+                .environment(mcp)
                 .preferredColorScheme(scheme)
                 .tint(Theme.accent)
                 .onAppear {
                     appDelegate.model = model
                     appDelegate.dial = dial
+                    if appDelegate.mcp == nil {
+                        appDelegate.mcp = mcp
+                        if mcp.settings.enabled { Task { await mcp.apply(mcp.settings) } }
+                    }
                     dial.start()
                     KeyboardController.shared.install(model: model)
                     NSApp.activate()
@@ -98,6 +108,7 @@ struct SubFloorApp: App {
             SettingsView()
                 .environment(model)
                 .environment(dial)
+                .environment(mcp)
                 .preferredColorScheme(scheme)
         }
     }

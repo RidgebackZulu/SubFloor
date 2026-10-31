@@ -54,6 +54,14 @@ struct MCPSessions {
         live[id ?? ""]?.client
     }
 
+    /// The client of every session active within `connectedSeconds` of `now`, the most recent first.
+    func connectedClients(now: Date) -> [String] {
+        live.values
+            .filter { now.timeIntervalSince($0.lastSeen) < Self.connectedSeconds }
+            .sorted { $0.lastSeen > $1.lastSeen }
+            .map(\.client)
+    }
+
     /// The client most recently active within `connectedSeconds` of `now`, or nil.
     func connectedClient(now: Date) -> String? {
         live.values
