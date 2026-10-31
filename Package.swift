@@ -28,12 +28,14 @@ let package = Package(
         .target(name: "CFT8", path: "Sources/CFT8", cSettings: cft8Settings),
         .target(name: "Modems", dependencies: ["DSPCore", "CFT8"]),
         .target(name: "SubFloorCore", dependencies: ["DSPCore"]),
+        /// Signal ID: measures and names a signal from its IQ (pure, no AppKit).
+        .target(name: "SignalID", dependencies: ["DSPCore"], swiftSettings: fastMath),
         .target(name: "Recording", swiftSettings: fastMath),
         .target(name: "Transcription"),
         .target(name: "SDRplayKit", dependencies: ["CSDRplay", "DSPCore"], linkerSettings: sdrplayLinker),
         .executableTarget(
             name: "SubFloor",
-            dependencies: ["DSPCore", "SubFloorCore", "SDRplayKit", "Modems", "Recording", "Transcription"],
+            dependencies: ["DSPCore", "SubFloorCore", "SDRplayKit", "Modems", "Recording", "Transcription", "SignalID"],
             exclude: ["Info.plist"],
             resources: [.copy("Resources/AppIcon.png")],
             swiftSettings: fastMath,
@@ -46,6 +48,7 @@ let package = Package(
         .testTarget(name: "ModemsTests", dependencies: ["Modems", "DSPCore"]),
         .testTarget(name: "SubFloorCoreTests", dependencies: ["SubFloorCore", "DSPCore"]),
         .testTarget(name: "RecordingTests", dependencies: ["Recording", "DSPCore"]),
+        .testTarget(name: "SignalIDTests", dependencies: ["SignalID", "DSPCore"]),
         .testTarget(name: "TranscriptionTests", dependencies: ["Transcription"], resources: [.copy("Fixtures")]),
         .testTarget(name: "SDRplayKitTests", dependencies: ["SDRplayKit", "CSDRplay"], linkerSettings: sdrplayLinker),
         .testTarget(name: "SubFloorTests", dependencies: ["SubFloor"], linkerSettings: sdrplayLinker),
