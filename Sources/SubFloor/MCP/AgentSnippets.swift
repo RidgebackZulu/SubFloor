@@ -8,43 +8,69 @@ struct AgentSnippet: Identifiable {
     var whereItGoes: String
     /// Ready to paste, with the URL and token filled in.
     var text: String
+    /// A second block that goes somewhere else (a file, say), with its own Copy button.
+    var extra: Extra?
+    /// The agent asks for the token itself, so the window offers Copy Token.
+    var asksForToken = false
     /// The agent's own "add MCP server" command, when it takes the token without asking for it.
     var install: AgentInstall?
+
+    struct Extra {
+        /// The Copy button's title, naming where the block goes.
+        var copyLabel: String
+        var text: String
+    }
 }
 
-/// A command that adds SubFloor to an agent, run without a shell.
+/// The commands that add SubFloor to an agent, run in order and without a shell.
 struct AgentInstall: Equatable, Sendable {
+    struct Step: Equatable, Sendable {
+        var arguments: [String]
+        /// Written to the command's standard input, then closed.
+        var stdin: String?
+        /// A failure is ignored and its output left out (removing an entry that may not be there).
+        var mayFail = false
+    }
+
     /// A bare name ("claude") found by `AgentInstaller.locate`, or an absolute path.
     var executable: String
-    var arguments: [String]
-    /// Written to the command's standard input, then closed.
-    var stdin: String?
+    var steps: [Step]
 }
 
 /// The Setup tab's "Connect an agent" list. Each format follows that client's documentation as of 2026-10-31;
 /// where the documentation was unclear, `whereItGoes` says to check it.
 enum AgentSnippets {
+    /// Shown in place of the token while the Token field is hidden.
+    static let mask = "••••••••"
+
     static func all(url: String, token: String) -> [AgentSnippet] {
         let bearer = "Authorization: Bearer \(token)"
         return [
             AgentSnippet(
                 id: "claude-code", name: "Claude Code",
-                whereItGoes: "Run in Terminal, or click Add: SubFloor joins every project (~/.claude.json). "
+                whereItGoes: "Click Add, or run in Terminal: SubFloor joins every project (~/.claude.json). If you "
+                    + "added it before (a new token, say), run claude mcp remove --scope user subfloor first; Add does. "
                     + "Restart Claude Code, or /mcp to reconnect.",
                 text: #"claude mcp add --transport http --scope user subfloor \#(url) --header "\#(bearer)""#,
-                install: AgentInstall(executable: "claude",
-                                      arguments: ["mcp", "add", "--transport", "http", "--scope", "user", "subfloor", url,
-                                                  "--header", bearer])),
+                install: AgentInstall(executable: "claude", steps: [
+                    // `claude mcp add` refuses a name it already has.
+                    .init(arguments: ["mcp", "remove", "--scope", "user", "subfloor"], mayFail: true),
+                    .init(arguments: ["mcp", "add", "--transport", "http", "--scope", "user", "subfloor", url,
+                                      "--header", bearer]),
+                ])),
             AgentSnippet(
                 id: "claude-code-plugin", name: "Claude Code plugin",
-                whereItGoes: "Run the first two lines once; put the exports in ~/.zshenv so Claude Code sees them, "
-                    + "then restart it. The plugin brings the SubFloor skill too.",
+                whereItGoes: "Type the two /plugin lines in Claude Code. Add the ~/.zshenv lines to that file in a "
+                    + "text editor (not at a prompt), then start Claude Code from a new Terminal. The plugin brings "
+                    + "the SubFloor skill too.",
                 text: """
-                    claude plugin marketplace add RidgebackZulu/SubFloor
-                    claude plugin install subfloor@subfloor
+                    /plugin marketplace add RidgebackZulu/SubFloor
+                    /plugin install subfloor@subfloor
+                    """,
+                extra: .init(copyLabel: "Copy ~/.zshenv lines", text: """
                     export SUBFLOOR_MCP_URL=\(url)
                     export SUBFLOOR_MCP_TOKEN=\(token)
-                    """),
+                    """)),
             AgentSnippet(
                 id: "claude-desktop", name: "Claude Desktop",
                 whereItGoes: "~/Library/Application Support/Claude/claude_desktop_config.json (Settings › Developer › "
@@ -67,28 +93,22 @@ enum AgentSnippets {
                     """),
             AgentSnippet(
                 id: "hermes", name: "Hermes Agent",
-                whereItGoes: "Run the first line in Terminal. Answer yes to authentication and paste the token when "
-                    + "asked. Then /reload-mcp in Hermes, or start a new session.",
-                text: """
-                    hermes mcp add subfloor --url \(url) --auth header
-                    # When asked for the API key / Bearer token, paste:
-                    # \(token)
-                    """),
+                whereItGoes: "Run in Terminal. Answer yes to authentication, and when it asks for the API key / "
+                    + "Bearer token, paste the token (Copy Token). Then /reload-mcp in Hermes, or start a new session.",
+                text: "hermes mcp add subfloor --url \(url) --auth header",
+                asksForToken: true),
             AgentSnippet(
                 id: "hermes-config", name: "Hermes (config.yaml)",
-                whereItGoes: "Add the first part to ~/.hermes/.env and the second to ~/.hermes/config.yaml, then "
+                whereItGoes: "Add the block to ~/.hermes/config.yaml and the .env line to ~/.hermes/.env, then "
                     + "hermes mcp test subfloor.",
                 text: """
-                    # ~/.hermes/.env
-                    MCP_SUBFLOOR_API_KEY=\(token)
-
-                    # ~/.hermes/config.yaml
                     mcp_servers:
                       subfloor:
                         url: "\(url)"
                         headers:
                           Authorization: "Bearer ${MCP_SUBFLOOR_API_KEY}"
-                    """),
+                    """,
+                extra: .init(copyLabel: "Copy ~/.hermes/.env line", text: "MCP_SUBFLOOR_API_KEY=\(token)")),
             AgentSnippet(
                 id: "codex", name: "Codex CLI",
                 whereItGoes: "~/.codex/config.toml. Restart Codex sessions after the change.",
@@ -102,9 +122,11 @@ enum AgentSnippets {
                 whereItGoes: "Run in Terminal, or click Add: SubFloor goes in ~/.gemini/settings.json for every "
                     + "project. Restart Gemini CLI; /mcp shows it.",
                 text: #"gemini mcp add --scope user --transport http --header "\#(bearer)" subfloor \#(url)"#,
-                install: AgentInstall(executable: "gemini",
-                                      arguments: ["mcp", "add", "--scope", "user", "--transport", "http",
-                                                  "--header", bearer, "subfloor", url])),
+                // `gemini mcp add` replaces an entry of the same name, so no remove first.
+                install: AgentInstall(executable: "gemini", steps: [
+                    .init(arguments: ["mcp", "add", "--scope", "user", "--transport", "http", "--header", bearer,
+                                      "subfloor", url]),
+                ])),
             AgentSnippet(
                 id: "cursor", name: "Cursor",
                 whereItGoes: "~/.cursor/mcp.json (every project) or .cursor/mcp.json in one, merged with any servers "

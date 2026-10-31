@@ -17,41 +17,84 @@ import Testing
         ])
         #expect(Set(snippets.map(\.id)).count == 13)
         for s in snippets {
-            #expect(s.text.contains(Self.url), "\(s.name)")
-            if s.name == "Claude Code plugin" {
-                #expect(s.text.contains("SUBFLOOR_MCP_TOKEN=tok123"))
-            } else {
-                #expect(s.text.contains("tok123"), "\(s.name)")
+            let all = s.text + "\n" + (s.extra?.text ?? "")
+            #expect(all.contains(Self.url), "\(s.name)")
+            switch s.name {
+            case "Claude Code plugin":
+                // Typed in Claude Code; the token only in the ~/.zshenv lines, never run in a shell.
+                #expect(!s.text.contains("tok123"))
+                #expect(s.extra?.text.contains("SUBFLOOR_MCP_TOKEN=tok123") == true)
+            case "Hermes Agent":
+                // Hermes asks for the token itself: the text is the command alone.
+                #expect(s.text == "hermes mcp add subfloor --url \(Self.url) --auth header")
+                #expect(s.asksForToken)
+            default:
+                #expect(all.contains("tok123"), "\(s.name)")
             }
             #expect(!s.whereItGoes.isEmpty, "\(s.name)")
         }
+    }
+
+    @Test func displayMasksTheTokenUntilShown() throws {
+        let snippets = AgentSnippets.all(url: Self.url, token: "tok123")
+        let claude = try #require(snippets.first { $0.name == "Claude Code" })
+        let hidden = MCPWindow.displayed(claude.text, token: "tok123", showToken: false)
+        #expect(!hidden.contains("tok123"))
+        #expect(hidden.contains(AgentSnippets.mask))
+        #expect(hidden.contains(Self.url))
+        #expect(MCPWindow.displayed(claude.text, token: "tok123", showToken: true) == claude.text)
+        #expect(MCPWindow.displayed("Added server, Bearer tok123", token: "tok123", showToken: false)
+                == "Added server, Bearer \(AgentSnippets.mask)")
     }
 
     @Test func claudeCodeInstallIsNonInteractive() throws {
         let snippets = AgentSnippets.all(url: Self.url, token: "tok123")
         let claude = try #require(snippets.first { $0.name == "Claude Code" }?.install)
         #expect(claude.executable == "claude")
-        #expect(claude.arguments == ["mcp", "add", "--transport", "http", "--scope", "user", "subfloor", Self.url,
-                                     "--header", "Authorization: Bearer tok123"])
-        #expect(claude.stdin == nil)
+        // Removes any earlier entry (after New Token, add refuses an existing name), then adds.
+        #expect(claude.steps == [
+            AgentInstall.Step(arguments: ["mcp", "remove", "--scope", "user", "subfloor"], mayFail: true),
+            AgentInstall.Step(arguments: ["mcp", "add", "--transport", "http", "--scope", "user", "subfloor", Self.url,
+                                          "--header", "Authorization: Bearer tok123"]),
+        ])
+        // Gemini's add replaces an existing entry of the same name.
         let gemini = try #require(snippets.first { $0.name == "Gemini CLI" }?.install)
         #expect(gemini.executable == "gemini")
-        #expect(gemini.arguments == ["mcp", "add", "--scope", "user", "--transport", "http",
-                                     "--header", "Authorization: Bearer tok123", "subfloor", Self.url])
+        #expect(gemini.steps == [
+            AgentInstall.Step(arguments: ["mcp", "add", "--scope", "user", "--transport", "http",
+                                          "--header", "Authorization: Bearer tok123", "subfloor", Self.url]),
+        ])
         // Only clients whose own add command takes the token without asking get a one-click Add.
         #expect(snippets.filter { $0.install != nil }.map(\.name) == ["Claude Code", "Gemini CLI"])
     }
 
     @Test func installerRunsWithoutAShell() async {
-        let echo = await AgentInstaller.run(AgentInstall(executable: "/bin/cat", arguments: [], stdin: "hello; $(rm x)"))
+        let echo = await AgentInstaller.run(AgentInstall(executable: "/bin/cat",
+                                                         steps: [.init(arguments: [], stdin: "hello; $(rm x)")]))
         #expect(echo.ok)
         #expect(echo.output == "hello; $(rm x)")
-        let failing = await AgentInstaller.run(AgentInstall(executable: "/usr/bin/false", arguments: [], stdin: nil))
+        let failing = await AgentInstaller.run(AgentInstall(executable: "/usr/bin/false", steps: [.init(arguments: [])]))
         #expect(!failing.ok)
-        let missing = await AgentInstaller.run(AgentInstall(executable: "no-such-agent-cli", arguments: [], stdin: nil))
+        let missing = await AgentInstaller.run(AgentInstall(executable: "no-such-agent-cli", steps: [.init(arguments: [])]))
         #expect(!missing.ok)
         #expect(missing.output.contains("not found"))
         #expect(AgentInstaller.locate("no-such-agent-cli") == nil)
+    }
+
+    @Test func installerStepsMayFailOrStop() async {
+        // A step allowed to fail is skipped quietly; a later failure stops the run before the next step.
+        let tolerated = await AgentInstaller.run(AgentInstall(executable: "/bin/sh", steps: [
+            .init(arguments: ["-c", "echo gone; exit 1"], mayFail: true),
+            .init(arguments: ["-c", "echo added"]),
+        ]))
+        #expect(tolerated.ok)
+        #expect(tolerated.output == "added")
+        let stopped = await AgentInstaller.run(AgentInstall(executable: "/bin/sh", steps: [
+            .init(arguments: ["-c", "echo first; exit 2"]),
+            .init(arguments: ["-c", "echo second"]),
+        ]))
+        #expect(!stopped.ok)
+        #expect(stopped.output == "first")
     }
 
     @Test func tooltipsAndStatusLines() {

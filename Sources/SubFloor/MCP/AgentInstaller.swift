@@ -38,7 +38,8 @@ enum AgentInstaller {
         await offCooperativePool { locate(executable) }
     }
 
-    /// Runs `install` with a 30 s limit. `ok` is a zero exit status; `output` is its stdout and stderr together.
+    /// Runs `install`'s steps in order, each with a 30 s limit, stopping at the first failure not allowed to
+    /// fail. `ok` is every such step exiting 0; `output` is their stdout and stderr together.
     static func run(_ install: AgentInstall) async -> (ok: Bool, output: String) {
         await offCooperativePool {
             guard let url = locate(install.executable) else {
@@ -48,10 +49,19 @@ enum AgentInstaller {
             // Node-based tools start with `#!/usr/bin/env node`, so their own folder must be on the PATH.
             let path = [url.deletingLastPathComponent().path] + searchDirectories + [env["PATH"] ?? "/usr/bin:/bin"]
             env["PATH"] = path.joined(separator: ":")
-            let result = Runner.run(url, install.arguments, stdin: install.stdin, environment: env, timeout: timeout)
-            var output = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
-            if result.timedOut { output += (output.isEmpty ? "" : "\n") + "Stopped after \(timeout.components.seconds) s." }
-            return (result.status == 0 && !result.timedOut, output)
+            var outputs: [String] = []
+            for step in install.steps {
+                let result = Runner.run(url, step.arguments, stdin: step.stdin, environment: env, timeout: timeout)
+                let ok = result.status == 0 && !result.timedOut
+                if !ok, step.mayFail { continue }
+                var output = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+                if result.timedOut {
+                    output += (output.isEmpty ? "" : "\n") + "Stopped after \(timeout.components.seconds) s."
+                }
+                if !output.isEmpty { outputs.append(output) }
+                if !ok { return (false, outputs.joined(separator: "\n")) }
+            }
+            return (true, outputs.joined(separator: "\n"))
         }
     }
 

@@ -38,6 +38,12 @@ struct MCPWindow: View {
         }
     }
 
+    /// `text` with the token masked unless the Token field is showing it: what the window displays of a
+    /// snippet or a command's output. Copy and Add use the real text.
+    static func displayed(_ text: String, token: String, showToken: Bool) -> String {
+        showToken || token.isEmpty ? text : text.replacingOccurrences(of: token, with: AgentSnippets.mask)
+    }
+
     static func copy(_ text: String) {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
@@ -58,7 +64,7 @@ struct MCPSetupTab: View {
             Divider()
             tokenSection
             Divider()
-            MCPConnectAgent()
+            MCPConnectAgent(showToken: showToken)
             Divider()
             Text(LocalizedStringKey(Self.skillLine))
                 .font(.callout)
@@ -142,6 +148,8 @@ struct MCPSetupTab: View {
 /// The agent list on the left; the chosen agent's snippet on the right, with Copy and, where its tool is
 /// installed, Add.
 private struct MCPConnectAgent: View {
+    /// The Token field's Show: until then the snippets display the token masked.
+    let showToken: Bool
     @Environment(MCPServer.self) private var server
     @State private var selection: AgentSnippet.ID? = "claude-code"
     /// Executable → found on this Mac.
@@ -173,25 +181,43 @@ private struct MCPConnectAgent: View {
         }
     }
 
+    private func shown(_ text: String) -> String {
+        MCPWindow.displayed(text, token: server.token, showToken: showToken)
+    }
+
+    private func box(_ text: String) -> some View {
+        ScrollView {
+            Text(shown(text))
+                .font(.system(size: 12, design: .monospaced))
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+                .padding(10)
+        }
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.05)))
+        .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.primary.opacity(0.12)))
+    }
+
     private func detail(_ snippet: AgentSnippet) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(snippet.whereItGoes)
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            ScrollView {
-                Text(snippet.text)
-                    .font(.system(size: 12, design: .monospaced))
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .topLeading)
-                    .padding(10)
+            box(snippet.text)
+                .frame(maxHeight: .infinity, alignment: .top)
+            if let extra = snippet.extra {
+                box(extra.text)
+                    .frame(height: 64)
             }
-            .frame(maxHeight: .infinity, alignment: .top)
-            .background(RoundedRectangle(cornerRadius: 6).fill(Color.primary.opacity(0.05)))
-            .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.primary.opacity(0.12)))
             HStack(spacing: 8) {
                 Button("Copy") { MCPWindow.copy(snippet.text) }
+                if let extra = snippet.extra {
+                    Button(extra.copyLabel) { MCPWindow.copy(extra.text) }
+                }
+                if snippet.asksForToken {
+                    Button("Copy Token") { MCPWindow.copy(server.token) }
+                }
                 if let install = snippet.install {
                     let available = found[install.executable] == true
                     Button("Add to \(snippet.name)") { add(snippet.id, install) }
@@ -204,7 +230,7 @@ private struct MCPConnectAgent: View {
             }
             if let result = output[snippet.id] {
                 ScrollView {
-                    Text(result.text.isEmpty ? (result.ok ? "Done." : "Failed.") : result.text)
+                    Text(result.text.isEmpty ? (result.ok ? "Done." : "Failed.") : shown(result.text))
                         .font(.system(size: 11, design: .monospaced))
                         .foregroundStyle(result.ok ? Color.primary : Color.orange)
                         .textSelection(.enabled)
