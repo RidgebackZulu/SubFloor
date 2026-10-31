@@ -216,6 +216,31 @@ struct AppModelTests {
         #expect(m.vfoHz == vfo)
     }
 
+    /// A HamItUp toggle at the same display centre retunes the hardware but leaves the IQ file's context
+    /// alone: the IQ heard before it must not reach a snapshot (or a pre-roll) of what comes after.
+    @Test func upconverterToggleIsABarrierInTheIQHistory() async {
+        let m = makeModel()
+        defer { m.shutdown() }
+        m.recording.preRollSeconds = 5
+        m.useSource(.synthetic)
+        guard m.isRunning else {
+            print("engine did not start (tolerated, no audio device)")
+            return
+        }
+        let r = m.engine.iqRecorder
+        #expect(await eventually { r.headFrame > 20_000 })   // some IQ heard at the old hardware frequency
+        let center = m.centerHz
+        let before = r.headFrame
+        m.setUpconverter(true)
+        #expect(m.centerHz == center)   // the same display centre: the IQ context compares equal
+        let after = r.headFrame
+        #expect(await eventually { r.headFrame > after + 10_000 })
+        let snapshot = r.snapshot(lastSeconds: 5)
+        let head = r.headFrame
+        #expect((snapshot?.frames ?? 0) > 0)
+        #expect((snapshot?.frames ?? .max) <= head - before)
+    }
+
     @Test func setBandwidthClampsToModeRange() {
         let m = makeModel()
         m.setMode(.usb)

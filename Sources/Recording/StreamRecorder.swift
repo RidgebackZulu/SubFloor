@@ -430,23 +430,40 @@ public final class StreamRecorder: @unchecked Sendable {
     public func snapshot(lastSeconds: Double) -> IQSnapshot? {
         let (setup, plan) = producer.withLock { ($0.setup, $0.plan) }
         guard lastSeconds > 0, let setup, let plan, setup.channels == 2 else { return nil }
-        let layout = setup.layout, bpf = layout.bytesPerFrame
-        let frames = Int(min(lastSeconds * setup.sampleRate, Double(plan.capacityBytes / bpf)).rounded())
+        let layout = setup.layout, format = layout.sampleFormat, bpf = layout.bytesPerFrame
+        // Sized by what the ring holds now, so a long `lastSeconds` early on does not fault in a whole ring.
+        let frames = Int(min(lastSeconds * setup.sampleRate, Double(ring.available / bpf)).rounded())
         guard frames > 0 else { return nil }
-        let bytes = UnsafeMutableRawBufferPointer.allocate(byteCount: frames * bpf, alignment: 16)
-        defer { bytes.deallocate() }
-        // Under the producer lock, so a reconfigure cannot change what the bytes mean before they are copied.
-        let (n, now) = producer.withLock { p -> (Int, @Sendable () -> Date) in
-            guard p.setup?.layout == layout, p.plan == plan else { return (0, p.now) }
-            return (ring.copyNewest(into: bytes), p.now)
+        var end = Date()
+        /// Copies the newest frames into `out`, under the producer lock so a reconfigure cannot change
+        /// what the bytes mean first. `out` must be faulted in already: a fresh allocation's page faults
+        /// would otherwise run with `push` blocked (tens of ms for 16 s of 2 MS/s).
+        func copy(into out: UnsafeMutableRawBufferPointer) -> Int {
+            let (n, now) = producer.withLock { p -> (Int, @Sendable () -> Date) in
+                guard p.setup?.layout == layout, p.plan == plan else { return (0, p.now) }
+                return (ring.copyNewest(into: out), p.now)
+            }
+            end = now()
+            return n
         }
-        guard n > 0, let base = bytes.baseAddress else { return nil }
-        let end = now()
-        let count = n / layout.sampleFormat.bytesPerSample
-        let samples = [Float](unsafeUninitializedCapacity: count) { out, initialized in
-            layout.sampleFormat.decode(base, count: count, into: out.baseAddress!)
-            initialized = count
+        let samples: [Float]
+        if format == .float32 {
+            // Straight into the result: no second buffer.
+            samples = [Float](unsafeUninitializedCapacity: frames * 2) { out, initialized in
+                memset(out.baseAddress!, 0, out.count * 4)   // faults it in
+                initialized = copy(into: UnsafeMutableRawBufferPointer(out)) / 4
+            }
+        } else {
+            let bytes = UnsafeMutableRawBufferPointer.allocate(byteCount: frames * bpf, alignment: 16)
+            defer { bytes.deallocate() }
+            memset(bytes.baseAddress!, 0, bytes.count)   // faults it in
+            let count = copy(into: bytes) / format.bytesPerSample
+            samples = [Float](unsafeUninitializedCapacity: count) { out, initialized in
+                if count > 0 { format.decode(bytes.baseAddress!, count: count, into: out.baseAddress!) }
+                initialized = count
+            }
         }
+        guard !samples.isEmpty else { return nil }
         return IQSnapshot(samples: samples, sampleRate: setup.sampleRate, endTime: end)
     }
 

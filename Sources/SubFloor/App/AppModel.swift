@@ -364,6 +364,8 @@ final class AppModel {
     @ObservationIgnored private var lastDiskCheck: ContinuousClock.Instant?
     /// Under 500 MB at the last check, so the warning is shown once per crossing.
     @ObservationIgnored private var diskLow = false
+    /// The hardware frequency last tuned: a change of it is a barrier in the IQ history.
+    @ObservationIgnored private var tunedHardwareHz: Double?
     /// The VFO and mode the audio recorder was last told: a change cuts an auto recording.
     @ObservationIgnored private var audioTuning: (hz: Double, mode: String)?
     /// The VFO and mode when the current audio recording started, for its log entry.
@@ -1000,8 +1002,13 @@ final class AppModel {
     private func retuneHardware() {
         guard sourceKind != .file else { return }
         synthetic.antennaOffset = upconverter.enabled ? upconverter.loHz : 0
+        let hardwareHz = upconverter.hardware(fromDisplay: centerHz)
         do {
-            try activeSource.setCenterFrequency(upconverter.hardware(fromDisplay: centerHz))
+            try activeSource.setCenterFrequency(hardwareHz)
+            // The IQ context is the display centre, so an upconverter toggle or LO change leaves it equal:
+            // forget the IQ from the old RF frequency here (files still roll only on a display change).
+            if let last = tunedHardwareHz, last != hardwareHz { engine.iqRecorder.clearHistory() }
+            tunedHardwareHz = hardwareHz
         } catch {
             show(Banner(kind: .error, message: "Tune failed: \(error)"))
         }
