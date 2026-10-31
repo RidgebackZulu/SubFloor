@@ -83,8 +83,10 @@ extension SynthSpec {
     public static let stanag4285 = SynthSpec.psk(PSK(order: 8, rate: 2400, shape: .rootRaisedCosine(rolloff: 0.2)))
     /// HFDL: PSK at 1800 Bd (QPSK, RRC 0.35).
     public static let hfdl = SynthSpec.psk(PSK(order: 4, rate: 1800, shape: .rootRaisedCosine(rolloff: 0.35)))
-    /// DRM (robustness mode B, 10 kHz): 41.67 Hz spacing, 240 carriers, 1/4 guard interval.
-    public static let drm = SynthSpec.ofdm(OFDM(carriers: 240, spacingHz: 1000 / 24.0, cpFraction: 0.25))
+    /// DRM robustness mode B, 10 kHz: 46.875 Hz spacing (Tu 21.33 ms), 206 carriers, guard 1/4.
+    public static let drm = SynthSpec.ofdm(OFDM(carriers: 206, spacingHz: 46.875, cpFraction: 0.25))
+    /// DRM robustness mode A, 10 kHz: 41.67 Hz spacing (Tu 24 ms), 228 carriers, guard 1/9.
+    public static let drmModeA = SynthSpec.ofdm(OFDM(carriers: 228, spacingHz: 1000 / 24.0, cpFraction: 1.0 / 9))
 
     // MARK: VHF and above digital
 
@@ -150,6 +152,7 @@ extension SynthSpec {
         ("STANAG 4285", stanag4285),
         ("HF fax", hfFax()),
         ("DRM", drm),
+        ("DRM", drmModeA),
         ("HFDL", hfdl),
         ("Time signal (WWV/WWVH/CHU)", timeSignal),
         ("NFM voice", nfmVoice(deviationHz: 2500)),

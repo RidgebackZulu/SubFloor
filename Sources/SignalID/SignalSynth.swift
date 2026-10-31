@@ -8,12 +8,12 @@ import Foundation
 ///
 /// The signal is centred on its occupied band: `offsetHz` in `SignalSynth.make` is the centre of the band
 /// (the carrier for AM, FM and carriers; the middle of the tones for FSK; the middle of the passband for SSB).
-public enum SynthSpec: Sendable, Equatable {
+public enum SynthSpec: Sendable, Hashable {
     /// Noise only. `snrDb` is ignored; the noise has unit power over the whole sample rate.
     case noise
     /// Unmodulated carrier.
     case carrier
-    /// Morse at `wpm` (PARIS timing, random text, 5 ms raised-cosine key edges).
+    /// Morse at `wpm` (PARIS timing, random text, 15 ms raised-cosine key edges, half a dot above 40 WPM).
     case cw(wpm: Double)
     /// Double-sideband AM with full carrier; `depth` is the peak modulation (0…1).
     case am(Audio, depth: Double)
@@ -31,7 +31,7 @@ public enum SynthSpec: Sendable, Equatable {
     indirect case bursts(SynthSpec, Bursts)
 
     /// What modulates an AM or FM carrier. Every kind is peak-normalised to ±1.
-    public enum Audio: Sendable, Equatable {
+    public enum Audio: Sendable, Hashable {
         /// Speech-like noise: −6 dB tilt across `lowHz…highHz`, steep edges, a syllabic envelope with pauses,
         /// driven to an rms of 0.45 of the peak as a transmitter's clipper does (on FM, after 6 dB/octave
         /// pre-emphasis).
@@ -62,7 +62,7 @@ public enum SynthSpec: Sendable, Equatable {
             case .voice(_, let high): high
             case .program(_, let high, let pilot): max(high, pilot ?? 0)
             case .tone(let hz): hz
-            case .afsk(let centre, let fsk): centre + fsk.occupiedBandwidthHz / 2
+            case .afsk(let centre, let fsk): centre + fsk.nominalBandwidthHz / 2
             case .timeTicks: 750
             case .aptVideo: 3500
             case .faxVideo: 60
@@ -71,7 +71,7 @@ public enum SynthSpec: Sendable, Equatable {
     }
 
     /// Continuous-phase FSK. Tone i (0…tones−1) sits at (i − (tones−1)/2) × `spacingHz` from the centre.
-    public struct FSK: Sendable, Equatable {
+    public struct FSK: Sendable, Hashable {
         public var tones: Int
         /// Symbols per second.
         public var rate: Double
@@ -89,17 +89,16 @@ public enum SynthSpec: Sendable, Equatable {
         }
 
         /// (tones − 1) × spacing plus k × rate: rectangular k = 2 (0.9 for MSK-like spacing ≤ rate / 2);
-        /// Gaussian k = 0.75 with BT ≤ 0.5, 1.25 with a wider BT. The −20 dB width of random data, checked
-        /// against the synthesised spectra in the tests.
-        public var occupiedBandwidthHz: Double {
+        /// Gaussian k = 0.75 with BT ≤ 0.5, 1.25 with a wider BT.
+        public var nominalBandwidthHz: Double {
             let k: Double = gaussianBT.map { $0 <= 0.5 ? 0.75 : 1.25 } ?? (spacingHz <= rate / 2 ? 0.9 : 2)
             return Double(tones - 1) * spacingHz + k * rate
         }
     }
 
     /// M-PSK: random symbols on the points e^{j2πk/M}.
-    public struct PSK: Sendable, Equatable {
-        public enum Shape: Sendable, Equatable {
+    public struct PSK: Sendable, Hashable {
+        public enum Shape: Sendable, Hashable {
             /// Root-raised-cosine pulses (span ±8 symbols) with this roll-off.
             case rootRaisedCosine(rolloff: Double)
             /// PSK31-style: raised-cosine pulses two symbols long, so the amplitude dips through zero on a
@@ -119,8 +118,8 @@ public enum SynthSpec: Sendable, Equatable {
             self.shape = shape
         }
 
-        /// rate × (1 + roll-off) for RRC; 1.6 × rate for the cosine pulse (its −20 dB width).
-        public var occupiedBandwidthHz: Double {
+        /// rate × (1 + roll-off) for RRC; 1.6 × rate for the cosine pulse.
+        public var nominalBandwidthHz: Double {
             switch shape {
             case .rootRaisedCosine(let a): rate * (1 + a)
             case .cosine: 1.6 * rate
@@ -130,7 +129,7 @@ public enum SynthSpec: Sendable, Equatable {
 
     /// OFDM: QPSK on every carrier, symbols of 1/spacing plus a cyclic prefix of `cpFraction` of that.
     /// An even carrier count leaves the centre (DC) carrier empty, as DAB does.
-    public struct OFDM: Sendable, Equatable {
+    public struct OFDM: Sendable, Hashable {
         public var carriers: Int
         public var spacingHz: Double
         public var cpFraction: Double
@@ -143,14 +142,14 @@ public enum SynthSpec: Sendable, Equatable {
         }
 
         /// Carriers × spacing (one more spacing for the empty centre of an even count).
-        public var occupiedBandwidthHz: Double {
+        public var nominalBandwidthHz: Double {
             Double(carriers + (carriers.isMultiple(of: 2) ? 1 : 0)) * spacingHz
         }
     }
 
     /// An on/off schedule. Time 0 of the schedule is the start of a period; the capture's first sample is at
     /// `captureStartSeconds` on that clock. Each transmission is a fresh stretch of the inner signal.
-    public struct Bursts: Sendable, Equatable {
+    public struct Bursts: Sendable, Hashable {
         public var periodSeconds: Double
         /// Where the transmission starts within each period.
         public var startSeconds: Double
@@ -173,27 +172,32 @@ public enum SynthSpec: Sendable, Equatable {
         public var duty: Double { onSeconds / periodSeconds }
     }
 
-    /// The −20 dB occupied bandwidth the synthesiser assumes when it scales the noise. It comes from the
-    /// parameters, never from the generated samples:
-    /// - noise: 0 (no signal); carrier: 10 Hz (nominal: a carrier's width is the analysis resolution);
-    /// - CW: 5 × the keying rate in units/s (ITU necessary bandwidth, K = 5): 4.17 × WPM;
+    /// The width the parameters imply, from conventional rules. It sets working and analysis rates; the
+    /// ground truth for the SNR is `occupiedBandwidthHz`, measured on a render.
+    /// - noise: 0; carrier: 10 Hz;
+    /// - CW: 5 × the keying rate in units/s (ITU necessary bandwidth, K = 5), 4.17 × WPM, at least 60 Hz;
     /// - AM: 2 × the highest audio frequency; SSB: `highHz − lowHz`;
     /// - FM: Carson, 2 × (deviation + highest audio frequency);
-    /// - FSK, PSK, OFDM: see their `occupiedBandwidthHz`; bursts: the inner signal's.
-    public var occupiedBandwidthHz: Double {
+    /// - FSK, PSK, OFDM: see their `nominalBandwidthHz`; bursts: the inner signal's.
+    public var nominalBandwidthHz: Double {
         switch self {
         case .noise: 0
         case .carrier: 10
-        case .cw(let wpm): 5 * wpm / 1.2
+        case .cw(let wpm): max(60, 5 * wpm / 1.2)
         case .am(let audio, _): 2 * audio.highestHz
         case .ssb(_, let low, let high): high - low
         case .fm(let audio, let deviation): 2 * (deviation + audio.highestHz)
-        case .fsk(let f): f.occupiedBandwidthHz
-        case .psk(let p): p.occupiedBandwidthHz
-        case .ofdm(let o): o.occupiedBandwidthHz
-        case .bursts(let inner, _): inner.occupiedBandwidthHz
+        case .fsk(let f): f.nominalBandwidthHz
+        case .psk(let p): p.nominalBandwidthHz
+        case .ofdm(let o): o.nominalBandwidthHz
+        case .bursts(let inner, _): inner.nominalBandwidthHz
         }
     }
+
+    /// The occupied (−20 dB) bandwidth: the ground truth the synthesiser scales its noise to and the tests
+    /// compare measurements with. Rendered once per spec and cached (see
+    /// `SignalSynth.occupiedBandwidthHz(for:)`).
+    public var occupiedBandwidthHz: Double { SignalSynth.occupiedBandwidthHz(for: self) }
 
     /// The lowest capture rate that holds the signal comfortably (1.25 × its occupied bandwidth).
     public var minimumSampleRate: Double { max(1.25 * occupiedBandwidthHz, 100) }
@@ -219,7 +223,7 @@ public struct SynthImpairments: Sendable, Equatable {
 
 /// Deterministic test-signal generator for Signal ID's tests (and the app's).
 ///
-/// The signal is built at complex baseband at a working rate of at least 8 × its occupied bandwidth (and
+/// The signal is built at complex baseband at a working rate of at least 8 × its nominal bandwidth (and
 /// 4 kHz), faded and drifted, normalised to unit mean power over the capture, interpolated to `sampleRate`
 /// (polyphase windowed sinc), mixed to `offsetHz`, and joined by complex white Gaussian noise whose power
 /// within `spec.occupiedBandwidthHz` is the signal's mean power / 10^(snrDb/10). The mean power is over
@@ -233,18 +237,32 @@ public enum SignalSynth {
     /// Interleaved IQ (I, Q, I, Q …), `seconds × sampleRate` complex samples.
     public static func make(_ spec: SynthSpec, sampleRate: Double, seconds: Double, snrDb: Double,
                             offsetHz: Double = 0, seed: UInt64, impairments: SynthImpairments = .none) -> [Float] {
+        if case .noise = spec {
+            var out = [Float](repeating: 0, count: 2 * max(0, Int((seconds * sampleRate).rounded())))
+            var noiseRandom = SynthRandom(seed: seed, stream: 1)
+            SynthNoise.add(to: &out, power: 1, random: &noiseRandom)
+            return out
+        }
+        var out = render(spec, sampleRate: sampleRate, seconds: seconds, offsetHz: offsetHz, seed: seed,
+                         impairments: impairments)
+        if snrDb.isFinite && !out.isEmpty {
+            var noiseRandom = SynthRandom(seed: seed, stream: 1)
+            let power = pow(10, -snrDb / 10) * sampleRate / max(occupiedBandwidthHz(for: spec), 1e-9)
+            SynthNoise.add(to: &out, power: power, random: &noiseRandom)
+        }
+        return out
+    }
+
+    /// The noise-free signal at unit mean power.
+    static func render(_ spec: SynthSpec, sampleRate: Double, seconds: Double, offsetHz: Double = 0, seed: UInt64,
+                       impairments: SynthImpairments = .none) -> [Float] {
         precondition(sampleRate > 0 && seconds >= 0)
         let n = Int((seconds * sampleRate).rounded())
         var out = [Float](repeating: 0, count: 2 * n)
         guard n > 0 else { return out }
-        var noiseRandom = SynthRandom(seed: seed, stream: 1)
-        if case .noise = spec {
-            SynthNoise.add(to: &out, power: 1, random: &noiseRandom)
-            return out
-        }
-        let bandwidth = spec.occupiedBandwidthHz
+        if case .noise = spec { return out }
         let excursion = abs(impairments.driftHzPerSecond) * seconds
-        let workingMinimum = max(8 * (bandwidth + excursion), 4000)
+        let workingMinimum = max(8 * (spec.nominalBandwidthHz + excursion), 4000)
         let factor = max(1, Int(sampleRate / workingMinimum))
         let rate = sampleRate / Double(factor)
         let used = (n + factor - 1) / factor
@@ -255,10 +273,6 @@ public enum SignalSynth {
         x.normalisePower(over: used)
         SynthDSP.interpolate(x, factor: factor, into: &out, count: n)
         if offsetHz != 0 { SynthDSP.mix(&out, frequency: offsetHz, sampleRate: sampleRate) }
-        if snrDb.isFinite {
-            let power = pow(10, -snrDb / 10) * sampleRate / max(bandwidth, 1e-9)
-            SynthNoise.add(to: &out, power: power, random: &noiseRandom)
-        }
         return out
     }
 }

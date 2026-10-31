@@ -52,7 +52,7 @@ func bin(_ hz: Double, binHz: Double, size: Int) -> Int { size / 2 + Int((hz / b
             (.ofdm(.init(carriers: 299, spacingHz: 12_500 / 299.0)), 12_500),
         ]
         for (index, (spec, width)) in cases.enumerated() {
-            #expect(abs(spec.occupiedBandwidthHz - width) < 1)
+            #expect(abs(spec.nominalBandwidthHz - width) < 1)
             let offset = 6000.0
             let iq = SignalSynth.make(spec, sampleRate: fs, seconds: 3, snrDb: 20, offsetHz: offset,
                                       seed: UInt64(100 + index))
@@ -62,7 +62,9 @@ func bin(_ hz: Double, binHz: Double, size: Int) -> Int { size / 2 + Int((hz / b
             #expect(found != nil, "no extent for \(width) Hz")
             guard let found else { continue }
             let measured = Double(found.upperBin - found.lowerBin + 1) * binHz
-            #expect(abs(measured / width - 1) <= 0.10, "\(width) Hz measured as \(measured) Hz")
+            let truth = spec.occupiedBandwidthHz
+            #expect(abs(measured / truth - 1) <= 0.10,
+                    "\(width) Hz signal (\(truth) Hz occupied) measured as \(measured) Hz")
             let centre = Double(found.lowerBin + found.upperBin) / 2
             #expect(abs((centre - Double(size / 2)) * binHz - offset) <= 0.05 * width)
         }
@@ -92,28 +94,60 @@ func bin(_ hz: Double, binHz: Double, size: Int) -> Int { size / 2 + Int((hz / b
         }
     }
 
-    @Test func wideShiftFSKAndAMAreEachOneSignal() {
-        // Pointing at one tone of a wide-shift FSK, or at an AM carrier, takes in the whole signal.
-        let cases: [(SynthSpec, Double, Double)] = [   // spec, sample rate, where to point (Hz from centre)
-            (.rtty(baud: 50, shiftHz: 850), 16_000, 425),
-            (.rtty(baud: 45.45, shiftHz: 170), 8000, -85),
-            (.pocsag(baud: 1200), 192_000, -4500),
-            (.amBroadcast, 96_000, 0),
-            (.amVoice, 96_000, 0),
-        ]
-        for (index, (spec, fs, point)) in cases.enumerated() {
-            let size = 4096
+    @Test func amIsOneSignalAndFSKTonesAreTheirOwn() {
+        // Pointing at an AM carrier takes in its symmetric sidebands, across the voice's low-cut gap too.
+        for (index, spec) in [SynthSpec.amBroadcast, .amVoice].enumerated() {
+            let fs = 48_000.0, size = 4096
             let binHz = fs / Double(size)
             let iq = SignalSynth.make(spec, sampleRate: fs, seconds: 4, snrDb: 20, seed: UInt64(500 + index))
-            let db = PowerSpectrum.average(iq, size: size)
-            let found = Extent.find(spectrumDb: db, binHz: binHz, nearBin: bin(point, binHz: binHz, size: size),
-                                    searchBins: 4)
+            let found = Extent.find(spectrumDb: PowerSpectrum.average(iq, size: size), binHz: binHz,
+                                    nearBin: size / 2, searchBins: 4)
             #expect(found != nil, "\(spec)")
             guard let found else { continue }
             let width = Double(found.upperBin - found.lowerBin + 1) * binHz
-            #expect(width >= 0.7 * spec.occupiedBandwidthHz && width <= 1.4 * spec.occupiedBandwidthHz,
+            #expect(abs(width / spec.occupiedBandwidthHz - 1) <= 0.25,
                     "\(spec): \(width) Hz of \(spec.occupiedBandwidthHz)")
         }
+        // The tones of a wide-shift FSK are two extents: spectrally they are two equal signals, and pairing
+        // them is the FSK measurement's job.
+        let fs = 8000.0, size = 4096
+        let binHz = fs / Double(size)
+        let iq = SignalSynth.make(.rtty(baud: 50, shiftHz: 850), sampleRate: fs, seconds: 4, snrDb: 20, seed: 510)
+        let found = Extent.find(spectrumDb: PowerSpectrum.average(iq, size: size), binHz: binHz,
+                                nearBin: bin(425, binHz: binHz, size: size), searchBins: 4)
+        #expect(found != nil)
+        if let found {
+            #expect(found.lowerBin > bin(0, binHz: binHz, size: size), "the extent reached the other tone")
+            #expect((found.lowerBin...found.upperBin).contains(bin(425, binHz: binHz, size: size)))
+        }
+    }
+
+    @Test func neighboursAreNotMerged() {
+        // Hand-built averaged spectra (noise −100 dB): each pointed-at signal comes back alone.
+        func check(_ signals: [(centreHz: Double, widthHz: Double, levelDb: Double)], binHz: Double,
+                   point: Int, expectHz: Double, _ label: String) {
+            let db = handBuilt(bins: 4096, binHz: binHz, signals: signals)
+            let pointBin = Int((signals[point].centreHz / binHz).rounded())
+            let found = Extent.find(spectrumDb: db, binHz: binHz, nearBin: pointBin, searchBins: 4)
+            #expect(found != nil, "\(label)")
+            guard let found else { return }
+            let width = Double(found.upperBin - found.lowerBin + 1) * binHz
+            #expect(abs(width - expectHz) <= 0.1 * expectHz + 4 * binHz, "\(label): \(width) Hz, expected \(expectHz)")
+            #expect((found.lowerBin...found.upperBin).contains(pointBin), "\(label)")
+        }
+        // Three FT8-like 50 Hz signals at 1000, 1200 and 1500 Hz.
+        let ft8 = [(1000.0, 50.0, -80.0), (1200, 50, -80), (1500, 50, -80)]
+        for i in 0..<3 { check(ft8, binHz: 3.125, point: i, expectHz: 50, "FT8 \(i)") }
+        // Two 80 Hz CW signals 800 Hz apart.
+        let cw = [(1000.0, 80.0, -75.0), (1800, 80, -75)]
+        for i in 0..<2 { check(cw, binHz: 5, point: i, expectHz: 80, "CW \(i)") }
+        // Two 7.5 kHz NFM signals in adjacent 12.5 kHz channels.
+        let nfm = [(25_000.0, 7500.0, -80.0), (37_500, 7500, -80)]
+        for i in 0..<2 { check(nfm, binHz: 50, point: i, expectHz: 7500, "NFM \(i)") }
+        // A weak carrier 400 Hz below an SSB signal (650–3350 Hz): pointing at either gives just that one.
+        let ssb = [(2000.0, 2700.0, -80.0), (250, 0, -76)]
+        check(ssb, binHz: 5, point: 0, expectHz: 2700, "SSB beside a carrier")
+        check(ssb, binHz: 5, point: 1, expectHz: 25, "carrier beside SSB")
     }
 
     @Test func noiseAndSplatterAreNotNamed() {
@@ -160,6 +194,33 @@ func bin(_ hz: Double, binHz: Double, size: Int) -> Int { size / 2 + Int((hz / b
         #expect(Extent.find(spectrumDb: skirt, binHz: 10, nearBin: near, searchBins: 4) == nil)
         #expect(Extent.find(spectrumDb: skirt, binHz: 10, nearBin: peakBin, searchBins: 4) != nil)
     }
+}
+
+/// An averaged spectrum built by hand: noise at −100 dB with ±0.3 dB of deterministic ripple, signals with
+/// flat tops (`widthHz` wide at `levelDb`) and 2-bin raised-cosine shoulders, and lines (`widthHz` 0) with a
+/// Blackman-Harris-like main lobe (0, −6, −30, −70 dB at 0, ±1, ±2, ±3 bins). Bin k is k × `binHz`.
+func handBuilt(bins: Int, binHz: Double, signals: [(centreHz: Double, widthHz: Double, levelDb: Double)]) -> [Float] {
+    var random = SystemNoise(seed: 77)
+    var power = (0..<bins).map { _ in pow(10, (-100 + 0.3 * random.next()) / 10) }
+    for s in signals {
+        let centre = s.centreHz / binHz
+        if s.widthHz == 0 {
+            for (offset, db) in [(0, 0.0), (1, -6), (2, -30), (3, -70)] {
+                let c = Int(centre.rounded())
+                for k in Set([c - offset, c + offset]) where k >= 0 && k < bins {
+                    power[k] += pow(10, (s.levelDb + db) / 10)
+                }
+            }
+            continue
+        }
+        let half = s.widthHz / 2 / binHz
+        for k in 0..<bins {
+            let outside = abs(Double(k) - centre) - half
+            let gain = outside <= 0 ? 1 : outside >= 2 ? 0 : 0.5 + 0.5 * cos(Double.pi * outside / 2)
+            power[k] += gain * pow(10, s.levelDb / 10)
+        }
+    }
+    return power.map { Float(10 * log10($0)) }
 }
 
 /// Uniform −1…1, deterministic (LCG): just enough roughness for a hand-built spectrum.

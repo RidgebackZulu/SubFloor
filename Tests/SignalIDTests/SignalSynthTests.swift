@@ -7,15 +7,14 @@ import Testing
 // Self-tests of the test-signal generator, so later tasks can trust it. Every check here uses an
 // independent measurement (spectra, envelopes, a discriminator), never the generator's internals.
 
-/// A sample rate and FFT size that resolve `spec`: 16 × its bandwidth, bins of at most 1/50 of it, and
-/// enough seconds for 8 frames.
+/// A low-cost plan for an independent SNR estimate: 6 × the occupied bandwidth, bins of at most 1/16 of it,
+/// 256 frames.
 private func analysisPlan(_ spec: SynthSpec) -> (rate: Double, size: Int, seconds: Double) {
     let b = spec.occupiedBandwidthHz
-    let rate: Double = b > 1_000_000 ? 2_048_000 : max(16 * b, 800)
-    var size = 256
-    while rate / Double(size) > b / 50 && size < 65_536 { size *= 2 }
-    let seconds: Double = max(3, 8 * Double(size) / rate)
-    return (rate, size, seconds)
+    let rate = 6 * b
+    var size = 64
+    while rate / Double(size) > b / 16 { size *= 2 }
+    return (rate, size, 256 * Double(size) / rate)
 }
 
 /// Power in each bin (linear), from dB.
@@ -96,48 +95,57 @@ private func runs(_ x: [Float], above threshold: Float) -> [(start: Int, length:
         for (found, want) in zip(tones, expected) { #expect(abs(found - want) <= binHz, "tone \(want): \(found)") }
     }
 
-    @Test func snrMatchesTheRequest() {
-        // Independent estimate: noise density from the bins beyond ±B, the signal as everything above it.
-        let specs: [SynthSpec] = [.rtty(), .navtex, .psk31, .usbVoice, .amVoice, .nfmVoice(), .stanag4285, .drm,
-                                  .p25, .dmr, .ft8(captureStartInSlot: 0), .olivia(), .hfFax(), .aprs]
-        for (index, spec) in specs.enumerated() {
-            let plan = analysisPlan(spec)
-            let b = spec.occupiedBandwidthHz
+    @Test func snrMatchesTheRequestForEveryMode() {
+        // Independent estimate: noise density from the bins beyond ±1.5 B, the signal as everything above it,
+        // over the noise in B (the occupied bandwidth).
+        for (index, entry) in SynthSpec.catalogue.enumerated() {
+            let plan = analysisPlan(entry.spec)
+            let b = entry.spec.occupiedBandwidthHz
             for snr in [10.0, 3.0] {
-                let iq = SignalSynth.make(spec, sampleRate: plan.rate, seconds: plan.seconds, snrDb: snr,
-                                          offsetHz: 0, seed: UInt64(300 + index))
+                let iq = SignalSynth.make(entry.spec, sampleRate: plan.rate, seconds: plan.seconds, snrDb: snr,
+                                          seed: UInt64(300 + index))
                 let p = linear(PowerSpectrum.average(iq, size: plan.size, maxFrames: 4096))
                 let binHz = plan.rate / Double(plan.size)
-                let far = p.indices.filter { abs(Double($0 - plan.size / 2) * binHz) > b }
+                let far = p.indices.filter { abs(Double($0 - plan.size / 2) * binHz) > 1.5 * b }
                 let density = far.map { p[$0] }.reduce(0, +) / Double(far.count)
                 let signal = p.reduce(0, +) - density * Double(p.count)
                 let estimate = 10 * log10(signal / (density * b / binHz))
-                #expect(abs(estimate - snr) <= 1, "\(spec) at \(snr) dB: estimated \(estimate) dB")
+                #expect(abs(estimate - snr) <= 1, "\(entry.name) \(entry.spec) at \(snr) dB: estimated \(estimate) dB")
             }
         }
     }
 
-    @Test func occupiedBandwidthMatchesTheSpectrum() {
-        // The declared −20 dB width against the clean spectrum's (levels smoothed over 3 bins). Modes whose
-        // spectrum is a carrier line with weak sidebands (AM, NFM voice, CW) are left out: there the −20 dB
-        // width depends on the resolution, and the declared width is the conventional one.
-        let specs: [SynthSpec] = [.usbVoice, .rtty(baud: 45.45, shiftHz: 170), .rtty(baud: 50, shiftHz: 850),
-                                  .rtty(baud: 75, shiftHz: 425), .navtex, .psk31, .psk63, .ft8(), .ft4(), .wspr(),
-                                  .olivia(), .olivia(tones: 8, bandwidthHz: 250), .mfsk16, .ale, .stanag4285,
-                                  .hfFax(), .drm, .hfdl, .pocsag(baud: 512), .pocsag(baud: 2400), .dmr, .p25,
-                                  .nxdn(baud: 2400), .nxdn(baud: 4800), .dstar, .ysf, .ais, .msk(rate: 2400),
-                                  .noaaAPT]
-        for (index, spec) in specs.enumerated() {
-            let plan = analysisPlan(spec)
-            let iq = SignalSynth.make(spec, sampleRate: plan.rate, seconds: plan.seconds, snrDb: .infinity,
-                                      seed: UInt64(400 + index))
-            let p = linear(PowerSpectrum.average(iq, size: plan.size, maxFrames: 4096))
-            let level = p.indices.map { k in p[max(0, k - 1)...min(p.count - 1, k + 1)].reduce(0, +) }
-            let top = level.max()!
-            let above = level.indices.filter { level[$0] >= top / 100 }
-            let width = Double(above.last! - above.first! + 1) * plan.rate / Double(plan.size)
-            let ratio = width / spec.occupiedBandwidthHz
-            #expect(ratio > 0.85 && ratio < 1.15, "\(spec): −20 dB width \(width) Hz, declared \(spec.occupiedBandwidthHz)")
+    @Test func occupiedBandwidthIsTheRenderedWidth() {
+        // The declared width is the rendered one by construction; an independent render (another seed, rate
+        // and resolution, this file's own fixed-point search) agrees within 6%.
+        for (index, entry) in SynthSpec.catalogue.enumerated() {
+            let declared = entry.spec.occupiedBandwidthHz
+            #expect(declared == SignalSynth.occupiedBandwidthHz(for: entry.spec))
+            guard entry.spec != .carrier else { continue }
+            // 10 × the width, 2048 bins (the cache uses 8 ×, 1024), over 2 s or 128 frames.
+            let rate = 10 * declared, size = 2048
+            let binHz = rate / Double(size)
+            let seconds = min(max(128 * Double(size) / rate, 2), 1_000_000 / rate)
+            let iq = SignalSynth.make(entry.spec, sampleRate: rate, seconds: seconds, snrDb: .infinity,
+                                      seed: UInt64(900 + index))
+            let p = linear(PowerSpectrum.average(iq, size: size, maxFrames: 4096))
+            let total = p.reduce(0, +)
+            var width = declared
+            for _ in 0..<40 {
+                // Edges where the density, averaged over ±1% of the width, falls to 1/100 of the mean
+                // density over the width.
+                let reach = max(1, Int((0.01 * width / binHz).rounded()))
+                let threshold = total * binHz / (100 * width)
+                let above = p.indices.filter { k in
+                    let window = p[max(0, k - reach)...min(size - 1, k + reach)]
+                    return window.reduce(0, +) / Double(window.count) >= threshold
+                }
+                let next = Double(above.last! - above.first! + 1) * binHz
+                if abs(next - width) < binHz / 2 { width = next; break }
+                width = next
+            }
+            #expect(abs(width / declared - 1) <= 0.06,
+                    "\(entry.name) \(entry.spec): rendered \(width) Hz, declared \(declared)")
         }
     }
 
@@ -214,7 +222,7 @@ private func runs(_ x: [Float], above threshold: Float) -> [(start: Int, length:
     @Test func everyCatalogueEntrySynthesises() {
         #expect(Set(SynthSpec.catalogue.map(\.name)).count == 30)
         for (index, entry) in SynthSpec.catalogue.enumerated() {
-            let fs = entry.spec.occupiedBandwidthHz > 1_000_000 ? 2_048_000 : max(2 * entry.spec.minimumSampleRate, 8000)
+            let fs = max(2 * entry.spec.minimumSampleRate, 8000)
             let iq = SignalSynth.make(entry.spec, sampleRate: fs, seconds: 0.5, snrDb: 10, offsetHz: 0.05 * fs,
                                       seed: UInt64(index))
             #expect(iq.count == 2 * Int((0.5 * fs).rounded()))

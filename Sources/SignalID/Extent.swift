@@ -11,11 +11,13 @@ import Foundation
 /// found again after each growth until it settles. Levels are smoothed over 3 bins for the climbing, the
 /// growing and the 6 dB test. `lowerBin…upperBin` is inclusive; `peakBin` is its strongest (unsmoothed) bin.
 ///
-/// Growth also bridges a gap to a further region of signal (two contiguous bins 6 dB over the noise) in two
-/// cases: a twin (peak within 6 dB and width within 2× of the region beside the gap, across no more than
-/// 12 of its widths: the tones of a wide-shift FSK), and the sidebands of a carrier (the peak's own region
-/// is a narrow line, at most 30 Hz or 12 bins, and the gap at most 10 of its widths or 600 Hz: AM with a
-/// low-cut audio filter).
+/// When the peak's own region is a carrier line (at most 30 Hz, or 10 bins: a Blackman-Harris main lobe and
+/// the smoothing), growth also takes in sidebands that sit symmetrically about it (AM whose audio has a
+/// low-cut leaves a gap beside the carrier): the level mirrored about the line, min(left, right) over 5
+/// bins, must rise 6 dB over the noise within 10 line widths or 600 Hz of it, and the extent runs out to
+/// where that mirrored level stays below noise + 3 dB. A neighbour on one side only is never taken in.
+/// Separate signals side by side are never merged otherwise: two equal tones (a wide-shift FSK) are two
+/// extents here, and pairing them is the FSK measurement's job (the instantaneous-frequency histogram).
 ///
 /// It returns nil when:
 /// - nothing within `searchBins` stands 6 dB above the local noise;
@@ -29,13 +31,11 @@ public enum Extent {
     static let edgeDb = 3.0
     static let skirtDb = 20.0
     static let noiseWidths = 10
-    static let twinLevelDb = 6.0
-    static let twinWidthRatio = 2.0
-    static let twinGapWidths = 12
     static let lineMaxHz = 30.0
-    static let lineMaxBins = 12
-    static let lineGapWidths = 10
-    static let lineGapHz = 600.0
+    static let lineMaxBins = 10
+    static let sidebandGapWidths = 10
+    static let sidebandGapHz = 600.0
+    static let mirrorSmoothing = 2
 
     public static func find(spectrumDb: [Float], binHz: Double, nearBin: Int,
                             searchBins: Int) -> (lowerBin: Int, upperBin: Int, peakBin: Int, snrDb: Double)? {
@@ -86,43 +86,43 @@ public enum Extent {
 
     // MARK: Growth
 
-    /// The region around `top` at ≥ noise + 3 dB, bridged across gaps to twins and to a carrier's sidebands.
+    /// The region around `top` at ≥ noise + 3 dB, and a line's symmetric sidebands.
     private static func grow(_ level: [Double], from top: Int, noise: Double, binHz: Double) -> ClosedRange<Int> {
         let edge = noise * pow(10, edgeDb / 10)
         let detect = noise * pow(10, detectDb / 10)
         let n = level.count
         let core = region(level, from: top, above: edge)
-        let isLine = Double(core.count) * binHz <= max(lineMaxHz, Double(lineMaxBins) * binHz)
-        var lower = core.lowerBound, upper = core.upperBound
-        for direction in [-1, 1] {
-            var adjacent = core
-            while true {
-                let edgeBin = direction < 0 ? lower : upper
-                let width = adjacent.count
-                let fromLine = isLine && adjacent == core
-                let reach = fromLine ? max(lineGapWidths * width, Int(lineGapHz / binHz)) : twinGapWidths * width
-                // Further regions start with two contiguous bins 6 dB up. A carrier takes the nearest; a
-                // region takes the nearest twin, passing over smaller bumps in between.
-                let nearPeak = adjacent.map { level[$0] }.max()!
-                var accepted: ClosedRange<Int>?
-                var k = edgeBin + direction
-                while accepted == nil, abs(k - edgeBin) <= reach + 1, k + direction >= 0, k + direction < n {
-                    guard level[k] >= detect && level[k + direction] >= detect else { k += direction; continue }
-                    let far = region(level, from: k, above: edge)
-                    let gap = direction < 0 ? edgeBin - far.upperBound - 1 : far.lowerBound - edgeBin - 1
-                    guard gap <= reach else { break }
-                    let farPeak = far.map { level[$0] }.max()!
-                    let twin = abs(10 * log10(farPeak / nearPeak)) <= twinLevelDb
-                        && Double(min(far.count, width)) / Double(max(far.count, width)) >= 1 / twinWidthRatio
-                    if fromLine || twin { accepted = far }
-                    k = (direction < 0 ? far.lowerBound : far.upperBound) + direction
-                }
-                guard let far = accepted else { break }
-                if direction < 0 { lower = far.lowerBound } else { upper = far.upperBound }
-                adjacent = far
+        guard Double(core.count) * binHz <= max(lineMaxHz, Double(lineMaxBins) * binHz) else { return core }
+        // Mirrored about the line: both sides must carry signal at the same distance.
+        let half = max(top - core.lowerBound, core.upperBound - top)
+        let limit = min(top, n - 1 - top)
+        guard limit > mirrorSmoothing + 1 else { return core }
+        func mirrored(_ d: Int) -> Double {
+            var left = 0.0, right = 0.0, count = 0
+            for j in max(1, d - mirrorSmoothing)...min(limit, d + mirrorSmoothing) {
+                left += level[top - j]
+                right += level[top + j]
+                count += 1
             }
+            return min(left, right) / Double(max(count, 1))
         }
-        return lower...upper
+        let reach = half + max(sidebandGapWidths * core.count, Int(sidebandGapHz / binHz))
+        var d = half + 1
+        var start: Int?
+        while d + 1 <= min(reach, limit) {
+            if mirrored(d) >= detect && mirrored(d + 1) >= detect { start = d; break }
+            d += 1
+        }
+        guard var outer = start else { return core }
+        // Out to where the mirrored level stays below noise + 3 dB (dips shorter than 3 bins or 10% bridged).
+        var k = outer + 1
+        while k <= limit {
+            if mirrored(k) >= edge { outer = k; k += 1; continue }
+            let tolerance = max(3, outer / 10)
+            guard k - outer <= tolerance else { break }
+            k += 1
+        }
+        return min(core.lowerBound, top - outer)...max(core.upperBound, top + outer)
     }
 
     /// The contiguous bins around `bin` at or above `threshold` (at least `bin` itself).

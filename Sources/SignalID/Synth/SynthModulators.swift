@@ -46,7 +46,8 @@ enum SynthModulators {
     private static let words = ["CQ", "DE", "TEST", "K", "PSE", "QTH", "NAME", "RST", "599", "TU", "73", "UR",
                                 "ES", "HR", "WX", "RIG", "ANT", "FB", "OM", "BK", "QRZ", "AGN", "GM", "5NN"]
 
-    /// 0…1 key of random Morse text at `wpm`, starting at a random point of the text, 5 ms edges.
+    /// 0…1 key of random Morse text at `wpm`, starting at a random point of the text, with raised-cosine
+    /// edges 15 ms long (half a dot above 40 WPM).
     static func morseKey(wpm: Double, rate: Double, count n: Int, random: inout SynthRandom) -> [Float] {
         let unit = MorseCode.dotSeconds(wpm: wpm)
         let skip = random.uniform(0...2)
@@ -70,7 +71,7 @@ enum SynthModulators {
             t = end
             if t * rate >= Double(n) { break }
         }
-        return SynthDSP.smoothKey(key, rate: rate, seconds: min(0.005, unit / 3))
+        return SynthDSP.smoothKey(key, rate: rate, seconds: min(0.015, unit / 2))
     }
 
     /// Speech-like noise in the passband (the lower audio frequencies at the carrier side), −6 dB tilt
