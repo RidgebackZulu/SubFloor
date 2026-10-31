@@ -107,6 +107,20 @@ struct DecodeHistoryTests {
         #expect(history.stations(since: day0.addingTimeInterval(100)).map(\.call) == ["W1AW"])
     }
 
+    @Test func stationsCanBeLimitedToOneMode() {
+        let folder = tempFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let history = DecodeHistory(folder: folder, now: { day0.addingTimeInterval(3_600) })
+        history.append([
+            heard(0, "CQ K1ABC FN42"),
+            heard(30, mode: .wspr, rfHz: 14_097_000, "W1AW FN31 37"),
+            heard(60, "CQ N0CALL EM10"),
+        ])
+        #expect(history.stations(since: day0, mode: "ft8").map(\.call) == ["N0CALL", "K1ABC"])
+        #expect(history.stations(since: day0, mode: "wspr").map(\.call) == ["W1AW"])
+        #expect(Set(history.stations(since: day0).map(\.call)) == ["K1ABC", "N0CALL", "W1AW"])
+    }
+
     @Test func prunesDayFilesOlderThanKeepDays() {
         let folder = tempFolder()
         defer { try? FileManager.default.removeItem(at: folder) }

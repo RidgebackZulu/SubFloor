@@ -61,7 +61,8 @@ public enum BandPlan {
 
 /// Thirty days of decoded FT8/WSPR messages, kept one JSON line per decode in a file per UTC day
 /// (`2026-10-01.jsonl`). The last 168 hours are held in memory, loaded on first use; older queries
-/// read the day files. Writes happen on a private serial queue.
+/// read the day files. All state belongs to a private serial queue: `append` only enqueues (it is
+/// called from the main thread and never waits on file I/O); queries wait for the queue.
 public final class DecodeHistory: @unchecked Sendable {
     private static let recentWindow: TimeInterval = 168 * 3_600
 
@@ -69,11 +70,10 @@ public final class DecodeHistory: @unchecked Sendable {
     private let keepDays: Int
     private let now: @Sendable () -> Date
     private let queue = DispatchQueue(label: "SubFloor.DecodeHistory")
-    /// Guards `recent` and `recentLoaded`. Taken before the queue, never inside it.
-    private let lock = NSLock()
+    // Queue only from here.
     private var recent: [HeardDecode] = []
     private var recentLoaded = false
-    /// The UTC day number of the last prune (queue only).
+    /// The UTC day number of the last prune.
     private var prunedDay: Int?
 
     private static let utc: Calendar = {
@@ -96,34 +96,35 @@ public final class DecodeHistory: @unchecked Sendable {
 
     public func append(_ decodes: [HeardDecode]) {
         guard !decodes.isEmpty else { return }
-        lock.lock()
-        defer { lock.unlock() }
-        // Queued under the lock, so a concurrent load reads the file either with or without these
-        // decodes and memory gets them in exactly the other case.
-        queue.async { self.write(decodes) }
-        guard recentLoaded else { return }
-        let cutoff = now().addingTimeInterval(-Self.recentWindow)
-        recent.removeAll { $0.time < cutoff }
-        recent.append(contentsOf: decodes.filter { $0.time >= cutoff })
+        queue.async {
+            self.write(decodes)
+            guard self.recentLoaded else { return }   // the file has them for the load
+            let cutoff = self.now().addingTimeInterval(-Self.recentWindow)
+            self.recent.removeAll { $0.time < cutoff }
+            self.recent.append(contentsOf: decodes.filter { $0.time >= cutoff })
+        }
     }
 
     /// Newest first.
     public func decodes(since: Date, until: Date = .distantFuture, mode: String? = nil) -> [HeardDecode] {
-        let cutoff = now().addingTimeInterval(-Self.recentWindow)
-        var found: [HeardDecode]
-        if since >= cutoff {
-            found = loadedRecent()
-        } else {
-            found = queue.sync { readDays(from: since, to: min(until, now())) }
+        let found: [HeardDecode] = queue.sync {
+            let t = now()
+            let cutoff = t.addingTimeInterval(-Self.recentWindow)
+            guard since >= cutoff else { return readDays(from: since, to: min(until, t)) }
+            if !recentLoaded {
+                recent = readDays(from: cutoff, to: t)
+                recentLoaded = true
+            }
+            return recent
         }
-        found = found.filter { $0.time >= since && $0.time <= until && (mode == nil || $0.mode == mode) }
-        return found.enumerated().sorted { ($0.element.time, $1.offset) > ($1.element.time, $0.offset) }.map(\.element)
+        return found.filter { $0.time >= since && $0.time <= until && (mode == nil || $0.mode == mode) }
+            .enumerated().sorted { ($0.element.time, $1.offset) > ($1.element.time, $0.offset) }.map(\.element)
     }
 
-    /// One row per sender heard since `since`, most recently heard first.
-    public func stations(since: Date) -> [HeardStation] {
+    /// One row per sender heard since `since` (in one mode, or any), most recently heard first.
+    public func stations(since: Date, mode: String? = nil) -> [HeardStation] {
         var byCall: [String: HeardStation] = [:]
-        for d in decodes(since: since).reversed() {
+        for d in decodes(since: since, mode: mode).reversed() {
             guard let call = d.from else { continue }
             let band = BandPlan.name(forHz: d.rfHz)
             if var s = byCall[call] {
@@ -143,19 +144,6 @@ public final class DecodeHistory: @unchecked Sendable {
 
     /// Waits for pending writes (tests).
     public func flush() { queue.sync {} }
-
-    // MARK: Memory
-
-    private func loadedRecent() -> [HeardDecode] {
-        lock.lock()
-        defer { lock.unlock() }
-        if !recentLoaded {
-            let t = now()
-            recent = queue.sync { readDays(from: t.addingTimeInterval(-Self.recentWindow), to: t) }
-            recentLoaded = true
-        }
-        return recent
-    }
 
     // MARK: Files (queue)
 
