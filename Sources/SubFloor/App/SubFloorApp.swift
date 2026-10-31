@@ -107,6 +107,15 @@ struct SubFloorApp: App {
         .defaultSize(width: 1400, height: 640)
         .defaultLaunchBehavior(.suppressed)
 
+        Window("MCP Server", id: "mcp") {
+            MCPWindow()
+                .environment(mcp)
+                .preferredColorScheme(scheme)
+                .tint(Theme.accent)
+        }
+        .defaultSize(width: 900, height: 680)
+        .defaultLaunchBehavior(.suppressed)
+
         Settings {
             SettingsView()
                 .environment(model)
@@ -153,6 +162,8 @@ struct RadioCommands: Commands {
             Button("Recordings…") { openWindow(id: "recordings") }
                 .keyboardShortcut("l", modifiers: [.command, .shift])
             Button("Show Recordings in Finder") { model.revealRecordings() }
+            Divider()
+            Button("MCP Server…") { openWindow(id: "mcp") }
         }
     }
 }

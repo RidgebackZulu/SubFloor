@@ -11,6 +11,7 @@ struct TopBarView: View {
         HStack(spacing: 14) {
             DeviceChip()
             DialChip()
+            MCPButton()
             Button { model.toggleRun() } label: {
                 Image(systemName: model.isRunning ? "stop.fill" : "play.fill").frame(width: 18)
             }
