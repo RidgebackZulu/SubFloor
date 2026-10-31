@@ -26,6 +26,10 @@ import Testing
                 #expect(s.extra?.text.contains("SUBFLOOR_MCP_TOKEN=tok123") == true)
                 // Claude Code takes one slash command per prompt.
                 #expect(s.whereItGoes.contains("one at a time"))
+            case "Codex CLI":
+                // A 60 s listen plus its transcript outlasts Codex's default 60 s tool timeout.
+                #expect(s.text.contains("tool_timeout_sec = 120"))
+                #expect(all.contains("tok123"))
             case "Hermes Agent":
                 // Hermes asks for the token itself: the text is the command alone.
                 #expect(s.text == "hermes mcp add subfloor --url \(Self.url) --auth header")

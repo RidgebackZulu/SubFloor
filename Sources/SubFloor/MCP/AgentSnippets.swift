@@ -114,11 +114,13 @@ enum AgentSnippets {
                 id: "codex", name: "Codex CLI",
                 whereItGoes: "~/.codex/config.toml. Restart Codex sessions after the change. Codex asks before each "
                     + "tool that changes the radio, and codex exec cancels them: add default_tools_approval_mode = "
-                    + "\"approve\" to the block to allow them.",
+                    + "\"approve\" to the block to allow them. tool_timeout_sec gives a 60 s listen and its "
+                    + "transcript time to finish.",
                 text: """
                     [mcp_servers.subfloor]
                     url = "\(url)"
                     http_headers = { "Authorization" = "Bearer \(token)" }
+                    tool_timeout_sec = 120
                     """),
             AgentSnippet(
                 id: "gemini", name: "Gemini CLI",

@@ -24,7 +24,7 @@ struct MCPEndToEndTests {
     @Test(.enabled(if: env["SUBFLOOR_MCP_E2E"] == "1", "set SUBFLOOR_MCP_E2E=1 to serve for agents"))
     func serveForAgents() async throws {
         let port = Int(Self.env["SUBFLOOR_MCP_E2E_PORT"] ?? "") ?? 7899
-        #expect(port != MCPSettings.defaultPort, "7824 is the owner's SubFloor")
+        try #require(port != MCPSettings.defaultPort, "7824 is the owner's SubFloor")
         let seconds = Double(Self.env["SUBFLOOR_MCP_E2E_SECONDS"] ?? "") ?? 300
         let token = Self.env["SUBFLOOR_MCP_E2E_TOKEN"].flatMap { $0.isEmpty ? nil : $0 } ?? MCPAuth.generateToken()
         let info = URL(fileURLWithPath: Self.env["SUBFLOOR_MCP_E2E_INFO"]
@@ -32,11 +32,17 @@ struct MCPEndToEndTests {
 
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("SubFloorE2E-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let modelSuite = "SubFloorE2E-\(UUID().uuidString)", serverSuite = "SubFloorE2E-\(UUID().uuidString)"
+        defer {
+            try? FileManager.default.removeItem(at: dir)
+            for suite in [modelSuite, serverSuite] { UserDefaults.standard.removePersistentDomain(forName: suite) }
+        }
         let m = AppModel(bookmarkStore: BookmarkStore(url: dir.appendingPathComponent("bookmarks.json")),
-                         defaults: UserDefaults(suiteName: "SubFloorE2E-\(UUID().uuidString)")!,
+                         defaults: UserDefaults(suiteName: modelSuite)!,
                          apiKeyStore: MemoryAPIKeyStore(),
                          openRSP: { throw CancellationError() }, rspOpenTimeout: .seconds(10),
                          decodeHistoryFolder: dir.appendingPathComponent("decodes"))
+        defer { m.shutdown() }   // before the folder goes
         m.recording.folderPath = dir.appendingPathComponent("rec").path
         m.volume = 0   // the owner's SubFloor may be playing
         m.useSource(.synthetic)
@@ -44,7 +50,7 @@ struct MCPEndToEndTests {
 
         let tools = SubFloorTools(model: m)
         let log = MCPLog(fileURL: info.deletingLastPathComponent().appendingPathComponent("mcp-e2e.log"))
-        let server = MCPServer(provider: tools, defaults: UserDefaults(suiteName: "SubFloorE2E-\(UUID().uuidString)")!,
+        let server = MCPServer(provider: tools, defaults: UserDefaults(suiteName: serverSuite)!,
                                tokenStore: MemoryAPIKeyStore(key: token), log: log)
         tools.connectedClients = { [weak server] in server?.connectedClients ?? [] }
         await server.apply(MCPSettings(enabled: true, port: port))
