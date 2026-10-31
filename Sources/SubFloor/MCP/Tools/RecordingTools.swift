@@ -21,27 +21,13 @@ final class AgentRecording {
     }
 }
 
-/// The Auto an agent turned on, and the task that turns it off at `offAt` (`set_auto_record`).
-@MainActor
-final class AgentAuto {
-    /// `AppModel.autoRecordChanges` once the agent had turned Auto on: any change since is the owner's.
-    let changes: Int
-    var offAt: Date
-    var task: Task<Void, Never>?
-
-    init(changes: Int, offAt: Date) {
-        self.changes = changes
-        self.offAt = offAt
-    }
-}
-
 /// Listening, recording, Auto, and the recordings and their transcripts. Agents never delete a recording, every
 /// recording an agent starts stops by itself, and the owner always wins: what the owner started or changed is
 /// left as it is.
 extension SubFloorTools {
     static var recordingTools: [SubFloorTool] {
         [
-            SubFloorTool("listen", title: "Listen", readOnly: false, description: """
+            SubFloorTool("listen", title: "Listen", readOnly: false, locksRadio: false, description: """
                 Hear the current frequency for seconds (2–60, default 15) and report what came through: the \
                 signal level over that time (level_dbfs min, median, max, sampled every 200 ms), how long the \
                 squelch was open (squelch_open_seconds; all of it when the squelch is off) and, when the owner has \
@@ -49,8 +35,8 @@ extension SubFloorTools {
                 {text, verdict: "voice" or "possible_noise", words (how many kept)} (about $0.0001 per 15 s; \
                 transcribe: false skips it, and note says why there is none). keep: true saves the clip as a \
                 recording in the owner's Recordings and returns its file. Needs the radio running. If the owner \
-                retunes, changes mode or stops the radio meanwhile, it stops early and returns {interrupted} \
-                saying which. Returns {seconds, level_dbfs, squelch_open_seconds, transcribed, transcript?, note?, \
+                or another agent retunes, changes mode or stops the radio meanwhile, it stops early and returns \
+                {interrupted} saying what changed and by whom, e.g. "retuned to 7.2 MHz by the owner". Returns {seconds, level_dbfs, squelch_open_seconds, transcribed, transcript?, note?, \
                 file?}.
                 """, properties: [
                     "seconds": .schema("number", "How long to listen, 2–60 s (default 15)."),
@@ -80,8 +66,9 @@ extension SubFloorTools {
                 Turn Auto-record on or off. Auto records each transmission that opens the squelch, so it needs the \
                 squelch on (set_squelch); it records only while the radio runs on the RSP1B, and waits otherwise \
                 (auto_state says why). With on: true it turns itself off after minutes (default 60, at most 720), \
-                unless the owner turns it off and on meanwhile; if the owner had it on already it stays on with no \
-                limit. Returns {on, auto_state, off_at?, note?}.
+                even across a relaunch, unless the owner turns it off and on meanwhile; if the owner had it on \
+                already it stays on with no limit. on: false turns off only an agent's Auto: the owner's is left on \
+                (an error says so). Returns {on, auto_state, off_at?, note?}.
                 """, properties: [
                     "on": .schema("boolean", "Auto on or off."),
                     "minutes": .schema("number", "With on: turn Auto off after this many minutes (default 60, at most 720)."),
@@ -127,28 +114,33 @@ extension SubFloorTools {
     /// How often `listen` samples the signal level and checks the tuning.
     static let listenPoll: Duration = .milliseconds(200)
 
-    /// Why `listen` must stop, if the owner changed the radio since it began.
-    private func interruption(vfo: Double, mode: DemodMode) -> String? {
-        let m = model
-        if !m.isRunning { return "the radio stopped" }
-        if m.vfoHz != vfo { return "retuned to \(FrequencyFormatter.short(m.vfoHz))" }
-        if m.mode != mode { return "mode changed to \(m.mode.label)" }
-        return nil
+    /// Why `listen` must stop, if the owner or an agent changed the radio from `start` since `since`.
+    private func interruption(from start: RadioState, since: Date) -> String? {
+        let now = radioState
+        guard now != start else { return nil }
+        let who = changedBy(now, since: since)
+        if !now.running { return "the radio stopped by \(who)" }
+        if now.vfoHz != start.vfoHz { return "retuned to \(FrequencyFormatter.short(now.vfoHz)) by \(who)" }
+        return "mode changed to \(now.mode.label) by \(who)"
     }
 
     func listen(_ args: ToolArguments) async throws -> [String: JSONValue] {
         let seconds = try args.double("seconds", default: 15, in: Self.listenSeconds)
         let wantsTranscript = try args.bool("transcribe", default: true)
         let keep = try args.bool("keep", default: false)
-        try requireRunning()
         let m = model, tap = m.engine.audioTap
-        let vfo = m.vfoHz, mode = m.mode
-        let mark = tap.mark(), start = Date()
+        // The radio lock only to start: after the changes queued before this call, and not in the way of those
+        // that come while it listens, which interrupt it.
+        let (initial, mark, start) = try await withRadio { () throws -> (RadioState, AudioTap.Mark, Date) in
+            try requireRunning()
+            return (radioState, tap.mark(), Date())
+        }
+        let vfo = initial.vfoHz, mode = initial.mode
         let end = ContinuousClock.now + .milliseconds(Int(seconds * 1000))
         var levels: [Float] = []
         while ContinuousClock.now < end {
             do { try await Task.sleep(for: min(Self.listenPoll, end - ContinuousClock.now)) } catch { break }
-            if let why = interruption(vfo: vfo, mode: mode) {
+            if let why = interruption(from: initial, since: start) {
                 return ["interrupted": .string(why), "seconds": .num(Self.tenths(Date().timeIntervalSince(start)))]
             }
             levels.append(m.signalDb)
@@ -347,39 +339,17 @@ extension SubFloorTools {
             if !notes.isEmpty { r["note"] = .string(notes.joined(separator: " ")) }
             return r
         }
+        // Auto with no time limit is the owner's: an agent neither turns it off nor puts a limit on it.
+        let ownersAuto = m.autoRecordEnabled && m.autoRecordOffAt == nil
         guard on else {
-            agentAuto?.task?.cancel()
-            agentAuto = nil
+            guard !ownersAuto else { throw ToolError("Auto was turned on by the owner: left on.") }
             m.autoRecordEnabled = false
             return result()
         }
         guard m.squelchEnabled else { throw ToolError("Turn the squelch on first (set_squelch).") }
+        if ownersAuto { return result(note: "Auto was already on (the owner's): it stays on, with no time limit.") }
         let offAt = Date().addingTimeInterval(minutes * 60)
-        if m.autoRecordEnabled {
-            // Still the agent's (nothing has changed it since): a new time. Otherwise it is the owner's.
-            if let a = agentAuto, a.changes == m.autoRecordChanges {
-                a.offAt = offAt
-                return result(offAt: offAt)
-            }
-            return result(note: "Auto was already on (the owner's): it stays on, with no time limit.")
-        }
-        m.autoRecordEnabled = true
-        agentAuto?.task?.cancel()
-        let a = AgentAuto(changes: m.autoRecordChanges, offAt: offAt)
-        agentAuto = a
-        a.task = Task { [weak self] in
-            while true {
-                let left = a.offAt.timeIntervalSinceNow
-                if left <= 0 { break }
-                do { try await Task.sleep(for: .milliseconds(Int(min(left, 1) * 1000) + 1)) } catch { return }
-                guard let self, self.model.autoRecordChanges == a.changes else { break }
-            }
-            guard let self else { return }
-            if self.agentAuto === a { self.agentAuto = nil }
-            if self.model.autoRecordChanges == a.changes && self.model.autoRecordEnabled {
-                self.model.autoRecordEnabled = false
-            }
-        }
+        m.turnOnAutoRecord(until: offAt)   // an agent's own Auto gets the new time
         return result(offAt: offAt)
     }
 

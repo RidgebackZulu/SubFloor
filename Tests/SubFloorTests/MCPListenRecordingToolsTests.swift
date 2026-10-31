@@ -36,12 +36,12 @@ final class ListenTranscriber: @unchecked Sendable {
 @MainActor
 @Suite(.serialized)
 struct MCPListenRecordingToolsTests {
-    private func makeModel(key: String? = "sk-or-test",
-                           transcriber: ListenTranscriber = ListenTranscriber()) -> (AppModel, URL) {
+    private func makeModel(key: String? = "sk-or-test", transcriber: ListenTranscriber = ListenTranscriber(),
+                           defaults: UserDefaults? = nil) -> (AppModel, URL) {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("SubFloorListenTests-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let m = AppModel(bookmarkStore: BookmarkStore(url: dir.appendingPathComponent("bookmarks.json")),
-                         defaults: UserDefaults(suiteName: UUID().uuidString)!,
+                         defaults: defaults ?? UserDefaults(suiteName: UUID().uuidString)!,
                          apiKeyStore: MemoryAPIKeyStore(key: key), transcribe: transcriber.function,
                          openRSP: { throw CancellationError() }, rspOpenTimeout: .seconds(10),
                          decodeHistoryFolder: dir.appendingPathComponent("decodes"))
@@ -56,8 +56,9 @@ struct MCPListenRecordingToolsTests {
         return m.isRunning
     }
 
-    private func call(_ tools: SubFloorTools, _ name: String, _ arguments: [String: JSONValue] = [:]) async -> MCPToolResult {
-        await tools.call(name, arguments: arguments, client: "test-agent 1.0")
+    private func call(_ tools: SubFloorTools, _ name: String, _ arguments: [String: JSONValue] = [:],
+                      client: String = "test-agent 1.0") async -> MCPToolResult {
+        await tools.call(name, arguments: arguments, client: client)
     }
 
     /// Waits (letting the main actor run) until `condition` holds or `seconds` pass.
@@ -145,8 +146,32 @@ struct MCPListenRecordingToolsTests {
         let r = await listening.value
         #expect(ContinuousClock.now - started < .seconds(1.5))
         #expect(!r.isError, "\(r.content)")
-        #expect(r.structured?["interrupted"]?.string == "retuned to \(FrequencyFormatter.short(7_200_000))")
+        #expect(r.structured?["interrupted"]?.string == "retuned to \(FrequencyFormatter.short(7_200_000)) by the owner")
         #expect(r.structured?["interrupted"]?.string?.hasPrefix("retuned to") == true)
+    }
+
+    /// Another agent's tune is not held up by a listen: it goes through at once, and the listen stops and names it.
+    @Test func listenStopsWhenAnotherAgentRetunes() async throws {
+        let (m, _) = makeModel()
+        defer { m.shutdown() }
+        guard runDemo(m) else { return }
+        let tools = SubFloorTools(model: m)
+        let started = ContinuousClock.now
+        let listening = Task { @MainActor in await call(tools, "listen", ["seconds": .number(10)], client: "agent-a 1.0") }
+        try await Task.sleep(for: .milliseconds(500))
+        let tuneStarted = ContinuousClock.now
+        let tune = await call(tools, "tune", ["frequency": .string("7.2 MHz")], client: "claude-code 2.1")
+        #expect(ContinuousClock.now - tuneStarted < .milliseconds(500))
+        #expect(!tune.isError, "\(tune.content)")
+        #expect(m.vfoHz == 7_200_000)
+        let r = await listening.value
+        #expect(ContinuousClock.now - started < .seconds(1.5))
+        #expect(r.structured?["interrupted"]?.string == "retuned to \(FrequencyFormatter.short(7_200_000)) by claude-code 2.1")
+        // The owner's change after the agent's is the owner's.
+        let again = Task { @MainActor in await call(tools, "listen", ["seconds": .number(10)], client: "agent-a 1.0") }
+        try await Task.sleep(for: .milliseconds(300))
+        m.tune(to: 7_250_000)
+        #expect(await again.value.structured?["interrupted"]?.string?.hasSuffix("by the owner") == true)
     }
 
     @Test func listenStopsWhenTheModeChangesOrTheRadioStops() async throws {
@@ -158,12 +183,12 @@ struct MCPListenRecordingToolsTests {
         let first = Task { @MainActor in await call(tools, "listen", ["seconds": .number(10)]) }
         try await Task.sleep(for: .milliseconds(300))
         m.setMode(.am)
-        #expect(await first.value.structured?["interrupted"]?.string == "mode changed to AM")
+        #expect(await first.value.structured?["interrupted"]?.string == "mode changed to AM by the owner")
 
         let second = Task { @MainActor in await call(tools, "listen", ["seconds": .number(10)]) }
         try await Task.sleep(for: .milliseconds(300))
         m.stop()
-        #expect(await second.value.structured?["interrupted"]?.string == "the radio stopped")
+        #expect(await second.value.structured?["interrupted"]?.string == "the radio stopped by the owner")
     }
 
     @Test func listenKeepsTheClipAsARecording() async {
@@ -307,9 +332,55 @@ struct MCPListenRecordingToolsTests {
         try await Task.sleep(for: .seconds(2))
         #expect(m.autoRecordEnabled)
 
+        // Nor does an agent turn the owner's Auto off.
+        let refused = await call(tools, "set_auto_record", ["on": .bool(false)])
+        #expect(refused.isError)
+        #expect(refused.content == "Auto was turned on by the owner: left on.")
+        #expect(m.autoRecordEnabled)
+
+        // An agent's own Auto it may turn off.
+        m.autoRecordEnabled = false
+        _ = await call(tools, "set_auto_record", ["on": .bool(true), "minutes": .number(10)])
         let off = await call(tools, "set_auto_record", ["on": .bool(false)])
+        #expect(!off.isError, "\(off.content)")
         #expect(off.structured?["on"]?.bool == false)
         #expect(!m.autoRecordEnabled)
+        #expect(m.autoRecordOffAt == nil)
+    }
+
+    /// The agent's limit is saved with Auto: a relaunch past it turns Auto off, one before it waits for it.
+    @Test func autoLimitSurvivesARelaunch() async throws {
+        let defaults = UserDefaults(suiteName: UUID().uuidString)!
+        let (first, _) = makeModel(defaults: defaults)
+        first.squelchEnabled = true
+        let r = await call(SubFloorTools(model: first), "set_auto_record", ["on": .bool(true), "minutes": .number(0.01)])
+        #expect(!r.isError, "\(r.content)")
+        first.shutdown()   // quits with Auto on and 0.6 s to go
+        try await Task.sleep(for: .seconds(1))
+        let (late, _) = makeModel(defaults: defaults)
+        #expect(!late.autoRecordEnabled)
+        #expect(late.autoRecordOffAt == nil)
+        late.shutdown()
+
+        let (second, _) = makeModel(defaults: defaults)
+        second.squelchEnabled = true
+        _ = await call(SubFloorTools(model: second), "set_auto_record", ["on": .bool(true), "minutes": .number(0.03)])
+        let offAt = try #require(second.autoRecordOffAt)
+        second.shutdown()   // 1.8 s to go
+        let (early, _) = makeModel(defaults: defaults)
+        defer { early.shutdown() }
+        #expect(early.autoRecordEnabled)
+        #expect(abs((early.autoRecordOffAt ?? .distantPast).timeIntervalSince(offAt)) < 0.01)
+        #expect(await eventually(4) { !early.autoRecordEnabled })
+        #expect(early.autoRecordOffAt == nil)
+
+        // The owner's Auto has no limit to restore.
+        early.autoRecordEnabled = true
+        early.shutdown()
+        let (owners, _) = makeModel(defaults: defaults)
+        defer { owners.shutdown() }
+        #expect(owners.autoRecordEnabled)
+        #expect(owners.autoRecordOffAt == nil)
     }
 
     // MARK: Decoder and decodes

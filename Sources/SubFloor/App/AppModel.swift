@@ -76,6 +76,8 @@ private struct SessionState: Codable {
     var skipSilence: Bool?
     // Optional so that sessions saved before transcripts decode.
     var transcription: TranscriptionSettings?
+    /// An agent's Auto time limit (`AppModel.autoRecordOffAt`).
+    var autoRecordOffAt: Date?
 }
 
 @MainActor @Observable
@@ -214,15 +216,47 @@ final class AppModel {
     var autoRecordEnabled = false {
         didSet {
             guard autoRecordEnabled != oldValue else { return }
-            autoRecordChanges += 1
+            // Any change ends an agent's time limit (`turnOnAutoRecord(until:)` sets it after turning Auto on):
+            // the owner turning Auto off and on again makes it theirs.
+            autoRecordOffAt = nil
             if autoRecordEnabled { lastDiskCheck = nil }   // check the disk at the next refresh
             pushAutoRecord()
         }
     }
 
-    /// Counts every change to `autoRecordEnabled`, however it was made: an agent's timed Auto (`set_auto_record`)
-    /// turns it off at its deadline only if nothing has changed it since.
-    @ObservationIgnored private(set) var autoRecordChanges = 0
+    /// When the Auto an agent turned on turns itself off (`set_auto_record`); nil while Auto is off or is the
+    /// owner's. Saved with the session, so a quit or a crash does not leave Auto on with no limit: a relaunch
+    /// past it turns Auto off, and one before it waits for it again.
+    @ObservationIgnored private(set) var autoRecordOffAt: Date? {
+        didSet {
+            guard autoRecordOffAt != oldValue else { return }
+            armAutoRecordOff()
+            saveSessionIfChanged()
+        }
+    }
+    @ObservationIgnored private var autoRecordOffTask: Task<Void, Never>?
+
+    /// An agent's Auto: on until `offAt`, or, if it is on for an agent already, until `offAt` instead.
+    func turnOnAutoRecord(until offAt: Date) {
+        autoRecordEnabled = true
+        autoRecordOffAt = offAt
+    }
+
+    /// Waits for `autoRecordOffAt` and turns Auto off then, unless the limit has changed meanwhile.
+    private func armAutoRecordOff() {
+        autoRecordOffTask?.cancel()
+        autoRecordOffTask = nil
+        guard let offAt = autoRecordOffAt else { return }
+        autoRecordOffTask = Task { [weak self] in
+            while offAt.timeIntervalSinceNow > 0 {
+                // In steps of at most a second, by the wall clock: a Mac that slept past it turns Auto off on waking.
+                let step = min(offAt.timeIntervalSinceNow, 1)
+                do { try await Task.sleep(for: .milliseconds(Int(step * 1000) + 1)) } catch { return }
+            }
+            guard let self, self.autoRecordOffAt == offAt else { return }
+            self.autoRecordEnabled = false
+        }
+    }
 
     /// `paused`: Auto is on but a manual audio recording owns the recorder; the trigger resumes after it.
     enum AutoRecordState: Equatable { case off, armed, recording, needsSquelch, needsRadio, demoSource, paused }
@@ -662,6 +696,7 @@ final class AppModel {
         sdrplay?.close()
         sdrplay = nil
         saveSessionIfChanged()
+        autoRecordOffTask?.cancel()
         statsTimer?.invalidate()
         statsTimer = nil
         if let libraryActivation { NotificationCenter.default.removeObserver(libraryActivation) }
@@ -1647,7 +1682,7 @@ final class AppModel {
                                  modemBox: nil, modemSettings: modem.settings, recording: recording,
                                  autoRecord: autoRecordEnabled, squelchEnabled: squelchEnabled, squelchDb: squelchDb,
                                  noiseReduction: noiseReduction, skipSilence: skipSilence,
-                                 transcription: transcriptionSettings)
+                                 transcription: transcriptionSettings, autoRecordOffAt: autoRecordOffAt)
         guard let data = try? JSONEncoder().encode(state), data != lastSavedSession else { return }
         defaults.set(data, forKey: "session")
         lastSavedSession = data
@@ -1668,8 +1703,13 @@ final class AppModel {
         if let on = s.autoRecord { autoRecordEnabled = on }
         if let on = s.skipSilence { skipSilence = on }
         if let t = s.transcription { transcriptionSettings = t }
-        // Last: it saves the session, which must be whole by then.
+        // With the rest restored: it saves the session, which must be whole by then.
         if let nr = s.noiseReduction { noiseReduction = nr }
+        // An agent's Auto limit after Auto itself, whose change clears it, and after the rest, since setting it
+        // saves the session. A limit that passed while SubFloor was not running ends Auto.
+        if autoRecordEnabled, let offAt = s.autoRecordOffAt {
+            if offAt > Date() { autoRecordOffAt = offAt } else { autoRecordEnabled = false }
+        }
         lastSavedSession = data
     }
 }

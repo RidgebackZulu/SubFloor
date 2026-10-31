@@ -1,3 +1,4 @@
+import DSPCore
 import Foundation
 import Recording
 import SubFloorCore
@@ -7,16 +8,35 @@ import Transcription
 /// (`"ok": true` is added) or throws a `ToolError` whose message is the tool error.
 struct SubFloorTool {
     var descriptor: MCPToolDescriptor
+    /// The call runs inside `withRadio`. Every tool that changes the radio does, except one that waits on the
+    /// radio for a long time (`listen`), which takes the lock itself only for as long as it must.
+    var locksRadio: Bool
     var run: @MainActor (SubFloorTools, ToolArguments, _ client: String) async throws -> [String: JSONValue]
 
-    init(_ name: String, title: String, readOnly: Bool, description: String,
+    init(_ name: String, title: String, readOnly: Bool, locksRadio: Bool? = nil, description: String,
          properties: [String: JSONValue] = [:], required: [String] = [],
          run: @escaping @MainActor (SubFloorTools, ToolArguments, _ client: String) async throws -> [String: JSONValue]) {
         descriptor = MCPToolDescriptor(name: name, title: title, description: description,
                                        inputSchema: .inputSchema(properties: properties, required: required),
                                        readOnly: readOnly)
+        self.locksRadio = locksRadio ?? !readOnly
         self.run = run
     }
+}
+
+/// What a `listen` watches for: the tuning, the mode and whether the radio runs.
+struct RadioState: Equatable {
+    var vfoHz: Double
+    var mode: DemodMode
+    var running: Bool
+}
+
+/// The last change an agent's call made to the radio's state, so a `listen` it interrupted can say who did it.
+struct RadioChange {
+    var client: String
+    var at: Date
+    /// The state the call left.
+    var state: RadioState
 }
 
 /// A failed precondition or a bad argument: `message` says what to do, and is the tool error's text.
@@ -26,7 +46,7 @@ struct ToolError: Error {
 }
 
 /// SubFloor's tools over the app's model. Read-only tools run at once; the others run one at a time, in the
-/// order they were called (`withRadio`).
+/// order they were called (`withRadio`), except `listen`, which holds the radio only while it starts.
 @MainActor
 final class SubFloorTools: MCPToolProvider {
     let model: AppModel
@@ -38,8 +58,8 @@ final class SubFloorTools: MCPToolProvider {
     private var radioWaiters: [CheckedContinuation<Void, Never>] = []
     /// The recordings agents started that may still run, each with the task that stops it (`start_recording`).
     var agentRecordings: [StreamKind: AgentRecording] = [:]
-    /// The Auto an agent turned on for a while, and the task that turns it off (`set_auto_record`).
-    var agentAuto: AgentAuto?
+    /// The last change an agent's call made to the tuning, mode or running state.
+    private(set) var lastRadioChange: RadioChange?
 
     init(model: AppModel) {
         self.model = model
@@ -52,6 +72,11 @@ final class SubFloorTools: MCPToolProvider {
         guard let tool = registry[name] else { return .failure("Unknown tool \(name)") }
         let args = ToolArguments(arguments)
         let run = { () async -> MCPToolResult in
+            let before = self.radioState
+            defer {
+                let after = self.radioState
+                if after != before { self.lastRadioChange = RadioChange(client: client, at: Date(), state: after) }
+            }
             do {
                 var fields = try await tool.run(self, args, client)
                 fields["ok"] = .bool(true)
@@ -62,7 +87,15 @@ final class SubFloorTools: MCPToolProvider {
                 return .failure("\(name) failed: \(error.localizedDescription)")
             }
         }
-        return tool.descriptor.readOnly ? await run() : await withRadio(run)
+        return tool.locksRadio ? await withRadio(run) : await run()
+    }
+
+    var radioState: RadioState { RadioState(vfoHz: model.vfoHz, mode: model.mode, running: model.isRunning) }
+
+    /// Who made the radio `now` since `since`: the agent whose call left it so, or the owner.
+    func changedBy(_ now: RadioState, since: Date) -> String {
+        if let c = lastRadioChange, c.at >= since, c.state == now { return c.client }
+        return "the owner"
     }
 
     // MARK: Radio lock
