@@ -16,6 +16,7 @@ enum ShaderSource {
         float2 viewSize;
         uint showPeak;
         float rowHeightPx;
+        float traceShiftBins;
     };
 
     struct VOut { float4 position [[position]]; float2 uv; };
@@ -52,7 +53,8 @@ enum ShaderSource {
                                      device const float *peak [[buffer(1)]],
                                      device const half *waterfall [[buffer(2)]],
                                      constant float4 *lut [[buffer(3)]],
-                                     constant Uniforms &u [[buffer(4)]]) {
+                                     constant Uniforms &u [[buffer(4)]],
+                                     device const float *rowShift [[buffer(5)]]) {
         float px = in.uv.x * u.viewSize.x;
         float py = in.uv.y * u.viewSize.y;
         float binsPerPx = u.viewBinCount / u.viewSize.x;
@@ -62,9 +64,14 @@ enum ShaderSource {
         float specH = u.spectrumFraction * u.viewSize.y;
         float4 background = float4(0.035, 0.047, 0.067, 1.0);
 
+        float n = float(u.fftSize);
+
         if (py < specH) {
-            float v = clamp((columnMax(average, u.fftSize, b0, b1) - u.dbMin) / range, 0.0, 1.0);
-            float vPrev = clamp((columnMax(average, u.fftSize, b0 - binsPerPx, b0) - u.dbMin) / range, 0.0, 1.0);
+            // The latest spectrum may have been measured before a retune: index it where it was.
+            float t0 = b0 + u.traceShiftBins, t1 = b1 + u.traceShiftBins;
+            if (t1 <= 0.0 || t0 >= n) { return background; }
+            float v = clamp((columnMax(average, u.fftSize, t0, t1) - u.dbMin) / range, 0.0, 1.0);
+            float vPrev = clamp((columnMax(average, u.fftSize, t0 - binsPerPx, t0) - u.dbMin) / range, 0.0, 1.0);
             float y = (1.0 - v) * specH;
             float yPrev = (1.0 - vPrev) * specH;
             float top = min(y, yPrev) - 0.75;
@@ -76,7 +83,7 @@ enum ShaderSource {
                 color = float4(mix(background.rgb, color.rgb, color.a), 1.0);
             }
             if (u.showPeak != 0) {
-                float pv = clamp((columnMax(peak, u.fftSize, b0, b1) - u.dbMin) / range, 0.0, 1.0);
+                float pv = clamp((columnMax(peak, u.fftSize, t0, t1) - u.dbMin) / range, 0.0, 1.0);
                 if (abs(py - (1.0 - pv) * specH) < 0.8) { color = float4(1.0, 0.75, 0.30, 0.9); }
             }
             if (py >= top && py <= bottom) { color = float4(0.45, 0.88, 1.0, 1.0); }
@@ -87,7 +94,11 @@ enum ShaderSource {
         uint row = uint((py - specH) / max(u.rowHeightPx, 1.0));
         if (row >= u.waterfallRows) { return background; }
         uint ringRow = (u.waterfallHead + u.waterfallRows - row) % u.waterfallRows;
-        float db = columnMaxHalf(waterfall + ringRow * u.fftSize, u.fftSize, b0, b1);
+        // A row measured at another capture centre: its bins sit `rowShift` bins along; past its
+        // edges there is nothing measured.
+        float w0 = b0 + rowShift[ringRow], w1 = b1 + rowShift[ringRow];
+        if (w1 <= 0.0 || w0 >= n) { return background; }
+        float db = columnMaxHalf(waterfall + ringRow * u.fftSize, u.fftSize, w0, w1);
         float v = clamp((db - u.dbMin) / range, 0.0, 1.0);
         return lut[uint(v * 255.0)];
     }

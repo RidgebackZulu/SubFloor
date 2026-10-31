@@ -70,7 +70,8 @@ final class AppModel {
     private(set) var sourceKind: SourceKind = .synthetic
     private(set) var preferredSource: SourceKind = .sdrplay
     private(set) var deviceName = "Not started"
-    private(set) var centerHz: Double = 14_100_000
+    /// The engine tags spectrum frames with it, so the waterfall slides its history on a retune.
+    private(set) var centerHz: Double = 14_100_000 { didSet { engine.update(captureCenter: centerHz) } }
     private(set) var vfoHz: Double = 14_200_000
     private(set) var mode: DemodMode = .usb
     private(set) var bandwidthHz: Double = 2_700
@@ -329,6 +330,8 @@ final class AppModel {
     // MARK: Bookmarks, modems, UI
     private(set) var bookmarks: [Bookmark] = []
     var showBookmarks = true
+    /// The bookmarks selected in the bookmark manager (set before opening it to show one).
+    var bookmarkManagerSelection = Set<Bookmark.ID>()
     /// The multi-signal modem's box, settings and cursor (see `ModemControl`). Not observed: it also
     /// changes with the cursor's tracking and the engine bookkeeping several times a second, which
     /// would re-render every view reading any part of it (the modem strip's segmented pickers among
@@ -479,12 +482,32 @@ final class AppModel {
         return (c - bandwidthHz / 2)...(c + bandwidthHz / 2)
     }
 
-    var passbandEdgeFractions: (lower: Double, upper: Double)? {
-        (viewport.fraction(ofHz: passbandRange.lowerBound), viewport.fraction(ofHz: passbandRange.upperBound))
+    /// The passband as drawn: SSB's runs from the carrier (the tuning line) to its far edge, so no
+    /// gap shows between them; the filter itself still starts 100 Hz from the carrier.
+    var displayedPassband: ClosedRange<Double> {
+        let pb = passbandRange
+        switch mode {
+        case .usb: return vfoHz...pb.upperBound
+        case .lsb: return pb.lowerBound...vfoHz
+        default: return pb
+        }
+    }
+
+    /// The draggable passband edges in view fractions: SSB only drags its far edge (the near one is
+    /// the tuning line, where a click must tune).
+    var passbandEdgeFractions: (lower: Double?, upper: Double?)? {
+        let pb = passbandRange
+        let lower = viewport.fraction(ofHz: pb.lowerBound), upper = viewport.fraction(ofHz: pb.upperBound)
+        switch mode {
+        case .usb: return (nil, upper)
+        case .lsb: return (lower, nil)
+        default: return (lower, upper)
+        }
     }
 
     var displayState: DisplayState {
         DisplayState(startFraction: viewport.startFractionOfCapture, widthFraction: viewport.widthFractionOfCapture,
+                     captureCenterHz: centerHz, captureSpanHz: sampleRate,
                      dbMin: dbMin, dbMax: dbMax, spectrumFraction: Float(spectrumFraction),
                      showPeak: showPeak, colormap: colormap)
     }
@@ -811,10 +834,38 @@ final class AppModel {
         setVFO(((vfoHz / step).rounded() + Double(steps)) * step)
     }
 
-    /// The dial's knob: `steps` of `stepHz` from that step's grid, as `stepVFO` does with the mode's step.
+    /// The dial's knob: `steps` of `stepHz` from that step's grid, as `stepVFO` does with the mode's
+    /// step, keeping the tuning line where it is on screen (`centreVFO`).
     func stepVFO(_ steps: Int, stepHz: Double) {
         guard stepHz > 0 else { return }
-        setVFO(((vfoHz / stepHz).rounded() + Double(steps)) * stepHz)
+        centreVFO(((vfoHz / stepHz).rounded() + Double(steps)) * stepHz)
+    }
+
+    /// Moves the VFO and keeps it in the middle of the view: the spectrum slides under a still
+    /// tuning line. The view pans while the capture has room; when it would run off the capture's
+    /// edge the radio retunes (the VFO `TuningPlanner`'s DC offset above the new centre). Zoomed out
+    /// past 90% of the capture the view cannot centre the VFO, so the radio retunes every step and
+    /// the line stays put at that offset instead.
+    func centreVFO(_ displayHz: Double) {
+        var hz = clampedDisplay(displayHz)
+        if sourceKind == .file {
+            hz = min(max(hz, centerHz - sampleRate * 0.45), centerHz + sampleRate * 0.45)
+        }
+        vfoHz = hz
+        viewport.center(on: hz)
+        let offCentre = abs(viewport.centerHz - hz) > viewport.spanHz * 1e-4
+        let outside = abs(hz - centerHz) > sampleRate * TuningPlanner.usableFraction
+        if sourceKind != .file && (offCentre || outside) {
+            let newCenter = clampedCenter(TuningPlanner.center(forVFO: hz, sampleRate: sampleRate))
+            if newCenter != centerHz {
+                centerHz = newCenter
+                retuneHardware()
+                viewport.setCapture(centerHz: centerHz, spanHz: sampleRate)
+                viewport.center(on: hz)
+                syncModem()
+            }
+        }
+        pushReceiver()
     }
 
     func stepBandwidth(_ steps: Int) {
@@ -962,10 +1013,43 @@ final class AppModel {
         return b
     }
 
-    func addBookmark() {
-        bookmarks.append(Bookmark(name: "\(FrequencyFormatter.short(vfoHz)) \(mode.label)", frequencyHz: vfoHz, mode: mode,
-                                  bandwidthHz: bandwidthHz, upconverter: upconverter.enabled, group: "Saved"))
+    /// Bookmarks the current tuning in the "Saved" group; returns its id.
+    @discardableResult
+    func addBookmark() -> Bookmark.ID {
+        addBookmark(Bookmark(name: "\(FrequencyFormatter.short(vfoHz)) \(mode.label)", frequencyHz: vfoHz, mode: mode,
+                             bandwidthHz: bandwidthHz, upconverter: upconverter.enabled, group: "Saved"))
+    }
+
+    /// Adds `bookmark` (its group spelled like an existing one, `created` stamped if unset); returns its id.
+    @discardableResult
+    func addBookmark(_ bookmark: Bookmark) -> Bookmark.ID {
+        var b = bookmark
+        b.group = BookmarkGroups.normalized(b.group, existing: bookmarkGroups)
+        if b.created == nil { b.created = Date() }
+        bookmarks.append(b)
         saveBookmarks()
+        return b.id
+    }
+
+    /// The groups in use, for the group pickers.
+    var bookmarkGroups: [String] { BookmarkGroups.names(bookmarks) }
+
+    /// Deletes every bookmark in `ids`.
+    func deleteBookmarks(_ ids: Set<Bookmark.ID>) {
+        guard !ids.isEmpty else { return }
+        bookmarks.removeAll { ids.contains($0.id) }
+        saveBookmarks()
+    }
+
+    /// Moves every bookmark in `ids` to `group` (nil: ungrouped).
+    func moveBookmarks(_ ids: Set<Bookmark.ID>, toGroup group: String?) {
+        let g = BookmarkGroups.normalized(group, existing: bookmarkGroups)
+        var changed = false
+        for i in bookmarks.indices where ids.contains(bookmarks[i].id) && bookmarks[i].group != g {
+            bookmarks[i].group = g
+            changed = true
+        }
+        if changed { saveBookmarks() }
     }
 
     func deleteBookmark(_ id: Bookmark.ID) {
@@ -1304,7 +1388,7 @@ final class AppModel {
     var modemSignalCountText: String { ModemPanelFormat.signalCount(decodeLog.liveRows.count) }
 
     /// The decode band (inside the passband) in view fractions, while the modem is on and the box
-    /// active: clicks inside it lock the cursor; elsewhere they tune the VFO.
+    /// active: a right click inside it locks the cursor; a left click tunes the VFO, as anywhere.
     var modemBoxFractions: (lower: Double, upper: Double)? {
         guard modemUserSettings.mode != nil, modemBoxActive, let band = modemAudioBand else { return nil }
         return (viewport.fraction(ofHz: modemBox.rfHz(forAudio: band.lowerBound)),

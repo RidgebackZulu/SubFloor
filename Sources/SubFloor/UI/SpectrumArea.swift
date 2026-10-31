@@ -94,7 +94,7 @@ private struct SpectrumOverlay: View {
                            with: .color(Theme.grid), lineWidth: 1)
             }
 
-            let pb = model.passbandRange
+            let pb = model.displayedPassband
             let x0 = x(pb.lowerBound), x1 = x(pb.upperBound)
             ctx.fill(Path(CGRect(x: x0, y: 0, width: max(x1 - x0, 1), height: size.height)), with: .color(Theme.passband))
             for edge in [x0, x1] {
@@ -230,68 +230,6 @@ private struct BookmarkFlag: View {
 
     private var help: String {
         "\(bookmark.name) — \(FrequencyFormatter.short(bookmark.frequencyHz)) \(bookmark.mode.label) \(FrequencyFormatter.audio(bookmark.bandwidthHz))\(bookmark.upconverter ? " via HamItUp" : ""). Click to tune, right-click to edit"
-    }
-}
-
-/// Edits one bookmark in place: each change is saved as it is made (the frequency when entered).
-private struct BookmarkEditor: View {
-    @Environment(AppModel.self) private var model
-    @State private var draft: Bookmark
-    @State private var frequencyText: String
-    let close: () -> Void
-
-    init(bookmark: Bookmark, close: @escaping () -> Void) {
-        _draft = State(initialValue: bookmark)
-        _frequencyText = State(initialValue: FrequencyFormatter.grouped(bookmark.frequencyHz))
-        self.close = close
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Form {
-                TextField("Name", text: $draft.name)
-                TextField("Frequency", text: $frequencyText)
-                    .onSubmit { commitFrequency() }
-                    .help("e.g. 14.074, 7074k, 144.39m")
-                Picker("Mode", selection: $draft.mode) {
-                    ForEach(DemodMode.allCases) { Text($0.label).tag($0) }
-                }
-                TextField("Bandwidth (Hz)", value: $draft.bandwidthHz, format: .number.precision(.fractionLength(0)))
-                    .help("The passband width tuned with the bookmark")
-                TextField("Group", text: Binding(get: { draft.group ?? "" },
-                                                  set: { draft.group = $0.isEmpty ? nil : $0 }))
-                Toggle("Via HamItUp", isOn: $draft.upconverter)
-            }
-            HStack {
-                Button("Delete", role: .destructive) {
-                    model.deleteBookmark(draft.id)
-                    close()
-                }
-                Spacer()
-                Button("Use Current Tuning") {
-                    draft = model.withCurrentTuning(draft)
-                    frequencyText = FrequencyFormatter.grouped(draft.frequencyHz)
-                }
-                .help("Save the current frequency, mode, passband width and HamItUp state in this bookmark")
-                Button("Tune") {
-                    commitFrequency()
-                    model.select(draft)
-                    close()
-                }
-                .keyboardShortcut(.defaultAction)
-            }
-        }
-        .padding(14)
-        .frame(width: 300)
-        .onChange(of: draft) { _, edited in model.updateBookmark(edited) }
-        .onDisappear { commitFrequency() }
-    }
-
-    /// Takes the typed frequency if it parses (else restores the field) and saves.
-    private func commitFrequency() {
-        if let hz = FrequencyParser.parse(frequencyText) { draft.frequencyHz = hz }
-        frequencyText = FrequencyFormatter.grouped(draft.frequencyHz)
-        model.updateBookmark(draft)
     }
 }
 

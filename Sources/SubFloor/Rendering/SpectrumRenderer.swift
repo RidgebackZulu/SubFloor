@@ -4,6 +4,10 @@ import simd
 struct DisplayState: Equatable {
     var startFraction: Double = 0
     var widthFraction: Double = 1
+    /// Where the radio is tuned now (display Hz; NaN if unknown) and the captured span: the
+    /// waterfall's older rows are shifted by how far the centre has moved since they were measured.
+    var captureCenterHz = Double.nan
+    var captureSpanHz: Double = 1
     var dbMin: Float = -130
     var dbMax: Float = -20
     var spectrumFraction: Float = 0.4
@@ -23,10 +27,14 @@ struct Uniforms {
     var viewSize: SIMD2<Float>
     var showPeak: UInt32
     var rowHeightPx: Float
+    /// Bins to add to a screen bin to index the latest spectrum (it may predate a retune).
+    var traceShiftBins: Float
 }
 
 /// Single full-screen pass: spectrum trace in the top band, scrolling waterfall below.
-/// All zoom/pan is done with uniforms; the CPU only uploads one spectrum and one waterfall row per frame.
+/// All zoom/pan is done with uniforms; the CPU only uploads one spectrum and one waterfall row per frame,
+/// plus each row's shift in bins (`rowShiftBuffers`): a row measured at another capture centre is
+/// drawn where its frequencies are now, so a retune slides the waterfall rather than smearing it.
 @MainActor
 final class SpectrumRenderer: NSObject, MTKViewDelegate {
     var displayProvider: (() -> DisplayState)?
@@ -39,6 +47,10 @@ final class SpectrumRenderer: NSObject, MTKViewDelegate {
     private var averageBuffers: [MTLBuffer] = []
     private var peakBuffers: [MTLBuffer] = []
     private var waterfall: MTLBuffer!
+    private var rowShiftBuffers: [MTLBuffer] = []
+    /// The capture centre each waterfall row was measured at (NaN: unknown, drawn unshifted).
+    private var rowCenters: [Double] = []
+    private var latestCenter = Double.nan
     private var lutBuffer: MTLBuffer!
     private var lutColormap: Colormap?
     private var fftSize = 0
@@ -77,8 +89,18 @@ final class SpectrumRenderer: NSObject, MTKViewDelegate {
         waterfall = device.makeBuffer(length: rows * size * 2, options: .storageModeShared)!
         let w = waterfall.contents().bindMemory(to: Float16.self, capacity: rows * size)
         w.initialize(repeating: -200, count: rows * size)
+        rowShiftBuffers = (0..<3).map { _ in device.makeBuffer(length: rows * 4, options: .storageModeShared)! }
+        rowCenters = .init(repeating: .nan, count: rows)
         latestAverage = empty
         latestPeak = empty
+    }
+
+    /// Bins to add to a screen bin (in the current capture) to index a spectrum measured with the
+    /// capture centred at `measuredAt`: the same frequency sits that many bins further along it.
+    /// Zero when either centre is unknown.
+    nonisolated static func shiftBins(measuredAt: Double, currentCenterHz: Double, binHz: Double) -> Float {
+        guard measuredAt.isFinite, currentCenterHz.isFinite, binHz > 0 else { return 0 }
+        return Float((currentCenterHz - measuredAt) / binHz)
     }
 
     func mtkView(_ view: MTKView, drawableSizeWillChange size: CGSize) {}
@@ -91,8 +113,9 @@ final class SpectrumRenderer: NSObject, MTKViewDelegate {
             lutColormap = state.colormap
         }
 
-        if let seq = frames.read(after: sequence, average: &latestAverage, peak: &latestPeak) {
-            sequence = seq
+        if let frame = frames.readFrame(after: sequence, average: &latestAverage, peak: &latestPeak) {
+            sequence = frame.sequence
+            latestCenter = frame.centerHz
             if latestAverage.count != fftSize {
                 let keepAverage = latestAverage, keepPeak = latestPeak
                 allocate(fftSize: keepAverage.count)
@@ -102,6 +125,7 @@ final class SpectrumRenderer: NSObject, MTKViewDelegate {
             head = (head + 1) % rows
             let row = waterfall.contents().bindMemory(to: Float16.self, capacity: rows * fftSize) + head * fftSize
             for i in 0..<fftSize { row[i] = Float16(latestAverage[i]) }
+            rowCenters[head] = latestCenter
         }
 
         // Nothing new to show (no spectrum frame since, same view, same size): keep the last frame
@@ -119,6 +143,10 @@ final class SpectrumRenderer: NSObject, MTKViewDelegate {
         slot = (slot + 1) % 3
         averageBuffers[slot].contents().copyMemory(from: latestAverage, byteCount: fftSize * 4)
         peakBuffers[slot].contents().copyMemory(from: latestPeak, byteCount: fftSize * 4)
+        let binHz = state.captureSpanHz / Double(max(fftSize, 1))
+        let shift = { Self.shiftBins(measuredAt: $0, currentCenterHz: state.captureCenterHz, binHz: binHz) }
+        let shifts = rowShiftBuffers[slot].contents().bindMemory(to: Float.self, capacity: rows)
+        for r in 0..<rows { shifts[r] = shift(rowCenters[r]) }
 
         let size = view.drawableSize
         var uniforms = Uniforms(
@@ -129,7 +157,8 @@ final class SpectrumRenderer: NSObject, MTKViewDelegate {
             spectrumFraction: state.spectrumFraction,
             viewSize: SIMD2(Float(size.width), Float(size.height)),
             showPeak: state.showPeak ? 1 : 0,
-            rowHeightPx: Float(scale))
+            rowHeightPx: Float(scale),
+            traceShiftBins: shift(latestCenter))
 
         let encoder = commands.makeRenderCommandEncoder(descriptor: pass)!
         encoder.setRenderPipelineState(pipeline)
@@ -138,6 +167,7 @@ final class SpectrumRenderer: NSObject, MTKViewDelegate {
         encoder.setFragmentBuffer(waterfall, offset: 0, index: 2)
         encoder.setFragmentBuffer(lutBuffer, offset: 0, index: 3)
         encoder.setFragmentBytes(&uniforms, length: MemoryLayout<Uniforms>.stride, index: 4)
+        encoder.setFragmentBuffer(rowShiftBuffers[slot], offset: 0, index: 5)
         encoder.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
         encoder.endEncoding()
         let semaphore = inFlight

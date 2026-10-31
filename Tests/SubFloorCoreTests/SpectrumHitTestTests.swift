@@ -6,7 +6,7 @@ import Testing
 
     private func hit(_ x: Double, _ y: Double, tab: (lower: Double, upper: Double)? = (0.4, 0.6),
                      box: (lower: Double, upper: Double)? = (0.4, 0.6),
-                     edges: (lower: Double, upper: Double)? = nil) -> SpectrumHit {
+                     edges: (lower: Double?, upper: Double?)? = nil) -> SpectrumHit {
         SpectrumHitTest.hit(x: x, y: y, width: width, grabTab: tab, box: box, passbandEdges: edges)
     }
 
@@ -55,5 +55,13 @@ import Testing
         // An inactive box: no body (clicks tune the VFO), but it can be dragged back.
         #expect(hit(500, 5, box: nil) == .boxGrabTab)
         #expect(hit(500, 300, box: nil) == .elsewhere)
+    }
+
+    @Test func anEdgeThatDoesNotDragIsNotHit() {
+        // SSB: the edge at the carrier is the tuning line, where a click tunes.
+        #expect(hit(452, 300, tab: nil, box: nil, edges: (lower: nil, upper: 0.48)) == .elsewhere)
+        #expect(hit(478, 300, tab: nil, box: nil, edges: (lower: nil, upper: 0.48)) == .passbandEdge(upper: true))
+        #expect(hit(478, 300, tab: nil, box: nil, edges: (lower: 0.45, upper: nil)) == .elsewhere)
+        #expect(hit(452, 300, tab: nil, box: nil, edges: (lower: 0.45, upper: nil)) == .passbandEdge(upper: false))
     }
 }

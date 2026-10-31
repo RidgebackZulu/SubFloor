@@ -40,3 +40,13 @@ private func spectrum(_ iq: [DSPComplex], size: Int) -> [Float] {
     avg.resetPeak()
     #expect(avg.peak == avg.average)
 }
+
+@Test func averagerRestartTakesTheNextFrameWhole() {
+    let avg = SpectrumAverager(size: 2, alpha: 0.5)
+    [Float(0), 0].withUnsafeBufferPointer { avg.add($0) }
+    [Float(10), -10].withUnsafeBufferPointer { avg.add($0) }
+    avg.restart()
+    [Float(-40), -50].withUnsafeBufferPointer { avg.add($0) }
+    #expect(avg.average == [-40, -50])
+    #expect(avg.peak == [-40, -50])
+}

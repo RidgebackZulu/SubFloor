@@ -85,6 +85,15 @@ struct SubFloorApp: App {
         .defaultSize(width: 1100, height: 640)
         .defaultLaunchBehavior(.suppressed)   // opened from the menu or the button, never restored at launch
 
+        Window("Bookmarks", id: "bookmarks") {
+            BookmarkManagerWindow()
+                .environment(model)
+                .preferredColorScheme(scheme)
+                .tint(Theme.accent)
+        }
+        .defaultSize(width: 1400, height: 640)
+        .defaultLaunchBehavior(.suppressed)
+
         Settings {
             SettingsView()
                 .environment(model)
@@ -104,6 +113,7 @@ struct RadioCommands: Commands {
             Button("Quick Tune…") { model.quickTuneVisible = true }.keyboardShortcut("l")
             Divider()
             Button("Add Bookmark") { model.addBookmark() }.keyboardShortcut("d")
+            Button("Bookmarks…") { openWindow(id: "bookmarks") }.keyboardShortcut("b", modifiers: [.command, .option])
             Button(model.showBookmarks ? "Hide Bookmarks on Spectrum" : "Show Bookmarks on Spectrum") {
                 model.showBookmarks.toggle()
             }

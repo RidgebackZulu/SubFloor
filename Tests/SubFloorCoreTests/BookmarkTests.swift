@@ -96,3 +96,48 @@ private func backupFiles(in dir: URL) throws -> [URL] {
     try BookmarkStore.write([good] + bad, to: url)
     #expect(try BookmarkStore.read(from: url) == [good])
 }
+
+@Test func notesAgentAndDateRoundTrip() throws {
+    let url = tempURL()
+    let b = Bookmark(name: "Radio Ndarason", frequencyHz: 6_100_000, mode: .am, bandwidthHz: 8_000, group: "Broadcast",
+                     notes: "Hausa, 0500–0600 UTC", addedBy: "Claude Code 2.1", created: Date(timeIntervalSince1970: 1_800_000_000))
+    try BookmarkStore.write([b], to: url)
+    #expect(try BookmarkStore.read(from: url) == [b])
+}
+
+@Test func bookmarksSavedBeforeNotesStillLoad() throws {
+    let url = tempURL()
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    let old = """
+    {"version":1,"bookmarks":[{"id":"00000000-0000-0000-0000-0000000000AA","name":"Old","frequencyHz":7074000,
+    "mode":"usb","bandwidthHz":2700,"upconverter":false,"group":"HF Voice"}]}
+    """
+    try Data(old.utf8).write(to: url)
+    let loaded = try BookmarkStore.read(from: url)
+    #expect(loaded.count == 1)
+    #expect(loaded[0].notes == nil && loaded[0].addedBy == nil && loaded[0].created == nil)
+    #expect(loaded[0].group == "HF Voice")
+}
+
+@Test func groupNamesAreUniqueTrimmedAndSorted() {
+    let bs = ["HF Voice", "digital", " Digital ", "hf voice", "", "Broadcast", "  "].map {
+        Bookmark(name: "x", frequencyHz: 7_000_000, mode: .usb, bandwidthHz: 2_700, group: $0)
+    } + [Bookmark(name: "y", frequencyHz: 7_000_000, mode: .usb, bandwidthHz: 2_700)]
+    #expect(BookmarkGroups.names(bs) == ["Broadcast", "digital", "HF Voice"])
+}
+
+@Test func typedGroupJoinsAnExistingSpelling() {
+    let existing = ["HF Voice", "Digital"]
+    #expect(BookmarkGroups.normalized("hf voice", existing: existing) == "HF Voice")
+    #expect(BookmarkGroups.normalized("  Pirates ", existing: existing) == "Pirates")
+    #expect(BookmarkGroups.normalized("   ", existing: existing) == nil)
+    #expect(BookmarkGroups.normalized(nil, existing: existing) == nil)
+}
+
+@Test func searchFindsNotesAndAgentBookmarks() {
+    let mine = Bookmark(name: "A", frequencyHz: 6_925_000, mode: .usb, bandwidthHz: 2_700, notes: "pirate, plays rock")
+    let agents = Bookmark(name: "B", frequencyHz: 4_625_000, mode: .usb, bandwidthHz: 2_700, addedBy: "Hermes 0.9")
+    #expect(BookmarkSearch.filter([mine, agents], query: "rock") == [mine])
+    #expect(BookmarkSearch.filter([mine, agents], query: "mcp") == [agents])
+    #expect(BookmarkSearch.filter([mine, agents], query: "hermes") == [agents])
+}
