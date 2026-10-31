@@ -94,7 +94,7 @@ private struct SpectrumOverlay: View {
                            with: .color(Theme.grid), lineWidth: 1)
             }
 
-            let pb = model.passbandRange
+            let pb = model.displayedPassband
             let x0 = x(pb.lowerBound), x1 = x(pb.upperBound)
             ctx.fill(Path(CGRect(x: x0, y: 0, width: max(x1 - x0, 1), height: size.height)), with: .color(Theme.passband))
             for edge in [x0, x1] {

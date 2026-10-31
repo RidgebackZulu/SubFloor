@@ -8,7 +8,8 @@ struct SpectrumInteraction {
     var click: @MainActor (_ fraction: Double) -> Void
     var reset: @MainActor () -> Void
     var hover: @MainActor (_ unitPoint: CGPoint?) -> Void
-    var passbandEdges: @MainActor () -> (lower: Double, upper: Double)?
+    /// The passband's draggable edges in view fractions (nil: that edge does not drag).
+    var passbandEdges: @MainActor () -> (lower: Double?, upper: Double?)?
     var dragEdge: @MainActor (_ upper: Bool, _ fraction: Double) -> Void
     /// The modem box's grab tab, horizontally, in view fractions (nil: no box).
     var boxGrabRect: @MainActor () -> (lower: Double, upper: Double)?
@@ -18,18 +19,19 @@ struct SpectrumInteraction {
     var clickInBox: @MainActor (_ fraction: Double) -> Void
 }
 
-/// Mouse/trackpad: click tunes, drag pans, pinch or ⌥-scroll (or a plain mouse wheel) zooms,
-/// two-finger scroll pans, passband edges drag to set bandwidth, double-click resets the view.
-/// The modem box drags by its grab tab; a click inside the box locks the modem cursor, and a drag
-/// that starts inside it pans (see `SpectrumHitTest` for the order).
+/// Mouse/trackpad: a click anywhere tunes (on a passband edge or inside the modem box too), drag
+/// pans, pinch or ⌥-scroll (or a plain mouse wheel) zooms, two-finger scroll pans, a passband edge
+/// dragged sets the bandwidth, double-click resets the view. A right click (or ⌃-click) inside the
+/// modem box locks the modem cursor. The modem box drags by its grab tab (see `SpectrumHitTest` for
+/// the order).
 final class SpectrumMTKView: MTKView {
     var interaction: SpectrumInteraction?
 
     private enum Drag {
         case none
         case pending(start: CGPoint)
-        /// A press inside the modem box: a click locks the cursor, a drag pans.
-        case pendingBox(start: CGPoint)
+        /// A press on a passband edge: a drag sets the bandwidth, a click tunes.
+        case pendingEdge(upper: Bool, start: CGPoint)
         case pan(last: CGPoint)
         case edge(upper: Bool)
         case box(last: CGPoint)
@@ -84,23 +86,39 @@ final class SpectrumMTKView: MTKView {
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         let p = point(event)
+        if event.modifierFlags.contains(.control) {
+            drag = .none
+            rightClick(p)
+            return
+        }
         switch hit(p) {
         case .boxGrabTab:
             drag = .box(last: p)
             NSCursor.closedHand.set()
-        case .passbandEdge(let upper): drag = .edge(upper: upper)
-        case .boxBody: drag = .pendingBox(start: p)
-        case .elsewhere: drag = .pending(start: p)
+        case .passbandEdge(let upper): drag = .pendingEdge(upper: upper, start: p)
+        case .boxBody, .elsewhere: drag = .pending(start: p)
         }
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        rightClick(point(event))
+    }
+
+    /// Inside the modem box: locks the modem cursor there (or unlocks it, on the cursor).
+    private func rightClick(_ p: CGPoint) {
+        if case .boxBody = hit(p) { interaction?.clickInBox(fraction(p)) }
     }
 
     override func mouseDragged(with event: NSEvent) {
         let p = point(event)
         switch drag {
-        case .pending(let start) where hypot(p.x - start.x, p.y - start.y) > 3,
-             .pendingBox(let start) where hypot(p.x - start.x, p.y - start.y) > 3:
+        case .pending(let start) where hypot(p.x - start.x, p.y - start.y) > 3:
             interaction?.pan(-Double((p.x - start.x) / max(bounds.width, 1)))
             drag = .pan(last: p)
+        case .pendingEdge(let upper, let start) where hypot(p.x - start.x, p.y - start.y) > 3:
+            interaction?.dragEdge(upper, fraction(p))
+            drag = .edge(upper: upper)
         case .pan(let last):
             interaction?.pan(-Double((p.x - last.x) / max(bounds.width, 1)))
             drag = .pan(last: p)
@@ -117,11 +135,9 @@ final class SpectrumMTKView: MTKView {
 
     override func mouseUp(with event: NSEvent) {
         switch drag {
-        case .pending, .pendingBox:
+        case .pending, .pendingEdge:
             if event.clickCount == 2 {
                 interaction?.reset()
-            } else if case .pendingBox = drag {
-                interaction?.clickInBox(fraction(point(event)))
             } else {
                 interaction?.click(fraction(point(event)))
             }

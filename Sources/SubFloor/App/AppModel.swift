@@ -70,7 +70,8 @@ final class AppModel {
     private(set) var sourceKind: SourceKind = .synthetic
     private(set) var preferredSource: SourceKind = .sdrplay
     private(set) var deviceName = "Not started"
-    private(set) var centerHz: Double = 14_100_000
+    /// The engine tags spectrum frames with it, so the waterfall slides its history on a retune.
+    private(set) var centerHz: Double = 14_100_000 { didSet { engine.update(captureCenter: centerHz) } }
     private(set) var vfoHz: Double = 14_200_000
     private(set) var mode: DemodMode = .usb
     private(set) var bandwidthHz: Double = 2_700
@@ -479,12 +480,32 @@ final class AppModel {
         return (c - bandwidthHz / 2)...(c + bandwidthHz / 2)
     }
 
-    var passbandEdgeFractions: (lower: Double, upper: Double)? {
-        (viewport.fraction(ofHz: passbandRange.lowerBound), viewport.fraction(ofHz: passbandRange.upperBound))
+    /// The passband as drawn: SSB's runs from the carrier (the tuning line) to its far edge, so no
+    /// gap shows between them; the filter itself still starts 100 Hz from the carrier.
+    var displayedPassband: ClosedRange<Double> {
+        let pb = passbandRange
+        switch mode {
+        case .usb: return vfoHz...pb.upperBound
+        case .lsb: return pb.lowerBound...vfoHz
+        default: return pb
+        }
+    }
+
+    /// The draggable passband edges in view fractions: SSB only drags its far edge (the near one is
+    /// the tuning line, where a click must tune).
+    var passbandEdgeFractions: (lower: Double?, upper: Double?)? {
+        let pb = passbandRange
+        let lower = viewport.fraction(ofHz: pb.lowerBound), upper = viewport.fraction(ofHz: pb.upperBound)
+        switch mode {
+        case .usb: return (nil, upper)
+        case .lsb: return (lower, nil)
+        default: return (lower, upper)
+        }
     }
 
     var displayState: DisplayState {
         DisplayState(startFraction: viewport.startFractionOfCapture, widthFraction: viewport.widthFractionOfCapture,
+                     captureCenterHz: centerHz, captureSpanHz: sampleRate,
                      dbMin: dbMin, dbMax: dbMax, spectrumFraction: Float(spectrumFraction),
                      showPeak: showPeak, colormap: colormap)
     }
@@ -811,10 +832,38 @@ final class AppModel {
         setVFO(((vfoHz / step).rounded() + Double(steps)) * step)
     }
 
-    /// The dial's knob: `steps` of `stepHz` from that step's grid, as `stepVFO` does with the mode's step.
+    /// The dial's knob: `steps` of `stepHz` from that step's grid, as `stepVFO` does with the mode's
+    /// step, keeping the tuning line where it is on screen (`centreVFO`).
     func stepVFO(_ steps: Int, stepHz: Double) {
         guard stepHz > 0 else { return }
-        setVFO(((vfoHz / stepHz).rounded() + Double(steps)) * stepHz)
+        centreVFO(((vfoHz / stepHz).rounded() + Double(steps)) * stepHz)
+    }
+
+    /// Moves the VFO and keeps it in the middle of the view: the spectrum slides under a still
+    /// tuning line. The view pans while the capture has room; when it would run off the capture's
+    /// edge the radio retunes (the VFO `TuningPlanner`'s DC offset above the new centre). Zoomed out
+    /// past 90% of the capture the view cannot centre the VFO, so the radio retunes every step and
+    /// the line stays put at that offset instead.
+    func centreVFO(_ displayHz: Double) {
+        var hz = clampedDisplay(displayHz)
+        if sourceKind == .file {
+            hz = min(max(hz, centerHz - sampleRate * 0.45), centerHz + sampleRate * 0.45)
+        }
+        vfoHz = hz
+        viewport.center(on: hz)
+        let offCentre = abs(viewport.centerHz - hz) > viewport.spanHz * 1e-4
+        let outside = abs(hz - centerHz) > sampleRate * TuningPlanner.usableFraction
+        if sourceKind != .file && (offCentre || outside) {
+            let newCenter = clampedCenter(TuningPlanner.center(forVFO: hz, sampleRate: sampleRate))
+            if newCenter != centerHz {
+                centerHz = newCenter
+                retuneHardware()
+                viewport.setCapture(centerHz: centerHz, spanHz: sampleRate)
+                viewport.center(on: hz)
+                syncModem()
+            }
+        }
+        pushReceiver()
     }
 
     func stepBandwidth(_ steps: Int) {
@@ -1304,7 +1353,7 @@ final class AppModel {
     var modemSignalCountText: String { ModemPanelFormat.signalCount(decodeLog.liveRows.count) }
 
     /// The decode band (inside the passband) in view fractions, while the modem is on and the box
-    /// active: clicks inside it lock the cursor; elsewhere they tune the VFO.
+    /// active: a right click inside it locks the cursor; a left click tunes the VFO, as anywhere.
     var modemBoxFractions: (lower: Double, upper: Double)? {
         guard modemUserSettings.mode != nil, modemBoxActive, let band = modemAudioBand else { return nil }
         return (viewport.fraction(ofHz: modemBox.rfHz(forAudio: band.lowerBound)),

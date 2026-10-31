@@ -181,7 +181,7 @@ import Testing
         let wspr = CursorFrame(waveform: [], spectrumDb: [], spectrumCenterHz: 1_500, iq: [], frequencyHz: 1_500,
                                snrDb: -20, submode: "WSPR", symbolRate: 12_000.0 / 8_192)
         #expect(BenchReadouts(wspr).iq == "WSPR · 1.465 Bd")
-        #expect(ModemPanelFormat.benchPlaceholder == "Click a signal in the passband, or a decode, to analyse it")
+        #expect(ModemPanelFormat.benchPlaceholder == "Right-click a signal in the passband, or click a decode, to analyse it")
     }
 
     @Test func benchFeedFollowsTheStoreAndTheLock() {

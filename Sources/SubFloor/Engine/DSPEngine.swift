@@ -23,12 +23,15 @@ final class SpectrumFrameStore: @unchecked Sendable {
         var sequence: UInt64 = 0
         var average: [Float] = []
         var peak: [Float] = []
+        var centerHz = Double.nan
     }
 
     private let state = Mutex(Frame())
 
-    func publish(average: [Float], peak: [Float]) {
+    /// `centerHz`: the capture centre (display Hz) the frame was measured at, NaN if unknown.
+    func publish(average: [Float], peak: [Float], centerHz: Double = .nan) {
         state.withLock { f in
+            f.centerHz = centerHz
             if f.average.count != average.count {
                 f.average = average
                 f.peak = peak
@@ -42,6 +45,11 @@ final class SpectrumFrameStore: @unchecked Sendable {
 
     /// Copies the latest frame if it is newer than `sequence`; returns its sequence number.
     func read(after sequence: UInt64, average: inout [Float], peak: inout [Float]) -> UInt64? {
+        readFrame(after: sequence, average: &average, peak: &peak)?.sequence
+    }
+
+    /// As `read`, with the capture centre the frame was measured at (NaN if unknown).
+    func readFrame(after sequence: UInt64, average: inout [Float], peak: inout [Float]) -> (sequence: UInt64, centerHz: Double)? {
         state.withLock { f in
             guard f.sequence != sequence, !f.average.isEmpty else { return nil }
             if average.count != f.average.count {
@@ -51,7 +59,7 @@ final class SpectrumFrameStore: @unchecked Sendable {
                 average.withUnsafeMutableBufferPointer { d in f.average.withUnsafeBufferPointer { d.baseAddress!.update(from: $0.baseAddress!, count: $0.count) } }
                 peak.withUnsafeMutableBufferPointer { d in f.peak.withUnsafeBufferPointer { d.baseAddress!.update(from: $0.baseAddress!, count: $0.count) } }
             }
-            return f.sequence
+            return (f.sequence, f.centerHz)
         }
     }
 }
@@ -132,6 +140,8 @@ final class DSPEngine: @unchecked Sendable {
     }
 
     private let ring = SPSCRing<DSPComplex>(capacity: 1 << 22, fill: DSPComplex(real: 0, imag: 0))
+    /// The capture centre (display Hz) the radio is tuned to; spectrum frames are tagged with it.
+    private let captureCenter = Mutex(Double.nan)
     private let wake = DispatchSemaphore(value: 0)
     private let running = Atomic<Bool>(false)
     private let pending = Mutex(Pending())
@@ -261,6 +271,9 @@ final class DSPEngine: @unchecked Sendable {
         pending.withLock { $0.noiseReduction = noiseReduction }
     }
     func resetPeak() { pending.withLock { $0.resetPeak = true } }
+    /// The radio was retuned to `hz` (display): the spectrum average starts over, and frames carry
+    /// the new centre so the waterfall can slide its history to match.
+    func update(captureCenter hz: Double) { captureCenter.withLock { $0 = hz } }
 
     // MARK: Modem
 
@@ -334,6 +347,7 @@ final class DSPEngine: @unchecked Sendable {
         var db = [Float](repeating: -200, count: settings.fftSize)
         var historyPos = 0
         var sinceFrame = 0
+        var frameCenter = captureCenter.withLock { $0 }
         var block = [DSPComplex](repeating: DSPComplex(real: 0, imag: 0), count: 1 << 16)
         var audioOut = [Float]()
         audioOut.reserveCapacity(1 << 15)
@@ -462,6 +476,11 @@ final class DSPEngine: @unchecked Sendable {
                 }
             }
             sinceFrame += n
+            let center = captureCenter.withLock { $0 }
+            if center != frameCenter && !(center.isNaN && frameCenter.isNaN) {
+                frameCenter = center
+                averager.restart()
+            }
             if sinceFrame >= max(size, Int(sampleRate / max(1, settings.framesPerSecond.isFinite ? settings.framesPerSecond : 1))) {
                 sinceFrame = 0
                 linear.withUnsafeMutableBufferPointer { l in
@@ -473,7 +492,7 @@ final class DSPEngine: @unchecked Sendable {
                 }
                 linear.withUnsafeBufferPointer { src in db.withUnsafeMutableBufferPointer { analyzer.process(src, into: $0) } }
                 db.withUnsafeBufferPointer { averager.add($0) }
-                frames.publish(average: averager.average, peak: averager.peak)
+                frames.publish(average: averager.average, peak: averager.peak, centerHz: frameCenter)
             }
 
             // Audio.

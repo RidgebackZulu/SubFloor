@@ -92,4 +92,8 @@ public final class SpectrumAverager {
     }
 
     public func resetPeak() { peak = average }
+
+    /// Starts over: the next frame replaces both the average and the peak (after a retune, the old
+    /// frames are of other frequencies).
+    public func restart() { primed = false }
 }

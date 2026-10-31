@@ -7,7 +7,7 @@ enum ModemPanelFormat {
     /// The mode segment's choices: Off, then every mode.
     static let modeChoices: [ModeID?] = [nil] + ModemControl.offeredModes.map { $0 }
 
-    static let benchPlaceholder = "Click a signal in the passband, or a decode, to analyse it"
+    static let benchPlaceholder = "Right-click a signal in the passband, or click a decode, to analyse it"
     static let offHint = "Pick a mode to decode every signal in the receiver's passband"
 
     /// A mode segment's label: "Off" or the mode's name.

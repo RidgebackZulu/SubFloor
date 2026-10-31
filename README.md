@@ -24,7 +24,7 @@ records lossless audio and IQ that start *before* you press the button.
 - 🌊 **A waterfall that keeps up.** Metal rendering at up to 120 fps, FFTs up to 65,536 points, and
   pinch, zoom and pan that never retune the radio.
 - 📡 **Decodes the whole passband at once.** Every CW, PSK31, FT8 and WSPR signal in the receiver's
-  passband gets its own decoder. Click one and the bench shows its waveform, its spectrum within
+  passband gets its own decoder. Right-click one and the bench shows its waveform, its spectrum within
   ±100 Hz and its IQ.
 - ⏪ **Records the past.** A rolling pre-roll keeps the last 5 to 120 seconds in memory, so a recording
   starts before your click. FLAC, WAV, Apple Lossless or SigMF, and all of it lossless.
@@ -121,7 +121,7 @@ always released.
 ## Using it
 | Action | How |
 | --- | --- |
-| Tune | Click the spectrum · scroll a readout digit · click readout and type `14.074`, `7074k`, `144.39m` |
+| Tune | Click anywhere on the spectrum · scroll a readout digit · click readout and type `14.074`, `7074k`, `144.39m` |
 | Quick tune | ⌘L or `/` — frequency or bookmark name (`ft8 20`) |
 | Run / Stop | Space or ⌘R |
 | Open IQ recording | ⌘O (stereo I/Q WAV) |
@@ -134,7 +134,7 @@ always released.
 | Step VFO | ← / → (⇧ ×10); with a modem mode on they move the modem cursor instead |
 | Mode | Top bar, or `[` / `]` |
 | Zoom / pan | Pinch or ⌥-scroll / two-finger scroll or drag — never retunes the radio |
-| Bandwidth | Drag the passband edges |
+| Bandwidth | Drag a passband edge (in SSB, the far one; the near one is the tuning line) |
 | Bookmarks | ⌘D add · ⌘B show on spectrum · sidebar list |
 | HamItUp | Top-bar button (green when on) or ⌘U (LO set in Settings, default 125 MHz) |
 | Tune a bookmark | Click its flag above the spectrum: frequency, mode, passband width and HamItUp, at the current zoom |
@@ -221,7 +221,7 @@ underlines the digit the knob tunes, and a HUD shows the knob, step and mode whi
 
 | On the dial | Does |
 | --- | --- |
-| Turn | Tune by the step (the amber digit) |
+| Turn | Tune by the step (the amber digit): the tuning line stays put and the spectrum and waterfall slide under it |
 | Press | Next coarser step, 1 Hz → 1 MHz, then back to 1 Hz |
 | Hold and turn | Pick the step |
 | Long-press | Settings: Bluetooth, acceleration, direction, brightness, sounds |
@@ -252,7 +252,7 @@ panel shows the band being decoded. Changing mode starts afresh: nothing of the 
 
 | Action | How |
 | --- | --- |
-| Analyse a signal | Click it inside the passband: the amber cursor snaps to the nearest tracked signal and follows it; the bench shows its waveform, ±100 Hz spectrum and IQ. Clicking outside the passband still tunes the VFO |
+| Analyse a signal | Right-click (or ⌃-click) it inside the passband: the amber cursor snaps to the nearest tracked signal and follows it; the bench shows its waveform, ±100 Hz spectrum and IQ. A plain click anywhere, inside the passband too, tunes the VFO |
 | Analyse a decode | Click a row in the decode list (FT8/WSPR messages included): the cursor goes to that signal and the bench shows it; the row turns amber |
 | Unlock the cursor | Esc, click the cursor again, or click its (amber) row |
 | Next / previous signal | ← / → while a mode is on (instead of stepping the VFO) |

@@ -4,9 +4,10 @@ import Foundation
 public enum SpectrumHit: Equatable, Sendable {
     /// The modem box's grab tab: drags the box.
     case boxGrabTab
-    /// A VFO passband edge: drags the bandwidth.
+    /// A VFO passband edge: a drag sets the bandwidth, a click tunes.
     case passbandEdge(upper: Bool)
-    /// Inside the modem box: a click locks the modem cursor, a drag pans the spectrum.
+    /// Inside the modem box: a click tunes and a drag pans, as elsewhere; a right click locks the
+    /// modem cursor.
     case boxBody
     /// Anywhere else: a click tunes the VFO, a drag pans.
     case elsewhere
@@ -32,18 +33,18 @@ public enum SpectrumHitTest {
 
     /// What the point `(x, y)` hits in a view `width` points wide: the grab tab first, then a
     /// passband edge (the upper one first), then the box body. Nil extents are absent (no box, an
-    /// inactive box's body, no passband).
+    /// inactive box's body, no passband, an edge that does not drag: SSB's edge at the carrier).
     public static func hit(x: Double, y: Double, width: Double,
                            grabTab: (lower: Double, upper: Double)?,
                            box: (lower: Double, upper: Double)?,
-                           passbandEdges: (lower: Double, upper: Double)?) -> SpectrumHit {
+                           passbandEdges: (lower: Double?, upper: Double?)?) -> SpectrumHit {
         if let tab = grabTab, y >= 0, y < tabHeight {
             let t = tabExtent(lower: tab.lower * width, upper: tab.upper * width)
             if x >= t.lower && x <= t.upper { return .boxGrabTab }
         }
         if let edges = passbandEdges {
-            if abs(x - edges.upper * width) < edgeTolerance { return .passbandEdge(upper: true) }
-            if abs(x - edges.lower * width) < edgeTolerance { return .passbandEdge(upper: false) }
+            if let upper = edges.upper, abs(x - upper * width) < edgeTolerance { return .passbandEdge(upper: true) }
+            if let lower = edges.lower, abs(x - lower * width) < edgeTolerance { return .passbandEdge(upper: false) }
         }
         if let box, x >= box.lower * width, x <= box.upper * width { return .boxBody }
         return .elsewhere

@@ -21,7 +21,16 @@ import Testing
     }
 
     @Test func uniformsLayoutMatchesMetal() {
-        #expect(MemoryLayout<Uniforms>.stride == 48)
+        #expect(MemoryLayout<Uniforms>.stride == 56)
+    }
+
+    @Test func waterfallRowsShiftByTheRetune() {
+        // Retuned up 10 kHz with 100 Hz bins: a row from before is indexed 100 bins further along
+        // (its bin 100 + b is the frequency now at screen bin b).
+        #expect(SpectrumRenderer.shiftBins(measuredAt: 7_000_000, currentCenterHz: 7_010_000, binHz: 100) == 100)
+        #expect(SpectrumRenderer.shiftBins(measuredAt: 7_010_000, currentCenterHz: 7_000_000, binHz: 100) == -100)
+        #expect(SpectrumRenderer.shiftBins(measuredAt: .nan, currentCenterHz: 7_000_000, binHz: 100) == 0)
+        #expect(SpectrumRenderer.shiftBins(measuredAt: 7_000_000, currentCenterHz: .nan, binHz: 100) == 0)
     }
 
     @Test @MainActor func shaderCompilesAndPipelineBuilds() throws {
