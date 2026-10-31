@@ -46,7 +46,7 @@ protocol MCPToolProvider: AnyObject {
     func call(_ name: String, arguments: [String: JSONValue], client: String) async -> MCPToolResult
 }
 
-/// No tools: every call is an unknown tool. The server runs with it until the SubFloor tools exist.
+/// No tools: every call is an unknown tool (the server tests run with it; the app uses `SubFloorTools`).
 @MainActor
 final class EmptyToolProvider: MCPToolProvider {
     let tools: [MCPToolDescriptor] = []

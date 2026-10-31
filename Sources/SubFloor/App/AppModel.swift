@@ -30,6 +30,21 @@ struct HoverReadout: Equatable {
     var db: Float?
 }
 
+/// Where the pointer last rested over the spectrum or waterfall, kept after it leaves (for `get_cursor`).
+struct PointerReadout: Equatable {
+    var hz: Double
+    /// The dB scale at the pointer's height; nil over the waterfall.
+    var db: Float?
+    var at: Date
+}
+
+/// The latest averaged spectrum: `average[0]` is at `centerHz − spanHz / 2`, one bin every `spanHz / count` (dBFS).
+struct SpectrumSnapshot {
+    var centerHz: Double
+    var spanHz: Double
+    var average: [Float]
+}
+
 private struct SessionState: Codable {
     var vfoHz: Double
     var centerHz: Double
@@ -326,6 +341,8 @@ final class AppModel {
     var showPeak = false
     var spectrumFraction: CGFloat = 0.4
     private(set) var hover: HoverReadout?
+    /// `hover` as it last was, kept when the pointer leaves. Read on demand, so not observed.
+    @ObservationIgnored private(set) var lastPointer: PointerReadout?
 
     // MARK: Bookmarks, modems, UI
     private(set) var bookmarks: [Bookmark] = []
@@ -993,7 +1010,18 @@ final class AppModel {
         guard let unit else { hover = nil; return }
         let sf = Double(spectrumFraction)
         let db: Float? = Double(unit.y) <= sf ? dbMax - Float(Double(unit.y) / sf) * (dbMax - dbMin) : nil
-        hover = HoverReadout(point: unit, hz: viewport.hz(atFraction: Double(unit.x)), db: db)
+        let hz = viewport.hz(atFraction: Double(unit.x))
+        hover = HoverReadout(point: unit, hz: hz, db: db)
+        lastPointer = PointerReadout(hz: hz, db: db, at: Date())
+    }
+
+    /// The latest spectrum frame, or nil before the first one. Frames from before a retune carry their own
+    /// centre; one with none is taken to be at `centerHz`.
+    func spectrumSnapshot() -> SpectrumSnapshot? {
+        var average: [Float] = [], peak: [Float] = []
+        guard let frame = engine.frames.readFrame(after: 0, average: &average, peak: &peak) else { return nil }
+        return SpectrumSnapshot(centerHz: frame.centerHz.isFinite ? frame.centerHz : centerHz, spanHz: sampleRate,
+                                average: average)
     }
 
     // MARK: Bookmarks

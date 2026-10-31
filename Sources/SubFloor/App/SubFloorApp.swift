@@ -52,7 +52,10 @@ struct SubFloorApp: App {
         let model = AppModel()
         _model = State(initialValue: model)
         _dial = State(initialValue: DialController(model: model))
-        _mcp = State(initialValue: MCPServer(provider: EmptyToolProvider()))
+        let tools = SubFloorTools(model: model)
+        let mcp = MCPServer(provider: tools)
+        tools.connectedClients = { [weak mcp] in mcp?.connectedClients ?? [] }
+        _mcp = State(initialValue: mcp)
     }
 
     private var scheme: ColorScheme? {
