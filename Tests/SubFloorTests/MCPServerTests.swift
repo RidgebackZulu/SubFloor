@@ -54,6 +54,31 @@ struct MCPServerTests {
         return true
     }
 
+    /// Set from a Network callback, read by the test.
+    private final class Flag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var set = false
+        var value: Bool { lock.withLock { set } }
+        func raise() { lock.withLock { set = true } }
+    }
+
+    /// A loopback port free right now: bound by a throwaway listener, which is cancelled and gone before
+    /// this returns.
+    private func freePort() async throws -> Int {
+        let parameters = NWParameters.tcp
+        parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback), port: .any)
+        let throwaway = try NWListener(using: parameters)
+        let cancelled = Flag()
+        throwaway.stateUpdateHandler = { if case .cancelled = $0 { cancelled.raise() } }
+        throwaway.newConnectionHandler = { $0.cancel() }
+        throwaway.start(queue: DispatchQueue(label: "MCPServerTests.freePort"))
+        #expect(await waitFor { throwaway.port != nil && throwaway.port?.rawValue != 0 })
+        let port = Int(try #require(throwaway.port).rawValue)
+        throwaway.cancel()
+        #expect(await waitFor { cancelled.value })
+        return port
+    }
+
     @Test func servesOverLoopback() async throws {
         let server = makeServer()
         defer { server.stop() }
@@ -169,6 +194,56 @@ struct MCPServerTests {
         #expect(server.log.events.contains { $0.kind == .auth })
         let (accepted, _, _) = try await post(server, Self.initializeBody)
         #expect(accepted == 200)
+    }
+
+    @Test func newTokenKeepsAFixedPort() async throws {
+        let port = try await freePort()
+        let server = makeServer()
+        defer { server.stop() }
+        await server.apply(MCPSettings(enabled: true, port: port))
+        #expect(server.state == .listening)
+        #expect(server.boundPort == UInt16(port))
+        let (status, _, _) = try await post(server, Self.initializeBody)
+        #expect(status == 200)
+
+        server.newToken()
+        #expect(await waitFor { server.boundPort != nil || { if case .failed = server.state { true } else { false } }() })
+        #expect(server.state == .listening)
+        #expect(server.boundPort == UInt16(port))
+        let (accepted, _, _) = try await post(server, Self.initializeBody)
+        #expect(accepted == 200)
+    }
+
+    @Test func stopThenApplyRebindsTheSamePort() async throws {
+        let port = try await freePort()
+        let other = try await freePort()
+        let server = makeServer()
+        defer { server.stop() }
+        await server.apply(MCPSettings(enabled: true, port: port))
+        #expect(server.boundPort == UInt16(port))
+        let (first, _, _) = try await post(server, Self.initializeBody)   // an agent holds a connection open
+        #expect(first == 200)
+
+        server.stop()
+        await server.apply(MCPSettings(enabled: true, port: port))
+        #expect(server.state == .listening)
+        #expect(server.boundPort == UInt16(port))
+
+        let (second, _, _) = try await post(server, Self.initializeBody)
+        #expect(second == 200)
+        await server.apply(MCPSettings(enabled: false, port: port))
+        await server.apply(MCPSettings(enabled: true, port: port))
+        #expect(server.state == .listening)
+        #expect(server.boundPort == UInt16(port))
+
+        // A port change there and back.
+        await server.apply(MCPSettings(enabled: true, port: other))
+        #expect(server.boundPort == UInt16(other))
+        await server.apply(MCPSettings(enabled: true, port: port))
+        #expect(server.state == .listening)
+        #expect(server.boundPort == UInt16(port))
+        let (status, _, _) = try await post(server, Self.initializeBody)
+        #expect(status == 200)
     }
 
     @Test func offByDefaultAndPersists() async throws {

@@ -48,6 +48,11 @@ final class MCPServer {
     @ObservationIgnored private var generation = 0
     /// `start` callers waiting for the listener to be ready or to fail.
     @ObservationIgnored private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    /// The generations of cancelled listeners that still hold their port. The port is free again only once a
+    /// listener reports `.cancelled`; binding it before then fails with EADDRINUSE.
+    @ObservationIgnored private var closing: Set<Int> = []
+    /// `start` callers waiting for `closing` to empty.
+    @ObservationIgnored private var closedWaiters: [CheckedContinuation<Void, Never>] = []
     @ObservationIgnored private var refreshTask: Task<Void, Never>?
 
     init(provider: MCPToolProvider, defaults: UserDefaults = .standard,
@@ -112,6 +117,8 @@ final class MCPServer {
     private func start(port: Int) async {
         closeListener()
         let current = generation
+        await listenersClosed()
+        guard current == generation else { return }   // stopped or started again meanwhile
         let parameters = NWParameters.tcp
         parameters.acceptLocalOnly = true
         parameters.requiredLocalEndpoint = .hostPort(host: .ipv4(.loopback),
@@ -140,6 +147,7 @@ final class MCPServer {
     }
 
     private func listenerChanged(_ newState: NWListener.State, port: Int, generation current: Int) {
+        if case .cancelled = newState { return listenerCancelled(current) }
         guard current == generation, let listener else { return }
         switch newState {
         case .ready:
@@ -165,10 +173,20 @@ final class MCPServer {
         log.add(.error, client: nil, "Could not start on port \(port): \(error)")
     }
 
-    /// Cancels the listener and its connections and ends every session; `state` is left to the caller.
+    /// Cancels the listener and its connections and ends every session; `state` is left to the caller. The
+    /// port stays taken until the listener reports `.cancelled` (see `listenersClosed`).
     private func closeListener() {
+        if let listener {
+            let closed = generation
+            closing.insert(closed)
+            listener.cancel()
+            // In case `.cancelled` never comes, so a start cannot wait forever.
+            Task { [weak self] in
+                try? await Task.sleep(for: .seconds(2))
+                self?.listenerCancelled(closed)
+            }
+        }
         generation += 1
-        listener?.cancel()
         listener = nil
         listenerPort = nil
         for connection in connections.values { connection.cancel() }
@@ -178,6 +196,19 @@ final class MCPServer {
         boundPort = nil
         rpc.sessions.endAll()
         resumeStartWaiters()
+    }
+
+    /// Returns once every cancelled listener has let go of its port.
+    private func listenersClosed() async {
+        guard !closing.isEmpty else { return }
+        await withCheckedContinuation { closedWaiters.append($0) }
+    }
+
+    private func listenerCancelled(_ closed: Int) {
+        guard closing.remove(closed) != nil, closing.isEmpty else { return }
+        let waiters = closedWaiters
+        closedWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
     }
 
     private func resumeStartWaiters() {
