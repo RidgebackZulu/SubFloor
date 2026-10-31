@@ -41,6 +41,8 @@ records lossless audio and IQ that start *before* you press the button.
   switches AM/LSB/USB with a tap, and connects over Bluetooth or USB. [More below](#subfloor-dial).
 - 🔖 **Bookmarks on the spectrum.** Flags float above the signals; click one to tune, right-click to edit.
   Groups, notes, and a manager window (⌥⌘B) for the whole list.
+- 🤖 **AI agents can drive it.** Claude Code, Hermes, Codex and other agents tune, listen, record, decode
+  and log bookmarks through SubFloor's MCP server, on this Mac only. [Set it up](#-ai-agents-mcp).
 - 🛟 **Calm when the radio isn't.** No RSP or a stuck SDRplay service? SubFloor falls back to a built-in
   demo signal and tells you how to fix it.
 
@@ -99,6 +101,39 @@ into the key field and pressing **Save** does the same thing. From then on every
 transcribed once it closes; *Transcribe older recordings* in the same panel sends the ones you
 already have, and shows the cost first. [What you get](#transcripts).
 
+## 🤖 AI agents (MCP)
+
+SubFloor has an MCP server, so an AI agent can work the radio for you: you ask, it researches, tunes,
+listens, records and logs. It's off until you switch it on, it answers only this Mac, and only agents
+holding its token.
+
+1. **Switch it on.** Click the **MCP** button in the top bar (or Radio › MCP Server…) and tick **Enable the
+   MCP server**. The button glows while an agent is connected and pulses with every request.
+2. **Pick your agent.** The Setup tab has a ready snippet for Claude Code, Hermes, Codex, Gemini CLI, Cursor,
+   VS Code, Claude Desktop and more, with the address and token filled in.
+3. **Paste it, or click Add.** For Claude Code and Gemini CLI, **Add** does it for you. For Claude Code and
+   Hermes, the SubFloor plugin also brings a skill that teaches the agent to work the radio well:
+   ```
+   /plugin marketplace add RidgebackZulu/SubFloor
+   /plugin install subfloor@subfloor
+   ```
+   (one line at a time in Claude Code), or `hermes plugins install RidgebackZulu/SubFloor/plugins/subfloor --enable`.
+   [More in the plugin's README](plugins/subfloor/README.md).
+
+Then ask, for example:
+
+- "What type of signal is my cursor on?"
+- "Research a broadcast, then at its time tune, record, and set the squelch above the noise floor."
+- "Generate a map of the FT8 talkers."
+- "Look up the callsign…"
+- "Research pirate stations, hunt the band for audio, and record only real pirates, not noise."
+- "Research propaganda stations and their schedules."
+- "Scan 4–7 MHz for digital signals and log them as bookmarks."
+
+The **Event log** tab shows every call an agent makes. Agents never transmit, never delete a recording or
+your bookmarks, and every recording they start stops by itself. Not built yet: recording at a set time with
+no agent present, naming a signal's modulation, and a measured noise floor. Agents work around them for now.
+
 ## Build from source
 You need macOS 15 or later on Apple Silicon, Xcode 26 (Swift 6.2), and the
 [SDRplay API 3.15](https://www.sdrplay.com/api/) installed at `/usr/local/lib/libsdrplay_api.dylib`.
@@ -141,6 +176,7 @@ always released.
 | Tune a bookmark | Click its flag above the spectrum: frequency, mode, passband width and HamItUp, at the current zoom |
 | Edit a bookmark | Right-click (or ⌃-click) its flag: name, frequency, mode, bandwidth, group (pick one or type a new one), HamItUp, notes; Use Current Tuning, Tune or Delete |
 | Manage bookmarks | Radio › Bookmarks… (⌥⌘B): every bookmark in a sortable table, filtered by group or search (notes too). Double-click tunes, ⌫ deletes, drag rows onto a group or select several to move them together. Bookmarks an AI agent saved are marked **MCP** |
+| AI agents | Top-bar **MCP** button or Radio › MCP Server…: switch the server on, copy a snippet for your agent, watch the event log. See [AI agents](#-ai-agents-mcp) |
 
 ## Recording
 The save buffer is always running: each stream keeps its last 5–120 s (Settings, default 30 s) in

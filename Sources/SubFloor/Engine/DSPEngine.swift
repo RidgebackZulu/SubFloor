@@ -110,6 +110,9 @@ final class DSPEngine: @unchecked Sendable {
     /// auto sessions on it from the squelch gate (when configured on).
     let autoRecorder = AutoRecorder(recorder: StreamRecorder(kind: .audio, rollsOnContextChange: false))
     var audioRecorder: StreamRecorder { autoRecorder.recorder }
+    /// The last minute of the receiver's audio before the squelch gate, with the gate's open time, for an
+    /// agent's `listen`. Pushed with every block on the DSP thread; a new run starts it over (`start`).
+    let audioTap = AudioTap()
 
     /// What the DSP thread should do with the box.
     struct ModemBoxState: Equatable, Sendable {
@@ -191,6 +194,7 @@ final class DSPEngine: @unchecked Sendable {
         iqRecorder.clearHistory()
         audioRecorder.clearHistory()
         autoRecorder.reset()
+        audioTap.clear()
         pending.withLock { $0 = Pending() }
         dropped.store(0, ordering: .relaxed)
         losses.drain()
@@ -502,6 +506,7 @@ final class DSPEngine: @unchecked Sendable {
             audioOut.withUnsafeBufferPointer { heard in
                 receiver.ungatedAudio.withUnsafeBufferPointer { autoRecorder.process(heard, ungated: $0, gateOpen: receiver.isSquelchOpen) }
             }
+            receiver.ungatedAudio.withUnsafeBufferPointer { audioTap.push($0, gateOpen: receiver.isSquelchOpen) }
             // The speaker path only: the recorders above and the modem have the audio as heard.
             audioOut.withUnsafeMutableBufferPointer { reducer.process($0) }
             audioOut.withUnsafeMutableBufferPointer { a in

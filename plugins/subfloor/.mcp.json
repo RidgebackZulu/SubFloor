@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "subfloor": {
+      "type": "http",
+      "url": "${SUBFLOOR_MCP_URL:-http://127.0.0.1:7824/mcp}",
+      "headers": {
+        "Authorization": "Bearer ${SUBFLOOR_MCP_TOKEN}"
+      }
+    }
+  }
+}

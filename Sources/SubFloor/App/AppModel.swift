@@ -30,6 +30,21 @@ struct HoverReadout: Equatable {
     var db: Float?
 }
 
+/// Where the pointer last rested over the spectrum or waterfall, kept after it leaves (for `get_cursor`).
+struct PointerReadout: Equatable {
+    var hz: Double
+    /// The dB scale at the pointer's height; nil over the waterfall.
+    var db: Float?
+    var at: Date
+}
+
+/// The latest averaged spectrum: `average[0]` is at `centerHz − spanHz / 2`, one bin every `spanHz / count` (dBFS).
+struct SpectrumSnapshot {
+    var centerHz: Double
+    var spanHz: Double
+    var average: [Float]
+}
+
 private struct SessionState: Codable {
     var vfoHz: Double
     var centerHz: Double
@@ -61,6 +76,8 @@ private struct SessionState: Codable {
     var skipSilence: Bool?
     // Optional so that sessions saved before transcripts decode.
     var transcription: TranscriptionSettings?
+    /// An agent's Auto time limit (`AppModel.autoRecordOffAt`).
+    var autoRecordOffAt: Date?
 }
 
 @MainActor @Observable
@@ -128,6 +145,8 @@ final class AppModel {
     /// Saving a key, even the same one, also unblocks the transcription queue.
     private(set) var apiKey: String? { didSet { transcription.apiKey = apiKey } }
     var hasAPIKey: Bool { !(apiKey ?? "").isEmpty }
+    /// The key to transcribe with, or nil when none is saved (an agent's `listen`).
+    var transcriptionKey: String? { hasAPIKey ? apiKey : nil }
     /// Stores `key` (trimmed) in the key store and queues today's recordings that were waiting for one; an
     /// empty or blank key removes it instead.
     func saveAPIKey(_ key: String) throws {
@@ -188,14 +207,54 @@ final class AppModel {
     }
     /// Each recorder's state, polled at 5 Hz (`refreshStats`); set at once on start.
     private(set) var recordingStatus: [StreamKind: RecordingStatus] = [:]
+    /// The manual recordings started of each kind (taking over an auto recording counts), so an agent tells the
+    /// recording it started from one started after it.
+    @ObservationIgnored private(set) var recordingStarts: [StreamKind: Int] = [:]
 
     /// Auto-record (the Auto button), persisted. It records only while the radio runs on a real
     /// source with the squelch on; otherwise it waits (`autoRecordState`).
     var autoRecordEnabled = false {
         didSet {
             guard autoRecordEnabled != oldValue else { return }
+            // Any change ends an agent's time limit (`turnOnAutoRecord(until:)` sets it after turning Auto on):
+            // the owner turning Auto off and on again makes it theirs.
+            autoRecordOffAt = nil
             if autoRecordEnabled { lastDiskCheck = nil }   // check the disk at the next refresh
             pushAutoRecord()
+        }
+    }
+
+    /// When the Auto an agent turned on turns itself off (`set_auto_record`); nil while Auto is off or is the
+    /// owner's. Saved with the session, so a quit or a crash does not leave Auto on with no limit: a relaunch
+    /// past it turns Auto off, and one before it waits for it again.
+    @ObservationIgnored private(set) var autoRecordOffAt: Date? {
+        didSet {
+            guard autoRecordOffAt != oldValue else { return }
+            armAutoRecordOff()
+            saveSessionIfChanged()
+        }
+    }
+    @ObservationIgnored private var autoRecordOffTask: Task<Void, Never>?
+
+    /// An agent's Auto: on until `offAt`, or, if it is on for an agent already, until `offAt` instead.
+    func turnOnAutoRecord(until offAt: Date) {
+        autoRecordEnabled = true
+        autoRecordOffAt = offAt
+    }
+
+    /// Waits for `autoRecordOffAt` and turns Auto off then, unless the limit has changed meanwhile.
+    private func armAutoRecordOff() {
+        autoRecordOffTask?.cancel()
+        autoRecordOffTask = nil
+        guard let offAt = autoRecordOffAt else { return }
+        autoRecordOffTask = Task { [weak self] in
+            while offAt.timeIntervalSinceNow > 0 {
+                // In steps of at most a second, by the wall clock: a Mac that slept past it turns Auto off on waking.
+                let step = min(offAt.timeIntervalSinceNow, 1)
+                do { try await Task.sleep(for: .milliseconds(Int(step * 1000) + 1)) } catch { return }
+            }
+            guard let self, self.autoRecordOffAt == offAt else { return }
+            self.autoRecordEnabled = false
         }
     }
 
@@ -237,6 +296,8 @@ final class AppModel {
 
     /// Sends finished recordings for transcription and saves their transcripts beside them.
     let transcription: TranscriptionQueue
+    /// What turns a recording into a transcript (the queue's, and an agent's `listen`).
+    let transcribeFunction: TranscribeFunction
 
     /// The relaunch rule: queues the folder's audio recordings that have a length and no transcript and
     /// started within the last 24 hours, at or after transcription was last turned on. Run after the
@@ -326,6 +387,8 @@ final class AppModel {
     var showPeak = false
     var spectrumFraction: CGFloat = 0.4
     private(set) var hover: HoverReadout?
+    /// `hover` as it last was, kept when the pointer leaves. Read on demand, so not observed.
+    @ObservationIgnored private(set) var lastPointer: PointerReadout?
 
     // MARK: Bookmarks, modems, UI
     private(set) var bookmarks: [Bookmark] = []
@@ -354,6 +417,8 @@ final class AppModel {
     /// The rows as the engine's output arrives (10 Hz); not observed.
     @ObservationIgnored private var liveLog = DecodeLog()
     @ObservationIgnored private var liveLogChanged = false
+    /// Every FT8/WSPR message decoded, kept for 30 days.
+    let decodeHistory: DecodeHistory
     /// The live rows' audio frequencies, for the ruler's ticks: assigned only when a tick would move
     /// (to the nearest hertz), so the rows' text doesn't redraw the ruler.
     private(set) var modemTrackAudioHz: [Double] = []
@@ -412,15 +477,18 @@ final class AppModel {
          apiKeyStore: any APIKeyStore = MemoryAPIKeyStore(),
          transcribe: @escaping TranscribeFunction = OpenRouterTranscriber.liveTranscribe,
          openRSP: @escaping @Sendable () throws -> SDRplayDevice = { try SDRplayDevice.open() },
-         rspOpenTimeout: Duration = .seconds(10)) {
+         rspOpenTimeout: Duration = .seconds(10),
+         decodeHistoryFolder: URL? = nil) {
         self.bookmarkStore = bookmarkStore
         self.defaults = defaults
         self.apiKeyStore = apiKeyStore
         apiKey = apiKeyStore.load()
         self.openRSP = openRSP
         self.rspOpenTimeout = rspOpenTimeout
+        decodeHistory = DecodeHistory(folder: decodeHistoryFolder ?? DecodeHistory.defaultFolder)
         library = RecordingsLibrary(folder: RecordingSettings().folder)   // the folder `restoreSession` may replace
         transcription = TranscriptionQueue(transcribe: transcribe)
+        transcribeFunction = transcribe
         player = RecordingPlayer(library: library, setLiveMuted: { [weak self] muted in self?.liveAudioMuted = muted })
         let (loaded, result) = bookmarkStore.load()
         bookmarks = loaded
@@ -535,7 +603,7 @@ final class AppModel {
     }
 
     /// Shows `new` unless it would hide a more severe banner that is already up (error > warning > info).
-    private func show(_ new: Banner) {
+    func show(_ new: Banner) {
         func rank(_ k: Banner.Kind) -> Int { switch k { case .info: 0; case .warning: 1; case .error: 2 } }
         if let current = banner, rank(new.kind) < rank(current.kind) { return }
         banner = new
@@ -628,6 +696,7 @@ final class AppModel {
         sdrplay?.close()
         sdrplay = nil
         saveSessionIfChanged()
+        autoRecordOffTask?.cancel()
         statsTimer?.invalidate()
         statsTimer = nil
         if let libraryActivation { NotificationCenter.default.removeObserver(libraryActivation) }
@@ -989,7 +1058,18 @@ final class AppModel {
         guard let unit else { hover = nil; return }
         let sf = Double(spectrumFraction)
         let db: Float? = Double(unit.y) <= sf ? dbMax - Float(Double(unit.y) / sf) * (dbMax - dbMin) : nil
-        hover = HoverReadout(point: unit, hz: viewport.hz(atFraction: Double(unit.x)), db: db)
+        let hz = viewport.hz(atFraction: Double(unit.x))
+        hover = HoverReadout(point: unit, hz: hz, db: db)
+        lastPointer = PointerReadout(hz: hz, db: db, at: Date())
+    }
+
+    /// The latest spectrum frame, or nil before the first one. Frames from before a retune carry their own
+    /// centre; one with none is taken to be at `centerHz`.
+    func spectrumSnapshot() -> SpectrumSnapshot? {
+        var average: [Float] = [], peak: [Float] = []
+        guard let frame = engine.frames.readFrame(after: 0, average: &average, peak: &peak) else { return nil }
+        return SpectrumSnapshot(centerHz: frame.centerHz.isFinite ? frame.centerHz : centerHz, spanHz: sampleRate,
+                                average: average)
     }
 
     // MARK: Bookmarks
@@ -1143,6 +1223,7 @@ final class AppModel {
             show(Banner(kind: .warning, message: Self.lowDiskMessage))
         }
         recorder(kind).start()
+        recordingStarts[kind, default: 0] += 1
         refreshRecordingStatus()
     }
 
@@ -1293,6 +1374,60 @@ final class AppModel {
         }
     }
 
+    /// Keeps an agent's `listen` clip (mono `rate` Hz audio whose first sample was at `start`, heard at
+    /// `frequencyHz` in `mode`: the tuning when it began, which may have changed since) as a manual recording:
+    /// written in the audio recording format to the recordings folder, named for that tuning, and logged, so it shows in Recordings. The file is written and listed off the main actor. `transcript`,
+    /// the one `listen` made of the clip, if any, is saved beside it and indexed before the log line queues the
+    /// clip, so it is not sent again. Returns the file name.
+    func saveListenClip(_ samples: [Float], rate: Double, start: Date, frequencyHz hz: Double, mode: DemodMode,
+                        transcript: StoredTranscript? = nil) async throws -> String {
+        let folder = recording.folder, format = recording.audioFormat, sampleFormat = recording.audioSampleFormat
+        let label = mode.label, hardware = activeSource.name
+        let file = try await Task.detached(priority: .userInitiated) {
+            try Self.writeClip(samples, rate: rate, start: start, folder: folder, format: format, sampleFormat: sampleFormat,
+                               frequencyHz: hz, label: label, hardware: hardware)
+        }.value
+        if var t = transcript {
+            t.file = file
+            let saved = t
+            // Indexed even if the sidecar can't be written: the clip is kept either way, and not sent again today.
+            try? await Task.detached(priority: .utility) { try TranscriptStore.write(saved, in: folder) }.value
+            library.didTranscribe(saved, folder: folder)
+        }
+        appendToLog([.recording(file: file, start: start, seconds: Double(samples.count) / rate,
+                                frequencyHz: hz, mode: label, auto: false)])
+        await library.refreshFiles()   // listed now, so it is in Recordings when the agent hears back
+        return file
+    }
+
+    /// Writes `samples` as a new recording in `folder`; returns its file name.
+    nonisolated private static func writeClip(_ samples: [Float], rate: Double, start: Date, folder: URL, format: FileFormat,
+                                              sampleFormat: SampleFormat, frequencyHz: Double, label: String,
+                                              hardware: String) throws -> String {
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let name = RecordingNames.base(firstSample: start, frequencyHz: frequencyHz, label: label)
+        let base = RecordingNames.unique(folder.appendingPathComponent(name), extension: format.fileExtension)
+        let layout = StreamLayout(sampleRate: rate, channels: StreamKind.audio.channels, sampleFormat: sampleFormat)
+        let metadata = RecordingMetadata(frequencyHz: frequencyHz, firstSample: start, hardware: hardware,
+                                         description: "SubFloor audio clip (\(label))")
+        let file = try RecordingFiles.open(format, base: base, layout: layout, metadata: metadata)
+        let converter = SampleConverter(format: sampleFormat)
+        let block = 48_000
+        let bytes = UnsafeMutableRawBufferPointer.allocate(byteCount: block * sampleFormat.bytesPerSample, alignment: 16)
+        defer { bytes.deallocate() }
+        try samples.withUnsafeBufferPointer { all in
+            var from = 0
+            while from < all.count {
+                let n = min(block, all.count - from)
+                converter.convert(UnsafeBufferPointer(rebasing: all[from..<(from + n)]), into: bytes)
+                try file.write(UnsafeRawBufferPointer(rebasing: bytes[0..<(n * sampleFormat.bytesPerSample)]))
+                from += n
+            }
+        }
+        try file.finalize()
+        return file.url.lastPathComponent
+    }
+
     // MARK: Auto-record
 
     /// Turns Auto on or off. On with the squelch off, it says so and waits for the squelch.
@@ -1322,6 +1457,8 @@ final class AppModel {
     }
 
     static let lowDiskBytes: Int64 = 500_000_000
+    /// Under this free where recordings go, Auto turns off and an agent's recording stops.
+    static let autoOffDiskBytes: Int64 = 100_000_000
     static let lowDiskMessage = "Less than 500 MB free where recordings go."
     static let autoOffLowDiskReason = "less than 100 MB free"
 
@@ -1338,7 +1475,7 @@ final class AppModel {
         guard autoRecordEnabled else { return }
         lastDiskCheck = .now
         guard let free = freeSpaceProbe(recording.folder) else { return }
-        if free < 100_000_000 {
+        if free < Self.autoOffDiskBytes {
             autoRecordEnabled = false
             if engine.audioRecorder.sessionKind == .auto { engine.audioRecorder.stop() }
             // Logged before the banner, so a failed log write cannot replace it.
@@ -1351,6 +1488,9 @@ final class AppModel {
             diskLow = false
         }
     }
+
+    /// Free bytes where recordings go, or nil when unknown.
+    var recordingsFreeSpace: Int64? { freeSpaceProbe(recording.folder) }
 
     /// Free bytes for important use on the volume of `folder`, or of its nearest existing parent.
     nonisolated static func freeSpace(at folder: URL) -> Int64? {
@@ -1490,6 +1630,13 @@ final class AppModel {
             if outcomes != slotOutcomes { slotOutcomes = outcomes }
         }
         setModem(m)
+        recordSlotDecodes(batch.slotDecodes)
+    }
+
+    /// Adds FT8/WSPR decodes to the 30-day history, at the RF frequency of the box they were heard in.
+    func recordSlotDecodes(_ decodes: [SlotDecode]) {
+        guard !decodes.isEmpty else { return }
+        decodeHistory.append(decodes.map { HeardDecode.from($0, rfHz: modemBox.rfHz(forAudio: $0.frequencyHz)) })
     }
 
     /// Shows `liveLog` (when it changed since last shown).
@@ -1541,7 +1688,7 @@ final class AppModel {
                                  modemBox: nil, modemSettings: modem.settings, recording: recording,
                                  autoRecord: autoRecordEnabled, squelchEnabled: squelchEnabled, squelchDb: squelchDb,
                                  noiseReduction: noiseReduction, skipSilence: skipSilence,
-                                 transcription: transcriptionSettings)
+                                 transcription: transcriptionSettings, autoRecordOffAt: autoRecordOffAt)
         guard let data = try? JSONEncoder().encode(state), data != lastSavedSession else { return }
         defaults.set(data, forKey: "session")
         lastSavedSession = data
@@ -1562,8 +1709,13 @@ final class AppModel {
         if let on = s.autoRecord { autoRecordEnabled = on }
         if let on = s.skipSilence { skipSilence = on }
         if let t = s.transcription { transcriptionSettings = t }
-        // Last: it saves the session, which must be whole by then.
+        // With the rest restored: it saves the session, which must be whole by then.
         if let nr = s.noiseReduction { noiseReduction = nr }
+        // An agent's Auto limit after Auto itself, whose change clears it, and after the rest, since setting it
+        // saves the session. A limit that passed while SubFloor was not running ends Auto.
+        if autoRecordEnabled, let offAt = s.autoRecordOffAt {
+            if offAt > Date() { autoRecordOffAt = offAt } else { autoRecordEnabled = false }
+        }
         lastSavedSession = data
     }
 }

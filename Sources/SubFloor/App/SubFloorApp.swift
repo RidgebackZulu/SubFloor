@@ -5,6 +5,8 @@ import SwiftUI
 final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var model: AppModel?
     weak var dial: DialController?
+    /// The MCP server, handed over once the main window appears; stopped on quit.
+    var mcp: MCPServer?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         MainActor.assumeIsolated {
@@ -28,6 +30,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         MainActor.assumeIsolated {
+            mcp?.stop()
             dial?.shutdown()
             model?.shutdown()
         }
@@ -41,6 +44,7 @@ struct SubFloorApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @State private var model: AppModel
     @State private var dial: DialController
+    @State private var mcp: MCPServer
     @AppStorage("appearance") private var appearance = "dark"
 
     init() {
@@ -48,6 +52,11 @@ struct SubFloorApp: App {
         let model = AppModel()
         _model = State(initialValue: model)
         _dial = State(initialValue: DialController(model: model))
+        let tools = SubFloorTools(model: model)
+        let mcp = MCPServer(provider: tools)
+        tools.connectedClients = { [weak mcp] in mcp?.connectedClients ?? [] }
+        tools.log = mcp.log
+        _mcp = State(initialValue: mcp)
     }
 
     private var scheme: ColorScheme? {
@@ -63,11 +72,16 @@ struct SubFloorApp: App {
             ContentView()
                 .environment(model)
                 .environment(dial)
+                .environment(mcp)
                 .preferredColorScheme(scheme)
                 .tint(Theme.accent)
                 .onAppear {
                     appDelegate.model = model
                     appDelegate.dial = dial
+                    if appDelegate.mcp == nil {
+                        appDelegate.mcp = mcp
+                        if mcp.settings.enabled { Task { await mcp.apply(mcp.settings) } }
+                    }
                     dial.start()
                     KeyboardController.shared.install(model: model)
                     NSApp.activate()
@@ -94,10 +108,20 @@ struct SubFloorApp: App {
         .defaultSize(width: 1400, height: 640)
         .defaultLaunchBehavior(.suppressed)
 
+        Window("MCP Server", id: "mcp") {
+            MCPWindow()
+                .environment(mcp)
+                .preferredColorScheme(scheme)
+                .tint(Theme.accent)
+        }
+        .defaultSize(width: 900, height: 680)
+        .defaultLaunchBehavior(.suppressed)
+
         Settings {
             SettingsView()
                 .environment(model)
                 .environment(dial)
+                .environment(mcp)
                 .preferredColorScheme(scheme)
         }
     }
@@ -139,6 +163,8 @@ struct RadioCommands: Commands {
             Button("Recordings…") { openWindow(id: "recordings") }
                 .keyboardShortcut("l", modifiers: [.command, .shift])
             Button("Show Recordings in Finder") { model.revealRecordings() }
+            Divider()
+            Button("MCP Server…") { openWindow(id: "mcp") }
         }
     }
 }
