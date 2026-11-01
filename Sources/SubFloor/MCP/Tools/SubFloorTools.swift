@@ -64,13 +64,30 @@ final class SubFloorTools: MCPToolProvider {
     var recordingDiskCheckInterval: Duration = .seconds(2)
     /// The MCP event log, for what the tools do on their own (set by the app from `MCPServer.log`).
     var log: MCPLog?
+    /// The clock `get_cursor` ages the mouse by (tests move it).
+    var now: () -> Date = { Date() }
+    /// Whether the IQ ring holds `seconds` of IQ since the last retune: what `identify_signals` waits for after
+    /// each step (tests answer at once).
+    var ringReady: @MainActor (_ seconds: Double) -> Bool = { _ in true }
+    /// How long a scan waits for the ring to fill before it reads what there is (the answer says how much).
+    var ringWaitLimit: Duration = .seconds(20)
+    /// The spectrum a scan picks its signals from (tests supply their own).
+    var scanSpectrum: @MainActor () -> SpectrumSnapshot? = { nil }
+    /// The longer reads `get_cursor` started that are still running, by frequency (`quickIdentity`).
+    var cursorReads: [Int: CursorRead] = [:]
 
     /// `extraTools`: a test's own tools, offered beside SubFloor's.
     init(model: AppModel, extraTools: [SubFloorTool] = []) {
         self.model = model
-        let all = Self.radioTools + Self.bookmarkTools + Self.recordingTools + Self.decodeTools + extraTools
+        let all = Self.radioTools + Self.signalTools + Self.bookmarkTools + Self.recordingTools + Self.decodeTools + extraTools
         tools = all.map(\.descriptor)
         registry = Dictionary(all.map { ($0.descriptor.name, $0) }, uniquingKeysWith: { first, _ in first })
+        ringReady = { [unowned model] seconds in
+            let ring = model.engine.iqRecorder
+            // A ring that cannot hold the asked-for span is as full as it gets when it is nearly full.
+            return ring.status.preRollFill * ring.effectivePreRollSeconds >= min(seconds, 0.98 * ring.effectivePreRollSeconds)
+        }
+        scanSpectrum = { [unowned model] in model.spectrumSnapshot() }
     }
 
     func call(_ name: String, arguments: [String: JSONValue], client: String) async -> MCPToolResult {
@@ -98,6 +115,12 @@ final class SubFloorTools: MCPToolProvider {
     }
 
     var radioState: RadioState { RadioState(vfoHz: model.vfoHz, mode: model.mode, running: model.isRunning) }
+
+    /// Notes that `client`'s call just changed the radio to the state it is in, for a call that changes it in
+    /// steps (`identify_signals`): a `listen` it interrupts then says who did it.
+    func noteRadioChange(by client: String) {
+        lastRadioChange = RadioChange(client: client, at: Date(), state: radioState)
+    }
 
     /// Who made the radio `now` since `since`: the agent whose call left it so, or the owner.
     func changedBy(_ now: RadioState, since: Date) -> String {

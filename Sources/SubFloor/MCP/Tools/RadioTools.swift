@@ -55,8 +55,11 @@ extension SubFloorTools {
                 leaves, with seconds_ago; null if never), decoder_cursor (the decoder's locked cursor; null when no \
                 decoder is on or nothing is locked) and vfo. Each gives hz, level_dbfs (the live spectrum there; \
                 for the VFO, the passband's signal level), the nearest bookmark and the decodes within ± half the \
-                bandwidth.
-                """) { t, _, _ in t.cursor() },
+                bandwidth. And signal: what kind of signal is there (identify_signal's answer: family, name or null, \
+                confidence, parameters, alternatives), or null with signal_note saying why not (the mouse only if it \
+                rested within 30 s). A slow signal's first answer comes with needs_longer_read; ask again in a few \
+                seconds for the longer read's.
+                """) { t, _, _ in await t.cursor() },
 
             SubFloorTool("get_spectrum", title: "Get spectrum", readOnly: true, description: """
                 Power across from_hz…to_hz (default: the owner's current view) from the live averaged spectrum: \
@@ -212,7 +215,7 @@ extension SubFloorTools {
 
     // MARK: Cursors
 
-    func cursor() -> [String: JSONValue] {
+    func cursor() async -> [String: JSONValue] {
         let m = model
         let snap = m.isRunning ? m.spectrumSnapshot() : nil
         let half = m.bandwidthHz / 2
@@ -220,27 +223,28 @@ extension SubFloorTools {
 
         var mouse = JSONValue.null
         if let p = m.lastPointer {
-            mouse = .object(["hz": .hz(p.hz), "level_dbfs": level(p.hz),
-                             "seconds_ago": .num((Date().timeIntervalSince(p.at) * 10).rounded() / 10),
-                             "nearest_bookmark": nearestBookmark(p.hz, within: half),
-                             "decodes_near": decodesNear(p.hz, within: half)])
+            let age = now().timeIntervalSince(p.at)
+            mouse = await withSignal(["hz": .hz(p.hz), "level_dbfs": level(p.hz),
+                                      "seconds_ago": .num((age * 10).rounded() / 10),
+                                      "nearest_bookmark": nearestBookmark(p.hz, within: half),
+                                      "decodes_near": decodesNear(p.hz, within: half)], atHz: p.hz, ageSeconds: age)
         }
         var decoder = JSONValue.null
         if let mode = m.modemSettings.mode, let audio = m.modemCursorAudioHz {
             let hz = m.modemBox.rfHz(forAudio: audio)
             let row = m.decodeLog.liveRows.first { $0.isCursor }
-            decoder = .object(["hz": .hz(hz), "audio_hz": .hz(audio), "decoder": .string(mode.rawValue),
-                               "level_dbfs": level(hz), "snr_db": row.map { .db($0.snrDb) }.orNull,
-                               "text": row.map { .string($0.recentText) }.orNull,
-                               "nearest_bookmark": nearestBookmark(hz, within: half),
-                               "decodes_near": decodesNear(hz, within: half)])
+            decoder = await withSignal(["hz": .hz(hz), "audio_hz": .hz(audio), "decoder": .string(mode.rawValue),
+                                        "level_dbfs": level(hz), "snr_db": row.map { .db($0.snrDb) }.orNull,
+                                        "text": row.map { .string($0.recentText) }.orNull,
+                                        "nearest_bookmark": nearestBookmark(hz, within: half),
+                                        "decodes_near": decodesNear(hz, within: half)], atHz: hz)
         }
         // The VFO's decodes are those in its passband, which sits beside the carrier in SSB.
         let passband = m.vfoHz + m.mode.passbandOffset(bandwidth: m.bandwidthHz)
-        let vfo: JSONValue = .object(["hz": .hz(m.vfoHz), "mode": .string(m.mode.rawValue),
-                                      "bandwidth_hz": .hz(m.bandwidthHz), "level_dbfs": signalJSON,
-                                      "nearest_bookmark": nearestBookmark(m.vfoHz, within: half),
-                                      "decodes_near": decodesNear(passband, within: half)])
+        let vfo = await withSignal(["hz": .hz(m.vfoHz), "mode": .string(m.mode.rawValue),
+                                    "bandwidth_hz": .hz(m.bandwidthHz), "level_dbfs": signalJSON,
+                                    "nearest_bookmark": nearestBookmark(m.vfoHz, within: half),
+                                    "decodes_near": decodesNear(passband, within: half)], atHz: passband)
         return ["mouse": mouse, "decoder_cursor": decoder, "vfo": vfo]
     }
 
