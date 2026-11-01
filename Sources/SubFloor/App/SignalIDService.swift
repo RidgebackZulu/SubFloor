@@ -121,6 +121,8 @@ final class SignalIDService {
 
     /// The right-click card: where it opened, what it is for, and the answer as it comes.
     struct Card: Equatable {
+        /// Each opening has its own: a popover for one card is never taken for another's.
+        var id: Int
         /// Where it was clicked, in view points from the top left.
         var point: CGPoint
         /// The frequency clicked (display Hz).
@@ -145,6 +147,10 @@ final class SignalIDService {
     @ObservationIgnored var analysis: Analysis = { iq, rate, centre, at, width, spectrum, longer in
         SignalIdentifier.identify(iq: iq, sampleRate: rate, captureCenterHz: centre, atHz: at, bandwidthHz: width,
                                   spectrumDb: spectrum, longer: longer)
+    }
+    /// Test hook: the hover's dwell (returns early when cancelled).
+    @ObservationIgnored var dwell: @MainActor @Sendable () async -> Void = {
+        try? await Task.sleep(for: .seconds(SignalIDService.dwellSeconds))
     }
     @ObservationIgnored let tuning = TuneBarrier()
     @ObservationIgnored private weak var model: AppModel?
@@ -459,7 +465,8 @@ final class SignalIDService {
         hoverAnchor = point
         let generation = hoverGeneration
         hoverTask = Task { [weak self] in
-            try? await Task.sleep(for: .seconds(Self.dwellSeconds))
+            guard let dwell = self?.dwell else { return }
+            await dwell()
             guard !Task.isCancelled, let self else { return }
             hoverPending = true
             let identity = await identify(atHz: hz) { [weak self] first in
@@ -497,7 +504,7 @@ final class SignalIDService {
         closeCard()
         endHover()
         let generation = cardGeneration
-        card = Card(point: point, hz: hz, signalHz: hz)
+        card = Card(id: generation, point: point, hz: hz, signalHz: hz)
         cardTask = Task { [weak self] in
             guard let self else { return }
             let identity = await identify(atHz: hz) { [weak self] first in
@@ -509,8 +516,10 @@ final class SignalIDService {
         }
     }
 
-    /// Closes the card and cancels its identification.
-    func closeCard() {
+    /// Closes the card and cancels its identification; with `id`, only if that is the open card (a popover
+    /// dismissed late must not close the card that replaced it).
+    func closeCard(id: Int? = nil) {
+        if let id, card?.id != id { return }
         cardTask?.cancel()
         cardTask = nil
         cardGeneration += 1

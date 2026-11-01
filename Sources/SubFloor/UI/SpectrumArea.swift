@@ -68,23 +68,36 @@ private struct SpectrumView: NSViewRepresentable {
     }
 }
 
-/// The ID card's popover, anchored at the point that was right-clicked.
+/// The ID card's popover, anchored at the point that was right-clicked. A second right-click is a new card: the
+/// host is keyed by the card's id, so its popover opens at the new point with fresh state, and a late dismissal of
+/// the old one closes nothing.
 private struct SignalIDCardAnchor: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
-        let card = model.signalID.card
+        if let card = model.signalID.card {
+            SignalIDCardPopover(cardID: card.id, point: card.point).id(card.id)
+        }
+    }
+}
+
+private struct SignalIDCardPopover: View {
+    @Environment(AppModel.self) private var model
+    let cardID: Int
+    let point: CGPoint
+
+    var body: some View {
         Color.clear
             .frame(width: 1, height: 1)
-            .popover(isPresented: Binding(get: { model.signalID.card != nil },
-                                          set: { if !$0 { model.signalID.closeCard() } }),
+            .popover(isPresented: Binding(get: { model.signalID.card?.id == cardID },
+                                          set: { if !$0 { model.signalID.closeCard(id: cardID) } }),
                      arrowEdge: .trailing) {
-                if let card = model.signalID.card {
+                if let card = model.signalID.card, card.id == cardID {
                     SignalIDCard(identity: card.identity, atHz: card.signalHz, pending: card.pending,
-                                 measuring: card.measuring) { model.signalID.closeCard() }
+                                 measuring: card.measuring) { model.signalID.closeCard(id: cardID) }
                 }
             }
-            .position(x: card?.point.x ?? 0, y: card?.point.y ?? 0)
+            .position(x: point.x, y: point.y)
             .allowsHitTesting(false)
     }
 }

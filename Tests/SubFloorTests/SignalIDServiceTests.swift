@@ -271,17 +271,26 @@ struct SignalIDServiceTests {
         #expect(calls.withLock { $0 } == 2)
     }
 
-    /// A retune while the analysis runs: the answer is dropped (nil), and nothing is cached for the old centre.
+    /// A retune while the analysis runs: the answer is dropped (nil), and nothing is cached for the old centre. The
+    /// analysis waits (bounded) for the test's gate, opened after the retune: no race against its length.
     @Test func aRetuneWhileItRunsDropsTheAnswer() async throws {
         guard let m = runningModel() else { return }
         defer { m.shutdown() }
         let asked = Locked<[Double]>([])
+        let retuned = Locked(false), started = Locked(false)
         m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
-        m.signalID.analysis = Self.stub(seconds: 0.5, asked: asked)
+        let inner = Self.stub(asked: asked)
+        m.signalID.analysis = { iq, rate, centre, at, width, spectrum, longer in
+            started.withLock { $0 = true }
+            let deadline = Date().addingTimeInterval(20)
+            while !retuned.withLock({ $0 }), Date() < deadline { Thread.sleep(forTimeInterval: 0.005) }
+            return inner(iq, rate, centre, at, width, spectrum, longer)
+        }
         let at = m.centerHz + 5_000
         let running = Task { await m.signalID.identify(atHz: at) }
-        #expect(await eventually { asked.withLock { $0.count } == 1 })
+        #expect(await eventually(20) { started.withLock { $0 } })
         m.setVFO(m.centerHz + 0.6 * m.sampleRate)
+        retuned.withLock { $0 = true }
         #expect(await running.value == nil)
         m.signalID.analysis = Self.stub(asked: asked)
         _ = await m.signalID.identify(atHz: at)
@@ -418,45 +427,42 @@ struct SignalIDServiceTests {
     }
 
     /// The snapshot and the analysis run off the main thread, and the main actor keeps running meanwhile: a probe
-    /// ticking on it every 10 ms ticks while the (1.5 s) analysis runs. Other suites can hold the main actor for a
-    /// while, so it asks for one tick inside the analysis, not for no gap.
+    /// on it counts a tick every 10 ms, and the analysis does not return until a tick has come after it began (it
+    /// gives up after 20 s, and the test says so). No wall-clock window: how long other suites hold the main actor
+    /// doesn't matter, only that it runs while the analysis is waiting.
     @Test func nothingOnTheMainThread() async throws {
         guard let m = runningModel() else { return }
         defer { m.shutdown() }
         let offMain = Locked((snapshot: true, analysis: true))
-        let window = Locked<(start: Date, end: Date)?>(nil)
+        let ticks = Locked(0)
+        let ticked = Locked(false)
         let snap = Self.snapshot(.rtty(), seconds: 3.1, offsetHz: 5_000)
         m.signalID.snapshotProvider = { _ in
             let main = Thread.isMainThread
             offMain.withLock { $0.snapshot = $0.snapshot && !main }
             return snap
         }
-        let analysis = Self.stub(seconds: 1.5)
+        let analysis = Self.stub()
         m.signalID.analysis = { iq, rate, centre, at, width, spectrum, longer in
             let main = Thread.isMainThread
             offMain.withLock { $0.analysis = $0.analysis && !main }
-            let start = Date()
-            defer { window.withLock { $0 = (start, Date()) } }
+            let before = ticks.withLock { $0 }
+            let deadline = Date().addingTimeInterval(20)
+            while ticks.withLock({ $0 }) <= before, Date() < deadline { Thread.sleep(forTimeInterval: 0.005) }
+            ticked.withLock { $0 = ticks.withLock { $0 } > before }
             return analysis(iq, rate, centre, at, width, spectrum, longer)
         }
-        // The stall probe: when the main actor ran a tick.
         let probe = Task { @MainActor in
-            var ticks: [Date] = []
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(10))
-                ticks.append(Date())
+                ticks.withLock { $0 += 1 }
             }
-            return ticks
         }
-        try await Task.sleep(for: .milliseconds(50))   // the probe is ticking
         let id = await m.signalID.identify(atHz: m.centerHz + 5_000)
         probe.cancel()
-        let ticks = await probe.value
         #expect(id != nil)
         #expect(offMain.withLock { $0.snapshot && $0.analysis })
-        let ran = try #require(window.withLock { $0 })
-        let during = ticks.filter { $0 > ran.start.addingTimeInterval(0.05) && $0 < ran.end.addingTimeInterval(-0.05) }
-        #expect(!during.isEmpty, "the main actor never ran during the \(ran.end.timeIntervalSince(ran.start)) s analysis")
+        #expect(ticked.withLock { $0 }, "the main actor never ran while the analysis waited")
     }
 
     /// Half a second's dwell starts it (`hoverPending` while it runs); a move of more than 3 px cancels it and

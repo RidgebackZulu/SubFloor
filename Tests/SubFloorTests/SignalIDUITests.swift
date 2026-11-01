@@ -134,28 +134,43 @@ struct SignalIDUITests {
     static let tooWeak = SignalIdentity(
         measurement: SignalMeasurement(offsetHz: 5_000, snrDb: 2, seconds: 3), note: "Too weak to identify (SNR 2 dB)")
 
-    static let noSignal = SignalIdentity(measurement: SignalMeasurement(offsetHz: 5_000, seconds: 3), note: "No signal")
+    static let noSignal = SignalIdentity(measurement: SignalMeasurement(offsetHz: 5_000, family: .noise, seconds: 3),
+                                         note: "No signal")
 
     // MARK: Hover
 
-    /// Half a second's dwell starts an identification; a move of 10 px inside 0.3 s cancels that dwell, and the
-    /// rest after it starts exactly one.
+    /// The dwell is gated, not timed: the first hover's dwell is cancelled by the 10 px move (it is never let go and
+    /// its identification never starts, even when the gate opens), and the rest after it starts exactly one. The
+    /// 0.5 s itself is Task 7's `dwellSeconds`.
     @Test func hoverWaitsForADwellAndCancels() async throws {
         guard let m = runningModel() else { return }
         defer { m.shutdown() }
         let runs = Locked(0)
+        let dwells = Locked(0), open = Locked(false)
         m.signalID.snapshotProvider = Self.provider(Self.snapshot(seconds: 3.1))
-        m.signalID.analysis = Self.rtty(runs: runs)
+        // No extent: nothing is cached, so every identification that starts is a run.
+        m.signalID.analysis = { _, _, centre, at, _, _, _ in
+            runs.withLock { $0 += 1 }
+            return SignalIdentity(measurement: SignalMeasurement(offsetHz: at - centre, family: .noise, seconds: 3),
+                                  note: "No signal")
+        }
+        m.signalID.dwell = {
+            dwells.withLock { $0 += 1 }
+            while !open.withLock({ $0 }), !Task.isCancelled { try? await Task.sleep(for: .milliseconds(5)) }
+        }
 
         m.hover(at: CGPoint(x: 0.500, y: 0.2), viewSize: Self.view)
-        try await Task.sleep(for: .milliseconds(300))
-        m.hover(at: CGPoint(x: 0.510, y: 0.2), viewSize: Self.view)   // 10 px, 0.3 s in
-        try await Task.sleep(for: .milliseconds(300))                 // 0.6 s after the first: no dwell ran out
-        #expect(runs.withLock { $0 } == 0)
-        #expect(m.signalID.hoverIdentity == nil)
-        try await Task.sleep(for: .milliseconds(450))                 // 0.75 s after the second
+        #expect(await eventually { dwells.withLock { $0 } == 1 })
+        m.hover(at: CGPoint(x: 0.510, y: 0.2), viewSize: Self.view)   // 10 px: the first dwell is cancelled
+        #expect(await eventually { dwells.withLock { $0 } == 2 })
+        #expect(runs.withLock { $0 } == 0 && !m.signalID.hoverPending)
+        open.withLock { $0 = true }                                   // the rest ends the dwell
         #expect(await eventually { m.signalID.hoverIdentity != nil })
+        try await Task.sleep(for: .milliseconds(100))                 // a cancelled one would have started by now
         #expect(runs.withLock { $0 } == 1)
+        // A move of 1.5 px is the same point: no new dwell.
+        m.hover(at: CGPoint(x: 0.5115, y: 0.2), viewSize: Self.view)
+        #expect(dwells.withLock { $0 } == 2)
     }
 
     /// After the first pass asks for a longer read, the first answer is on the line with `measuring` set until the
@@ -225,6 +240,57 @@ struct SignalIDUITests {
         m.setMode(.cw)
         m.tuneToIdentified(Self.tooWeak, atHz: 7_030_000)
         #expect(m.mode == .cw && m.vfoHz == 7_030_000)
+    }
+
+    /// SSB voice is tuned by its suppressed carrier (about 300 Hz outside its near edge), not its passband centre.
+    @Test func ssbVoiceIsTunedByItsCarrier() {
+        func voice(_ family: SignalFamily, width: Double = 2_400) -> SignalIdentity {
+            SignalIdentity(measurement: SignalMeasurement(occupiedBandwidthHz: width, snrDb: 25, family: family),
+                           best: ModeMatch(name: "SSB voice (USB/LSB)", confidence: 0.9, evidence: []))
+        }
+        let usb = SignalIDTuning.plan(for: voice(.usb), atHz: 14_200_000)
+        #expect(usb.demod == .usb && usb.vfoHz == 14_200_000 - 1_200 - 300)
+        let lsb = SignalIDTuning.plan(for: voice(.lsb), atHz: 7_100_000)
+        #expect(lsb.demod == .lsb && lsb.vfoHz == 7_100_000 + 1_200 + 300)
+        // A sideband family nothing named is the same; a digital mode in USB is not (centred in the passband).
+        var unnamed = voice(.usb)
+        unnamed.best = nil
+        #expect(SignalIDTuning.plan(for: unnamed, atHz: 14_200_000).vfoHz == 14_200_000 - 1_500)
+        #expect(SignalIDTuning.plan(for: Self.rtty, atHz: 14_080_000).vfoHz == 14_080_000 - 1_450)
+        // The passband from the carrier + 100 Hz covers the voice's far edge.
+        let carrier = usb.vfoHz, top = carrier + 100 + (usb.bandwidthHz ?? 0)
+        #expect(top >= 14_200_000 + 1_200)
+    }
+
+    /// A bookmark of what Tune cannot name (too weak) is where Tune goes: same frequency, same mode.
+    @Test func aTooWeakBookmarkReproducesTune() throws {
+        let m = idleModel()
+        defer { m.shutdown() }
+        m.setMode(.usb)
+        let id = try #require(m.bookmarkIdentified(Self.tooWeak, atHz: 7_105_000))
+        let b = try #require(m.bookmarks.first { $0.id == id })
+        #expect(b.frequencyHz == 7_105_000 && b.mode == .usb && b.bandwidthHz == m.bandwidthHz)
+        #expect(!SignalIDText.canBookmark(Self.noSignal))
+        let tooSoon = SignalIdentity(measurement: SignalMeasurement(family: .noise, seconds: 0.5),
+                                     note: "Too soon after tuning — try again")
+        #expect(!SignalIDText.canBookmark(tooSoon))
+        #expect(SignalIDText.canBookmark(Self.tooWeak))
+    }
+
+    /// Wide signals go to a demod whose passband has the room: DRM (10 kHz) to AM, not a clipped USB; NOAA APT
+    /// (38 kHz) to WFM, not NFM's 25 kHz.
+    @Test func wideSignalsGetAWideEnoughDemod() {
+        func named(_ name: String, family: SignalFamily, width: Double) -> SignalIdentity {
+            SignalIdentity(measurement: SignalMeasurement(occupiedBandwidthHz: width, snrDb: 20, family: family),
+                           best: ModeMatch(name: name, confidence: 0.9, evidence: []))
+        }
+        let drm = SignalIDTuning.plan(for: named("DRM", family: .ofdm, width: 10_000), atHz: 9_800_000)
+        #expect(drm.demod == .am && drm.bandwidthHz == 12_000 && drm.vfoHz == 9_800_000)
+        let apt = SignalIDTuning.plan(for: named("NOAA APT", family: .fm, width: 38_000), atHz: 137_620_000)
+        #expect(apt.demod == .wfm && (apt.bandwidthHz ?? 0) >= 38_000)
+        // Narrow ones keep their own.
+        #expect(SignalIDTuning.plan(for: named("NOAA APT", family: .fm, width: 20_000), atHz: 137_620_000).demod == .nfm)
+        #expect(SignalIDTuning.plan(for: named("DRM", family: .ofdm, width: 3_000), atHz: 9_800_000).demod == .usb)
     }
 
     @Test func demodByNameAndFamily() {
@@ -361,6 +427,31 @@ struct SignalIDUITests {
         #expect(await eventually { m.signalID.card?.pending == false })
         let card = try #require(m.signalID.card)
         #expect(card.identity == nil && card.signalHz == 7_000_000)
+    }
+
+    /// A second right-click is a new card: it has its own id, and the first card's popover being dismissed late
+    /// closes nothing of the second's.
+    @Test func aSecondCardIsNotClosedByTheFirstsDismissal() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let snap = Self.snapshot(seconds: 3.1)
+        m.signalID.snapshotProvider = Self.provider(snap)
+        m.signalID.chunkProvider = Self.chunks(snap)
+        m.signalID.analysis = Self.rtty()
+        m.signalID.openCard(at: CGPoint(x: 100, y: 50), hz: m.centerHz + 1_000)
+        let first = try #require(m.signalID.card)
+        #expect(await eventually { m.signalID.card?.identity != nil })
+        m.signalID.openCard(at: CGPoint(x: 700, y: 80), hz: m.centerHz + 9_000)
+        let second = try #require(m.signalID.card)
+        #expect(second.id != first.id && second.point == CGPoint(x: 700, y: 80))
+        // Fresh: nothing of the first card's answer, still identifying.
+        #expect(second.identity == nil && second.pending && !second.measuring)
+        m.signalID.closeCard(id: first.id)   // the first popover's dismissal, after the second opened
+        #expect(m.signalID.card?.id == second.id)
+        #expect(await eventually { m.signalID.card?.identity != nil })
+        #expect(abs((m.signalID.card?.signalHz ?? 0) - (m.centerHz + 9_000)) < 1e-6)
+        m.signalID.closeCard(id: second.id)
+        #expect(m.signalID.card == nil)
     }
 
     // MARK: Right-click

@@ -319,7 +319,7 @@ public enum SignalIdentifier {
                                 longer: (() -> (iq: [Float], seconds: Double)?)?) -> SignalIdentity {
         let available = sampleRate > 0 ? Double(iq.count / 2) / sampleRate : 0
         guard available >= minimumSeconds else {
-            return SignalIdentity(measurement: SignalMeasurement(seconds: available),
+            return SignalIdentity(measurement: SignalMeasurement(family: .noise, seconds: available),
                                   note: "Too soon after tuning — try again")
         }
         let seconds = min(firstSeconds, available)
@@ -451,7 +451,7 @@ public enum SignalIdentifier {
         let power = db.map { pow(10, Double($0) / 10) }
         let around = max(0, centre - 10 * half)...min(size - 1, centre + 10 * half)
         let outside = around.filter { !window.contains($0) }.map { power[$0] }.sorted()
-        var result = SignalMeasurement(offsetHz: pointHz, seconds: seconds)
+        var result = SignalMeasurement(offsetHz: pointHz, family: .noise, seconds: seconds)
         guard !outside.isEmpty, !window.isEmpty else { return SignalIdentity(measurement: result, note: "No signal") }
         let noise = outside[outside.count / 2]
         // The noise bins' own scatter, for the window's mean (its bins share leakage: half as many independent).
@@ -462,6 +462,7 @@ public enum SignalIdentifier {
         guard noise > 0, excess > threshold else { return SignalIdentity(measurement: result, note: "No signal") }
         let snr = 10 * log10(excess / (noise * Double(window.count)))
         result.snrDb = snr
+        result.family = .unknown   // energy there, too weak to measure
         return SignalIdentity(measurement: result, note: String(format: "Too weak to identify (SNR %.0f dB)", snr))
     }
 }
