@@ -10,7 +10,7 @@ struct SpectrumArea: View {
     var body: some View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
-                FrequencyRuler().frame(height: 34)
+                FrequencyRuler().frame(height: BookmarkFlags.rulerHeight)
                 GeometryReader { geo in
                     ZStack(alignment: .topLeading) {
                         SpectrumView()
@@ -21,6 +21,7 @@ struct SpectrumArea: View {
                     .coordinateSpace(name: "spectrum")
                 }
             }
+            .overlay { BookmarkFlags() }
             DBRangeControls().frame(width: 36)
         }
         .background(Theme.spectrumBackground)
@@ -221,7 +222,7 @@ private struct SplitHandle: View {
     }
 }
 
-/// Frequency labels, bookmark flags and a minimap of the captured span.
+/// Frequency labels and a minimap of the captured span.
 private struct FrequencyRuler: View {
     @Environment(AppModel.self) private var model
 
@@ -252,13 +253,68 @@ private struct FrequencyRuler: View {
                     ctx.fill(Path(CGRect(x: 0, y: size.height - 3, width: size.width, height: 3)), with: .color(.white.opacity(0.06)))
                     ctx.fill(Path(CGRect(x: start, y: size.height - 3, width: width, height: 3)), with: .color(Theme.accent.opacity(0.6)))
                 }
-                ForEach(model.visibleBookmarks) { bookmark in
-                    BookmarkFlag(bookmark: bookmark)
-                        .position(x: CGFloat(vp.fraction(ofHz: bookmark.frequencyHz)) * geo.size.width, y: 9)
-                }
             }
         }
         .background(Color.black.opacity(0.35))
+    }
+}
+
+/// The bookmark flags, over the ruler and the spectrum. The first row sits in the ruler; flags that would overlap
+/// step down over the top of the spectrum. Each has a short line to its frequency, and the one under the pointer
+/// runs it down the whole display.
+struct BookmarkFlags: View {
+    static let rulerHeight: CGFloat = 40
+    private static let rowHeight: CGFloat = 17
+
+    @Environment(AppModel.self) private var model
+    @State private var widths: [UUID: CGFloat] = [:]
+    @State private var hovered: UUID?
+
+    init(hovered: UUID? = nil) {
+        _hovered = State(initialValue: hovered)
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            let vp = model.viewport
+            let bookmarks = model.visibleBookmarks
+            let xs = bookmarks.map { CGFloat(vp.fraction(ofHz: $0.frequencyHz)) * geo.size.width }
+            let flags = zip(bookmarks, xs).map { bookmark, x in
+                // Measured once drawn; until then, near enough for one frame.
+                BookmarkFlagLayout.Flag(id: bookmark.id, x: x, width: widths[bookmark.id] ?? CGFloat(bookmark.name.count) * 6 + 24)
+            }
+            let placed = BookmarkFlagLayout.place(flags, viewWidth: geo.size.width)
+            ZStack(alignment: .topLeading) {
+                Canvas { ctx, size in
+                    for (bookmark, x) in zip(bookmarks, xs) {
+                        guard let place = placed[bookmark.id] else { continue }
+                        let isHovered = bookmark.id == hovered
+                        let top = Self.rowY(place.row) + 6
+                        let bottom = isHovered ? size.height : max(top, place.row == 0 ? Self.rulerHeight : top) + 6
+                        let color = Color(hex: bookmark.colorHex) ?? Theme.accent
+                        ctx.stroke(Path { $0.move(to: CGPoint(x: x, y: top)); $0.addLine(to: CGPoint(x: x, y: bottom)) },
+                                   with: .color(color.opacity(isHovered ? 1 : 0.7)), lineWidth: isHovered ? 1.5 : 1)
+                    }
+                }
+                .allowsHitTesting(false)
+                ForEach(bookmarks) { bookmark in
+                    if let place = placed[bookmark.id] {
+                        BookmarkFlag(bookmark: bookmark) { inside in
+                            if inside { hovered = bookmark.id } else if hovered == bookmark.id { hovered = nil }
+                        }
+                        .fixedSize()
+                        .onGeometryChange(for: CGFloat.self, of: \.size.width) { widths[bookmark.id] = $0 }
+                        .position(x: place.centerX, y: Self.rowY(place.row))
+                        .zIndex(bookmark.id == hovered ? 1 : 0)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The first row sits above the ruler's labels, the others just below the ruler.
+    private static func rowY(_ row: Int) -> CGFloat {
+        row == 0 ? 8 : rulerHeight + 8 + CGFloat(row - 1) * rowHeight
     }
 }
 
@@ -267,6 +323,7 @@ private struct FrequencyRuler: View {
 private struct BookmarkFlag: View {
     @Environment(AppModel.self) private var model
     let bookmark: Bookmark
+    var onHover: (Bool) -> Void
     @State private var editing = false
 
     var body: some View {
@@ -279,7 +336,7 @@ private struct BookmarkFlag: View {
         .padding(.vertical, 1)
         .foregroundStyle(.black)
         .background(Capsule().fill(color.opacity(0.9)))
-        .overlay { ClickCatcher(toolTip: help, onLeft: { model.select(bookmark) }, onRight: { editing = true }) }
+        .overlay { ClickCatcher(toolTip: help, onLeft: { model.select(bookmark) }, onRight: { editing = true }, onHover: onHover) }
         .popover(isPresented: $editing, arrowEdge: .bottom) {
             BookmarkEditor(bookmark: bookmark) { editing = false }
         }

@@ -34,7 +34,7 @@ struct TopBarView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .frame(width: 250)
+            .fixedSize()
 
             BandwidthControl()
 

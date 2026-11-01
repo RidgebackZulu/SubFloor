@@ -5,17 +5,28 @@ import SubFloorCore
 import SwiftUI
 
 struct SidebarView: View {
+    static let width: CGFloat = 280
+    static let padding: CGFloat = 14
+
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 22) {
-                RadioSection()
-                DisplaySection()
-                AudioSection()
-                BookmarksSection()
-            }
-            .padding(14)
+            // The fixed width keeps it leading: a scroll view centres content wider than itself, cutting off the left.
+            SidebarContent()
+                .frame(width: Self.width - 2 * Self.padding, alignment: .leading)
+                .padding(Self.padding)
         }
         .background(.ultraThinMaterial)
+    }
+}
+
+struct SidebarContent: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            RadioSection()
+            DisplaySection()
+            AudioSection()
+            BookmarksSection()
+        }
     }
 }
 
@@ -122,10 +133,15 @@ private struct AudioSection: View {
             SectionHeader("Audio")
             SliderRow(title: "Volume", value: Binding(get: { Double(model.volume) }, set: { model.volume = Float($0) }),
                       range: 0...1, text: "\(Int(model.volume * 100))%")
-            Picker("AGC", selection: $model.agcSpeed) {
-                ForEach(AGCSpeed.allCases, id: \.self) { Text($0.label).tag($0) }
+            VStack(alignment: .leading, spacing: 4) {
+                Text("AGC")
+                Picker("AGC", selection: $model.agcSpeed) {
+                    ForEach(AGCSpeed.allCases, id: \.self) { Text($0.label).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .controlSize(.small)
             }
-            .pickerStyle(.segmented)
             HStack {
                 Toggle("Squelch", isOn: $model.squelchEnabled)
                 Spacer()
