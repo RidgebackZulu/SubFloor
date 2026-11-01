@@ -57,6 +57,21 @@ public struct ModeRow: Sendable {
         }
     }
 
+    /// Told apart by a period in its signal (time-signal ticks, fax lines).
+    var hasPeriod: Bool {
+        variants.contains { $0.contains { if case .period = $0.kind { true } else { false } } }
+    }
+
+    /// Whether the measurement shows the row's period.
+    func showsPeriod(_ m: SignalMeasurement) -> Bool {
+        variants.contains { features in
+            features.contains { f in
+                guard case .period = f.kind else { return false }
+                return ModeTable.evaluate(f.kind, m, rfHz: 0).0 > 0
+            }
+        }
+    }
+
     /// Whether `rfHz` lies in any of the row's hint ranges.
     func hinted(_ rfHz: Double) -> Bool { hints.contains { $0.contains(rfHz) } }
 }
@@ -94,8 +109,9 @@ struct ModeFeature: Sendable {
         case period([Double], tolerance: Double)
         /// No period in the demodulated signal (a time signal's ticks are another row's).
         case noPeriod
-        /// Inside these display-Hz ranges: +1; outside: −1. Not a hint: it rules a variant out (a steady AM
-        /// outside the broadcast bands isn't broadcast) but never adds to a match that has nothing else.
+        /// A veto: outside these display-Hz ranges the variant is ruled out (a steady AM outside the broadcast
+        /// bands isn't broadcast); inside them it adds nothing (R22: frequency affects confidence only through the
+        /// band hint).
         case inside([ClosedRange<Double>])
         /// Tone spacing equal to the symbol rate within 5% (Olivia's tones are one symbol rate apart).
         case spacingIsRate
@@ -202,7 +218,7 @@ public enum ModeTable {
                 [[width(3000...12_000, weight: 2), ModeFeature(.noSubcarrier), ModeFeature(.noPeriod),
                   ModeFeature(.envelope([.voice]), weight: 2)],
                  [width(3000...12_000, weight: 2), ModeFeature(.noSubcarrier), ModeFeature(.noPeriod),
-                  ModeFeature(.envelope([.steady])), ModeFeature(.inside(broadcast), weight: 3)]],
+                  ModeFeature(.envelope([.steady])), ModeFeature(.inside(broadcast))]],
                 hints: [ModeHint("broadcast band", broadcast)]),
         ModeRow("CW", [.ook], [[ModeFeature(.wpm(5...50, softness: 0.3)), width(20...300, softness: 0.5)]],
                 hints: [ModeHint("CW sub-band", cwSubBands, inside: 0.1)]),
@@ -245,7 +261,8 @@ public enum ModeTable {
         ModeRow("HFDL", [.psk], [[ModeFeature(.pskOrder([2, 4, 8]), weight: 0.5), rate([1800]), width(1800...3000)]]),
         ModeRow("Time signal (WWV/WWVH/CHU)", [.am],
                 [[ModeFeature(.period([1], tolerance: 0.02), weight: 3), width(500...12_000, weight: 0.5)]],
-                hints: [ModeHint("time signal frequency", timeSignals)], needsTiming: true),
+                hints: [ModeHint("time signal frequency", timeSignals)], needsTiming: true,
+                shaping: .atLeast(2070)),
 
         // VHF and above
         ModeRow("NFM voice", [.fm],
@@ -297,7 +314,9 @@ public enum ModeTable {
 
     /// The row's parameter score (−1…1, before hints) for `m` at `rfHz`, and the evidence for it. Nil when the
     /// family rules it out.
-    static func score(_ row: ModeRow, _ m: SignalMeasurement, rfHz: Double) -> (score: Double, evidence: [String])? {
+    /// `periodOpen`: a `.period` feature counts as not yet read (0), whatever the read.
+    static func score(_ row: ModeRow, _ m: SignalMeasurement, rfHz: Double,
+                      periodOpen: Bool = false) -> (score: Double, evidence: [String])? {
         let family: Double
         if row.families.contains(m.family) {
             family = 1
@@ -307,10 +326,21 @@ public enum ModeTable {
             return nil
         }
         var best: (score: Double, evidence: [String])?
-        for variant in row.variants {
+        variants: for variant in row.variants {
             var sum = 2 * family, weights = 2.0
             var evidence = [String(format: "%@ %@", familyName(m), family == 1 ? "fits" : "may fit")]
             for feature in variant {
+                // Band plans never enter the parameter score (R22): outside its bands a variant is ruled out,
+                // inside them it is judged on its parameters alone.
+                if case .inside(let ranges) = feature.kind {
+                    guard ranges.contains(where: { $0.contains(rfHz) }) else { continue variants }
+                    continue
+                }
+                if periodOpen, case .period = feature.kind {
+                    weights += feature.weight
+                    evidence.append("timing not read")
+                    continue
+                }
                 let (match, text) = evaluate(feature.kind, m, rfHz: rfHz)
                 sum += feature.weight * match
                 weights += feature.weight
@@ -384,8 +414,9 @@ public enum ModeTable {
         case .noPeriod:
             return m.modulationPeriodSeconds == nil ? (1, nil)
                 : (-1, String(format: "repeats every %.2f s", m.modulationPeriodSeconds!))
-        case .inside(let ranges):
-            return ranges.contains { $0.contains(rfHz) } ? (1, nil) : (-1, "outside the bands it lives in")
+        case .inside:
+            // A veto, applied in `score`: it never adds to a match.
+            return (0, nil)
         case .spacingIsRate:
             guard let rate = m.symbolRate, let spacing = m.toneSpacingHz else { return (-0.5, nil) }
             return (graded(abs(spacing / rate - 1), 0.05), nil)

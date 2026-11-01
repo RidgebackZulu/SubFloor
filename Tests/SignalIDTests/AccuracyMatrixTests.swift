@@ -15,8 +15,8 @@ import Testing
 ///
 /// The full matrix (every SNR, 5 seeds a cell) runs with `SUBFLOOR_SIGNALID_MATRIX=1`; otherwise the always-on
 /// subset (ruling R20): 10 and 3 dB, one seed a cell, the captures of 96 kS/s or less (20 dB naming, WFM's and
-/// DAB's included, is `IdentifyTests.eachRowIsNamed`'s). Its targets may fall two cases short of 95% (one-seed
-/// cells); the full matrix's may not.
+/// DAB's included, is `IdentifyTests.eachRowIsNamed`'s). Its targets must reach 90% where they have 10 cases or
+/// more and pass every case where they have fewer (ruling R23); the full matrix's reach 95%.
 @Suite struct AccuracyMatrixTests {
     static let snrs = [20.0, 10, 6, 3]
     /// `SUBFLOOR_SIGNALID_MATRIX=1`: the full matrix. Otherwise the always-on subset (ruling R20).
@@ -183,8 +183,10 @@ import Testing
                 let met = Double(judged.filter(\.1).count) / Double(judged.count)
                 print(String(format: "accuracyMatrix: %@ at %.0f dB: %d of %d (%.1f%%)", target, snr,
                              judged.filter(\.1).count, judged.count, 100 * met))
-                // The subset's cells are one seed: it may fall two cases short of 95% (the full matrix may not).
-                let needed = (0.95 * Double(judged.count)).rounded(.up) - (Self.full ? 0 : 2)
+                // R23: the full matrix holds the spec's 95%; the one-seed subset 90% where a target has 10 cases or
+                // more, every case where it has fewer.
+                let n = Double(judged.count)
+                let needed = Self.full ? (0.95 * n).rounded(.up) : judged.count >= 10 ? (0.9 * n).rounded(.up) : n
                 #expect(Double(judged.filter(\.1).count) >= needed, "\(target) at \(snr) dB: \(met) of \(judged.count)")
             }
             print(String(format: "accuracyMatrix: at %.0f dB family right %.1f%%, named right %.1f%%", snr,

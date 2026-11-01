@@ -21,8 +21,12 @@ import Testing
         var captureCenterHz: Double { rfHz - offsetHz }
     }
 
-    /// Every catalogue entry, placed.
-    static let placements: [Placement] = SynthSpec.catalogue.map { name, spec in
+    /// Every catalogue entry, placed; then the time signal again at 5 MHz (WWV, inside the 60 m broadcast band).
+    static let placements: [Placement] = catalogued + [
+        Placement(name: "Time signal (WWV/WWVH/CHU)", spec: .timeSignal, rfHz: 5_000_000),
+    ]
+
+    static let catalogued: [Placement] = SynthSpec.catalogue.map { name, spec in
         var p = Placement(name: name, spec: spec, rfHz: 14_000_000)
         switch name {
         case "SSB voice (USB/LSB)": p.rfHz = spec == .lsbVoice ? 7_150_000 : 14_250_000
@@ -148,7 +152,7 @@ import Testing
         for seed in UInt64(21)...23 {
             let first = Self.identified(wspr, snr: 20, seed: seed, longer: false)
             #expect(first.needsLongerRead, "seed \(seed): \(Self.describe(first))")
-            #expect(first.best?.name != "WSPR" || first.best!.confidence >= 0.7)
+            #expect(first.best?.name != "WSPR", "seed \(seed): \(Self.describe(first))")
             #expect(!(first.measurement.family == .carrier && first.measurement.familyConfidence >= 0.7),
                     "seed \(seed): a confident carrier \(Self.describe(first))")
             let slow = Self.identified(wspr, snr: 20, seed: seed)
@@ -221,6 +225,44 @@ import Testing
         print("identifyFirstPassBudget: \(elapsed)")
         if AnalogFamilyTests.optimised() {
             #expect(elapsed <= .milliseconds(150), "identify took \(elapsed)")
+        }
+    }
+
+    // MARK: Time signals (R22)
+
+    /// WWV/WWVH at 2.5, 5, 10 and 15 MHz and CHU at 3.33 and 7.85 MHz: the synthesiser's time signal, and a steady
+    /// AM 6 kHz wide (as real WWV is, with its voice announcements) whose ticks aren't there to see. Neither is ever
+    /// named "AM voice/broadcast", on the first pass or after the longer read: the first pass asks for the longer
+    /// read and offers the time signal (and the broadcast AM where it fits too); the longer read names the time
+    /// signal by its ticks (at 20 dB; at 10 dB it may miss them and name nothing), and never the tickless AM.
+    @Test(arguments: [2_500_000.0, 5_000_000, 10_000_000, 15_000_000, 3_330_000, 7_850_000])
+    func timeSignalsAreNeverNamedBroadcast(rfHz: Double) {
+        let wideAM = SynthSpec.am(.program(lowHz: 100, highHz: 3000, pilotHz: nil), depth: 0.8)
+        for (index, spec) in [SynthSpec.timeSignal, wideAM].enumerated() {
+            let p = Placement(name: "Time signal (WWV/WWVH/CHU)", spec: spec, rfHz: rfHz)
+            for snr in [20.0, 10] {
+                let seed = UInt64(41 + 2 * index + (snr == 20 ? 0 : 1))
+                let label = "\(spec.label) at \(rfHz / 1e6) MHz, \(snr) dB"
+                let first = Self.identified(p, snr: snr, seed: seed, longer: false)
+                #expect(first.best?.name != "AM voice/broadcast", "first pass, \(label): \(Self.describe(first))")
+                #expect(first.best == nil && first.needsLongerRead
+                        && first.alternatives.contains { $0.name == "Time signal (WWV/WWVH/CHU)" },
+                        "first pass, \(label): \(Self.describe(first))")
+                if index == 1 {
+                    #expect(first.alternatives.contains { $0.name == "AM voice/broadcast" } || !ModeTable.broadcast
+                        .contains { $0.contains(rfHz) }, "first pass, \(label): \(Self.describe(first))")
+                }
+                let slow = Self.identified(p, snr: snr, seed: seed)
+                #expect(slow.best?.name != "AM voice/broadcast", "longer read, \(label): \(Self.describe(slow))")
+                if index == 0 {
+                    #expect(slow.best == nil || slow.best?.name == "Time signal (WWV/WWVH/CHU)", "\(label): \(Self.describe(slow))")
+                    if snr == 20 {
+                        #expect(slow.best?.name == "Time signal (WWV/WWVH/CHU)", "longer read, \(label): \(Self.describe(slow))")
+                    }
+                } else {
+                    #expect(slow.best == nil, "longer read, \(label): \(Self.describe(slow))")
+                }
+            }
         }
     }
 
@@ -384,6 +426,15 @@ import Testing
                                                spectrumDb: nil, longer: nil)
             #expect(id.best == nil || id.best?.name == "SSB voice (USB/LSB)", "window to \(end) s: \(Self.describe(id))")
             print("realAudioVoiceIsNeverWronglyNamed to \(end) s: \(Self.describe(id))")
+            // What the windows do read, so a regression to silence or noise doesn't pass: the squelch-open ones
+            // "Too weak" at 1–2 dB, the muted ones "No signal".
+            let zeros = voice.samples[start..<stop].filter { $0 == 0 }.count
+            if zeros == stop - start {
+                #expect(id.note == "No signal", "muted window to \(end) s: \(Self.describe(id))")
+            } else if zeros < Int(0.01 * rate) {
+                #expect(id.note?.hasPrefix("Too weak to identify (SNR ") == true
+                        && (-1...4).contains(id.measurement.snrDb), "open window to \(end) s: \(Self.describe(id))")
+            }
         }
     }
 

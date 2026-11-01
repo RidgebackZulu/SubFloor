@@ -245,6 +245,31 @@ public enum SignalIdentifier {
             ranked.append((ModeMatch(name: row.name, confidence: Float(min(1, confidence)), evidence: evidence),
                            confidence))
         }
+        // A row told apart only by a period in its signal (a time signal's ticks, fax lines), at its own
+        // frequencies, whose period the measurement doesn't show: what else fits can't be told from it (a time
+        // signal is AM like a broadcast until its ticks show; 3 s can't show them, and 16 s at 10 dB may miss them).
+        // Nothing is named: it is offered, scored with its period left open, and on a short read the longer read
+        // is asked for.
+        var held = false
+        for row in ModeTable.rows where row.hasPeriod && row.hinted(rfHz) && !row.showsPeriod(m) {
+            guard let (open, openEvidence) = ModeTable.score(row, m, rfHz: rfHz, periodOpen: true), open > 0 else { continue }
+            held = true
+            let hint = row.hints.first { $0.contains(rfHz) }?.inside ?? 0
+            let offer = min(max(0, open) * factor + hint, Double(nameThreshold) - 0.01)
+            ranked.removeAll { $0.match.name == row.name }
+            ranked.append((ModeMatch(name: row.name, confidence: Float(offer),
+                                     evidence: openEvidence + ["its period not seen: can't be told from what else fits"]),
+                          offer))
+            if m.seconds < ModulationPeriod.minSeconds { longer = true }
+        }
+        if held {
+            let cap = Double(nameThreshold) - 0.01
+            ranked = ranked.map { entry in
+                var match = entry.match
+                match.confidence = min(match.confidence, Float(cap))
+                return (match, min(entry.raw, cap))
+            }
+        }
         // An unidentified signal in a slot mode's own frequencies, about as wide as one of its transmissions (FT8,
         // FT4): their symbols take a whole slot to show, so the row is offered (never named) and the longer read
         // asked for.

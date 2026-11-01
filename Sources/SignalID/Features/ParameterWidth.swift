@@ -18,12 +18,16 @@ import Foundation
 ///   row gives its filter: (n − 1) × spacing + k(BT, n) × rate.
 /// - **CW**: by keying speed, from the table below (Hann-shaped keying, 15 ms edges, half a dot above 40 WPM).
 /// - **FM carrying one tone subcarrier** (NOAA APT): Carson's rule, 1.98 × (deviation + subcarrier).
+/// - **A named time signal** (its ticks seen): at least its 1 kHz ticks' width, 2.07 kHz.
 enum ParameterWidth {
     /// How a named row's FSK is keyed, when its shift doesn't say (`ModeRow.shaping`).
     enum Shaping: Sendable {
         case rectangular
         /// The Gaussian filter's BT by tone count (0: any count).
         case gaussian([Int: Double])
+        /// At least this wide by its standard (a time signal's 1 kHz ticks of 5 ms: 2.07 kHz on noise-free renders,
+        /// seeds 1000–1004): the measured width when that is wider (real WWV's voice announcements).
+        case atLeast(Double)
     }
 
     static let note = "bandwidth from parameters"
@@ -54,12 +58,15 @@ enum ParameterWidth {
     /// The width the family's parameters give, or nil when they don't fix it (or the shaping is unknown).
     /// `shaping`: a named row's, for an FSK whose shift doesn't say how it is keyed.
     static func width(_ m: SignalMeasurement, shaping: Shaping? = nil) -> Double? {
+        if case .atLeast(let width) = shaping { return width > m.occupiedBandwidthHz ? width : nil }
         switch m.family {
         case .fsk, .mfsk:
             guard let n = m.toneCount, let spacing = m.toneSpacingHz, let rate = m.symbolRate, rate > 0 else { return nil }
             let h = spacing / rate
             let span = Double(n - 1) * spacing
             switch shaping {
+            case .atLeast:
+                return nil
             case .gaussian(let bts):
                 guard let bt = bts[n] ?? bts[0], let ks = gaussianK[bt], abs(h - 1) <= maxGaussianShiftError
                 else { return nil }
