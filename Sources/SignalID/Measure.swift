@@ -37,8 +37,9 @@ import Foundation
 ///   ("wider than the view", ruling R5). A signal filling such a view leaves no noise to see; OFDM's cyclic
 ///   prefix shows anyway, and gives `ofdm` alone.
 ///
-/// **Bandwidth and SNR.** On a second spectrum about 64 bins across the signal (zoomed in on narrow ones,
-/// coarser for wide ones, at least 4 / seconds), the noise is subtracted and:
+/// **Bandwidth and SNR.** On a second spectrum about 128 bins across the signal (zoomed in on narrow ones,
+/// coarser for wide ones, at least 8 / seconds; on a long read a very narrow one is measured again finer, down
+/// to 4 / seconds), the noise is subtracted and:
 /// - `occupiedBandwidthHz` is `OccupiedWidth.fixedPoint`, the definition the synthesiser's ground truth uses:
 ///   −20 dB relative to the signal's mean density over the width, never the extent's span; where that level
 ///   lies under the noise's scatter, the width is what stands out of the noise (narrower at low SNR);
@@ -71,11 +72,12 @@ import Foundation
 ///    noise taken out, says which apply:
 ///    - **ofdm** (1.5…2.8, a Gaussian-like amplitude): a cyclic prefix (`OFDMFeatures`) gives
 ///      `ofdmSpacingHz`;
-///    - **fsk / mfsk** (≤ 1.15, constant; discrete frequencies, as rule 6 tells them, or bursts): a clean
-///      tone grid at a symbol rate (`FSKFeatures.isFSK`, its rate
-///      line 8 × its continuum), and no subcarrier in the instantaneous frequency (an FM signal carrying
-///      AFSK has a rate line too). `symbolRate`, `toneCount`, `toneSpacingHz` and, for 2 tones,
-///      `fskShiftHz`; more than 8 tones is `mfsk`;
+///    - **fsk / mfsk** (≤ 1.15, constant; discrete frequencies, as rule 6 tells them, or bursts, or too narrow
+///      for the FM rule: FT8's GFSK tones blur into one hump): a clean tone grid at a symbol rate
+///      (`FSKFeatures.isFSK`, its rate line 8 × its continuum), and no subcarrier in the instantaneous
+///      frequency (an FM signal carrying AFSK has a rate line too). A channel over 256 × the occupied width
+///      (WSPR's 6 Hz) is looked at decimated to 16 × it. `symbolRate`, `toneCount`, `toneSpacingHz` and, for
+///      2 tones, `fskShiftHz`; more than 8 tones is `mfsk`;
 ///    - **psk** (1.05…2.0, filtered): a symbol-rate line in |x|² 6 × its continuum and a line in the
 ///      symbols' n-th power (`PSKFeatures`) give `pskOrder` and `symbolRate`.
 ///    These come before FM, so an FSK or PSK never falls through to `fm`.
@@ -86,11 +88,18 @@ import Foundation
 ///    distribution (in `subcarriersHz`, an AFSK's rate in `symbolRate`), and so does a steady modulating
 ///    tone (noted, not a subcarrier: R15); otherwise a distribution with separate peaks or a kurtosis under
 ///    2.5 is discrete frequencies and is left `unknown`. WFM when ≥ 100 kHz wide, or ≥ 60 kHz with the
-///    19 kHz stereo pilot in the demodulated baseband (then in `subcarriersHz`); `fmDeviationHz` either way.
+///    19 kHz stereo pilot in the demodulated baseband (then in `subcarriersHz`); `fmDeviationHz` either way, and
+///    `audioEnvelope`: `voice` when the demodulated audio's level comes in syllables with pauses (block CV ≥ 0.5,
+///    ≥ 5% pauses), `steady` otherwise.
 /// 7. **usb / lsb:** no line (< 10%), a voice envelope (block CV ≥ 0.5 with ≥ 5% pauses), the passband's
 ///    power ≥ 15 dB over its mirror about the carrier side, and a tilt of at least 1 dB towards the carrier
 ///    side (voice is strongest at low audio frequencies): USB when the lower edge is the stronger.
 /// 8. Otherwise `unknown`.
+///
+/// **Timing.** On a read of 6 s or more (the slow pass), an `am`, `fm` or `unknown` signal's demodulated series is
+/// searched for a period of 0.2–2 s (`ModulationPeriod`: fax lines, second ticks) into `modulationPeriodSeconds`.
+/// An `unknown` constant envelope with discrete frequencies that repeats so, wide enough for the FM rule, is FM
+/// video (HF fax), not an FSK whose symbols didn't show.
 ///
 /// **Envelope:** `keyed` (OOK), `bursty` (two-level without a line, or a regular burst period), `voice`
 /// (block CV ≥ 0.5 with pauses; for AM, of its in-phase modulation), `steady` otherwise; `none` for noise.
@@ -106,10 +115,11 @@ public enum SignalMeasurer {
     /// a filter's skirt).
     static let wholeViewFraction = 0.9
     static let widerThanTheView = "Signal wider than the view — bandwidth is a lower bound; family only"
+    static let fskLike = "Constant envelope with discrete frequencies (FSK-like)"
     static let windowFactor = 3.0
     static let minimumWindowHz = 40_000.0
     static let coarseBins = 2048.0
-    static let measureBins = 64.0
+    static let measureBins = 128.0
     static let detectSigma = 5.0
     static let edgeSigma = 4.0
     static let lineContrastDb = 15.0
@@ -144,6 +154,16 @@ public enum SignalMeasurer {
     static let minFSKLineContrast = 8.0
     static let minPSKLineContrast = 6.0
     static let minPSKPowerLine = 0.12
+    /// On a read of `minRefineSeconds` or more, a signal under `measureBins / refineBins` bins wide is measured
+    /// again on a view `refinedWidths` of it wide, when that view's bins are `refineGain` times finer.
+    static let minRefineSeconds = 8.0
+    static let refineBins = 12.0
+    static let refinedWidths = 2.0
+    static let refineGain = 2.0
+    /// The finest bins, in units of 1 / seconds: the first view's (enough frames that a carrier's band isn't
+    /// blurred by its noise on 3 s), and a refined view's.
+    static let firstViewFinest = 8.0
+    static let refinedFinest = 4.0
 
     public static func measure(_ iq: [Float], sampleRate: Double, offsetHz: Double, bandwidthHz: Double,
                                seconds: Double) -> SignalMeasurement {
@@ -241,51 +261,39 @@ public enum SignalMeasurer {
             result.notes.append(String(format: "Tones %.0f Hz apart keyed in turn: one FSK", paired.separationHz))
         }
 
-        // The measurement spectrum: about 64 bins across the signal.
-        let regionHz = Double(signalRegion.bins.count) * coarse.binHz
-        let regionCentre = coarse.hz(Double(signalRegion.bins.lowerBound + signalRegion.bins.upperBound) / 2)
-        let target = max(regionHz / measureBins, 4 / duration)
-        var view = coarse
-        var viewCentre = 0.0
-        var viewSamples = window
-        if target < coarse.binHz / 1.5 {
-            let zoomHz = min(windowHz, max(8 * regionHz, 400))
-            viewSamples = Channel.extract(interleaved(window.samples), sampleRate: window.rate,
-                                          offsetHz: regionCentre, bandwidthHz: zoomHz)
-            viewCentre = regionCentre
-            view = SpectrumView(viewSamples.samples, rate: viewSamples.rate, binHz: target, usableHz: zoomHz)
-        } else if target > 1.5 * coarse.binHz {
-            // Coarser for a wide signal: more frames, less scatter in the noise.
-            view = SpectrumView(window.samples, rate: window.rate, binHz: target, usableHz: windowHz)
+        // The measurement spectrum: about 128 bins across the region the coarse view gave the signal, none finer
+        // than 8 / seconds (`measurementView`). On a long read (the slow pass), a signal that fills only a few of
+        // them (a narrow one standing on its own window leakage: a carrier, WSPR) is measured again on a view
+        // fitted to it, twice its width with bins at least twice as fine (down to 4 / seconds), which resolves
+        // its structure (WSPR's tones 1.46 Hz apart in 16 s). A 3 s read's bins can't, and there the extra
+        // view's noise only blurs the occupied band.
+        var lowHz = coarse.hz(Double(signalRegion.bins.lowerBound))
+        var highHz = coarse.hz(Double(signalRegion.bins.upperBound))
+        var regionHz = Double(signalRegion.bins.count) * coarse.binHz
+        var fitted: MeasurementView?
+        for pass in 0..<3 {
+            let finest = (pass == 0 ? firstViewFinest : refinedFinest) / duration
+            guard let next = measurementView(window, coarse: coarse, windowHz: windowHz, lowHz: lowHz,
+                                             highHz: highHz, regionHz: regionHz, room: signalRegion.room,
+                                             finestHz: finest) else { break }
+            fitted = next
+            let refined = refinedWidths * next.occupiedHz
+            guard duration >= minRefineSeconds, Double(next.occupied.count) < measureBins / refineBins,
+                  next.view.binHz > refineGain * max(refined / measureBins, refinedFinest / duration) else { break }
+            let middle = next.viewCentre + next.view.hz(Double(next.occupied.lowerBound + next.occupied.upperBound) / 2)
+            regionHz = refined
+            lowHz = middle - regionHz / 2
+            highHz = middle + regionHz / 2
         }
-        let mapped = view.bin(coarse.hz(Double(signalRegion.bins.lowerBound)) - viewCentre)...view.bin(
-            coarse.hz(Double(signalRegion.bins.upperBound)) - viewCentre)
-        let excluded = widened(mapped, by: 0.1, in: view)
-        view.estimateNoise(excluding: excluded)
-        // A coarser view of a signal that fills the window (DAB) has too few bins beside it for its own noise:
-        // the coarse view's density serves.
-        if view.binHz > coarse.binHz && view.count - excluded.count < max(16, view.count / 5) {
-            view.useNoise(of: coarse)
-        }
-        // The margin beyond the signal stops short of anything else.
-        let room = view.bin(coarse.hz(Double(signalRegion.room.lowerBound)) - viewCentre)...view.bin(
-            coarse.hz(Double(signalRegion.room.upperBound)) - viewCentre)
-        let margin = max(3, mapped.count * 15 / 100)
-        let sliceLow = max(0, room.lowerBound + 1, mapped.lowerBound - margin)
-        let sliceHigh = min(view.count - 1, room.upperBound - 1, mapped.upperBound + margin)
-        let slice = sliceLow <= sliceHigh ? sliceLow...sliceHigh : mapped
-        let signal = view.signal(slice)
-        let width = OccupiedWidth.fixedPoint(signal, binHz: view.binHz, start: regionHz,
-                                             noiseSigma: view.noise * view.spread)
-        let total = signal.reduce(0, +)
-        guard let occupiedLocal = width.bins, total > 0 else {
+        guard let fitted else {
             result.family = .noise
             result.familyConfidence = 0.6
             result.notes.append("Nothing stands above the noise")
             return result
         }
-        let occupied = (slice.lowerBound + occupiedLocal.lowerBound)...(slice.lowerBound + occupiedLocal.upperBound)
-        let occupiedHz = Double(occupied.count) * view.binHz
+        let view = fitted.view, viewCentre = fitted.viewCentre, viewSamples = fitted.samples
+        let mapped = fitted.mapped, signal = fitted.signal, total = fitted.total
+        let occupied = fitted.occupied, occupiedHz = fitted.occupiedHz
         let inBand = view.signal(occupied).reduce(0, +)
         let line = Line(view, occupied: occupied, total: inBand)
         // A carrier line in the middle of the band is its centre (and the channel's, so the in-phase test
@@ -329,6 +337,22 @@ public enum SignalMeasurer {
                                       signalPower: signalPower, envelope: envelope)
         classify(&result, line: line, envelope: envelope, frequency: frequency, sidebands: sidebands,
                  keyedTwinHz: twin, comb: signalRegion.comb, digital: digital)
+        // A period in the demodulated signal (fax lines, second ticks), on a read long enough to show it.
+        if [.am, .fm, .unknown].contains(result.family), result.seconds >= ModulationPeriod.minSeconds,
+           let period = ModulationPeriod.find(channel.samples, rate: channel.rate, am: result.family == .am) {
+            result.modulationPeriodSeconds = period
+            result.notes.append(String(format: "Repeats every %.3f s", period))
+            // A constant envelope whose discrete frequencies repeat line by line is FM video (HF fax's black and
+            // white levels), not an FSK whose symbols didn't show; wide enough for the FM rule (not FT8's or
+            // WSPR's own tone patterns).
+            if result.family == .unknown && result.envelope == .steady && result.notes.contains(fskLike)
+                && result.occupiedBandwidthHz * result.seconds >= minFMSamples {
+                result.family = .fm
+                result.familyConfidence = 0.6
+                result.fmDeviationHz = frequency.deviationHz
+                result.notes.append("Frequency-modulated video in lines")
+            }
+        }
         // Reaching the edge of a view the capture limits: family only; the width and SNR are the visible part's,
         // the width a lower bound (rulings R5, R14).
         if capped && result.family != .noise && reachesEdge(signalRegion) {
@@ -339,6 +363,68 @@ public enum SignalMeasurer {
                                        notes: result.notes + [widerThanTheView])
         }
         return result
+    }
+
+    /// The measurement spectrum over a region (`lowHz…highHz` in the window, `regionHz` wide): about 128 bins
+    /// across it (zoomed in for a narrow one, coarser for a wide one, never finer than `finestHz`), its
+    /// noise from the bins beside it, and the occupied band within the region and a 15% margin (stopping
+    /// short of `room`). Nil when nothing in it stands above the noise.
+    static func measurementView(_ window: (samples: [DSPComplex], rate: Double), coarse: SpectrumView,
+                                windowHz: Double, lowHz: Double, highHz: Double, regionHz: Double,
+                                room coarseRoom: ClosedRange<Int>, finestHz: Double) -> MeasurementView? {
+        let regionCentre = (lowHz + highHz) / 2
+        let target = max(regionHz / measureBins, finestHz)
+        var view = coarse
+        var viewCentre = 0.0
+        var viewSamples = window
+        if target < coarse.binHz / 1.5 {
+            let zoomHz = min(windowHz, max(8 * regionHz, 400))
+            viewSamples = Channel.extract(interleaved(window.samples), sampleRate: window.rate,
+                                          offsetHz: regionCentre, bandwidthHz: zoomHz)
+            viewCentre = regionCentre
+            view = SpectrumView(viewSamples.samples, rate: viewSamples.rate, binHz: target, usableHz: zoomHz)
+        } else if target > 1.5 * coarse.binHz {
+            // Coarser for a wide signal: more frames, less scatter in the noise.
+            view = SpectrumView(window.samples, rate: window.rate, binHz: target, usableHz: windowHz)
+        }
+        let mapped = view.bin(lowHz - viewCentre)...view.bin(highHz - viewCentre)
+        let excluded = widened(mapped, by: 0.1, in: view)
+        view.estimateNoise(excluding: excluded)
+        // A coarser view of a signal that fills the window (DAB) has too few bins beside it for its own noise:
+        // the coarse view's density serves.
+        if view.binHz > coarse.binHz && view.count - excluded.count < max(16, view.count / 5) {
+            view.useNoise(of: coarse)
+        }
+        // The margin beyond the signal stops short of anything else.
+        let room = view.bin(coarse.hz(Double(coarseRoom.lowerBound)) - viewCentre)...view.bin(
+            coarse.hz(Double(coarseRoom.upperBound)) - viewCentre)
+        let margin = max(3, mapped.count * 15 / 100)
+        let sliceLow = max(0, room.lowerBound + 1, mapped.lowerBound - margin)
+        let sliceHigh = min(view.count - 1, room.upperBound - 1, mapped.upperBound + margin)
+        let slice = sliceLow <= sliceHigh ? sliceLow...sliceHigh : mapped
+        let signal = view.signal(slice)
+        let width = OccupiedWidth.fixedPoint(signal, binHz: view.binHz, start: regionHz,
+                                             noiseSigma: view.noise * view.spread)
+        let total = signal.reduce(0, +)
+        guard let occupiedLocal = width.bins, total > 0 else { return nil }
+        let occupied = (slice.lowerBound + occupiedLocal.lowerBound)...(slice.lowerBound + occupiedLocal.upperBound)
+        return MeasurementView(view: view, viewCentre: viewCentre, samples: viewSamples, mapped: mapped,
+                               signal: signal, total: total, occupied: occupied,
+                               occupiedHz: Double(occupied.count) * view.binHz)
+    }
+
+    struct MeasurementView {
+        var view: SpectrumView
+        /// The view's 0 Hz in the window.
+        var viewCentre: Double
+        var samples: (samples: [DSPComplex], rate: Double)
+        /// The region's bins.
+        var mapped: ClosedRange<Int>
+        /// The noise-subtracted levels of the region and its margin, and their sum.
+        var signal: [Double]
+        var total: Double
+        var occupied: ClosedRange<Int>
+        var occupiedHz: Double
     }
 
     // MARK: Decision
@@ -399,20 +485,23 @@ public enum SignalMeasurer {
         }
         // 5. FSK, MFSK, PSK and OFDM.
         // Discrete frequencies (separate peaks, or a kurtosis under 2.5): what FSK and an FM subcarrier show.
-        // A continuous signal without them (FM voice) isn't searched for either, which keeps it cheap.
+        // A continuous signal without them (FM voice) isn't searched for either, which keeps it cheap. One too
+        // narrow for the FM rule (FT8's 8-GFSK, whose tones blur into one hump) is searched whatever its shape.
         let discrete = frequency.tonal || frequency.kurtosis < minKurtosis
+            || m.occupiedBandwidthHz * m.seconds < minFMSamples
         if let digital, !voice, digitalFamily(&m, digital, discrete: discrete) { return }
         // 6. FM (one carrying a subcarrier is FM whatever its frequencies' distribution).
         if steady && constant && frequency.spread >= minSpread
             && m.occupiedBandwidthHz * m.seconds >= minFMSamples {
             let subcarrier = discrete ? digital?.fmSubcarrier : nil
             guard subcarrier != nil || (!frequency.tonal && frequency.kurtosis >= minKurtosis) else {
-                m.notes.append("Constant envelope with discrete frequencies (FSK-like)")
+                m.notes.append(fskLike)
                 return
             }
             let pilot = frequency.lines.first { abs($0 - 19_000) < 200 }
             m.fmDeviationHz = frequency.deviationHz
             m.envelope = .steady
+            m.audioEnvelope = frequency.audioIsVoice ? .voice : .steady
             if let pilot { m.subcarriersHz.append(pilot) }
             if let subcarrier { addSubcarrier(subcarrier, to: &m) }
             // A subcarrier's tones make the distribution discrete: its own strength stands in for the kurtosis.
@@ -948,9 +1037,38 @@ final class DigitalEvidence {
         return (m4 - 4 * s2 * noisePower - 2 * noisePower * noisePower) / (s2 * s2)
     }()
 
-    lazy var fsk: FSKFeatures? = FSKFeatures(z, rate: rate, occupiedHz: occupiedHz, segments: segments,
-                                             noisePower: noisePower, signalPower: signalPower,
-                                             noiseCorrelation: noiseCorrelation)
+    /// A very narrow signal's FSK (WSPR: 6 Hz in a channel of at least 8 kHz) is looked for at a rate nearer
+    /// its width: thousands of samples a symbol leave the lag products nothing to see. The channel filter has
+    /// already band-limited it, so block means decimate it (the noise keeps its power; its correlation is
+    /// taken `factor` channel samples a lag).
+    lazy var fsk: FSKFeatures? = {
+        let factor = Int(rate / (Self.narrowRateWidths * occupiedHz))
+        guard rate > Self.narrowRatio * occupiedHz, factor >= 2 else {
+            return FSKFeatures(z, rate: rate, occupiedHz: occupiedHz, segments: segments, noisePower: noisePower,
+                               signalPower: signalPower, noiseCorrelation: noiseCorrelation)
+        }
+        let count = z.count / factor
+        var reduced = [DSPComplex](repeating: DSPComplex(real: 0, imag: 0), count: count)
+        let scale = 1 / Float(factor)
+        for j in 0..<count {
+            var re: Float = 0, im: Float = 0
+            for k in (j * factor)..<((j + 1) * factor) {
+                re += z[k].real
+                im += z[k].imag
+            }
+            reduced[j] = DSPComplex(real: re * scale, imag: im * scale)
+        }
+        let reducedSegments = segments.compactMap { s -> Range<Int>? in
+            let r = ((s.lowerBound + factor - 1) / factor)..<(s.upperBound / factor)
+            return r.isEmpty ? nil : r
+        }
+        return FSKFeatures(reduced, rate: rate / Double(factor), occupiedHz: occupiedHz, segments: reducedSegments,
+                           noisePower: noisePower, signalPower: signalPower,
+                           noiseCorrelation: { [noiseCorrelation] lag in noiseCorrelation(lag * factor) })
+    }()
+    /// A channel this many times the occupied width is decimated for the FSK search, to this many widths.
+    static let narrowRatio = 256.0
+    static let narrowRateWidths = 16.0
     lazy var psk: PSKFeatures? = PSKFeatures(z, rate: rate, occupiedHz: occupiedHz, segments: segments)
     lazy var ofdm: OFDMFeatures? = OFDMFeatures(z, rate: rate, occupiedHz: occupiedHz)
 

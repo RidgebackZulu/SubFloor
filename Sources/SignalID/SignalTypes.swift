@@ -50,6 +50,12 @@ public struct SignalMeasurement: Codable, Sendable, Equatable {
     public var burstDuty: Double?
     /// Subcarriers found inside the demodulated signal (AFSK tones, the APT 2400 Hz, ACARS MSK).
     public var subcarriersHz: [Double]
+    /// How an FM signal's demodulated audio behaves: `voice` when its level comes in syllables with pauses
+    /// (speech), `steady` otherwise (a data stream, a tone). Nil for other families.
+    public var audioEnvelope: EnvelopeKind?
+    /// A period in the demodulated signal from 0.2 to 2 s (HF fax lines, a time signal's second ticks), found
+    /// on a read of 6 s or more (the slow pass). Nil when there is none or the read is shorter.
+    public var modulationPeriodSeconds: Double?
     /// Length of IQ analysed.
     public var seconds: Double
     /// Evidence and caveats, for the ID card.
@@ -60,7 +66,8 @@ public struct SignalMeasurement: Codable, Sendable, Equatable {
                 symbolRate: Double? = nil, fskShiftHz: Double? = nil, toneCount: Int? = nil,
                 toneSpacingHz: Double? = nil, pskOrder: Int? = nil, ofdmSpacingHz: Double? = nil,
                 fmDeviationHz: Double? = nil, cwWPM: Double? = nil, burstPeriodSeconds: Double? = nil,
-                burstDuty: Double? = nil, subcarriersHz: [Double] = [], seconds: Double = 0, notes: [String] = []) {
+                burstDuty: Double? = nil, subcarriersHz: [Double] = [], seconds: Double = 0, notes: [String] = [],
+                audioEnvelope: EnvelopeKind? = nil, modulationPeriodSeconds: Double? = nil) {
         self.offsetHz = offsetHz
         self.occupiedBandwidthHz = occupiedBandwidthHz
         self.bandwidth6dBHz = bandwidth6dBHz
@@ -79,6 +86,8 @@ public struct SignalMeasurement: Codable, Sendable, Equatable {
         self.burstPeriodSeconds = burstPeriodSeconds
         self.burstDuty = burstDuty
         self.subcarriersHz = subcarriersHz
+        self.audioEnvelope = audioEnvelope
+        self.modulationPeriodSeconds = modulationPeriodSeconds
         self.seconds = seconds
         self.notes = notes
     }

@@ -298,6 +298,12 @@ struct FrequencyFeatures {
     var noiseHz = 0.0
     /// Bandwidth of the modulation (the demodulated baseband standing over the noise).
     var audioHz = 0.0
+    /// The demodulated audio's level over 20 ms blocks (its power less the noise's), as `EnvelopeFeatures` has
+    /// them for the RF envelope: speech comes in syllables with pauses; a data stream or a tone is steady.
+    var audioCV = 0.0
+    var audioPauseFraction = 0.0
+    /// Speech-like audio: block CV ≥ 0.5 and ≥ 5% pauses (the RF envelope's voice rule).
+    var audioIsVoice: Bool { audioCV >= 0.5 && audioPauseFraction >= 0.05 }
 
     /// `channelHz` is the channel's width (its noise reaches about ±0.625 of it).
     init(_ z: [DSPComplex], rate: Double, occupiedHz: Double, channelHz: Double, noiseDensity: Double,
@@ -341,6 +347,11 @@ struct FrequencyFeatures {
         var centred = [Float](repeating: 0, count: body.count)
         var shift = Float(-mean)
         vDSP_vsadd(body, 1, &shift, &centred, 1, vDSP_Length(body.count))
+        let blockLength = max(1, Int((EnvelopeFeatures.blockSeconds * rate / Double(step)).rounded()))
+        var audioPower = [Float](repeating: 0, count: centred.count)
+        vDSP_vsq(centred, 1, &audioPower, 1, vDSP_Length(centred.count))
+        let audioBlocks = EnvelopeFeatures.blockMeans(audioPower, length: blockLength).map { Double($0) - noiseHz * noiseHz }
+        (audioCV, audioPauseFraction) = EnvelopeFeatures.variation(audioBlocks)
         let clean = Self.deconvolved(centred, noise: noiseHz)
         deviationHz = clean.percentile(Self.deviationPercentile)
         kurtosis = clean.kurtosis

@@ -48,7 +48,7 @@ let package = Package(
         .testTarget(name: "ModemsTests", dependencies: ["Modems", "DSPCore"]),
         .testTarget(name: "SubFloorCoreTests", dependencies: ["SubFloorCore", "DSPCore"]),
         .testTarget(name: "RecordingTests", dependencies: ["Recording", "DSPCore"]),
-        .testTarget(name: "SignalIDTests", dependencies: ["SignalID", "DSPCore"]),
+        .testTarget(name: "SignalIDTests", dependencies: ["SignalID", "DSPCore"], resources: [.copy("Fixtures")]),
         .testTarget(name: "TranscriptionTests", dependencies: ["Transcription"], resources: [.copy("Fixtures")]),
         .testTarget(name: "SDRplayKitTests", dependencies: ["SDRplayKit", "CSDRplay"], linkerSettings: sdrplayLinker),
         .testTarget(name: "SubFloorTests", dependencies: ["SubFloor"], linkerSettings: sdrplayLinker),

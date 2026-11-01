@@ -692,7 +692,8 @@ struct ToneMixture {
 /// AFSK (APRS's Bell 202 in NFM), MSK audio (ACARS in AM), or a steady tone (NOAA APT's 2400 Hz).
 ///
 /// The audio's spectrum, less its noise, must be band-pass: 5% of its power below f₅ and f₅ at least 0.3 × the
-/// median frequency (an FSK signal's own frequency is a baseband pulse train, strongest near 0 Hz). Then:
+/// median frequency (an FSK signal's own frequency is a baseband pulse train, strongest near 0 Hz) and 4 bins
+/// (rate / 512) from 0 Hz. Then:
 /// - a line standing 15 dB over the bins ±3–4 beside it and holding ≥ 10% of the audio's power is a tone
 ///   subcarrier when it carries its own modulation: its envelope (the band ±10% of its frequency, at least
 ///   ±100 Hz) varies, block CV over 2 × what noise alone gives + 0.1 (APT's image: 0.26–0.55; a steady FM
@@ -704,6 +705,7 @@ struct ToneMixture {
 struct Subcarrier {
     static let size = 2048
     static let minBandPass = 0.3
+    static let minBandBins = 4.0
     static let lineContrastDb = 15.0
     static let minLineFraction = 0.1
     static let minLineContrast = 8.0
@@ -746,7 +748,9 @@ struct Subcarrier {
             if f50 == 0 && cumulative >= 0.5 * total { f50 = hz }
             if f95 == 0 && cumulative >= 0.95 * total { f95 = hz }
         }
-        guard f5 >= Self.minBandPass * f50, f95 > f5 else { return nil }
+        // …and resolved: a band within a few bins of 0 Hz is a narrow signal's own frequency wander (FT8's
+        // tones read as a 3–5 Hz "subcarrier"), not a tone it carries.
+        guard f5 >= Self.minBandPass * f50, f5 >= Self.minBandBins * binHz, f95 > f5 else { return nil }
         // A steady tone.
         let peak = (1...top).max { raw[$0] < raw[$1] }!
         if peak >= 5 && peak + 4 <= top {
