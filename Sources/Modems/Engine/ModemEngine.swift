@@ -728,14 +728,15 @@ public final class ModemEngine {
         let mode = s?.mode ?? displayMode(key: c.key)
         let submode = s?.decoder.submode ?? c.trackID.flatMap { classes[$0]?.classification?.submode } ?? mode?.label ?? ""
         return analyzer.frame(frequencyHz: c.frequencyHz, snrDb: track?.snrDb ?? estimatedSNR(at: c.frequencyHz),
-                              submode: submode, symbolRate: mode.flatMap(Self.symbolRate),
+                              submode: submode, symbolRate: mode.flatMap { Self.symbolRate($0, submode: submode) },
                               constellation: s?.decoder.constellation() ?? [])
     }
 
-    static func symbolRate(_ mode: ModeID) -> Double? {
+    /// The symbol rate of `mode`; RTTY's is read from its submode ("RTTY 75 · 170"), else 45.45.
+    static func symbolRate(_ mode: ModeID, submode: String = "") -> Double? {
         switch mode {
         case .psk31: 31.25
-        case .rtty: 45.45
+        case .rtty: SignalClassifier.rttyBauds.first { submode.hasPrefix("RTTY \($0.label)") }?.baud ?? 45.45
         case .ft8: 6.25
         case .wspr: 12_000.0 / 8_192
         case .cw: nil

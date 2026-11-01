@@ -1,8 +1,8 @@
 import Modems
 import SwiftUI
 
-/// The modem panel's top strip: the mode, then the signal count, the decode band (the receiver's
-/// passband) and, while FT8/WSPR decode, their slot progress.
+/// The modem panel's top strip: the mode, Auto-detect, then the signal count, the decode band (the
+/// receiver's passband) and, while FT8/WSPR decode, their slot progress.
 struct ModemControlStrip: View {
     @Environment(AppModel.self) private var model
     let status: ModemPanelStatus
@@ -25,6 +25,14 @@ struct ModemControlStrip: View {
             .pickerStyle(.segmented)
             .labelsHidden()
             .frame(width: 260)
+
+            Toggle(isOn: Binding(get: { status.autoDetect }, set: { model.setModemAutoDetect($0) })) {
+                Label("Auto-detect", systemImage: "wand.and.stars")
+            }
+            .toggleStyle(.button)
+            .tint(Theme.modemBox)
+            .disabled(!status.isOn)
+            .help("Classify every signal in the passband and decode it in its own mode; the mode above is the cursor's fallback. RTTY is identified only, not decoded")
 
             Spacer(minLength: 8)
 

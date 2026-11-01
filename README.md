@@ -305,8 +305,11 @@ off. After each slot the strip shows its outcome: "WSPR 14:32 · 2 decodes", "·
 band, so a HamItUp oscillator a few hundred hertz off (2 ppm at 125 MHz is 250 Hz) still decodes; the
 decoded audio frequencies then show the error, which Settings' HamItUp LO corrects. If the passband can't be decoded (narrower than 50 Hz above 300 Hz), the panel says so.
 
-RTTY and auto-detect are disabled for now; their code is kept (`RTTYModem`, `SignalClassifier`, and the
-engine's support for both) and covered by the tests.
+The Auto-detect button classifies every signal in the passband and decodes each in its own mode, with the
+picked mode as the cursor's fallback. It recognises RTTY (45.45, 50 or 75 Bd; 170, 425 or 850 Hz shift) and
+shows it as "RTTY 45 · 170", but only identifies it: there is no RTTY decoder in the catalog, so the row
+reads "RTTY (identified, no decoder)". `RTTYModem` and the engine's support for it are kept and covered by
+the tests.
 
 ## Manual hardware checklist
 Run through this with an RSP1B attached before a release:

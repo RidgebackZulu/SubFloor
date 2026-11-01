@@ -34,8 +34,8 @@ enum ModemEngineUpdate: Equatable, Sendable {
 struct ModemControl: Equatable, Sendable {
     /// The box's first dial: 20 m FT8.
     static let defaultDialHz = 14_074_000.0
-    /// The modes the panel offers. RTTY is disabled for now (its modem is kept; see `ModemCatalog`),
-    /// and auto-detect is off (`engineSettings`); a saved setting for either is dropped.
+    /// The modes the panel offers. RTTY is identified (auto-detect) but never decoded (its modem is
+    /// kept; see `ModemCatalog`), so a saved RTTY mode is dropped.
     static let offeredModes: [ModeID] = [.cw, .psk31, .ft8, .wspr]
     /// See **The cursor**: the widest lock range (RTTY's 30 Hz).
     static let lockAcceptHz = 30.0
@@ -76,7 +76,6 @@ struct ModemControl: Equatable, Sendable {
         self.box = box
         self.settings = settings
         if let mode = settings.mode, !Self.offeredModes.contains(mode) { self.settings.mode = nil }
-        self.settings.autoDetect = false
     }
 
     // MARK: Derived
@@ -91,12 +90,11 @@ struct ModemControl: Equatable, Sendable {
         isBoxActive(captureCenter: captureCenter, captureSpan: captureSpan) ? box.dialHz - captureCenter : nil
     }
 
-    /// What the engine gets: the user's settings with `slotModesEnabled` off for file sources, the
-    /// decode band, and auto-detect off (disabled for now; the engine's support is kept).
+    /// What the engine gets: the user's settings with `slotModesEnabled` off for file sources, and
+    /// the decode band.
     func engineSettings(isFileSource: Bool) -> ModemSettings {
         var s = settings
         s.slotModesEnabled = !isFileSource
-        s.autoDetect = false
         s.audioBand = audioBand ?? ModemSettings.fullBand
         return s
     }
@@ -108,6 +106,8 @@ struct ModemControl: Equatable, Sendable {
     }
 
     // MARK: Settings
+
+    mutating func setAutoDetect(_ on: Bool) { settings.autoDetect = on }
 
     mutating func setMode(_ mode: ModeID?) {
         settings.mode = mode.flatMap { Self.offeredModes.contains($0) ? $0 : nil }

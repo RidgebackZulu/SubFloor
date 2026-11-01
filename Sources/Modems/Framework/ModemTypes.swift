@@ -167,8 +167,9 @@ public protocol SlotModem {
 
 /// Registry of the available modems. Each modem task appends its type here.
 ///
-/// RTTY is disabled for now: `RTTYModem` and its tests are kept, and adding `RTTYModem.self` to
-/// `streaming` (and `.rtty` to the panel's mode choices) brings it back.
+/// RTTY is identified only, never decoded (`SignalClassifier` names its rate and shift): `RTTYModem`
+/// and its tests are kept, and adding `RTTYModem.self` to `streaming` (and `.rtty` to the panel's
+/// mode choices) would bring decoding back.
 public enum ModemCatalog {
     public static var streaming: [any StreamingModem.Type] { [CWModem.self, PSK31Modem.self] }
     public static var slot: [any SlotModem.Type] { [FT8Modem.self, WSPRModem.self] }

@@ -224,6 +224,27 @@ private let cwTexts = ["CQ CQ DE W1AW W1AW K TU 599 NAME JOHN QTH CT BK", "TEST 
         }
     }
 
+    /// RTTY is identified only: with auto-detect on its signal shows as RTTY with the rate and shift, and
+    /// ends up with no decoder, with the cursor on it or off it (the catalog has no RTTY modem). A cursor
+    /// locked before the signal is classified decodes in the fallback mode until then.
+    @Test func rttyIsIdentifiedButNotDecoded() {
+        let rtty = RTTYEncoder.audio(text: "CQ CQ DE W1AW W1AW K", centerHz: 1_500, leadInSeconds: 1)
+        let audio = ModemTestSignals.awgn(rtty, snrDb: 10, seed: 906, signalPower: 0.5 * 0.5 / 2)
+        for locked in [false, true] {
+            let engine = ModemEngine()
+            engine.settings = ModemSettings(mode: .psk31, autoDetect: true)
+            var run = Run()
+            if locked { engine.lockCursor(atAudioHz: 1_500) }
+            var decoders = 0
+            feed(engine, audio, into: &run) { _, _ in decoders = max(decoders, engine.decoderKeys.count) }
+            let s = snapshot(near: 1_500, in: run.signals, within: 10)
+            #expect(s?.mode == .rtty, "cursor locked \(locked): \(String(describing: s))")
+            #expect(s?.submode == "RTTY 45 · 170", "cursor locked \(locked): \(String(describing: s))")
+            #expect(engine.decoderKeys.isEmpty, "cursor locked \(locked): \(engine.decoderKeys)")
+            #expect(locked || decoders == 0, "a decoder was made for RTTY")
+        }
+    }
+
     @Test func manualModeDecodesAllWithOneModem() {
         let hz = [700.0, 1_400, 2_100]
         let texts = ["CQ CQ DE W1AW K", "TEST DE OH2XX K", "PARIS PARIS 73"]

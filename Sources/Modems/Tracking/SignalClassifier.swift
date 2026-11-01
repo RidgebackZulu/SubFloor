@@ -6,7 +6,7 @@ import simd
 public struct Classification: Sendable, Equatable {
     /// Nil when the signal matches no mode: a plain carrier, noise, or a mode SubFloor doesn't decode.
     public var mode: ModeID?
-    /// "CW", "BPSK31", "QPSK31", "RTTY 45", "FT8" or "WSPR"; empty when `mode` is nil.
+    /// "CW", "BPSK31", "QPSK31", "RTTY 45 · 170" (rate, shift), "FT8" or "WSPR"; empty when `mode` is nil.
     public var submode: String
     /// 0...1, from how far each of the rule's features lies past its threshold: 0.5 when one only just
     /// passed, 1 when every one is at or beyond its "solid" level. At least 0.5 whenever `mode` is set
@@ -26,8 +26,11 @@ public struct Classification: Sendable, Equatable {
 ///
 /// The audio is mixed down at the track's frequency to complex baseband at 500 Hz (±150 Hz kept;
 /// a triangular CIC stage to 2 kHz, then a 65-tap Blackman FIR), and the rules are checked in order:
-/// 1. **RTTY**: the tracker paired the track as FSK; two tones 170 ± 15 Hz apart within 6 dB show in
-///    the baseband spectrum, and their short-time energies are anticorrelated (keying).
+/// 1. **RTTY**: two tones 170 ± 15 Hz (the tracker paired the track as FSK), 425 ± 30 or 850 ± 60 Hz
+///    apart (a track on either tone; seen on a ±1 kHz baseband of the last 4 s) within 6 dB show in
+///    the spectrum, and their short-time energies are anticorrelated (keying). The rate (45.45, 50 or
+///    75 Bd) is the one whose bit time best divides the runs of the tone keyed on and off by whole bits.
+///    The submode reads "RTTY 45 · 170". RTTY is identified only: the catalog has no RTTY decoder.
 /// 2. **CW**: the envelope (16 ms smoothing) has std/mean > 0.6 and an on/off (bimodal) histogram:
 ///    an Otsu split with the off level below 0.35 of the on level, at least 3 key-down runs, and
 ///    key-up and key-down runs with medians of at least 20 ms. PSK31's reversal dips are shorter.
@@ -78,6 +81,23 @@ public enum SignalClassifier {
     static let rttyLevelDb: Float = 6
     static let rttyMaxCorrelation: Float = -0.3
     static let rttySolidCorrelation: Float = -0.8
+    /// The wider shifts (170 Hz is the tracker's FSK pair), each with the tolerance on its tone spacing.
+    static let rttyWideShifts: [(hz: Double, toleranceHz: Double)] = [(425, 30), (850, 60)]
+    /// Rates, by submode label: 45.45, 50 and 75 Bd.
+    static let rttyBauds: [(baud: Double, label: String)] = [(45.45, "45"), (50, "50"), (75, "75")]
+    /// The wide baseband (±1 kHz) the wide shifts and the rate are measured on: the last 4 s at 2 kHz.
+    static let rttyWideSeconds = 4.0
+    static let rttyWideRate = 2_000.0
+    static let rttyWideCutoffHz = 1_000.0
+    /// Boxcar of the tone energies the rate is read from (a half-bit of the fastest rate).
+    static let rttyEnergySeconds = 0.0065
+    /// Dead band (of the normalised mark - space energy) a keying change must cross, so noise between
+    /// the tones does not chatter, and the fewest runs of one tone that fit a rate.
+    static let rttyHysteresis: Float = 0.25
+    /// A sample counts as keyed signal when the two tones' energy is over this fraction of its 90th
+    /// percentile.
+    static let rttyActiveFraction: Float = 0.25
+    static let rttyMinRuns = 6
 
     // CW
     static let envelopeSmoothingSeconds = 0.016
@@ -175,11 +195,16 @@ public enum SignalClassifier {
         let seconds: Double
         let spectrum: Spectrum
         let envelope: [Float]
+        /// The audio used (the last 16 s at most) and its rate, for the RTTY rule's wide baseband.
+        let tail: ArraySlice<Float>
+        let sampleRate: Double
 
         init(track: Track, audio: ArraySlice<Float>, sampleRate: Double, utcSecondOfMinute: Double?) {
             self.track = track
             let keep = min(audio.count, Int(SignalClassifier.maxSeconds * sampleRate))
             let slice = audio[(audio.endIndex - keep)...]
+            tail = slice
+            self.sampleRate = sampleRate
             let (z, rate) = SignalClassifier.baseband(slice, centreHz: track.frequencyHz, sampleRate: sampleRate)
             // UTC time of baseband sample 0: past the dropped head and the filters' start-up.
             let skipped = Double(audio.count - keep) / sampleRate
@@ -197,7 +222,7 @@ public enum SignalClassifier {
         // MARK: Rule 1: RTTY
 
         func rtty() -> Classification? {
-            guard track.isFSKPair else { return nil }
+            guard track.isFSKPair else { return wideRTTY() }
             let half = SignalClassifier.rttyShiftHz / 2
             // Each tone within half the shift tolerance, with the track's centre up to 22 Hz off.
             let reach = SignalClassifier.rttyShiftToleranceHz / 2 + 22
@@ -218,7 +243,9 @@ public enum SignalClassifier {
                 SignalClassifier.score(shiftError, threshold: SignalClassifier.rttyShiftToleranceHz, solid: 5),
                 SignalClassifier.score(correlation, threshold: SignalClassifier.rttyMaxCorrelation,
                                        solid: SignalClassifier.rttySolidCorrelation))
-            return Classification(mode: .rtty, submode: "RTTY 45", confidence: confidence)
+            let baud = rttyBaud(lowHz: low.hz, highHz: high.hz)
+            return Classification(mode: .rtty, submode: SignalClassifier.rttySubmode(baud: baud, shiftHz: 170),
+                                  confidence: confidence)
         }
 
         /// Pearson correlation of the short-time energies at two baseband frequencies, each series with
@@ -401,7 +428,9 @@ public enum SignalClassifier {
     /// (2nd-order CIC) stage to ≈ 2 kHz, then a 65-tap Blackman low-pass (−6 dB at 250 Hz, flat to
     /// ±165 Hz, ≥ 55 dB down from ±335 Hz, so nothing aliases into ±150 Hz). A real tone of amplitude A
     /// reads A/2.
-    static func baseband(_ audio: ArraySlice<Float>, centreHz: Double, sampleRate: Double) -> (z: [SIMD2<Float>], rate: Double) {
+    static func baseband(_ audio: ArraySlice<Float>, centreHz: Double, sampleRate: Double,
+                         stage1Rate: Double = SignalClassifier.stage1Rate, basebandRate: Double = SignalClassifier.basebandRate,
+                         firCutoffHz: Double = SignalClassifier.firCutoffHz) -> (z: [SIMD2<Float>], rate: Double) {
         let d1 = max(1, Int((sampleRate / stage1Rate).rounded()))
         let rate1 = sampleRate / Double(d1)
         let d2 = max(1, Int((rate1 / basebandRate).rounded()))
@@ -515,7 +544,7 @@ public enum SignalClassifier {
             var centroidHz: Double
         }
 
-        init(_ z: [SIMD2<Float>], rate: Double) {
+        init(_ z: [SIMD2<Float>], rate: Double, halfWidthHz: Double = SignalClassifier.analysisHalfWidthHz) {
             var segment = 128
             while segment * 2 <= min(z.count / 2, 2_048) { segment *= 2 }
             guard z.count >= segment, let dft = vDSP_DFT_zop_CreateSetup(nil, vDSP_Length(segment), .FORWARD)
@@ -541,7 +570,7 @@ public enum SignalClassifier {
             power = (0..<segment).map { sum[($0 + half) % segment] / Float(segments) }
             zero = half
             binHz = rate / Double(segment)
-            let span = Int(SignalClassifier.analysisHalfWidthHz / binHz)
+            let span = Int(halfWidthHz / binHz)
             let lo = max(0, zero - span), hi = min(segment - 1, zero + span)
             median = SignalClassifier.percentile(Array(power[lo...hi]), 0.5)
             region = findRegion(lo: lo, hi: hi)

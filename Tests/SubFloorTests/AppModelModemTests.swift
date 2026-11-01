@@ -104,6 +104,38 @@ struct AppModelModemTests {
         #expect(!m.modemSettings.autoDetect)
     }
 
+    /// Auto-detect is the user's: the control keeps it and the engine gets it.
+    @Test func autoDetectSurvivesEngineSettings() {
+        let c = ModemControl(settings: ModemSettings(mode: .psk31, autoDetect: true))
+        #expect(c.settings.autoDetect)
+        #expect(c.engineSettings(isFileSource: false).autoDetect)
+        #expect(c.engineSettings(isFileSource: true).autoDetect)
+    }
+
+    @Test func autoDetectToggleReachesTheEngineAndThePanel() {
+        let m = makeModel()
+        var updates: [ModemEngineUpdate] = []
+        m.onModemEngineUpdate = { updates.append($0) }
+        m.setModemMode(.psk31)
+        #expect(!m.modemPanelStatus.autoDetect)
+        m.setModemAutoDetect(true)
+        #expect(m.modemSettings.autoDetect)
+        #expect(m.modemPanelStatus.autoDetect)
+        #expect(updates.last == .settings(ModemSettings(mode: .psk31, autoDetect: true, audioBand: usbBand)))
+        m.setModemAutoDetect(false)
+        #expect(!m.modemPanelStatus.autoDetect)
+    }
+
+    @Test func autoDetectPersistsWithTheSession() {
+        let defaults = UserDefaults(suiteName: UUID().uuidString)!
+        let m = makeModel(defaults: defaults)
+        m.setModemMode(.cw)
+        m.setModemAutoDetect(true)
+        m.shutdown()
+        let restored = makeModel(defaults: defaults)
+        #expect(restored.modemSettings.autoDetect)
+    }
+
     @Test func sessionPersistsTheModeAndTheBoxFollowsTheVFO() {
         let defaults = UserDefaults(suiteName: UUID().uuidString)!
         let m = makeModel(defaults: defaults)

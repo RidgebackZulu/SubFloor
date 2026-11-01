@@ -1547,6 +1547,10 @@ final class AppModel {
         if m != nil { startClockCheckIfNeeded() }
     }
 
+    func setModemAutoDetect(_ on: Bool) {
+        changeModem { $0.setAutoDetect(on) }
+    }
+
     func lockModemCursor(atRF rf: Double) {
         let active = modemBoxActive
         changeModem { $0.lock(atRF: rf, boxActive: active) }
