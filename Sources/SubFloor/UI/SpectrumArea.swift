@@ -55,7 +55,7 @@ private struct SpectrumView: NSViewRepresentable {
             pan: { model.pan(byFraction: $0) },
             click: { model.click(atFraction: $0) },
             reset: { model.resetView() },
-            hover: { model.hover(at: $0) },
+            hover: { model.hover(at: $0, viewSize: $1) },
             passbandEdges: { model.passbandEdgeFractions },
             dragEdge: { model.dragPassbandEdge(upper: $0, fraction: $1) },
             // No grab tab: the modem decodes the receiver's passband, which follows the VFO.

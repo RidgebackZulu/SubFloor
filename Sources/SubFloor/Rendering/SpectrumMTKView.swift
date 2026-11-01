@@ -7,7 +7,8 @@ struct SpectrumInteraction {
     var pan: @MainActor (_ deltaFraction: Double) -> Void
     var click: @MainActor (_ fraction: Double) -> Void
     var reset: @MainActor () -> Void
-    var hover: @MainActor (_ unitPoint: CGPoint?) -> Void
+    /// The pointer in unit coordinates (nil: it left), and the view's size in points.
+    var hover: @MainActor (_ unitPoint: CGPoint?, _ viewSize: CGSize) -> Void
     /// The passband's draggable edges in view fractions (nil: that edge does not drag).
     var passbandEdges: @MainActor () -> (lower: Double?, upper: Double?)?
     var dragEdge: @MainActor (_ upper: Bool, _ fraction: Double) -> Void
@@ -130,7 +131,7 @@ final class SpectrumMTKView: MTKView {
         default:
             break
         }
-        interaction?.hover(unit(p))
+        interaction?.hover(unit(p), bounds.size)
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -152,7 +153,7 @@ final class SpectrumMTKView: MTKView {
     override func mouseMoved(with event: NSEvent) {
         let p = point(event)
         updateCursor(p)
-        interaction?.hover(unit(p))
+        interaction?.hover(unit(p), bounds.size)
     }
 
     /// Open hand over the modem box's grab tab, resize over a passband edge, crosshair elsewhere.
@@ -166,6 +167,6 @@ final class SpectrumMTKView: MTKView {
 
     override func mouseExited(with event: NSEvent) {
         NSCursor.arrow.set()
-        interaction?.hover(nil)
+        interaction?.hover(nil, bounds.size)
     }
 }
