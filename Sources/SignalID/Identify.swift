@@ -187,6 +187,8 @@ public enum SignalIdentifier {
     static let timingCandidate = 0.4
     static let hintedTimingCandidate = 0.2
     static let shortCarrierConfidence: Float = 0.6
+    /// An unidentified signal of a slot mode's width in its sub-band is offered as it at this.
+    static let slotOffer = 0.4
     /// The window the "Too weak" SNR is taken over when no extent is found (an SSB channel).
     static let defaultWindowHz = 2500.0
     static let searchBins = 4
@@ -242,6 +244,19 @@ public enum SignalIdentifier {
             }
             ranked.append((ModeMatch(name: row.name, confidence: Float(min(1, confidence)), evidence: evidence),
                            confidence))
+        }
+        // An unidentified signal in a slot mode's own frequencies, about as wide as one of its transmissions (FT8,
+        // FT4): their symbols take a whole slot to show, so the row is offered (never named) and the longer read
+        // asked for.
+        if m.family == .unknown {
+            for row in ModeTable.rows where row.slotted && row.hinted(rfHz) && !ranked.contains(where: { $0.match.name == row.name })
+                && row.slotWidthsHz.contains(where: { (0.5 * $0)...(1.5 * $0) ~= m.occupiedBandwidthHz }) {
+                ranked.append((ModeMatch(name: row.name, confidence: Float(slotOffer), evidence: [
+                    String(format: "an unidentified %.0f Hz signal in the %@ sub-band", m.occupiedBandwidthHz, row.name),
+                    "its symbols need a whole slot to show: reading longer",
+                ]), slotOffer))
+                if m.seconds < row.slotSeconds { longer = true }
+            }
         }
         ranked.sort { $0.raw > $1.raw }
 
@@ -313,6 +328,7 @@ public enum SignalIdentifier {
         // The longer read, from the same seed.
         var long = read.iq
         var readSeconds = min(read.seconds, Double(long.count / 2) / sampleRate)
+        let snapshotSeconds = readSeconds
         var notes: [String] = []
         if readSeconds < longSeconds - 0.1 {
             notes.append(String(format: "Read %.1f s of the %.0f s asked for", readSeconds, longSeconds))
@@ -329,7 +345,8 @@ public enum SignalIdentifier {
         let slow = SignalMeasurer.measure(long, sampleRate: sampleRate, offsetHz: seed.offsetHz,
                                           bandwidthHz: seed.widthHz, seconds: readSeconds)
         var refined = identify(slow, rfHz: captureCenterHz + slow.offsetHz)
-        refined.needsLongerRead = false
+        // The longer read has been made; only a shorter one than asked for leaves a need that more IQ could meet.
+        refined.needsLongerRead = refined.needsLongerRead && snapshotSeconds < longSeconds - 0.1
         if let note = refined.note { notes.insert(note, at: 0) }
         refined.note = notes.isEmpty ? nil : notes.joined(separator: "; ")
         return refined
@@ -410,11 +427,12 @@ public enum SignalIdentifier {
 /// between slots, which the measurer would take for speech pauses: one transmission is measured instead.
 ///
 /// The signal's channel (its width and a half, at least 50 Hz) in 50 ms blocks; when the strongest blocks (90th
-/// percentile) stand 6 dB over the weakest (10th), the blocks over their geometric mean are on, gaps of up to
-/// 0.1 s bridged. The longest run of 2 s or more that isn't the whole read, in input samples.
+/// percentile) stand 6 dB over the weakest (10th) and at most 20% of the blocks lie between (3 dB inside each),
+/// the blocks over their geometric mean are on, gaps of up to 0.1 s bridged. The longest run of 2 s or more that isn't the whole read, in input samples.
 enum Transmissions {
     static let blockSeconds = 0.05
     static let minContrast = 4.0
+    static let maxMiddleShare = 0.2
     static let bridgeBlocks = 2
     static let minSeconds = 2.0
 
@@ -435,6 +453,10 @@ enum Transmissions {
         let sorted = blocks.sorted()
         let low = sorted[blocks.count / 10], high = sorted[blocks.count * 9 / 10]
         guard low > 0, high >= minContrast * low else { return nil }
+        // Slots are on or off: few blocks sit between the two levels. A level that drifts (a recording's AGC
+        // recovering) fills the middle, and is no gap.
+        let middle = blocks.filter { $0 > 2 * low && $0 < high / 2 }.count
+        guard Double(middle) <= maxMiddleShare * Double(blocks.count) else { return nil }
         let threshold = (low * high).squareRoot()
         var runs: [Range<Int>] = []
         var start: Int?

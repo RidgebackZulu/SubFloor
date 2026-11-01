@@ -215,7 +215,8 @@ import Testing
         _ = run()
         let clock = ContinuousClock()
         var id = SignalIdentity(measurement: SignalMeasurement())
-        let elapsed = clock.measure { id = run() }
+        // The best of three, so a test run's other work on the cores doesn't count against it.
+        let elapsed = (0..<3).map { _ in clock.measure { id = run() } }.min()!
         #expect(id.best?.name == "NFM voice", "\(Self.describe(id))")
         print("identifyFirstPassBudget: \(elapsed)")
         if AnalogFamilyTests.optimised() {
@@ -350,18 +351,24 @@ import Testing
         print("realIQRecording: 11.1765 MHz \(Self.describe(voiceBand)); 11.1862 MHz \(Self.describe(line))")
     }
 
-    /// HFGCS activity at 11.175 MHz in the owner's hour-long IQ capture `captures/SubFloor_20261027_150938Z_11125000Hz_IQ.wav`
+    /// HFGCS voice at 11.175 MHz in the owner's hour-long IQ capture `captures/SubFloor_20261027_150938Z_11125000Hz_IQ.wav`
     /// (found by scanning it for voice-band excess; 2040–2047.5 s, channelised to 62 500 S/s around 11.178 MHz).
-    /// Never a wrong name. It measures as an unknown 3.7–4 kHz signal: see the report.
-    @Test func realIQCaptureVoiceBand() throws {
+    /// Ruling R21: real recordings are the ground truth. Named SSB voice where its 3 s hold speech with pauses
+    /// (two of the four windows; the other two hold continuous speech, 0.7–4.7% pauses, or a 24 dB line), and
+    /// never anything else.
+    @Test func realIQCaptureVoice() throws {
         let capture = try Self.iqFixture("SubFloor_20261027_150938Z_IQ_11178000Hz_62500Sps_7.5s")
-        for end in [3.0, 4.5, 6.0, 7.5] {
+        var named = 0
+        let ends = [3.0, 4.5, 6.0, 7.5]
+        for end in ends {
             let slice = Array(capture.iq[(2 * Int((end - 3) * capture.rate))..<(2 * Int(end * capture.rate))])
             let id = SignalIdentifier.identify(iq: slice, sampleRate: capture.rate, captureCenterHz: 11_178_000,
                                                atHz: 11_176_500, bandwidthHz: nil, spectrumDb: nil, longer: nil)
             #expect(id.best == nil || id.best?.name == "SSB voice (USB/LSB)", "to \(end) s: \(Self.describe(id))")
-            print("realIQCaptureVoiceBand to \(end) s: \(Self.describe(id))")
+            if id.best?.name == "SSB voice (USB/LSB)" { named += 1 }
+            print("realIQCaptureVoice to \(end) s: \(Self.describe(id))")
         }
+        #expect(named * 2 >= ends.count, "named SSB voice in \(named) of \(ends.count) windows")
     }
 
     /// SubFloor's own audio recordings, turned back into IQ (`AnalyticAudio`): 30 s of 11.175 MHz USB voice (HFGCS,
@@ -381,8 +388,9 @@ import Testing
     }
 
     /// An FT8 clip from 14.074 MHz (8 s of the :30 slot): pointed at one transmission's track, the strongest
-    /// narrow (about 50 Hz) plateau in the averaged spectrum. Never a wrong name; FT8 itself is a known issue (see the
-    /// report: the tracks stand about 5 dB over the AGC'd passband).
+    /// narrow (about 50 Hz) plateau in the averaged spectrum. Its tracks stand 4–7 dB over the passband: 8 s doesn't
+    /// show their 6.25 Bd grid, so the honest answer (R21) is FT8 offered and the longer read asked for, or FT8
+    /// named; never anything else.
     @Test func realFT8Track() throws {
         let ft8 = try Self.fixture("SubFloor_20261028_015635Z_14074000Hz_USB_FT8")
         let (iq, rate) = AnalyticAudio.iq(fromSSBAudio: ft8.samples, sampleRate: ft8.rate)
@@ -390,11 +398,11 @@ import Testing
         let id = SignalIdentifier.identify(iq: Array(iq.suffix(2 * Int(3 * rate))), sampleRate: rate,
                                            captureCenterHz: 14_074_000, atHz: 14_074_000 + audioHz, bandwidthHz: nil,
                                            spectrumDb: nil, longer: { (iq, Double(iq.count / 2) / rate) })
-        print("realFT8Track at \(audioHz) Hz: \(Self.describe(id))")
+        print("realFT8Track at \(audioHz) Hz: \(Self.describe(id)) needsLongerRead \(id.needsLongerRead)")
         #expect(id.best == nil || id.best?.name == "FT8 / FT4", "FT8 at \(audioHz) Hz: \(Self.describe(id))")
-        withKnownIssue("A real FT8 track about 5 dB over an AGC'd passband, 8 s: its FSK doesn't show") {
-            #expect(id.best?.name == "FT8 / FT4", "FT8 at \(audioHz) Hz: \(Self.describe(id))")
-        }
+        let offered = id.best?.name == "FT8 / FT4"
+            || (id.needsLongerRead && id.alternatives.contains { $0.name == "FT8 / FT4" })
+        #expect(offered, "FT8 at \(audioHz) Hz: \(Self.describe(id)), needsLongerRead \(id.needsLongerRead)")
     }
 
     /// The audio frequency (200–3000 Hz) of the strongest ~50 Hz plateau: the mean over ±22 Hz against the mean

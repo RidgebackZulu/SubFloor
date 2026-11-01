@@ -20,13 +20,15 @@ public struct ModeRow: Sendable {
     let needsTiming: Bool
     /// Transmits in slots with silence between (FT8, FT4): the longer read measures one transmission.
     let slotted: Bool
+    /// Its longest transmission (FT8's 79 symbols, 12.64 s): a shorter read can't show all of one.
+    let slotSeconds: Double
     /// How its FSK is keyed by its standard (WSPR and MFSK16 rectangular, FT8/FT4 and Olivia Gaussian): when
     /// named, its width comes from its parameters where the edges sit under the noise (`ParameterWidth`, R16).
     let shaping: ParameterWidth.Shaping?
 
     init(_ name: String, _ families: Set<SignalFamily>, partial: [SignalFamily: Double] = [:],
          _ variants: [[ModeFeature]], hints: [ModeHint] = [], needsTiming: Bool = false, slotted: Bool = false,
-         shaping: ParameterWidth.Shaping? = nil) {
+         slotSeconds: Double = 0, shaping: ParameterWidth.Shaping? = nil) {
         self.name = name
         self.families = families
         self.partialFamilies = partial
@@ -34,7 +36,25 @@ public struct ModeRow: Sendable {
         self.hints = hints
         self.needsTiming = needsTiming
         self.slotted = slotted
+        self.slotSeconds = slotSeconds
         self.shaping = shaping
+    }
+
+    /// Each variant's width from its parameters, (n − 1) × spacing + 2 × rate (a slotted row's: its transmissions').
+    var slotWidthsHz: [Double] {
+        variants.compactMap { features in
+            var n: Int?, rate: Double?, spacing: Double?
+            for f in features {
+                switch f.kind {
+                case .toneCount(let v): n = v.first
+                case .symbolRate(let v, _): rate = v.first
+                case .spacing(let v, _): spacing = v.first
+                default: break
+                }
+            }
+            guard let n, let rate, let spacing else { return nil }
+            return Double(n - 1) * spacing + 2 * rate
+        }
     }
 
     /// Whether `rfHz` lies in any of the row's hint ranges.
@@ -199,7 +219,7 @@ public enum ModeTable {
                  [tones([4]), rate([12_000 / 576], 0.03), ModeFeature(.spacing([12_000 / 576], tolerance: 0.05))]],
                 hints: [ModeHint("FT8/FT4 frequency", dials(ft8Dials, 0, 3200) + dials(ft4Dials, 0, 3200),
                                  outside: 0.05)],
-                needsTiming: true, slotted: true, shaping: .gaussian([8: 2, 4: 1])),
+                needsTiming: true, slotted: true, slotSeconds: 79 / 6.25, shaping: .gaussian([8: 2, 4: 1])),
         ModeRow("WSPR", [.fsk],
                 [[tones([4]), rate([12_000 / 8192], 0.03), ModeFeature(.spacing([12_000 / 8192], tolerance: 0.06)),
                   width(3...15, softness: 0.5)]],

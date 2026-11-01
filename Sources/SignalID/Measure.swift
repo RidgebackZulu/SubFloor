@@ -27,9 +27,11 @@ import Foundation
 ///   end short of it. The growth itself also stops halfway to other lines as strong as this one 5 kHz or
 ///   more away, and the margin the measurement adds stops short of the next other signal;
 /// - a symmetric pair within 5 kHz, beyond the strongest bin's skirt, no more than 5 dB under it (stronger
-///   than any AM's sidebands) makes that bin one of a comb, an FM tone's Bessel lines (APT seen on its
-///   centre line): if the measurement finds a line there, it is never `am` or `carrier`, and the region
-///   grows over the comb's lines (`overComb`), so the FM is measured whole;
+///   than any AM's sidebands) makes that bin, when it is a line itself (6 dB over the bins 3 either side, as the
+///   comb's other lines must be; the top of an FT8 track among others in a crowded sub-band isn't), one of a
+///   comb, an FM tone's Bessel lines (APT seen on its centre line): if the measurement finds a line there, it
+///   is never `am` or `carrier`, and the region grows over the comb's lines (`overComb`), so the FM is
+///   measured whole;
 /// - a wide-shift FSK's extent may take one tone (RTTY 850, POCSAG's ±4.5 kHz): another signal within
 ///   ±12 kHz about as strong and as wide is its twin when the channel spanning both is one FSK
 ///   (`fskTwin`: a constant envelope, its frequency on one tone or the other), and the two become one region;
@@ -94,7 +96,8 @@ import Foundation
 ///    19 kHz stereo pilot in the demodulated baseband (then in `subcarriersHz`); `fmDeviationHz` either way, and
 ///    `audioEnvelope`: `voice` when the demodulated audio's level comes in syllables with pauses (block CV ≥ 0.5,
 ///    ≥ 5% pauses), `steady` otherwise.
-/// 7. **usb / lsb:** no line (< 10%), a voice envelope (block CV ≥ 0.5 with ≥ 5% pauses), the passband's
+/// 7. **usb / lsb:** no carrier line holding ≥ 10% (a strongest bin that isn't a line, a real voice's formant
+///    holding 13–26%, doesn't count), at least 1 kHz wide, a voice envelope (block CV ≥ 0.5 with ≥ 5% pauses), the passband's
 ///    power ≥ 15 dB over its mirror about the carrier side, and a tilt of at least 1 dB towards the carrier
 ///    side (voice is strongest at low audio frequencies): USB when the lower edge is the stronger.
 /// 8. Otherwise `unknown`.
@@ -137,12 +140,16 @@ public enum SignalMeasurer {
     static let minSpread = 0.15
     static let minKurtosis = 2.5
     static let minTiltDb = 1.0
+    /// Speech needs at least this much audio: narrower is not SSB voice (two FT8 tracks side by side).
+    static let minSSBHz = 1000.0
     static let minCarrierFraction = 0.97
     static let minFMSamples = 1000.0
     static let maxFeatureSamples = 1 << 21
     static let twinSearchHz = 3000.0
     static let combMaxHz = 5000.0
     static let combBelowLineDb = 5.0
+    /// A comb's lines, the strongest included, stand this many times (6 dB) over the bins 3 either side.
+    static let combLineContrast = 4.0
     static let twinBelowDb = 10.0
     static let maxTwinCorrelation = -0.3
     static let fskTwinMaxHz = 12_000.0
@@ -529,7 +536,7 @@ public enum SignalMeasurer {
             return
         }
         // 7. SSB.
-        if voice && line.fraction < 0.1 && sidebands.asymmetryDb >= 15 && abs(sidebands.tiltDb) >= minTiltDb {
+        if voice && !(line.isLine && line.fraction >= 0.1) && m.occupiedBandwidthHz >= minSSBHz && sidebands.asymmetryDb >= 15 && abs(sidebands.tiltDb) >= minTiltDb {
             m.family = sidebands.tiltDb < 0 ? .usb : .lsb
             m.envelope = .voice
             m.familyConfidence = min(score(sidebands.asymmetryDb, 15, 25),
@@ -735,7 +742,10 @@ public enum SignalMeasurer {
         func lobe(_ k: Int) -> Double { (k - 2...k + 2).reduce(0) { $0 + max(0, view.power[$1] - view.noise) } }
         let limit = min(top, view.count - 1 - top) - 2
         let first = 8, last = min(limit, Int(combMaxHz / view.binHz))
-        guard first <= last else { return nil }
+        // Only a line can be one of a comb (as its other lines must be, `overComb`): the top of a plateau (an FT8
+        // track among others in a crowded sub-band) isn't.
+        guard first <= last, view.power[top] >= combLineContrast * max(view.power[top - 3], view.power[top + 3])
+        else { return nil }
         let floor = lobe(top) * pow(10, -combBelowLineDb / 10)
         return (first...last).first { min(lobe(top - $0), lobe(top + $0)) >= floor }
     }
@@ -751,7 +761,7 @@ public enum SignalMeasurer {
         let reach = max(2, step / 10)
         func isLine(_ k: Int) -> Bool {
             k - 3 >= 0 && k + 3 < view.count && view.power[k] >= 10 * view.noise
-                && view.power[k] >= 4 * max(view.power[k - 3], view.power[k + 3])
+                && view.power[k] >= combLineContrast * max(view.power[k - 3], view.power[k + 3])
         }
         func outermost(_ direction: Int) -> Int {
             var last = top, missed = 0
