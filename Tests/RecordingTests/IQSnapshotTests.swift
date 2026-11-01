@@ -97,6 +97,45 @@ import Testing
         #expect(r.snapshot(lastSeconds: 3, chunkFrames: 700_000) { _ in false } == nil)
     }
 
+    /// A full ring (a 5 s pre-roll, under the 16 s asked for) while the producer keeps pushing: the read stays
+    /// inside the pre-roll, ahead of the writer's overwrites, and hands over the 5 s it holds, in order.
+    @Test func chunkedSnapshotOfAFullRingWhileWriting() throws {
+        let rate = 100_000.0
+        let r = makeIQ(rate: rate, format: .float32, preRoll: 5)
+        defer { r.shutdown() }
+        let index: (Int) -> Float = { Float($0) }
+        push(r, frames: 0..<1_000_000, i: index, q: index)   // the 7 s ring is full
+        let writing = Reading()
+        let writer = Thread { [r] in
+            var next = 1_000_000
+            var block = [Float](repeating: 0, count: 2_000)
+            while !writing.done.load(ordering: .acquiring) {
+                for k in 0..<1_000 {
+                    block[2 * k] = Float(next + k)
+                    block[2 * k + 1] = Float(next + k)
+                }
+                block.withUnsafeBufferPointer { r.push($0) }
+                next += 1_000
+                Thread.sleep(forTimeInterval: 0.001)   // ten times real time
+            }
+        }
+        writer.start()
+        defer { writing.done.store(true, ordering: .releasing) }
+        var expected: Float?
+        var inOrder = true
+        let read = r.snapshot(lastSeconds: 16, chunkFrames: 50_000) { piece in
+            for k in stride(from: 0, to: piece.count, by: 2) {
+                if let e = expected, piece[k] != e { inOrder = false }
+                expected = piece[k] + 1
+            }
+            Thread.sleep(forTimeInterval: 0.005)
+            return true
+        }
+        let got = try #require(read)
+        #expect(got.frames == 500_000)
+        #expect(inOrder)
+    }
+
     @Test func chunkedSnapshotStopsAtTheRetune() throws {
         let r = makeIQ()
         defer { r.shutdown() }

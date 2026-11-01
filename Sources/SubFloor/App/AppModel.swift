@@ -1011,8 +1011,10 @@ final class AppModel {
         guard sourceKind != .file else { return }
         synthetic.antennaOffset = upconverter.enabled ? upconverter.loHz : 0
         let hardwareHz = upconverter.hardware(fromDisplay: centerHz)
-        // Signal ID reads the IQ off the main thread: the barrier keeps it from a read across the retune.
+        // Signal ID reads the IQ off the main thread: the barrier keeps it from a read across the retune. An LO
+        // change with the hardware clamped moves only the display centre the IQ is at; that is a barrier too.
         let moving = tunedHardwareHz != hardwareHz
+            || signalID.tuning.current.centerHz != upconverter.display(fromHardware: hardwareHz)
         if moving { signalID.retuneBegins() }
         do {
             try activeSource.setCenterFrequency(hardwareHz)
@@ -1056,9 +1058,21 @@ final class AppModel {
 
     // MARK: Spectrum interaction (never retunes except through setVFO)
 
-    func zoom(by factor: Double, anchor: Double) { viewport.zoom(by: factor, anchorFraction: anchor) }
-    func pan(byFraction f: Double) { viewport.pan(byFraction: f) }
-    func resetView() { viewport.reset() }
+    // The spectrum moves under a still pointer: Signal ID's hover answer is for a frequency it no longer rests on.
+    func zoom(by factor: Double, anchor: Double) {
+        viewport.zoom(by: factor, anchorFraction: anchor)
+        signalID.endHover()
+    }
+
+    func pan(byFraction f: Double) {
+        viewport.pan(byFraction: f)
+        signalID.endHover()
+    }
+
+    func resetView() {
+        viewport.reset()
+        signalID.endHover()
+    }
 
     func click(atFraction f: Double) {
         let step = min(mode.tuningStep, mode == .wfm ? 100_000 : 1_000)

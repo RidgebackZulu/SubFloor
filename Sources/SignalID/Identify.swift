@@ -178,7 +178,8 @@ public enum SignalIdentifier {
     static let hintFloor = 0.55
     static let firstSeconds = 3.0
     static let longSeconds = 16.0
-    static let minimumSeconds = 1.0
+    /// Under this much IQ is "Too soon after tuning — try again".
+    public static let minimumSeconds = 1.0
     /// A read this long has had its longer read.
     static let longRead = 10.0
     static let narrowHz = 50.0

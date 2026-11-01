@@ -66,11 +66,15 @@ struct SignalIDServiceTests {
                    sampleRate: 48_000, endTime: Date())
     }
 
-    /// A snapshot provider that always gives `snap`, counting its calls.
+    /// A snapshot provider that gives the newest of `snap` (all of it when it is shorter than asked for, as a ring
+    /// filling since a retune would), counting its calls. The "full" snapshots are 3.1 s: the service asks for 3 s
+    /// and the 50 ms it drops after a retune.
     private static func provider(_ snap: IQSnapshot, calls: Locked<Int>? = nil) -> SignalIDService.SnapshotProvider {
-        { _ in
+        { lastSeconds in
             calls?.withLock { $0 += 1 }
-            return snap
+            var newest = snap
+            newest.samples = Array(snap.samples.suffix(2 * Int((lastSeconds * snap.sampleRate).rounded())))
+            return newest
         }
     }
 
@@ -100,21 +104,22 @@ struct SignalIDServiceTests {
 
     /// A stub analysis: a 100 Hz signal centred where it was asked, named `name` when given.
     private static func stub(name: String? = nil, alternatives: [ModeMatch] = [], widthHz: Double = 100,
-                             seconds: Double = 0, asked: Locked<[Double]>? = nil) -> SignalIDService.Analysis {
+                             family: SignalFamily = .fsk, note: String? = nil, seconds: Double = 0,
+                             asked: Locked<[Double]>? = nil) -> SignalIDService.Analysis {
         { _, _, centre, at, _, _, _ in
             asked?.withLock { $0.append(at) }
             if seconds > 0 { Thread.sleep(forTimeInterval: seconds) }
             return SignalIdentity(measurement: SignalMeasurement(offsetHz: at - centre, occupiedBandwidthHz: widthHz,
-                                                                 family: .fsk, familyConfidence: 0.8, seconds: 3),
+                                                                 family: family, familyConfidence: 0.8, seconds: 3),
                                   best: name.map { ModeMatch(name: $0, confidence: 0.8, evidence: []) },
-                                  alternatives: alternatives)
+                                  alternatives: alternatives, note: note)
         }
     }
 
     @Test func identifiesAtAFrequency() async throws {
         guard let m = runningModel() else { return }
         defer { m.shutdown() }
-        let snap = Self.snapshot(.rtty(), seconds: 3, offsetHz: 5_000)
+        let snap = Self.snapshot(.rtty(), seconds: 3.1, offsetHz: 5_000)
         m.signalID.snapshotProvider = Self.provider(snap)
         m.signalID.chunkProvider = Self.chunks(snap)
         let id = try #require(await m.signalID.identify(atHz: m.centerHz + 5_000))
@@ -129,7 +134,7 @@ struct SignalIDServiceTests {
         defer { m.shutdown() }
         m.signalID.snapshotProvider = { _ in nil }
         #expect(await m.signalID.identify(atHz: m.centerHz + 5_000) == nil)
-        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.rtty(), seconds: 3, offsetHz: 5_000))
+        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.rtty(), seconds: 3.1, offsetHz: 5_000))
         m.stop()
         #expect(await m.signalID.identify(atHz: m.centerHz + 5_000) == nil)
     }
@@ -139,7 +144,7 @@ struct SignalIDServiceTests {
         guard let m = runningModel() else { return }
         defer { m.shutdown() }
         let runs = Locked(0)
-        let snap = Self.snapshot(.rtty(), seconds: 3, offsetHz: 5_000)
+        let snap = Self.snapshot(.rtty(), seconds: 3.1, offsetHz: 5_000)
         m.signalID.snapshotProvider = Self.provider(snap)
         m.signalID.chunkProvider = Self.chunks(snap)
         m.signalID.analysis = Self.counting(runs)
@@ -175,6 +180,7 @@ struct SignalIDServiceTests {
         defer { m.shutdown() }
         m.setMode(.usb)
         m.tune(to: 14_074_000)
+        try await Task.sleep(for: .milliseconds(300))   // the modem's reset for the tune (it clears the rows) lands
         // FT8 reports tone 0; the signal's centre is 3.5 tones (21.9 Hz) above it.
         let rf = m.modemBox.rfHz(forAudio: 1_500 + 3.5 * FT8Encoder.toneSpacing)
         let now = Date()
@@ -184,7 +190,7 @@ struct SignalIDServiceTests {
                        timeOffset: 0.2, message: "CQ K1ABC FN42"),
         ], now: now)
         m.showDecodeLog(log)
-        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3, offsetHz: 0))
+        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
         let ft8 = ModeMatch(name: "FT8 / FT4", confidence: 0.5, evidence: [])
         m.signalID.analysis = Self.stub(alternatives: [ft8], widthHz: 50)
 
@@ -195,6 +201,7 @@ struct SignalIDServiceTests {
         #expect(!id.alternatives.contains { $0.name == "FT8 / FT4" })
 
         // Named otherwise: no confirmation.
+        m.showDecodeLog(log)
         m.signalID.invalidateCache()
         m.signalID.analysis = Self.stub(name: "RTTY", widthHz: 50)
         let rtty = try #require(await m.signalID.identify(atHz: rf))
@@ -211,6 +218,118 @@ struct SignalIDServiceTests {
         m.signalID.analysis = Self.stub(alternatives: [ft8], widthHz: 50)
         let stale = try #require(await m.signalID.identify(atHz: rf))
         #expect(!stale.confirmedByDecode && stale.best == nil)
+    }
+
+    /// R28: with nothing named, a decode confirms only a mode the answer offers, or one whose family it measured;
+    /// never "No signal" or "Too weak" (nothing measured to agree with).
+    @Test func decodeConfirmsOnlyAConsistentUnnamedSignal() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        m.setMode(.usb)
+        m.tune(to: 14_074_000)
+        try await Task.sleep(for: .milliseconds(300))   // the modem's reset for the tune (it clears the rows) lands
+        let rf = m.modemBox.rfHz(forAudio: 1_500 + 3.5 * FT8Encoder.toneSpacing)
+        let now = Date()
+        var log = DecodeLog()
+        log.apply(signals: nil, text: [], slotDecodes: [
+            SlotDecode(mode: .ft8, slotStart: now.addingTimeInterval(-20), frequencyHz: 1_500, snrDb: -12,
+                       timeOffset: 0.2, message: "CQ K1ABC FN42"),
+        ], now: now)
+        m.showDecodeLog(log)
+        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
+        func identify(_ analysis: @escaping SignalIDService.Analysis) async throws -> SignalIdentity {
+            m.showDecodeLog(log)   // again: the modem's reset for the tune clears the rows when its batch lands
+            m.signalID.invalidateCache()
+            m.signalID.analysis = analysis
+            return try #require(await m.signalID.identify(atHz: rf))
+        }
+        let noSignal = try await identify(Self.stub(widthHz: 0, family: .noise, note: "No signal"))
+        #expect(!noSignal.confirmedByDecode && noSignal.best == nil && noSignal.note == "No signal")
+        let tooWeak = try await identify(Self.stub(widthHz: 0, family: .unknown,
+                                                   note: "Too weak to identify (SNR 2 dB)"))
+        #expect(!tooWeak.confirmedByDecode && tooWeak.best == nil)
+        // A PSK signal with no FT8 among its alternatives: inconsistent.
+        let psk = try await identify(Self.stub(widthHz: 50, family: .psk))
+        #expect(!psk.confirmedByDecode && psk.best == nil)
+        // An unnamed FSK (FT8's family) is.
+        let fsk = try await identify(Self.stub(widthHz: 50, family: .fsk))
+        #expect(fsk.confirmedByDecode && fsk.best?.name == "FT8 / FT4" && fsk.best?.confidence == 1)
+    }
+
+    /// A first read shorter than the 3 s asked for (but over the 1 s the identifier needs) says so in `note`, and
+    /// isn't cached: the ring is still filling.
+    @Test func aShortFirstReadIsSaid() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let calls = Locked(0)
+        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.rtty(), seconds: 1.5, offsetHz: 5_000), calls: calls)
+        let id = try #require(await m.signalID.identify(atHz: m.centerHz + 5_000))
+        // 1.5 s, less the 50 ms after the barrier.
+        let said = String(format: "Read %.1f s of the 3 s asked for", 1.45)
+        #expect(id.note?.contains(said) == true, "\(id.note ?? "no note")")
+        _ = await m.signalID.identify(atHz: m.centerHz + 5_000)
+        #expect(calls.withLock { $0 } == 2)
+    }
+
+    /// A retune while the analysis runs: the answer is dropped (nil), and nothing is cached for the old centre.
+    @Test func aRetuneWhileItRunsDropsTheAnswer() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let asked = Locked<[Double]>([])
+        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
+        m.signalID.analysis = Self.stub(seconds: 0.5, asked: asked)
+        let at = m.centerHz + 5_000
+        let running = Task { await m.signalID.identify(atHz: at) }
+        #expect(await eventually { asked.withLock { $0.count } == 1 })
+        m.setVFO(m.centerHz + 0.6 * m.sampleRate)
+        #expect(await running.value == nil)
+        m.signalID.analysis = Self.stub(asked: asked)
+        _ = await m.signalID.identify(atHz: at)
+        #expect(asked.withLock { $0.count } == 2)
+    }
+
+    /// A longer read that fails (the ring overwrote it, or was reconfigured) says so in `note`; the first read's
+    /// answer stands, still wanting the longer read, and isn't cached.
+    @Test func aFailedLongerReadIsSaid() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let reads = Locked(0)
+        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
+        m.signalID.chunkProvider = { _, _, _ in
+            reads.withLock { $0 += 1 }
+            return nil
+        }
+        m.signalID.analysis = { _, _, centre, at, _, _, _ in
+            SignalIdentity(measurement: SignalMeasurement(offsetHz: at - centre, occupiedBandwidthHz: 50,
+                                                          family: .carrier, seconds: 3),
+                           needsLongerRead: true)
+        }
+        let id = try #require(await m.signalID.identify(atHz: m.centerHz + 5_000))
+        #expect(id.note == "The longer read failed; this is the first read's answer")
+        #expect(id.needsLongerRead)
+        _ = await m.signalID.identify(atHz: m.centerHz + 5_000)
+        #expect(reads.withLock { $0 } == 2)
+    }
+
+    /// I1: a short pre-roll (5 s, under the 16 s asked for) on the demo source's own ring, the writer pushing
+    /// throughout: the longer read gets what the ring holds instead of failing against the writer.
+    @Test func aShortPreRollGivesTheLongerReadWhatItHolds() async throws {
+        guard let m = runningModel(preRollSeconds: 5) else { return }
+        defer { m.shutdown() }
+        let r = m.engine.iqRecorder
+        #expect(await eventually(120) { r.status.preRollFill >= 1 })
+        let second = Locked<(frames: Int, rate: Double)?>(nil)
+        let fs = m.sampleRate
+        m.signalID.analysis = { iq, rate, centre, at, _, _, _ in
+            if rate < fs { second.withLock { $0 = (iq.count / 2, rate) } }
+            return SignalIdentity(measurement: SignalMeasurement(offsetHz: at - centre, occupiedBandwidthHz: 50,
+                                                                 family: .carrier, seconds: 3),
+                                  needsLongerRead: rate >= fs)
+        }
+        let id = try #require(await m.signalID.identify(atHz: m.vfoHz + 1_000))
+        let got = try #require(second.withLock { $0 }, "no longer read: \(id.note ?? "no note")")
+        let seconds = Double(got.frames) / got.rate
+        #expect(seconds > 4 && seconds <= 5.01, "\(seconds) s")
     }
 
     /// R26: the longer read is never held at the radio's rate. A 16 s read of a 2 MS/s capture comes off the ring
@@ -274,7 +393,24 @@ struct SignalIDServiceTests {
         #expect(largestPiece.withLock { $0 } <= 1_000_000)
         #expect(got.rate == 250_000)
         #expect(got.frames == 4_000_000, "\(got.frames)")
-        #expect(2 * got.frames * MemoryLayout<Float>.size <= 32 << 20)
+        // The peak, from the same read made directly: the channel as reserved before the read (and never
+        // outgrown, so never reallocated by doubling) and one piece, its bytes and its floats (at most float32's
+        // 8 bytes a frame each).
+        let barrier = TuneBarrier()
+        barrier.end(centerHz: m.centerHz)
+        guard case .read(let long) = SignalIDService.longerRead(offsetHz: signalHz, widthHz: 50,
+                                                                tuning: barrier.current, sampleRate: fs,
+                                                                chunks: m.signalID.chunkProvider,
+                                                                barrier: barrier) else {
+            Issue.record("no longer read")
+            return
+        }
+        let channelBytes = long.reservedFloats * MemoryLayout<Float>.size
+        let pieceBytes = 2 * largestPiece.withLock { $0 } * 8
+        #expect(!long.grew)
+        #expect(long.iq.count == 2 * got.frames)
+        #expect(channelBytes <= 33 << 20, "channel \(channelBytes) bytes reserved")
+        #expect(channelBytes + pieceBytes <= 64 << 20, "peak \(channelBytes + pieceBytes) bytes")
         #expect(got.longer == 2 * got.frames)
         #expect(got.centre == m.centerHz + signalHz)
         #expect(got.toneDb > 40, "\(got.toneDb) dB")
@@ -289,7 +425,7 @@ struct SignalIDServiceTests {
         defer { m.shutdown() }
         let offMain = Locked((snapshot: true, analysis: true))
         let window = Locked<(start: Date, end: Date)?>(nil)
-        let snap = Self.snapshot(.rtty(), seconds: 3, offsetHz: 5_000)
+        let snap = Self.snapshot(.rtty(), seconds: 3.1, offsetHz: 5_000)
         m.signalID.snapshotProvider = { _ in
             let main = Thread.isMainThread
             offMain.withLock { $0.snapshot = $0.snapshot && !main }
@@ -329,7 +465,7 @@ struct SignalIDServiceTests {
         guard let m = runningModel() else { return }
         defer { m.shutdown() }
         let asked = Locked<[Double]>([])
-        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3, offsetHz: 0))
+        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
         m.signalID.analysis = Self.stub(asked: asked)
 
         m.hover(at: CGPoint(x: 0.50, y: 0.2), viewSize: Self.view)
@@ -360,7 +496,7 @@ struct SignalIDServiceTests {
         guard let m = runningModel() else { return }
         defer { m.shutdown() }
         let asked = Locked<[Double]>([])
-        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3, offsetHz: 0))
+        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
         m.signalID.analysis = Self.stub(seconds: 1, asked: asked)
 
         m.hover(at: CGPoint(x: 0.3, y: 0.2), viewSize: Self.view)
@@ -372,7 +508,8 @@ struct SignalIDServiceTests {
         try await Task.sleep(for: .milliseconds(300))   // past the first analysis' end
         let id = try #require(m.signalID.hoverIdentity)
         #expect(abs(id.measurement.offsetHz - (second - m.centerHz)) < 1e-6)
-        #expect(asked.withLock { $0.count } == 2)
+        // The first ran its analysis or, cancelled before it began, never did.
+        #expect((1...2).contains(asked.withLock { $0.count }))
     }
 
     /// The demo source's own ring, HamItUp on: the capture centre handed to the analysis is the display centre

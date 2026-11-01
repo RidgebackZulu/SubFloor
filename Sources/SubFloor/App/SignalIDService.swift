@@ -1,4 +1,5 @@
 import CoreGraphics
+import DSPCore
 import Foundation
 import Modems
 import Recording
@@ -48,7 +49,8 @@ final class TuneBarrier: Sendable {
 /// retried while the barrier is moving, and the whole identification is dropped (nil) when the radio retuned
 /// before it finished. A read that reaches back to the barrier (shorter than asked for) loses its oldest
 /// `settleSeconds`: the pipeline carries old-centre samples past it. Under a second left gives the identifier's
-/// "Too soon after tuning — try again".
+/// "Too soon after tuning — try again"; between that and the 3 s asked for, the answer's note says how much was
+/// read ("Read 1.4 s of the 3 s asked for").
 ///
 /// **The longer read** (ruling R26). The first pass is 3 s at the radio's rate. When it asks for more
 /// (`needsLongerRead`), up to `longSeconds` are read off the ring a piece at a time (`chunkProvider`, at most
@@ -58,18 +60,21 @@ final class TuneBarrier: Sendable {
 /// channel's read shortened to fit). The identifier then runs again on the channel, at its own rate and centre,
 /// with the channel as its longer read; its measurement is put back in the capture's frame. A ring holding less
 /// gives what it holds (its oldest `settleSeconds` dropped when it reaches back to a retune), which the identifier
-/// says in `note`.
+/// says in `note`; a read that fails, or a channel too wide for one, is said in `note` too, and the first read's
+/// answer stands.
 ///
-/// **Cache.** An answer with an extent (and no longer read still wanted) is kept `cacheSeconds`, over the extent it
-/// found (and the point asked about): a point on the same signal reuses it. A retune empties it.
+/// **Cache.** An answer with an extent that had every read it asked for (or that a decode confirmed) is kept
+/// `cacheSeconds`, over the extent it found (and the point asked about): a point on the same signal reuses it. A
+/// retune empties it.
 ///
 /// **Decode confirmation.** A running decoder's row within ±half the signal's width (at least `minimumMatchHz`) —
-/// a live row with text, or a slot row whose slot ended in the last `decodeSeconds` — whose mode is the one named,
-/// or names one when none was, confirms it: `confirmedByDecode`, at 1.0. Applied to every answer, cached or new.
+/// a live row with text, or a slot row whose slot ended in the last `decodeSeconds` — whose mode is consistent with
+/// the answer (ruling R28: the one named; when none was, one offered or one whose family was measured) confirms it:
+/// `confirmedByDecode`, at 1.0. Never an answer with no extent. Applied to every answer, cached or new.
 ///
 /// **Hover.** `AppModel.hover(at:viewSize:)` feeds the pointer: resting `dwellSeconds` starts `identify` there
 /// (`hoverPending` while it runs, then `hoverIdentity`); moving more than `moveTolerance` points from where it
-/// came to rest, leaving, or a retune cancels it and clears the answer.
+/// came to rest, leaving, the spectrum moving under it (zoom, pan) or a retune cancels it and clears the answer.
 @MainActor @Observable
 final class SignalIDService {
     /// Up to `lastSeconds` of the ring's newest IQ (`StreamRecorder.snapshot`), any thread.
@@ -150,7 +155,7 @@ final class SignalIDService {
         let sequence = tuning.current.sequence
         cache.removeAll { $0.sequence != sequence || now.timeIntervalSince($0.at) > Self.cacheSeconds }
         if let hit = cache.first(where: { $0.range.contains(atHz) && $0.bandwidthHz == bandwidthHz }) {
-            return confirmed(hit.identity, centerHz: hit.centerHz, atHz: atHz, bandwidthHz: bandwidthHz, now: now)
+            return confirmed(hit.identity, centerHz: hit.centerHz, bandwidthHz: bandwidthHz, now: now)
         }
 
         let spectrum = model.spectrumSnapshot()
@@ -160,28 +165,40 @@ final class SignalIDService {
                      analysis: analysis, barrier: barrier)
         }
         let result = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
-        guard !Task.isCancelled, let (identity, state) = result, state == tuning.current else { return nil }
+        guard !Task.isCancelled, let result, result.state == tuning.current else { return nil }
 
-        // Kept when it found an extent, and had the read it asked for (a short ring's answer improves as it fills).
+        let identity = result.identity, state = result.state
+        let answer = confirmed(identity, centerHz: state.centerHz, bandwidthHz: bandwidthHz, now: Date())
+        // Kept when it found an extent and had every read it asked for (a short ring's answer improves as it
+        // fills), or when a decode settled it.
         let m = identity.measurement
-        if m.occupiedBandwidthHz > 0 && !identity.needsLongerRead {
+        if m.occupiedBandwidthHz > 0 && (result.complete || answer.confirmedByDecode) {
             let centre = state.centerHz + m.offsetHz, half = max(m.occupiedBandwidthHz, m.bandwidth6dBHz) / 2
             cache.append(CacheEntry(range: min(centre - half, atHz)...max(centre + half, atHz),
                                     bandwidthHz: bandwidthHz, sequence: state.sequence, centerHz: state.centerHz,
                                     at: Date(), identity: identity))
         }
-        return confirmed(identity, centerHz: state.centerHz, atHz: atHz, bandwidthHz: bandwidthHz, now: Date())
+        return answer
     }
 
     /// Forgets every answer.
     func invalidateCache() { cache.removeAll() }
 
+    /// What `run` made of it: the answer, the tuning its IQ was heard in, and whether it had every read it asked
+    /// for (the first pass's 3 s, and the longer read when wanted).
+    struct Outcome: Sendable {
+        var identity: SignalIdentity
+        var state: TuneBarrier.State
+        var complete: Bool
+    }
+
     /// The first read, the analysis and (on request) the longer read: off the main actor. Nil when there is no IQ,
     /// the radio retuned meanwhile, or the task was cancelled.
     private nonisolated static func run(atHz: Double, bandwidthHz: Double?, spectrum: SpectrumSnapshot?,
                                         provider: SnapshotProvider, chunks: ChunkProvider, analysis: Analysis,
-                                        barrier: TuneBarrier) -> (SignalIdentity, TuneBarrier.State)? {
-        guard case (var first, let state)? = read(firstSeconds, provider: provider, barrier: barrier) else {
+                                        barrier: TuneBarrier) -> Outcome? {
+        guard !Task.isCancelled,
+              case (var first, let state)? = read(firstSeconds, provider: provider, barrier: barrier) else {
             return nil
         }
         // The app's spectrum, when it is of this capture (the identifier works out its own otherwise).
@@ -189,23 +206,47 @@ final class SignalIDService {
             abs(s.centerHz - state.centerHz) < 0.5 && abs(s.spanHz - first.sampleRate) < 0.5 && s.average.count >= 8
                 ? s.average : nil
         }
-        let identity = analysis(first.samples, first.sampleRate, state.centerHz, atHz, bandwidthHz, spectrumDb, nil)
+        var identity = analysis(first.samples, first.sampleRate, state.centerHz, atHz, bandwidthHz, spectrumDb, nil)
         guard !Task.isCancelled else { return nil }
-        guard identity.needsLongerRead else { return (identity, state) }
+        // Less than the 3 s asked for (but enough to measure): said in the note.
+        let rate = first.sampleRate, readSeconds = Double(first.frames) / rate
+        let short = first.frames < Int((firstSeconds * rate).rounded())
+        if short && readSeconds >= SignalIdentifier.minimumSeconds {
+            add(String(format: "Read %.1f s of the %.0f s asked for", readSeconds, firstSeconds), to: &identity)
+        }
+        guard identity.needsLongerRead else { return Outcome(identity: identity, state: state, complete: !short) }
 
         // The longer read, on the channel around what the first pass measured.
-        let rate = first.sampleRate
         first.samples = []   // not held through the longer read
         let m = identity.measurement
-        guard let long = longerRead(offsetHz: m.offsetHz, widthHz: max(m.occupiedBandwidthHz, bandwidthHz ?? 0),
-                                    tuning: state, sampleRate: rate, chunks: chunks, barrier: barrier) else {
-            return Task.isCancelled ? nil : (identity, state)
+        switch longerRead(offsetHz: m.offsetHz, widthHz: max(m.occupiedBandwidthHz, bandwidthHz ?? 0),
+                          tuning: state, sampleRate: rate, chunks: chunks, barrier: barrier) {
+        case .dropped:
+            return nil
+        case .unavailable(let why):
+            add(why, to: &identity)
+            return Outcome(identity: identity, state: state, complete: false)
+        case .read(let long):
+            var refined = analysis(long.iq, long.sampleRate, state.centerHz + long.offsetHz, atHz, bandwidthHz, nil,
+                                   { (long.iq, long.seconds) })
+            guard !Task.isCancelled else { return nil }
+            refined.measurement.offsetHz += long.offsetHz   // back in the capture's frame
+            return Outcome(identity: refined, state: state, complete: !refined.needsLongerRead)
         }
-        var refined = analysis(long.iq, long.sampleRate, state.centerHz + long.offsetHz, atHz, bandwidthHz, nil,
-                               { (long.iq, long.seconds) })
-        guard !Task.isCancelled else { return nil }
-        refined.measurement.offsetHz += long.offsetHz   // back in the capture's frame
-        return (refined, state)
+    }
+
+    /// `note` added after any the answer has.
+    private nonisolated static func add(_ note: String, to identity: inout SignalIdentity) {
+        identity.note = [identity.note, note].compactMap { $0 }.joined(separator: "; ")
+    }
+
+    /// How the longer read went.
+    enum LongReadOutcome: Sendable {
+        case read(LongRead)
+        /// None to be had: why, for the answer's note.
+        case unavailable(String)
+        /// Cancelled, or the radio retuned: the answer is dropped.
+        case dropped
     }
 
     /// The longer read's channel: interleaved IQ at `sampleRate`, centred `offsetHz` from the capture centre.
@@ -214,37 +255,55 @@ final class SignalIDService {
         var sampleRate: Double
         var offsetHz: Double
         var seconds: Double
+        /// The output's size as reserved before the read, in floats, and whether it outgrew that (it never
+        /// should: the read's peak is this plus one piece).
+        var reservedFloats: Int
+        var grew: Bool
     }
 
     /// Up to `longSeconds` (fewer for a channel too wide for `longReadBudgetBytes`) of the ring, read a piece at a
     /// time and cut to the channel around `offsetHz` (`widthHz` wide, the signal's) as it comes, in the tuning
-    /// `tuning`. A read that reaches back to the barrier loses its oldest `settleSeconds`. Nil when there is no
-    /// IQ, the radio retuned, or the task was cancelled.
+    /// `tuning`. A read that reaches back to the barrier loses its oldest `settleSeconds`; a shorter read than
+    /// asked for is the identifier's to say. The output is sized once, for what was asked: never grown by doubling.
     nonisolated static func longerRead(offsetHz: Double, widthHz: Double, tuning: TuneBarrier.State,
                                        sampleRate: Double, chunks: ChunkProvider,
-                                       barrier: TuneBarrier) -> LongRead? {
-        guard barrier.current == tuning, sampleRate > 0 else { return nil }
+                                       barrier: TuneBarrier) -> LongReadOutcome {
+        guard barrier.current == tuning, sampleRate > 0 else { return .dropped }
         let windowHz = max(minimumChannelHz, channelWidths * widthHz)
-        let extractor = ChannelExtractor(sampleRate: sampleRate, offsetHz: offsetHz, bandwidthHz: windowHz,
-                                         sharp: false)
-        // A capture no wider than the channel needs no cutting.
-        let whole = extractor.rate >= sampleRate
-        let rate = whole ? sampleRate : extractor.rate
+        // A capture the channel wouldn't decimate (no wider than 4 × it) needs no cutting.
+        let decimates = !DecimationPlan.stages(inputRate: sampleRate,
+                                               minimumRate: max(4 * windowHz, Channel.minimumRate)).isEmpty
+        let extractor = decimates ? ChannelExtractor(sampleRate: sampleRate, offsetHz: offsetHz,
+                                                     bandwidthHz: windowHz, sharp: false) : nil
+        let whole = extractor == nil
+        let rate = extractor?.rate ?? sampleRate
         let seconds = min(longSeconds, Double(longReadBudgetBytes / 8) / rate)
+        guard seconds > firstSeconds else {
+            return .unavailable(String(format: "No longer read: a %.0f kHz channel is too wide for one",
+                                       windowHz / 1000))
+        }
         let asked = seconds + settleSeconds
+        let askedFrames = Int((asked * sampleRate).rounded())
         var copied: [Float] = []
+        if let extractor { extractor.reserve(inputFrames: askedFrames) } else { copied.reserveCapacity(2 * askedFrames) }
         let read = chunks(asked, min(Int(chunkSeconds * sampleRate), maxChunkFrames)) { piece in
             guard !Task.isCancelled else { return false }
-            if whole { copied.append(contentsOf: piece) } else { extractor.feed(piece) }
+            if let extractor { extractor.feed(piece) } else { copied.append(contentsOf: piece) }
             return true
         }
-        guard let read, read.sampleRate == sampleRate, barrier.current == tuning else { return nil }
-        var iq = whole ? copied : extractor.finish().samples
+        guard !Task.isCancelled, barrier.current == tuning else { return .dropped }
+        guard let read, read.sampleRate == sampleRate else {
+            return .unavailable("The longer read failed; this is the first read's answer")
+        }
+        let reserved = extractor?.reservedFloats ?? 2 * askedFrames
+        let grew = extractor?.outgrewReservation ?? (copied.count > reserved)
+        var iq = extractor?.finish().samples ?? copied
         // The oldest `settleSeconds` of a read reaching back to the barrier, and anything over `seconds`.
-        let settle = read.frames < Int((asked * sampleRate).rounded()) ? Int((settleSeconds * rate).rounded()) : 0
+        let settle = read.frames < askedFrames ? Int((settleSeconds * rate).rounded()) : 0
         let keep = max(0, min(iq.count / 2 - settle, Int((seconds * rate).rounded())))
         iq.removeFirst(iq.count - 2 * keep)
-        return LongRead(iq: iq, sampleRate: rate, offsetHz: whole ? 0 : offsetHz, seconds: Double(keep) / rate)
+        return .read(LongRead(iq: iq, sampleRate: rate, offsetHz: whole ? 0 : offsetHz, seconds: Double(keep) / rate,
+                              reservedFloats: reserved, grew: grew))
     }
 
     /// Up to `seconds` of the ring's IQ and the tuning it was heard at. A read shorter than asked for reaches back
@@ -273,11 +332,11 @@ final class SignalIDService {
     // MARK: Decode confirmation
 
     /// `identity` with any decode confirming it (see the type's notes).
-    private func confirmed(_ identity: SignalIdentity, centerHz: Double, atHz: Double, bandwidthHz: Double?,
+    private func confirmed(_ identity: SignalIdentity, centerHz: Double, bandwidthHz: Double?,
                            now: Date) -> SignalIdentity {
         guard let model else { return identity }
         let m = identity.measurement
-        let signalHz = m.occupiedBandwidthHz > 0 ? centerHz + m.offsetHz : atHz
+        let signalHz = centerHz + m.offsetHz
         let halfWidth = max(max(m.occupiedBandwidthHz, bandwidthHz ?? 0) / 2, Self.minimumMatchHz)
         let log = model.decodeLog
         return Self.confirm(identity, signalHz: signalHz, halfWidthHz: halfWidth, rows: log.slotRows + log.liveRows,
@@ -285,9 +344,13 @@ final class SignalIDService {
     }
 
     /// `identity` confirmed by the nearest of `rows` (audio frequencies in `box`) within `halfWidthHz` of
-    /// `signalHz` whose mode is the one named, or by the nearest when none was named.
+    /// `signalHz` whose mode is consistent with it (ruling R28): the one named; when none was, one offered among
+    /// the alternatives, or one whose table row the measured family fits. Never an answer with no extent ("No
+    /// signal", "Too weak", "Too soon"): there is nothing measured for a decode to agree with.
     static func confirm(_ identity: SignalIdentity, signalHz: Double, halfWidthHz: Double, rows: [DecodeRow],
                         box: ModemBox, now: Date) -> SignalIdentity {
+        let m = identity.measurement
+        guard m.occupiedBandwidthHz > 0, m.family != .noise else { return identity }
         let decoded = rows.compactMap { row -> (mode: ModeID, distance: Double)? in
             guard let mode = row.mode else { return nil }
             if let slotStart = row.utcTime {
@@ -308,7 +371,11 @@ final class SignalIDService {
         if let best = identity.best {
             match = decoded.first { tableName($0.mode) == best.name }?.mode
         } else {
-            match = decoded.first?.mode
+            let offered = Set(identity.alternatives.map(\.name))
+            match = decoded.first {
+                let name = tableName($0.mode)
+                return offered.contains(name) || ModeTable.row(name)?.families.contains(m.family) == true
+            }?.mode
         }
         guard let match else { return identity }
         let name = tableName(match)
@@ -356,8 +423,9 @@ final class SignalIDService {
         hoverTask?.cancel()
         hoverTask = nil
         hoverAnchor = nil
-        hoverPending = false
-        hoverIdentity = nil
+        // Observed: written only when they change (this runs at mouse-move rate).
+        if hoverPending { hoverPending = false }
+        if hoverIdentity != nil { hoverIdentity = nil }
     }
 
     // MARK: Tuning

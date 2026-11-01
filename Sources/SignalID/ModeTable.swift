@@ -9,7 +9,7 @@ import Foundation
 public struct ModeRow: Sendable {
     public let name: String
     /// The families it is measured as.
-    let families: Set<SignalFamily>
+    public let families: Set<SignalFamily>
     /// Families that neither confirm nor rule it out, and the match they count as (HF fax measured `unknown`:
     /// a constant envelope with discrete frequencies, as its black and white levels make it).
     let partialFamilies: [SignalFamily: Double]

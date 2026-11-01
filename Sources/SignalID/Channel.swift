@@ -14,9 +14,6 @@ import Foundation
 /// With `sharp` false the last stage is only an anti-alias stage too: ±bandwidth/2 is kept clean, but what
 /// lies beyond it up to the output's Nyquist frequency is left in. Far cheaper at high input rates, for a
 /// view that only reads its middle band (Signal ID's analysis window).
-///
-/// A cancelled task's extraction stops early (between mixer blocks), its output cut short: the caller is
-/// abandoning the work anyway.
 public struct Channel {
     /// The lowest output rate.
     public static let minimumRate = 8000.0
@@ -36,7 +33,7 @@ public struct Channel {
             iq.withUnsafeBufferPointer { raw in
                 raw.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: n) { z in
                     var start = 0
-                    while start < n && !Task.isCancelled {
+                    while start < n {
                         let m = min(block.count, n - start)
                         block.withUnsafeMutableBufferPointer { b in
                             b.baseAddress!.update(from: z + start, count: m)
@@ -83,7 +80,7 @@ public struct Channel {
 
     /// The stages and the output rate.
     static func plan(sampleRate: Double, bandwidthHz: Double,
-                             sharp: Bool = true) -> (stages: [Stage], rate: Double) {
+                     sharp: Bool = true) -> (stages: [Stage], rate: Double) {
         let bandwidth = min(max(bandwidthHz, 1), sampleRate)
         let factors = DecimationPlan.stages(inputRate: sampleRate, minimumRate: max(4 * bandwidth, minimumRate))
         var stages: [Stage] = []
@@ -164,6 +161,8 @@ public final class ChannelExtractor {
     private var scratch: [[DSPComplex]]
     private var samples: [Float] = []
 
+    /// `expectedInputFrames`: how much will be fed, so the output is sized once instead of growing by doubling
+    /// (a 16 s read's would end at twice what it needs).
     public init(sampleRate: Double, offsetHz: Double, bandwidthHz: Double, sharp: Bool = true,
                 expectedInputFrames: Int = 0) {
         let (stages, rate) = Channel.plan(sampleRate: sampleRate, bandwidthHz: bandwidthHz, sharp: sharp)
@@ -176,9 +175,22 @@ public final class ChannelExtractor {
         toSkip = stages.map { ($0.taps.count - 1) / 2 / $0.factor }
         passed = Array(repeating: 0, count: stages.count)
         scratch = Array(repeating: [], count: stages.count)
-        let factor = stages.reduce(1) { $0 * $1.factor }
-        samples.reserveCapacity(2 * (expectedInputFrames / factor + 2))
+        reserve(inputFrames: expectedInputFrames)
     }
+
+    /// Sizes the output for `inputFrames` fed in all (see `init`).
+    public func reserve(inputFrames: Int) {
+        guard inputFrames > 0 else { return }
+        let factor = stages.reduce(1) { $0 * $1.factor }
+        reservedFloats = 2 * (inputFrames / factor + stages.count + 1)
+        samples.reserveCapacity(reservedFloats)
+    }
+
+    /// The output size reserved, in floats (`capacity` may show more: the allocator can hand back a larger free
+    /// block).
+    public private(set) var reservedFloats = 0
+    /// The output outgrew what was reserved (and so was reallocated, growing by doubling).
+    public private(set) var outgrewReservation = false
 
     /// The next piece of interleaved IQ.
     public func feed(_ iq: UnsafeBufferPointer<Float>) {
@@ -240,6 +252,7 @@ public final class ChannelExtractor {
             } else {
                 p.baseAddress!.withMemoryRebound(to: Float.self, capacity: 2 * p.count) {
                     samples.append(contentsOf: UnsafeBufferPointer(start: $0, count: 2 * p.count))
+                    if samples.count > reservedFloats { outgrewReservation = true }
                 }
             }
         }

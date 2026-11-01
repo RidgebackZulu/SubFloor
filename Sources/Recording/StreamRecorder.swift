@@ -484,6 +484,9 @@ public final class StreamRecorder: @unchecked Sendable {
     /// `snapshot(lastSeconds:)`'s frames (the same span, fixed when it is called: never from before the last
     /// retune or `clearHistory`), handed to `visit` oldest first as interleaved floats, at most `chunkFrames` at a
     /// time: only one piece is held, for a read too long to copy whole (Signal ID's 16 s at the radio's rate).
+    /// Unlike the one-copy snapshot it reads while the producer pushes, so it reaches back no further than the
+    /// ring's pre-roll: the margin beyond it is the writer's lead over the read (a full ring's oldest bytes are the
+    /// next overwritten).
     /// `visit` returns false to stop. Nil when there is nothing to read, when `visit` stopped, or when the ring
     /// overwrote frames not read yet or the recorder was reconfigured meanwhile (what was visited is then
     /// incomplete). Any thread: each piece blocks `push` for one memcpy.
@@ -496,7 +499,7 @@ public final class StreamRecorder: @unchecked Sendable {
         guard let span = producer.withLock({ p -> (start: Int, end: Int, time: Date)? in
             guard p.setup?.layout == layout, p.plan == plan else { return nil }
             let end = ring.head
-            return (ring.rewind(bytes: wanted), end, p.now())
+            return (ring.rewind(bytes: min(wanted, plan.preRollBytes)), end, p.now())
         }), span.end > span.start else { return nil }
 
         let pieceBytes = min(chunkFrames * bpf, span.end - span.start)
