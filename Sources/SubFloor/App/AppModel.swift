@@ -1105,6 +1105,14 @@ final class AppModel {
         signalID.hover(at: CGPoint(x: unit.x * hoverViewSize.width, y: unit.y * hoverViewSize.height), hz: hz)
     }
 
+    /// The spectrum was right-clicked at `unit` (0…1 each way) in a view `viewSize` points across: Signal ID's card
+    /// for the frequency there (`SignalIDService.openCard`).
+    func openIDCard(atUnit unit: CGPoint, viewSize: CGSize) {
+        hoverViewSize = viewSize
+        signalID.openCard(at: CGPoint(x: unit.x * viewSize.width, y: unit.y * viewSize.height),
+                          hz: viewport.hz(atFraction: Double(unit.x)))
+    }
+
     /// The latest spectrum frame, or nil before the first one. Frames from before a retune carry their own
     /// centre; one with none is taken to be at `centerHz`.
     func spectrumSnapshot() -> SpectrumSnapshot? {

@@ -73,8 +73,12 @@ final class TuneBarrier: Sendable {
 /// `confirmedByDecode`, at 1.0. Never an answer with no extent. Applied to every answer, cached or new.
 ///
 /// **Hover.** `AppModel.hover(at:viewSize:)` feeds the pointer: resting `dwellSeconds` starts `identify` there
-/// (`hoverPending` while it runs, then `hoverIdentity`); moving more than `moveTolerance` points from where it
+/// (`hoverPending` while it runs, then `hoverIdentity`; the first pass's answer is up with `hoverMeasuring` while a
+/// longer read runs); moving more than `moveTolerance` points from where it
 /// came to rest, leaving, the spectrum moving under it (zoom, pan) or a retune cancels it and clears the answer.
+///
+/// **Card.** A right click (`openCard`) identifies the signal there the same way and fills `card` in as it comes;
+/// the UI shows it as a popover at the click.
 @MainActor @Observable
 final class SignalIDService {
     /// Up to `lastSeconds` of the ring's newest IQ (`StreamRecorder.snapshot`), any thread.
@@ -112,6 +116,26 @@ final class SignalIDService {
     private(set) var hoverIdentity: SignalIdentity?
     /// An identification for the pointer's resting place is running.
     private(set) var hoverPending = false
+    /// `hoverIdentity` is the first pass's answer and the longer read it asked for is running.
+    private(set) var hoverMeasuring = false
+
+    /// The right-click card: where it opened, what it is for, and the answer as it comes.
+    struct Card: Equatable {
+        /// Where it was clicked, in view points from the top left.
+        var point: CGPoint
+        /// The frequency clicked (display Hz).
+        var hz: Double
+        /// The signal's centre (display Hz) when it has an extent, else `hz`.
+        var signalHz: Double
+        /// Nil while pending, and when there was no data (the radio stopped, or retuned meanwhile).
+        var identity: SignalIdentity?
+        var pending = true
+        /// `identity` is the first pass's answer and the longer read it asked for is running.
+        var measuring = false
+    }
+
+    /// The open card (nil: none). Shown as a popover at its point.
+    private(set) var card: Card?
 
     /// Test hook: where the IQ comes from (`AppModel` points it at its IQ recorder).
     @ObservationIgnored var snapshotProvider: SnapshotProvider = { _ in nil }
@@ -137,6 +161,10 @@ final class SignalIDService {
     @ObservationIgnored private var cache: [CacheEntry] = []
     @ObservationIgnored private var hoverAnchor: CGPoint?
     @ObservationIgnored private var hoverTask: Task<Void, Never>?
+    /// Counts the hovers ended, so a first answer arriving late is known for stale.
+    @ObservationIgnored private var hoverGeneration = 0
+    @ObservationIgnored private var cardTask: Task<Void, Never>?
+    @ObservationIgnored private var cardGeneration = 0
 
     /// Reads `model`'s radio, spectrum and decodes, and its IQ recorder's ring.
     func attach(to model: AppModel, recorder: StreamRecorder) {
@@ -149,7 +177,11 @@ final class SignalIDService {
 
     /// The signal at `atHz` (display Hz), or over `bandwidthHz` around it when given (an agent's); nil when there is
     /// no data (the radio stopped, an empty ring), when the radio retuned before it finished, or when cancelled.
-    func identify(atHz: Double, bandwidthHz: Double? = nil) async -> SignalIdentity? {
+    ///
+    /// When the first pass asks for a longer read, `firstAnswer` is called with that pass's answer as soon as it is
+    /// made (on the main actor, not after this call returned): the one to show while the longer read runs.
+    func identify(atHz: Double, bandwidthHz: Double? = nil,
+                  firstAnswer: (@MainActor (SignalIdentity) -> Void)? = nil) async -> SignalIdentity? {
         guard let model, model.isRunning else { return nil }
         let now = Date()
         let sequence = tuning.current.sequence
@@ -160,9 +192,22 @@ final class SignalIDService {
 
         let spectrum = model.spectrumSnapshot()
         let provider = snapshotProvider, chunks = chunkProvider, analysis = self.analysis, barrier = tuning
+        // The first answer reaches the main actor in a task of its own: dropped once this call has returned.
+        let finished = Finished()
+        defer { finished.value = true }
+        var onFirst: (@Sendable (SignalIdentity, TuneBarrier.State) -> Void)?
+        if let give = firstAnswer {
+            onFirst = { [weak self] first, state in
+                Task { @MainActor in
+                    guard let self, !finished.value, state == self.tuning.current else { return }
+                    give(self.confirmed(first, centerHz: state.centerHz, bandwidthHz: bandwidthHz, now: Date()))
+                }
+            }
+        }
+        let onFirstAnswer = onFirst
         let task = Task.detached(priority: .userInitiated) {
             Self.run(atHz: atHz, bandwidthHz: bandwidthHz, spectrum: spectrum, provider: provider, chunks: chunks,
-                     analysis: analysis, barrier: barrier)
+                     analysis: analysis, barrier: barrier, onFirst: onFirstAnswer)
         }
         let result = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
         guard !Task.isCancelled, let result, result.state == tuning.current else { return nil }
@@ -184,6 +229,9 @@ final class SignalIDService {
     /// Forgets every answer.
     func invalidateCache() { cache.removeAll() }
 
+    /// Whether an `identify` call has returned (read on the main actor).
+    @MainActor private final class Finished { var value = false }
+
     /// What `run` made of it: the answer, the tuning its IQ was heard in, and whether it had every read it asked
     /// for (the first pass's 3 s, and the longer read when wanted).
     struct Outcome: Sendable {
@@ -196,7 +244,8 @@ final class SignalIDService {
     /// the radio retuned meanwhile, or the task was cancelled.
     private nonisolated static func run(atHz: Double, bandwidthHz: Double?, spectrum: SpectrumSnapshot?,
                                         provider: SnapshotProvider, chunks: ChunkProvider, analysis: Analysis,
-                                        barrier: TuneBarrier) -> Outcome? {
+                                        barrier: TuneBarrier,
+                                        onFirst: (@Sendable (SignalIdentity, TuneBarrier.State) -> Void)?) -> Outcome? {
         guard !Task.isCancelled,
               case (var first, let state)? = read(firstSeconds, provider: provider, barrier: barrier) else {
             return nil
@@ -216,7 +265,8 @@ final class SignalIDService {
         }
         guard identity.needsLongerRead else { return Outcome(identity: identity, state: state, complete: !short) }
 
-        // The longer read, on the channel around what the first pass measured.
+        // The longer read, on the channel around what the first pass measured; the first answer is out meanwhile.
+        onFirst?(identity, state)
         first.samples = []   // not held through the longer read
         let m = identity.measurement
         switch longerRead(offsetHz: m.offsetHz, widthHz: max(m.occupiedBandwidthHz, bandwidthHz ?? 0),
@@ -407,13 +457,21 @@ final class SignalIDService {
         if let anchor = hoverAnchor, hypot(point.x - anchor.x, point.y - anchor.y) <= Self.moveTolerance { return }
         endHover()
         hoverAnchor = point
+        let generation = hoverGeneration
         hoverTask = Task { [weak self] in
             try? await Task.sleep(for: .seconds(Self.dwellSeconds))
             guard !Task.isCancelled, let self else { return }
             hoverPending = true
-            let identity = await identify(atHz: hz)
+            let identity = await identify(atHz: hz) { [weak self] first in
+                // The first pass is up while the longer read runs.
+                guard let self, hoverGeneration == generation else { return }
+                hoverPending = false
+                hoverMeasuring = true
+                hoverIdentity = first
+            }
             guard !Task.isCancelled else { return }
             hoverPending = false
+            hoverMeasuring = false
             hoverIdentity = identity
         }
     }
@@ -423,9 +481,53 @@ final class SignalIDService {
         hoverTask?.cancel()
         hoverTask = nil
         hoverAnchor = nil
+        hoverGeneration += 1
         // Observed: written only when they change (this runs at mouse-move rate).
         if hoverPending { hoverPending = false }
+        if hoverMeasuring { hoverMeasuring = false }
         if hoverIdentity != nil { hoverIdentity = nil }
+    }
+
+    // MARK: Card
+
+    /// Opens the card for the signal at `hz` (display Hz), clicked at `point` (view points): identifies it (the cache
+    /// answers at once for a signal the hover just read) and fills the card in, the first pass's answer first when
+    /// a longer read follows. Replaces any open card; the hover's answer is cleared (the card is the answer now).
+    func openCard(at point: CGPoint, hz: Double) {
+        closeCard()
+        endHover()
+        let generation = cardGeneration
+        card = Card(point: point, hz: hz, signalHz: hz)
+        cardTask = Task { [weak self] in
+            guard let self else { return }
+            let identity = await identify(atHz: hz) { [weak self] first in
+                guard let self, cardGeneration == generation else { return }
+                fill(first, measuring: true)
+            }
+            guard !Task.isCancelled, cardGeneration == generation else { return }
+            fill(identity, measuring: false)
+        }
+    }
+
+    /// Closes the card and cancels its identification.
+    func closeCard() {
+        cardTask?.cancel()
+        cardTask = nil
+        cardGeneration += 1
+        if card != nil { card = nil }
+    }
+
+    /// `identity` into the card; nil (no data, or a retune during the longer read) keeps any first answer.
+    private func fill(_ identity: SignalIdentity?, measuring: Bool) {
+        guard var shown = card else { return }
+        shown.pending = false
+        shown.measuring = measuring
+        if let identity {
+            shown.identity = identity
+            let m = identity.measurement
+            shown.signalHz = m.occupiedBandwidthHz > 0 ? tuning.current.centerHz + m.offsetHz : shown.hz
+        }
+        card = shown
     }
 
     // MARK: Tuning

@@ -15,6 +15,7 @@ struct SpectrumArea: View {
                     ZStack(alignment: .topLeading) {
                         SpectrumView()
                         SpectrumOverlay().allowsHitTesting(false)
+                        SignalIDCardAnchor()
                         SplitHandle(height: geo.size.height)
                     }
                     .coordinateSpace(name: "spectrum")
@@ -62,7 +63,51 @@ private struct SpectrumView: NSViewRepresentable {
             boxGrabRect: { nil },
             boxRange: { model.modemBoxFractions },
             dragBox: { _ in },
-            clickInBox: { model.clickInModemBox(atFraction: $0) })
+            clickInBox: { model.clickInModemBox(atFraction: $0) },
+            rightClick: { model.openIDCard(atUnit: $0, viewSize: $1) })
+    }
+}
+
+/// The ID card's popover, anchored at the point that was right-clicked.
+private struct SignalIDCardAnchor: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        let card = model.signalID.card
+        Color.clear
+            .frame(width: 1, height: 1)
+            .popover(isPresented: Binding(get: { model.signalID.card != nil },
+                                          set: { if !$0 { model.signalID.closeCard() } }),
+                     arrowEdge: .trailing) {
+                if let card = model.signalID.card {
+                    SignalIDCard(identity: card.identity, atHz: card.signalHz, pending: card.pending,
+                                 measuring: card.measuring) { model.signalID.closeCard() }
+                }
+            }
+            .position(x: card?.point.x ?? 0, y: card?.point.y ?? 0)
+            .allowsHitTesting(false)
+    }
+}
+
+/// The hover label: the frequency and level, and under them Signal ID's line when there is one.
+enum HoverLabelDrawing {
+    static func draw(_ ctx: GraphicsContext, in size: CGSize, at p: CGPoint, lines: [String]) {
+        let texts = lines.enumerated().map { i, line in
+            ctx.resolve(Text(line).font(.system(size: 11, weight: i == 0 ? .medium : .regular, design: .monospaced))
+                .foregroundStyle(i == 0 ? Color.white : Theme.accent))
+        }
+        let sizes = texts.map { $0.measure(in: size) }
+        let spacing: CGFloat = 2
+        let box = CGSize(width: sizes.map(\.width).max() ?? 0,
+                         height: sizes.map(\.height).reduce(0, +) + spacing * CGFloat(max(texts.count - 1, 0)))
+        let origin = CGPoint(x: max(min(p.x + 10, size.width - box.width - 12), 4), y: max(p.y - box.height - 10, 4))
+        ctx.fill(Path(roundedRect: CGRect(origin: origin, size: box).insetBy(dx: -6, dy: -3), cornerRadius: 5),
+                 with: .color(.black.opacity(0.65)))
+        var y = origin.y
+        for (text, textSize) in zip(texts, sizes) {
+            ctx.draw(text, at: CGPoint(x: origin.x, y: y), anchor: .topLeading)
+            y += textSize.height + spacing
+        }
     }
 }
 
@@ -115,13 +160,12 @@ private struct SpectrumOverlay: View {
                     ctx.stroke(Path { $0.move(to: CGPoint(x: 0, y: p.y)); $0.addLine(to: CGPoint(x: size.width, y: p.y)) },
                                with: .color(.white.opacity(0.18)), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
                 }
-                let label = FrequencyFormatter.grouped(hover.hz) + (hover.db.map { String(format: "   %.1f dB", $0) } ?? "")
-                let text = ctx.resolve(Text(label).font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundStyle(.white))
-                let ts = text.measure(in: size)
-                let origin = CGPoint(x: min(p.x + 10, size.width - ts.width - 12), y: max(p.y - ts.height - 10, 4))
-                ctx.fill(Path(roundedRect: CGRect(origin: origin, size: ts).insetBy(dx: -6, dy: -3), cornerRadius: 5),
-                         with: .color(.black.opacity(0.65)))
-                ctx.draw(text, at: origin, anchor: .topLeading)
+                var lines = [FrequencyFormatter.grouped(hover.hz) + (hover.db.map { String(format: "   %.1f dB", $0) } ?? "")]
+                if let id = SignalIDText.hoverLine(identity: model.signalID.hoverIdentity, pending: model.signalID.hoverPending,
+                                                   measuring: model.signalID.hoverMeasuring) {
+                    lines.append(id)
+                }
+                HoverLabelDrawing.draw(ctx, in: size, at: p, lines: lines)
             }
         }
     }
