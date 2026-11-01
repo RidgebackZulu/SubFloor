@@ -66,6 +66,7 @@ struct ClickCatcher: NSViewRepresentable {
     var toolTip: String?
     var onLeft: () -> Void
     var onRight: () -> Void
+    var onHover: ((Bool) -> Void)?
 
     func makeNSView(context: Context) -> CatcherView {
         let view = CatcherView()
@@ -76,12 +77,35 @@ struct ClickCatcher: NSViewRepresentable {
     func updateNSView(_ view: CatcherView, context: Context) {
         view.onLeft = onLeft
         view.onRight = onRight
+        view.onHover = onHover
         view.toolTip = toolTip
     }
 
     final class CatcherView: NSView {
         var onLeft: () -> Void = {}
         var onRight: () -> Void = {}
+        var onHover: ((Bool) -> Void)?
+        private var inside = false
+
+        override func updateTrackingAreas() {
+            super.updateTrackingAreas()
+            trackingAreas.forEach(removeTrackingArea)
+            addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+                                           owner: self, userInfo: nil))
+        }
+
+        override func mouseEntered(with event: NSEvent) { setInside(true) }
+        override func mouseExited(with event: NSEvent) { setInside(false) }
+        // A flag panned out of view under the pointer gets no exit event.
+        override func viewWillMove(toWindow newWindow: NSWindow?) {
+            if newWindow == nil { setInside(false) }
+        }
+
+        private func setInside(_ value: Bool) {
+            guard inside != value else { return }
+            inside = value
+            onHover?(value)
+        }
 
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
         override func mouseDown(with event: NSEvent) {

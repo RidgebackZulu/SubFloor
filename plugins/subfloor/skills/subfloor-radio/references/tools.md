@@ -89,8 +89,17 @@ Each gives `hz`, `level_dbfs` (the live spectrum there; for the VFO, the passban
 `nearest_bookmark` (`{id, name, frequency_hz, offset_hz, mode}` within ± half the bandwidth, or null) and
 `decodes_near` (decoder rows within ± half the bandwidth: `{hz, mode, snr_db, text, utc}`).
 
-No arguments. It does **not** say what kind of signal is there (no modulation identifier yet): judge from the
-level, the bookmark, the decodes, a `get_spectrum` around it, or a `listen`.
+Each also gives `signal`, what Signal ID makes of the signal there (the same fields as `identify_signal`, below:
+`family`, `name` or null, `confidence`, `parameters`, `alternatives`...), or null with a `signal_note` saying why:
+the radio is stopped, the point is outside the capture, nothing to read yet, or (the mouse only) the pointer last
+rested more than 30 s ago. The VFO's and the decoder cursor's are always read; the mouse's only while fresh. A
+signal that needs a longer read (a very narrow or slow one: WSPR, slow CW) comes back at once with
+`needs_longer_read: true` and its first-pass answer; call again a few seconds later for the finished one.
+
+No arguments. A `name` is given only at 70% confidence or more; below that `signal` is the family and its
+parameters (`2-FSK · 50 Bd · 850 Hz shift`), and `alternatives` lists what else it could be. Say which you used and
+how sure it is. Check it against the frequency, the bookmark and the decodes, and with a `get_spectrum` or a
+`listen` if it matters.
 
 ### `get_spectrum`
 
@@ -106,6 +115,103 @@ The range must lie inside the capture (`get_status`: `center_hz ± span_hz/2`); 
 there first. Returns `{from_hz, to_hz, bin_hz, levels_dbfs, peaks}`: `levels_dbfs` has `points` values, each the
 strongest bin in its slice; `peaks` lists up to 20 `{hz, level_dbfs, width_hz}` at least 6 dB above the window's
 median, strongest first, with the width at −6 dB. The median of `levels_dbfs` is a fair noise-floor estimate.
+
+## Signal ID
+
+SubFloor measures the signal itself (bandwidth, SNR, symbol rate, shift, tones, keying, envelope) from the last
+few seconds of IQ and matches the measurement and the band plan against a table of known modes. It names a mode
+only at 70% confidence or more; otherwise it gives the family and its parameters and lists the alternatives. It
+never guesses. When a decoder the owner already has running (FT8, WSPR, PSK31, CW) decoded the same signal in the
+last minute, `confirmed_by_decode` is true and the confidence is 1. The IQ is the capture's, so a signal must be
+inside it (`get_status`: `center_hz ± span_hz/2`).
+
+### `identify_signal`
+
+What kind of signal is at a frequency. Read-only: it never retunes.
+
+| Argument | Type | Description |
+|---|---|---|
+| `frequency` **(required)** | number or string | Display Hz, or a string like `"7.074 MHz"`. Inside the capture. |
+| `bandwidth_hz` | number | The signal's width in Hz, if you know it. |
+
+Returns `{hz, label, family, name, confidence, family_confidence, parameters, alternatives, evidence, tune,
+confirmed_by_decode, needs_longer_read, note}`:
+
+- `hz`: the signal's centre (the middle of its band), display Hz.
+- `label`: the one-line text the owner sees: `RTTY · 45.45 Bd · 170 Hz shift · 91%`, or without a name
+  `2-FSK · 50 Bd · 850 Hz shift`, or the reason there is nothing to say (`No signal`, `Too weak to identify
+  (SNR 4 dB)`, `Too soon after tuning — try again`).
+- `family`: `Noise`, `Carrier`, `AM`, `USB`, `LSB`, `FM`, `WFM`, `OOK`, `2-FSK` (or n-FSK), `MFSK`, `BPSK`/`QPSK`/
+  `8PSK`, `OFDM` or `Unknown`.
+- `name` and `confidence`: the named mode and how sure (0.7–1), or null.
+- `parameters`: what was measured, only the fields that apply: `bandwidth_hz` (at −20 dB), `bandwidth_6db_hz`,
+  `snr_db`, `envelope`, `symbol_rate_bd`, `shift_hz`, `tones`, `tone_spacing_hz`, `psk_order`,
+  `carrier_spacing_hz`, `deviation_hz`, `wpm`, `burst_period_s`, `burst_duty`, `period_s`, `subcarriers_hz`,
+  `audio`, `read_seconds`, `notes`.
+- `alternatives`: up to 3 other candidates, `{name, confidence}`, at 0.3 or more.
+- `evidence`: why it was named (only when it was).
+- `tune`: `{frequency, mode, bandwidth_hz}` to listen to it, the same as the card's Tune button (an SSB signal's
+  `frequency` is the carrier, not the signal's centre). Give them to `tune` or `add_bookmark`. Absent when there is
+  nothing to hear.
+- `needs_longer_read`: still true if a longer read was wanted and could not be made. `note`: caveats such as
+  `Read 1.4 s of the 3 s asked for`.
+
+A signal under 50 Hz wide, keyed slower than 10 WPM, or a candidate that needs timing (WSPR, FT8/FT4 slots, fax
+lines, time ticks) is read again over up to 16 s of the ring; that is included in this answer. Less than 1 s of
+IQ since the last retune gives `Too soon after tuning — try again`: wait and call again. Results for a signal are
+kept 5 s. With the radio stopped it reads what the IQ ring heard last; an empty ring is an error.
+
+### `identify_signals`
+
+Finds every signal across a range and identifies each. Use it to scan a band.
+
+| Argument | Type | Description |
+|---|---|---|
+| `from_hz` **(required)** | number or string | Lower edge, display Hz. |
+| `to_hz` **(required)** | number or string | Upper edge, display Hz. |
+| `min_snr_db` | number | A line must stand this many dB over the floor (default 10, 0–60). |
+| `max_signals` | integer | At most this many signals (default 40, 1–200); it stops there (`truncated`, `resume_from_hz`). |
+
+- **Inside the current capture** it does not touch the radio.
+- **Across a wider range** it retunes the radio, one capture at a time (about 90% of `span_hz` a step, at most 60
+  steps), waiting at each until the IQ ring holds about 3 s since the retune (at most 20 s) and then identifying
+  each line: about 4 s a step plus a fraction of a second a signal. It holds the radio lock so nothing else changes
+  it meanwhile. The owner hears every step, and each step restarts the owner's IQ pre-roll. When it has finished
+  (or fails, or is cancelled) it puts the VFO, mode, bandwidth and HamItUp back. It does not change HamItUp itself:
+  every frequency stays a display frequency.
+- **A stepped scan makes no longer read.** A step's IQ ring holds only the 3 s it waited for, so slow signals (FT8,
+  WSPR, slow CW, time signals) come back unnamed, with `needs_longer_read: true`, and are listed in
+  `needs_longer_read_hz`. To name one, `tune` there (its `identity.tune`) and call `identify_signal` after about
+  16 s. Inside the capture they get their longer read as `identify_signal` does.
+- **It refuses** while the owner is recording (audio or IQ) or Auto is on, because a retune would split their file
+  or cut an Auto recording: the error reads "The owner is recording: scan only within the current view, or ask
+  the owner". Scan inside the capture then, or ask. It also refuses while an IQ file is playing (a range outside
+  it), or a range the RSP1B cannot reach.
+- **It stops early** if the radio is changed under it (the VFO, mode, bandwidth, capture or HamItUp, or it is
+  stopped), or, when it steps, a recording or Auto is started. It checks before every step and before putting the
+  radio back, keeps what it found and writes nothing more to the radio, so the owner's change stands:
+  `stopped_early` says what happened and `restored` is false. Inside the capture only a change of the capture
+  itself stops it.
+
+Returns `{from_hz, to_hz, signals, pieces, restored, stopped_early?, truncated?, resume_from_hz?,
+needs_longer_read_hz?, notes?}`:
+
+- `signals`: `[{hz, level_dbfs, identity}]`, lowest first. `hz` is the signal's centre and `level_dbfs` its peak in
+  the spectrum; `identity` has the fields of `identify_signal` (without `hz`). A line inside an already identified
+  signal (a tone of an FSK, a sideband) is not listed twice, and a line that turns out to be noise ("No signal") is
+  dropped. A line read too soon after a step is read again once the ring has filled; one that still can't be read is
+  said in `notes`.
+  Every line over `min_snr_db` is looked at, however many there are. `at_receiver_centre: true` marks a line
+  within a few bins of the capture's centre, where the receiver's own DC spike can show: treat it as doubtful.
+- `pieces`: the captures read. `restored`: the VFO, mode, bandwidth and HamItUp are as they were (true when it
+  never moved the radio).
+- `truncated`: `max_signals` was reached, so there may be more above `resume_from_hz`: call `identify_signals`
+  again with `from_hz` set to it (and the same `to_hz`). `needs_longer_read_hz`: the signals a stepped scan could
+  not give their longer read (see above). `notes`: pieces skipped, points that could not be read, and that list.
+
+Log what it finds with `add_bookmark`, in the `Identified` group the owner's own ID bookmarks use: `name` from
+`identity.name` (or `identity.family`), `notes` from `identity.label` and its parameters, and `frequency`, `mode`
+and `bandwidth_hz` from `identity.tune`.
 
 ## Listening and recording
 

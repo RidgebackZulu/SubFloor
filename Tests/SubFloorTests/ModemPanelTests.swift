@@ -66,6 +66,21 @@ import Testing
         #expect(ModemPanelFormat.newRowsPill(4) == "4 new ↓")
     }
 
+    /// RTTY is identified only: its live row says so where the decoded text would be, until a decoder
+    /// (there is none in the catalog) gives it text.
+    @Test func rttyRowSaysItIsIdentifiedOnly() {
+        var row = slotRow(at: t143215, snr: 0, hz: 1_000, message: "")
+        row.mode = .rtty
+        row.submode = "RTTY 45 · 170"
+        row.recentText = ""
+        #expect(ModemPanelFormat.liveText(row) == "RTTY (identified, no decoder)")
+        row.recentText = "CQ"
+        #expect(ModemPanelFormat.liveText(row) == "CQ")
+        row.mode = .psk31
+        row.recentText = ""
+        #expect(ModemPanelFormat.liveText(row).isEmpty)
+    }
+
     // MARK: Slot progress
 
     @Test func slotProgressFromDate() {

@@ -364,6 +364,8 @@ final class AppModel {
     @ObservationIgnored private var lastDiskCheck: ContinuousClock.Instant?
     /// Under 500 MB at the last check, so the warning is shown once per crossing.
     @ObservationIgnored private var diskLow = false
+    /// The hardware frequency last tuned: a change of it is a barrier in the IQ history.
+    @ObservationIgnored private var tunedHardwareHz: Double?
     /// The VFO and mode the audio recorder was last told: a change cuts an auto recording.
     @ObservationIgnored private var audioTuning: (hz: Double, mode: String)?
     /// The VFO and mode when the current audio recording started, for its log entry.
@@ -389,6 +391,8 @@ final class AppModel {
     private(set) var hover: HoverReadout?
     /// `hover` as it last was, kept when the pointer leaves. Read on demand, so not observed.
     @ObservationIgnored private(set) var lastPointer: PointerReadout?
+    /// The spectrum view's size in points, for Signal ID's hover (a move of over 3 points is a new point).
+    @ObservationIgnored private var hoverViewSize = CGSize(width: 1000, height: 600)
 
     // MARK: Bookmarks, modems, UI
     private(set) var bookmarks: [Bookmark] = []
@@ -452,6 +456,8 @@ final class AppModel {
     static let serviceStalledMessage = "The SDRplay service is not responding, so the demo signal is running. Restart the service in Terminal, then reopen SubFloor."
 
     let engine = DSPEngine()
+    /// Signal ID: names the signal at a frequency from the IQ ring, and where the pointer rests.
+    let signalID = SignalIDService()
     private var sdrplay: SDRplayDevice?
     private let synthetic = SyntheticSource()
     private var fileSource: IQFileSource?
@@ -529,6 +535,7 @@ final class AppModel {
         }
         RunLoop.main.add(timer, forMode: .common)
         statsTimer = timer
+        signalID.attach(to: self, recorder: engine.iqRecorder)
     }
 
     // MARK: Derived
@@ -666,6 +673,9 @@ final class AppModel {
         syncModem()
         pushRecording()
         pushRecordingContexts()
+        // The engine's start clears the IQ history: a barrier for Signal ID, at the capture's display centre.
+        signalID.retuneBegins()
+        defer { signalID.retuned(displayCenterHz: centerHz) }
         do {
             try engine.start(source: activeSource, receiver: receiverConfig, spectrum: spectrum, volume: effectiveVolume)
             isRunning = true
@@ -1000,9 +1010,21 @@ final class AppModel {
     private func retuneHardware() {
         guard sourceKind != .file else { return }
         synthetic.antennaOffset = upconverter.enabled ? upconverter.loHz : 0
+        let hardwareHz = upconverter.hardware(fromDisplay: centerHz)
+        // Signal ID reads the IQ off the main thread: the barrier keeps it from a read across the retune. An LO
+        // change with the hardware clamped moves only the display centre the IQ is at; that is a barrier too.
+        let moving = tunedHardwareHz != hardwareHz
+            || signalID.tuning.current.centerHz != upconverter.display(fromHardware: hardwareHz)
+        if moving { signalID.retuneBegins() }
         do {
-            try activeSource.setCenterFrequency(upconverter.hardware(fromDisplay: centerHz))
+            try activeSource.setCenterFrequency(hardwareHz)
+            // The IQ context is the display centre, so an upconverter toggle or LO change leaves it equal:
+            // forget the IQ from the old RF frequency here (files still roll only on a display change).
+            if let last = tunedHardwareHz, last != hardwareHz { engine.iqRecorder.clearHistory() }
+            tunedHardwareHz = hardwareHz
+            if moving { signalID.retuned(displayCenterHz: upconverter.display(fromHardware: hardwareHz)) }
         } catch {
+            if moving { signalID.retuned(displayCenterHz: nil) }
             show(Banner(kind: .error, message: "Tune failed: \(error)"))
         }
         pushRecordingContexts()
@@ -1036,9 +1058,21 @@ final class AppModel {
 
     // MARK: Spectrum interaction (never retunes except through setVFO)
 
-    func zoom(by factor: Double, anchor: Double) { viewport.zoom(by: factor, anchorFraction: anchor) }
-    func pan(byFraction f: Double) { viewport.pan(byFraction: f) }
-    func resetView() { viewport.reset() }
+    // The spectrum moves under a still pointer: Signal ID's hover answer is for a frequency it no longer rests on.
+    func zoom(by factor: Double, anchor: Double) {
+        viewport.zoom(by: factor, anchorFraction: anchor)
+        signalID.endHover()
+    }
+
+    func pan(byFraction f: Double) {
+        viewport.pan(byFraction: f)
+        signalID.endHover()
+    }
+
+    func resetView() {
+        viewport.reset()
+        signalID.endHover()
+    }
 
     func click(atFraction f: Double) {
         let step = min(mode.tuningStep, mode == .wfm ? 100_000 : 1_000)
@@ -1054,13 +1088,29 @@ final class AppModel {
         }
     }
 
-    func hover(at unit: CGPoint?) {
-        guard let unit else { hover = nil; return }
+    /// The pointer at `unit` over the spectrum and waterfall (nil: it left), in a view `viewSize` points
+    /// across (nil: as last given). Signal ID identifies where it rests (`SignalIDService.hover`).
+    func hover(at unit: CGPoint?, viewSize: CGSize? = nil) {
+        if let viewSize { hoverViewSize = viewSize }
+        guard let unit else {
+            hover = nil
+            signalID.endHover()
+            return
+        }
         let sf = Double(spectrumFraction)
         let db: Float? = Double(unit.y) <= sf ? dbMax - Float(Double(unit.y) / sf) * (dbMax - dbMin) : nil
         let hz = viewport.hz(atFraction: Double(unit.x))
         hover = HoverReadout(point: unit, hz: hz, db: db)
         lastPointer = PointerReadout(hz: hz, db: db, at: Date())
+        signalID.hover(at: CGPoint(x: unit.x * hoverViewSize.width, y: unit.y * hoverViewSize.height), hz: hz)
+    }
+
+    /// The spectrum was right-clicked at `unit` (0…1 each way) in a view `viewSize` points across: Signal ID's card
+    /// for the frequency there (`SignalIDService.openCard`).
+    func openIDCard(atUnit unit: CGPoint, viewSize: CGSize) {
+        hoverViewSize = viewSize
+        signalID.openCard(at: CGPoint(x: unit.x * viewSize.width, y: unit.y * viewSize.height),
+                          hz: viewport.hz(atFraction: Double(unit.x)))
     }
 
     /// The latest spectrum frame, or nil before the first one. Frames from before a retune carry their own
@@ -1540,6 +1590,10 @@ final class AppModel {
         if m != nil { startClockCheckIfNeeded() }
     }
 
+    func setModemAutoDetect(_ on: Bool) {
+        changeModem { $0.setAutoDetect(on) }
+    }
+
     func lockModemCursor(atRF rf: Double) {
         let active = modemBoxActive
         changeModem { $0.lock(atRF: rf, boxActive: active) }
@@ -1637,6 +1691,13 @@ final class AppModel {
     func recordSlotDecodes(_ decodes: [SlotDecode]) {
         guard !decodes.isEmpty else { return }
         decodeHistory.append(decodes.map { HeardDecode.from($0, rfHz: modemBox.rfHz(forAudio: $0.frequencyHz)) })
+    }
+
+    /// Test hook: `log` as the rows, shown at once.
+    func showDecodeLog(_ log: DecodeLog) {
+        liveLog = log
+        liveLogChanged = true
+        publishLog()
     }
 
     /// Shows `liveLog` (when it changed since last shown).

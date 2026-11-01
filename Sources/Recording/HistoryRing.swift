@@ -101,6 +101,22 @@ public final class HistoryRing: @unchecked Sendable {
         withState { s in min(max(position, max(s.oldest, s.barrier)), s.head) }
     }
 
+    /// A second reader, beside the consumer: copies the newest bytes a rewind may reach (whole frames, at
+    /// most `out.count`) into `out`, ending at the head, and moves no read position. Returns the count.
+    public func copyNewest(into out: UnsafeMutableRawBufferPointer) -> Int {
+        guard let dst = out.baseAddress, out.count > 0 else { return 0 }
+        return withState { s in
+            guard let storage = s.storage, s.capacity > 0 else { return 0 }
+            let n = min(out.count, s.head - max(s.oldest, s.barrier)) / s.bytesPerFrame * s.bytesPerFrame
+            guard n > 0 else { return 0 }
+            let start = (s.head - n) % s.capacity
+            let first = min(n, s.capacity - start)
+            dst.copyMemory(from: storage + start, byteCount: first)
+            if n > first { (dst + first).copyMemory(from: storage, byteCount: n - first) }
+            return n
+        }
+    }
+
     /// Consumer: copies from `position` toward the head (at most `out.count` bytes, whole frames) and
     /// advances `position`. If the producer has already overwritten `position`, it is moved to the
     /// oldest byte still held and `skipped` says how many were lost.

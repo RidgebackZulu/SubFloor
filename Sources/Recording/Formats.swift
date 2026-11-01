@@ -37,6 +37,26 @@ public enum SampleFormat: String, Codable, CaseIterable, Sendable, Identifiable 
             }
         }
     }
+    /// The inverse of `SampleConverter`: `count` samples stored in this format at `bytes`, as floats
+    /// in [-1, 1] written to `out`.
+    public func decode(_ bytes: UnsafeRawPointer, count: Int, into out: UnsafeMutablePointer<Float>) {
+        guard count > 0 else { return }
+        switch self {
+        case .float32:
+            UnsafeMutableRawPointer(out).copyMemory(from: bytes, byteCount: count * 4)
+        case .int16:
+            var scale: Float = 1.0 / 32_767
+            vDSP_vflt16(bytes.assumingMemoryBound(to: Int16.self), 1, out, 1, vDSP_Length(count))
+            vDSP_vsmul(out, 1, &scale, out, 1, vDSP_Length(count))
+        case .int24:
+            let b = bytes.assumingMemoryBound(to: UInt8.self), scale: Float = 1.0 / 8_388_607
+            for k in 0..<count {
+                let raw = Int32(b[3 * k]) | Int32(b[3 * k + 1]) << 8 | Int32(b[3 * k + 2]) << 16
+                out[k] = Float((raw << 8) >> 8) * scale   // sign-extended from 24 bits
+            }
+        }
+    }
+
     public var isFloat: Bool { self == .float32 }
     public var label: String {
         switch self {

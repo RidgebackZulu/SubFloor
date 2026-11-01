@@ -7,7 +7,8 @@ struct SpectrumInteraction {
     var pan: @MainActor (_ deltaFraction: Double) -> Void
     var click: @MainActor (_ fraction: Double) -> Void
     var reset: @MainActor () -> Void
-    var hover: @MainActor (_ unitPoint: CGPoint?) -> Void
+    /// The pointer in unit coordinates (nil: it left), and the view's size in points.
+    var hover: @MainActor (_ unitPoint: CGPoint?, _ viewSize: CGSize) -> Void
     /// The passband's draggable edges in view fractions (nil: that edge does not drag).
     var passbandEdges: @MainActor () -> (lower: Double?, upper: Double?)?
     var dragEdge: @MainActor (_ upper: Bool, _ fraction: Double) -> Void
@@ -17,13 +18,16 @@ struct SpectrumInteraction {
     var boxRange: @MainActor () -> (lower: Double, upper: Double)?
     var dragBox: @MainActor (_ deltaFraction: Double) -> Void
     var clickInBox: @MainActor (_ fraction: Double) -> Void
+    /// A right click (or ⌃-click) anywhere: Signal ID's card for the signal there. The pointer in unit coordinates,
+    /// and the view's size in points.
+    var rightClick: @MainActor (_ unitPoint: CGPoint, _ viewSize: CGSize) -> Void
 }
 
 /// Mouse/trackpad: a click anywhere tunes (on a passband edge or inside the modem box too), drag
 /// pans, pinch or ⌥-scroll (or a plain mouse wheel) zooms, two-finger scroll pans, a passband edge
-/// dragged sets the bandwidth, double-click resets the view. A right click (or ⌃-click) inside the
-/// modem box locks the modem cursor. The modem box drags by its grab tab (see `SpectrumHitTest` for
-/// the order).
+/// dragged sets the bandwidth, double-click resets the view. A right click (or ⌃-click) anywhere opens
+/// Signal ID's card, and inside the modem box locks the modem cursor as well. The modem box drags by its
+/// grab tab (see `SpectrumHitTest` for the order).
 final class SpectrumMTKView: MTKView {
     var interaction: SpectrumInteraction?
 
@@ -105,9 +109,11 @@ final class SpectrumMTKView: MTKView {
         rightClick(point(event))
     }
 
-    /// Inside the modem box: locks the modem cursor there (or unlocks it, on the cursor).
+    /// Opens the ID card at the click; inside the modem box also locks the modem cursor there (or unlocks it, on
+    /// the cursor).
     private func rightClick(_ p: CGPoint) {
         if case .boxBody = hit(p) { interaction?.clickInBox(fraction(p)) }
+        interaction?.rightClick(unit(p), bounds.size)
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -130,7 +136,7 @@ final class SpectrumMTKView: MTKView {
         default:
             break
         }
-        interaction?.hover(unit(p))
+        interaction?.hover(unit(p), bounds.size)
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -152,7 +158,7 @@ final class SpectrumMTKView: MTKView {
     override func mouseMoved(with event: NSEvent) {
         let p = point(event)
         updateCursor(p)
-        interaction?.hover(unit(p))
+        interaction?.hover(unit(p), bounds.size)
     }
 
     /// Open hand over the modem box's grab tab, resize over a passband edge, crosshair elsewhere.
@@ -166,6 +172,6 @@ final class SpectrumMTKView: MTKView {
 
     override func mouseExited(with event: NSEvent) {
         NSCursor.arrow.set()
-        interaction?.hover(nil)
+        interaction?.hover(nil, bounds.size)
     }
 }

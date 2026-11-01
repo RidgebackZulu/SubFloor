@@ -561,6 +561,91 @@ private func confusionMatrix(_ trials: [TrialResult]) -> String {
         #expect(Sent.qpsk.isCorrect(a.classification))
     }
 
+    // MARK: RTTY rates and shifts
+
+    /// The classifications of one RTTY transmission's tracks, from the last 2 s of its audio: at 170 Hz
+    /// one track at the pair's centre; at the wider shifts one per tone (the tracker pairs 170 Hz
+    /// only), so two.
+    private static func classifiedRTTY(baud: Double, shift: Double, seed: UInt64, captureSeconds: Double = 2,
+                                       elapsed: ClosedRange<Double> = 3.2...6.0) -> [Classification] {
+        var rng = TrialRandom(seed)
+        let hz = rng.uniform(900...2_200)
+        let leadIn = rng.uniform(0.5...1.5)
+        let text = randomText(&rng, characters: 90)
+        let clean = RTTYEncoder.audio(text: text, centerHz: hz, baud: baud, shiftHz: shift, leadInSeconds: leadIn)
+        let audio = ModemTestSignals.awgn(clean, snrDb: 15, seed: seed &+ 77, signalPower: 0.125)
+        let end = Int((leadIn + rng.uniform(elapsed)) * fs)
+        let tracks = tracked(audio[0..<end])
+        let tones = shift == 170 ? [hz] : [hz - shift / 2, hz + shift / 2]
+        return tones.map { f in
+            guard let t = track(near: f, in: tracks) else { return .unknown }
+            return SignalClassifier.classify(track: t, audio: audio[max(0, end - Int(captureSeconds * fs))..<end],
+                                             sampleRate: fs, utcSecondOfMinute: nil)
+        }
+    }
+
+    /// Plan: each of RTTY's 45.45, 50 and 75 Bd at 170, 425 and 850 Hz shift at +15 dB is RTTY, with
+    /// the rate and shift in the submode ("RTTY 45 · 170"), from the last 2 s of audio. At the wide
+    /// shifts both tones' tracks say so.
+    @Test func rttyRatesAndShifts() {
+        let rates: [(baud: Double, label: String)] = [(45.45, "45"), (50, "50"), (75, "75")]
+        let shifts: [Double] = [170, 425, 850]
+        let jobs = rates.flatMap { r in shifts.flatMap { shift in (0..<3).map { (r, shift, UInt64(2_001 + $0)) } } }
+        let results = parallel(jobs.count) { i -> [String] in
+            let (rate, shift, seed) = jobs[i]
+            return Self.classifiedRTTY(baud: rate.baud, shift: shift, seed: seed).map { c in
+                "\(c.mode?.label ?? "none") \(c.submode)"
+            }
+        }
+        var misses: [String] = []
+        for (job, got) in zip(jobs, results) {
+            let want = "RTTY RTTY \(job.0.label) · \(Int(job.1))"
+            let tones = job.1 == 170 ? 1 : 2
+            if got.count != tones || got.contains(where: { $0 != want }) {
+                misses.append("\(job.0.baud) Bd \(Int(job.1)) Hz seed \(job.2): \(got) (want \(tones)× \(want))")
+            }
+        }
+        #expect(misses.isEmpty, "\(misses)")
+    }
+
+    /// The engine's first look at a new track: a capture that still holds a second of noise before the
+    /// transmission. The silence is not keying, so it must not skew the rate.
+    @Test func rttyRateWithSilenceBeforeTheOnset() {
+        let jobs: [(baud: Double, label: String, shift: Double)] = [
+            (45.45, "45", 170), (50, "50", 170), (75, "75", 170), (45.45, "45", 425), (75, "75", 850)]
+        let results = parallel(jobs.count * 3) { i -> [String] in
+            let job = jobs[i / 3]
+            return Self.classifiedRTTY(baud: job.baud, shift: job.shift, seed: UInt64(2_201 + i % 3), captureSeconds: 3.5,
+                                       elapsed: 2.0...2.6).map { $0.submode }
+        }
+        for (i, got) in results.enumerated() {
+            let job = jobs[i / 3]
+            let want = "RTTY \(job.label) · \(Int(job.shift))"
+            #expect(got.allSatisfy { $0 == want }, "\(job.baud) Bd \(Int(job.shift)) Hz: \(got)")
+        }
+    }
+
+    /// Two independent keyed carriers 425 Hz or 850 Hz apart are not an RTTY pair: their keying is
+    /// not anticorrelated.
+    @Test func independentKeyedCarriersAreNotRTTY() {
+        let results = parallel(8) { i -> String in
+            let shift = i % 2 == 0 ? 425.0 : 850
+            let hz = 1_000 + 80 * Double(i)
+            let a = cwAudio("cq cq de w1aw w1aw pse k", wpm: 25, hz: hz, leadIn: 0.5)
+            let b = cwAudio("test test de k1abc k1abc k", wpm: 22, hz: hz + shift, leadIn: 0.5)
+            let audio = ModemTestSignals.awgn(mix(a, b), snrDb: 15, seed: UInt64(2_101 + i), signalPower: 0.125)
+            let end = min(audio.count, Int(7 * fs))
+            let tracks = tracked(audio[0..<end])
+            let labels = [hz, hz + shift].map { f -> String in
+                guard let t = track(near: f, in: tracks) else { return "no track" }
+                return label(SignalClassifier.classify(track: t, audio: audio[(end - Int(2 * fs))..<end], sampleRate: fs,
+                                                       utcSecondOfMinute: nil))
+            }
+            return labels.contains("RTTY") ? "RTTY \(labels) at \(shift) Hz" : "ok"
+        }
+        #expect(results.allSatisfy { $0 == "ok" }, "\(results.filter { $0 != "ok" })")
+    }
+
     /// Cost per call, for the engine's budget (up to 40 tracks, each classified after 2 s and every
     /// 10 s). Reported, with a loose bound that only catches a pathological regression.
     @Test func classifierCost() {

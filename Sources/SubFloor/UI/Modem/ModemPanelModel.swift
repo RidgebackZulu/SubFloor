@@ -71,6 +71,13 @@ enum ModemPanelFormat {
         return row.mode?.label ?? "?"
     }
 
+    /// A live row's text: what was decoded, or for an RTTY signal (identified, never decoded) the note
+    /// that says so.
+    static func liveText(_ row: DecodeRow) -> String {
+        if row.recentText.isEmpty, row.mode == .rtty { return "RTTY (identified, no decoder)" }
+        return row.recentText
+    }
+
     /// `text` on one line: every line break becomes a space.
     static func singleLine(_ text: String) -> String {
         guard text.contains(where: \.isNewline) else { return text }

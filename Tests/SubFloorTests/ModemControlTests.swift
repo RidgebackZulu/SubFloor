@@ -46,17 +46,19 @@ import Testing
         #expect(take(&c).isEmpty)
     }
 
-    /// RTTY and auto-detect are disabled for now: a saved setting for either is dropped, and the
-    /// engine never gets auto-detect on.
-    @Test func disabledModeAndAutoDetectAreDropped() {
+    /// RTTY is identified only, never decoded: a saved RTTY mode is dropped. Auto-detect is the user's
+    /// setting, kept and sent to the engine.
+    @Test func disabledModeIsDroppedAndAutoDetectKept() {
         var c = ModemControl(settings: ModemSettings(mode: .rtty, autoDetect: true))
         #expect(c.settings.mode == nil)
-        #expect(!c.settings.autoDetect)
+        #expect(c.settings.autoDetect)
         c.setMode(.rtty)
         #expect(c.settings.mode == nil)
         c.setMode(.ft8)
-        c.settings.autoDetect = true
+        c.setAutoDetect(false)
         #expect(!c.engineSettings(isFileSource: false).autoDetect)
+        c.setAutoDetect(true)
+        #expect(c.engineSettings(isFileSource: false).autoDetect)
         #expect(ModemControl.offeredModes == [.cw, .psk31, .ft8, .wspr])
     }
 

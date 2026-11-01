@@ -10,16 +10,18 @@ struct SpectrumArea: View {
     var body: some View {
         HStack(spacing: 0) {
             VStack(spacing: 0) {
-                FrequencyRuler().frame(height: 34)
+                FrequencyRuler().frame(height: BookmarkFlags.rulerHeight)
                 GeometryReader { geo in
                     ZStack(alignment: .topLeading) {
                         SpectrumView()
                         SpectrumOverlay().allowsHitTesting(false)
+                        SignalIDCardAnchor()
                         SplitHandle(height: geo.size.height)
                     }
                     .coordinateSpace(name: "spectrum")
                 }
             }
+            .overlay { BookmarkFlags() }
             DBRangeControls().frame(width: 36)
         }
         .background(Theme.spectrumBackground)
@@ -55,14 +57,71 @@ private struct SpectrumView: NSViewRepresentable {
             pan: { model.pan(byFraction: $0) },
             click: { model.click(atFraction: $0) },
             reset: { model.resetView() },
-            hover: { model.hover(at: $0) },
+            hover: { model.hover(at: $0, viewSize: $1) },
             passbandEdges: { model.passbandEdgeFractions },
             dragEdge: { model.dragPassbandEdge(upper: $0, fraction: $1) },
             // No grab tab: the modem decodes the receiver's passband, which follows the VFO.
             boxGrabRect: { nil },
             boxRange: { model.modemBoxFractions },
             dragBox: { _ in },
-            clickInBox: { model.clickInModemBox(atFraction: $0) })
+            clickInBox: { model.clickInModemBox(atFraction: $0) },
+            rightClick: { model.openIDCard(atUnit: $0, viewSize: $1) })
+    }
+}
+
+/// The ID card's popover, anchored at the point that was right-clicked. A second right-click is a new card: the
+/// host is keyed by the card's id, so its popover opens at the new point with fresh state, and a late dismissal of
+/// the old one closes nothing.
+private struct SignalIDCardAnchor: View {
+    @Environment(AppModel.self) private var model
+
+    var body: some View {
+        if let card = model.signalID.card {
+            SignalIDCardPopover(cardID: card.id, point: card.point).id(card.id)
+        }
+    }
+}
+
+private struct SignalIDCardPopover: View {
+    @Environment(AppModel.self) private var model
+    let cardID: Int
+    let point: CGPoint
+
+    var body: some View {
+        Color.clear
+            .frame(width: 1, height: 1)
+            .popover(isPresented: Binding(get: { model.signalID.card?.id == cardID },
+                                          set: { if !$0 { model.signalID.closeCard(id: cardID) } }),
+                     arrowEdge: .trailing) {
+                if let card = model.signalID.card, card.id == cardID {
+                    SignalIDCard(identity: card.identity, atHz: card.signalHz, pending: card.pending,
+                                 measuring: card.measuring) { model.signalID.closeCard(id: cardID) }
+                }
+            }
+            .position(x: point.x, y: point.y)
+            .allowsHitTesting(false)
+    }
+}
+
+/// The hover label: the frequency and level, and under them Signal ID's line when there is one.
+enum HoverLabelDrawing {
+    static func draw(_ ctx: GraphicsContext, in size: CGSize, at p: CGPoint, lines: [String]) {
+        let texts = lines.enumerated().map { i, line in
+            ctx.resolve(Text(line).font(.system(size: 11, weight: i == 0 ? .medium : .regular, design: .monospaced))
+                .foregroundStyle(i == 0 ? Color.white : Theme.accent))
+        }
+        let sizes = texts.map { $0.measure(in: size) }
+        let spacing: CGFloat = 2
+        let box = CGSize(width: sizes.map(\.width).max() ?? 0,
+                         height: sizes.map(\.height).reduce(0, +) + spacing * CGFloat(max(texts.count - 1, 0)))
+        let origin = CGPoint(x: max(min(p.x + 10, size.width - box.width - 12), 4), y: max(p.y - box.height - 10, 4))
+        ctx.fill(Path(roundedRect: CGRect(origin: origin, size: box).insetBy(dx: -6, dy: -3), cornerRadius: 5),
+                 with: .color(.black.opacity(0.65)))
+        var y = origin.y
+        for (text, textSize) in zip(texts, sizes) {
+            ctx.draw(text, at: CGPoint(x: origin.x, y: y), anchor: .topLeading)
+            y += textSize.height + spacing
+        }
     }
 }
 
@@ -115,13 +174,12 @@ private struct SpectrumOverlay: View {
                     ctx.stroke(Path { $0.move(to: CGPoint(x: 0, y: p.y)); $0.addLine(to: CGPoint(x: size.width, y: p.y)) },
                                with: .color(.white.opacity(0.18)), style: StrokeStyle(lineWidth: 1, dash: [3, 3]))
                 }
-                let label = FrequencyFormatter.grouped(hover.hz) + (hover.db.map { String(format: "   %.1f dB", $0) } ?? "")
-                let text = ctx.resolve(Text(label).font(.system(size: 11, weight: .medium, design: .monospaced)).foregroundStyle(.white))
-                let ts = text.measure(in: size)
-                let origin = CGPoint(x: min(p.x + 10, size.width - ts.width - 12), y: max(p.y - ts.height - 10, 4))
-                ctx.fill(Path(roundedRect: CGRect(origin: origin, size: ts).insetBy(dx: -6, dy: -3), cornerRadius: 5),
-                         with: .color(.black.opacity(0.65)))
-                ctx.draw(text, at: origin, anchor: .topLeading)
+                var lines = [FrequencyFormatter.grouped(hover.hz) + (hover.db.map { String(format: "   %.1f dB", $0) } ?? "")]
+                if let id = SignalIDText.hoverLine(identity: model.signalID.hoverIdentity, pending: model.signalID.hoverPending,
+                                                   measuring: model.signalID.hoverMeasuring) {
+                    lines.append(id)
+                }
+                HoverLabelDrawing.draw(ctx, in: size, at: p, lines: lines)
             }
         }
     }
@@ -164,7 +222,7 @@ private struct SplitHandle: View {
     }
 }
 
-/// Frequency labels, bookmark flags and a minimap of the captured span.
+/// Frequency labels and a minimap of the captured span.
 private struct FrequencyRuler: View {
     @Environment(AppModel.self) private var model
 
@@ -195,13 +253,68 @@ private struct FrequencyRuler: View {
                     ctx.fill(Path(CGRect(x: 0, y: size.height - 3, width: size.width, height: 3)), with: .color(.white.opacity(0.06)))
                     ctx.fill(Path(CGRect(x: start, y: size.height - 3, width: width, height: 3)), with: .color(Theme.accent.opacity(0.6)))
                 }
-                ForEach(model.visibleBookmarks) { bookmark in
-                    BookmarkFlag(bookmark: bookmark)
-                        .position(x: CGFloat(vp.fraction(ofHz: bookmark.frequencyHz)) * geo.size.width, y: 9)
-                }
             }
         }
         .background(Color.black.opacity(0.35))
+    }
+}
+
+/// The bookmark flags, over the ruler and the spectrum. The first row sits in the ruler; flags that would overlap
+/// step down over the top of the spectrum. Each has a short line to its frequency, and the one under the pointer
+/// runs it down the whole display.
+struct BookmarkFlags: View {
+    static let rulerHeight: CGFloat = 40
+    private static let rowHeight: CGFloat = 17
+
+    @Environment(AppModel.self) private var model
+    @State private var widths: [UUID: CGFloat] = [:]
+    @State private var hovered: UUID?
+
+    init(hovered: UUID? = nil) {
+        _hovered = State(initialValue: hovered)
+    }
+
+    var body: some View {
+        GeometryReader { geo in
+            let vp = model.viewport
+            let bookmarks = model.visibleBookmarks
+            let xs = bookmarks.map { CGFloat(vp.fraction(ofHz: $0.frequencyHz)) * geo.size.width }
+            let flags = zip(bookmarks, xs).map { bookmark, x in
+                // Measured once drawn; until then, near enough for one frame.
+                BookmarkFlagLayout.Flag(id: bookmark.id, x: x, width: widths[bookmark.id] ?? CGFloat(bookmark.name.count) * 6 + 24)
+            }
+            let placed = BookmarkFlagLayout.place(flags, viewWidth: geo.size.width)
+            ZStack(alignment: .topLeading) {
+                Canvas { ctx, size in
+                    for (bookmark, x) in zip(bookmarks, xs) {
+                        guard let place = placed[bookmark.id] else { continue }
+                        let isHovered = bookmark.id == hovered
+                        let top = Self.rowY(place.row) + 6
+                        let bottom = isHovered ? size.height : max(top, place.row == 0 ? Self.rulerHeight : top) + 6
+                        let color = Color(hex: bookmark.colorHex) ?? Theme.accent
+                        ctx.stroke(Path { $0.move(to: CGPoint(x: x, y: top)); $0.addLine(to: CGPoint(x: x, y: bottom)) },
+                                   with: .color(color.opacity(isHovered ? 1 : 0.7)), lineWidth: isHovered ? 1.5 : 1)
+                    }
+                }
+                .allowsHitTesting(false)
+                ForEach(bookmarks) { bookmark in
+                    if let place = placed[bookmark.id] {
+                        BookmarkFlag(bookmark: bookmark) { inside in
+                            if inside { hovered = bookmark.id } else if hovered == bookmark.id { hovered = nil }
+                        }
+                        .fixedSize()
+                        .onGeometryChange(for: CGFloat.self, of: \.size.width) { widths[bookmark.id] = $0 }
+                        .position(x: place.centerX, y: Self.rowY(place.row))
+                        .zIndex(bookmark.id == hovered ? 1 : 0)
+                    }
+                }
+            }
+        }
+    }
+
+    /// The first row sits above the ruler's labels, the others just below the ruler.
+    private static func rowY(_ row: Int) -> CGFloat {
+        row == 0 ? 8 : rulerHeight + 8 + CGFloat(row - 1) * rowHeight
     }
 }
 
@@ -210,6 +323,7 @@ private struct FrequencyRuler: View {
 private struct BookmarkFlag: View {
     @Environment(AppModel.self) private var model
     let bookmark: Bookmark
+    var onHover: (Bool) -> Void
     @State private var editing = false
 
     var body: some View {
@@ -222,7 +336,7 @@ private struct BookmarkFlag: View {
         .padding(.vertical, 1)
         .foregroundStyle(.black)
         .background(Capsule().fill(color.opacity(0.9)))
-        .overlay { ClickCatcher(toolTip: help, onLeft: { model.select(bookmark) }, onRight: { editing = true }) }
+        .overlay { ClickCatcher(toolTip: help, onLeft: { model.select(bookmark) }, onRight: { editing = true }, onHover: onHover) }
         .popover(isPresented: $editing, arrowEdge: .bottom) {
             BookmarkEditor(bookmark: bookmark) { editing = false }
         }

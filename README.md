@@ -26,6 +26,9 @@ records lossless audio and IQ that start *before* you press the button.
 - 📡 **Decodes the whole passband at once.** Every CW, PSK31, FT8 and WSPR signal in the receiver's
   passband gets its own decoder. Right-click one and the bench shows its waveform, its spectrum within
   ±100 Hz and its IQ.
+- 🔍 **Knows what it's hearing.** Rest the pointer on a signal and SubFloor says what it is: RTTY, FT8,
+  WSPR, SSB voice, DMR and more. Right-click for the full card. It names a signal only when it's sure, and
+  otherwise tells you what it measured. [More below](#signal-id).
 - ⏪ **Records the past.** A rolling pre-roll keeps the last 5 to 120 seconds in memory, so a recording
   starts before your click. FLAC, WAV, Apple Lossless or SigMF, and all of it lossless.
 - 🔴 **Records while you're away.** Auto records every transmission the squelch lets through, and the
@@ -128,11 +131,14 @@ Then ask, for example:
 - "Look up the callsign…"
 - "Research pirate stations, hunt the band for audio, and record only real pirates, not noise."
 - "Research propaganda stations and their schedules."
-- "Scan 4–7 MHz for digital signals and log them as bookmarks."
+- "Scan 4–7 MHz, identify what's there and log the digital signals as bookmarks."
 
 The **Event log** tab shows every call an agent makes. Agents never transmit, never delete a recording or
-your bookmarks, and every recording they start stops by itself. Not built yet: recording at a set time with
-no agent present, naming a signal's modulation, and a measured noise floor. Agents work around them for now.
+your bookmarks, and every recording they start stops by itself. They can ask what a signal is, too: a scan
+steps the radio across a band and puts it back, but never while you're recording. A scan wider than the capture
+reads each step for only about 3 s, so slow signals such as FT8 and WSPR come back unnamed until the agent tunes to
+one and asks again. Not built yet: recording at a
+set time with no agent present, and a measured noise floor. Agents work around them for now.
 
 ## Build from source
 You need macOS 15 or later on Apple Silicon, Xcode 26 (Swift 6.2), and the
@@ -143,6 +149,7 @@ scripts/bundle.sh                    # build build/SubFloor.app (with its icon)
 VERSION=0.1.0 SIGN_IDENTITY="Developer ID Application: …" scripts/make_dmg.sh   # signed release DMG
 python3 scripts/make_icon.py Sources/SubFloor/Resources/AppIcon.png   # redraw the icon (needs Pillow, NumPy)
 swift test                           # unit tests
+SUBFLOOR_SIGNALID_MATRIX=1 swift test --filter SignalIDTests   # also Signal ID's full accuracy matrix and sweeps
 SUBFLOOR_HW=1 swift test             # also run the RSP1B hardware smoke test
 ```
 
@@ -177,6 +184,24 @@ always released.
 | Edit a bookmark | Right-click (or ⌃-click) its flag: name, frequency, mode, bandwidth, group (pick one or type a new one), HamItUp, notes; Use Current Tuning, Tune or Delete |
 | Manage bookmarks | Radio › Bookmarks… (⌥⌘B): every bookmark in a sortable table, filtered by group or search (notes too). Double-click tunes, ⌫ deletes, drag rows onto a group or select several to move them together. Bookmarks an AI agent saved are marked **MCP** |
 | AI agents | Top-bar **MCP** button or Radio › MCP Server…: switch the server on, copy a snippet for your agent, watch the event log. See [AI agents](#-ai-agents-mcp) |
+
+### Signal ID
+Rest the pointer on a signal for half a second and a line appears on the spectrum: `RTTY · 45.45 Bd · 170 Hz
+shift · 91%`. Right-click (or ⌃-click) for the card, which has the name and how sure SubFloor is, what it
+measured (bandwidth, SNR, symbol rate, shift, tones), the other things it could be and why, and buttons to
+**Tune** to it (in the mode and width that suit it), **Bookmark** it (into an **Identified** group) or **Copy**
+it. A very slow or narrow signal, like WSPR, takes a few seconds longer; the line says it's still measuring.
+
+It names SSB and AM voice, CW, RTTY, PSK31, FT8, WSPR and other HF data modes, and VHF and up ones such as
+NFM, WFM, DMR, P25, APRS, POCSAG and AIS. **It never guesses.** A name needs 70%
+confidence; below that you get the family and its numbers (`2-FSK · 50 Bd · 850 Hz shift`), with the
+alternatives on the card. A point with nothing there says `No signal`, and a faint one says `Too weak to
+identify (SNR 4 dB)`. If a decoder you're running has already decoded the same signal in the last minute, the card
+says "confirmed by decode".
+
+The decoder panel's **Auto-detect** is separate: it has its own, narrower classifier, which looks only at the
+signals in the passband and the modes the decoders handle, to pick a decoder for each, and recognises RTTY
+(45.45, 50 and 75 Bd; 170, 425 and 850 Hz shift). Signal ID never starts a decoder by itself.
 
 ## Recording
 The save buffer is always running: each stream keeps its last 5–120 s (Settings, default 30 s) in
@@ -305,8 +330,11 @@ off. After each slot the strip shows its outcome: "WSPR 14:32 · 2 decodes", "·
 band, so a HamItUp oscillator a few hundred hertz off (2 ppm at 125 MHz is 250 Hz) still decodes; the
 decoded audio frequencies then show the error, which Settings' HamItUp LO corrects. If the passband can't be decoded (narrower than 50 Hz above 300 Hz), the panel says so.
 
-RTTY and auto-detect are disabled for now; their code is kept (`RTTYModem`, `SignalClassifier`, and the
-engine's support for both) and covered by the tests.
+The Auto-detect button classifies every signal in the passband and decodes each in its own mode, with the
+picked mode as the cursor's fallback. It recognises RTTY (45.45, 50 or 75 Bd; 170, 425 or 850 Hz shift) and
+shows it as "RTTY 45 · 170", but only identifies it: there is no RTTY decoder in the catalog, so the row
+reads "RTTY (identified, no decoder)". `RTTYModem` and the engine's support for it are kept and covered by
+the tests.
 
 ## Manual hardware checklist
 Run through this with an RSP1B attached before a release:

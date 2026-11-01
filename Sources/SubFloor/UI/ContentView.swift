@@ -8,7 +8,7 @@ struct ContentView: View {
         let window = WindowContentLayout(minSize: CGSize(width: 1280, height: 720))
         window {
             HStack(spacing: 0) {
-                SidebarView().frame(width: 280)
+                SidebarView().frame(width: SidebarView.width)
                 Divider()
                 VStack(spacing: 0) {
                     TopBarView()

@@ -120,14 +120,14 @@ private struct LiveRow: View {
                 }
                 .frame(width: 84, alignment: .trailing)
                 if row.isCursor {
-                    Text(row.recentText.isEmpty ? "…" : row.recentText)
+                    Text(ModemPanelFormat.liveText(row).isEmpty ? "…" : ModemPanelFormat.liveText(row))
                         .font(.system(size: 18, design: .monospaced))
                         .foregroundStyle(.primary)
                         .lineLimit(4)
                         .truncationMode(.head)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
-                    Text(ModemPanelFormat.singleLine(row.recentText))
+                    Text(ModemPanelFormat.singleLine(ModemPanelFormat.liveText(row)))
                         .font(.system(size: 16, design: .monospaced))
                         .lineLimit(1)
                         .truncationMode(.head)
