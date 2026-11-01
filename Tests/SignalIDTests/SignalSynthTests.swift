@@ -5,7 +5,9 @@ import Testing
 @testable import SignalID
 
 // Self-tests of the test-signal generator, so later tasks can trust it. Every check here uses an
-// independent measurement (spectra, envelopes, a discriminator), never the generator's internals.
+// independent measurement (spectra, envelopes, a discriminator), never the generator's internals. The two
+// catalogue-wide sweeps take every sixth entry by default, every entry with SUBFLOOR_SIGNALID_MATRIX=1 (`Sweep`,
+// ruling R32).
 
 /// A low-cost plan for an independent SNR estimate: 6 × the occupied bandwidth, bins of at most 1/16 of it,
 /// 256 frames.
@@ -51,7 +53,7 @@ private func runs(_ x: [Float], above threshold: Float) -> [(start: Int, length:
     return out
 }
 
-@Suite struct SignalSynthTests {
+@Suite(.serialized) struct SignalSynthTests {
     @Test func deterministicFromSeedWithTheNoiseOnTop() {
         let fs = 48_000.0
         let a = SignalSynth.make(.rtty(), sampleRate: fs, seconds: 0.5, snrDb: 10, offsetHz: 900, seed: 1)
@@ -98,7 +100,8 @@ private func runs(_ x: [Float], above threshold: Float) -> [(start: Int, length:
     @Test func snrMatchesTheRequestForEveryMode() {
         // Independent estimate: noise density from the bins beyond ±1.5 B, the signal as everything above it,
         // over the noise in B (the occupied bandwidth).
-        for (index, entry) in SynthSpec.catalogue.enumerated() {
+        let catalogue = SynthSpec.catalogue
+        for (index, entry) in Sweep.cases(catalogue, default: Array(stride(from: 0, to: catalogue.count, by: 6))) {
             let plan = analysisPlan(entry.spec)
             let b = entry.spec.occupiedBandwidthHz
             for snr in [10.0, 3.0] {
@@ -118,7 +121,8 @@ private func runs(_ x: [Float], above threshold: Float) -> [(start: Int, length:
     @Test func occupiedBandwidthIsTheRenderedWidth() {
         // The declared width is the rendered one by construction; an independent render (another seed, rate
         // and resolution, this file's own fixed-point search) agrees within 6%.
-        for (index, entry) in SynthSpec.catalogue.enumerated() {
+        let catalogue = SynthSpec.catalogue
+        for (index, entry) in Sweep.cases(catalogue, default: Array(stride(from: 3, to: catalogue.count, by: 6))) {
             let declared = entry.spec.occupiedBandwidthHz
             #expect(declared == SignalSynth.occupiedBandwidthHz(for: entry.spec))
             guard entry.spec != .carrier else { continue }

@@ -7,7 +7,12 @@ import Testing
 /// Task 4's families through `SignalMeasurer.measure`: FSK, MFSK, PSK, OFDM, bursts and subcarriers, each
 /// synthesised at 20 and 10 dB and seeded the way the app seeds it (the extent `Extent.find` gives where the
 /// pointer rests). Seeds 1–50 only (thresholds were tuned on seeds ≥ 1000).
-@Suite struct DigitalFamilyTests {
+///
+/// A default run checks each test at 10 dB on its first seed, over the cases that stand for its families;
+/// `SUBFLOOR_SIGNALID_MATRIX=1` runs every SNR, seed and case, and DAB's spacing and the measurer's own
+/// wider-than-the-view sweep (`IdentifyTests.widerThanTheViewIsFamilyOnly` checks that through the identifier by
+/// default) (`Sweep`, ruling R32).
+@Suite(.serialized) struct DigitalFamilyTests {
     /// Synthesises `spec` centred on `offsetHz`, seeds the measurement with the extent found with the pointer
     /// `pointHz` from the centre (a wide-shift FSK's centre is empty: the pointer rests on one tone) and
     /// measures it.
@@ -69,10 +74,11 @@ import Testing
                 spacing: 4800),
     ]
 
-    @Test(arguments: [20.0, 10.0])
+    @Test(arguments: Sweep.snrs)
     func fskTonesRateAndShift(snr: Double) {
-        for (index, c) in Self.fskCases.enumerated() {
-            for seed in UInt64(1)...2 {
+        // By default RTTY 170, a wide shift pointed at one tone, 4-FSK and MFSK.
+        for (index, c) in Sweep.cases(Self.fskCases, default: [0, 1, 5, 7]) {
+            for seed in Sweep.seeds(1...2) {
                 let m = Self.measured(c.spec, sampleRate: c.sampleRate, snr: snr, seed: UInt64(3 * index) + seed,
                                       pointHz: c.pointHz)
                 let label = "\(c) at \(snr) dB, seed \(seed)"
@@ -90,9 +96,9 @@ import Testing
 
     /// DMR's 4-FSK 4800 in 27.5 ms bursts every 60 ms (one 30 ms TDMA slot in use): the same 4-FSK, plus the
     /// burst period and duty. SNR is the mean over the capture (ruling R6).
-    @Test(arguments: [20.0, 10.0])
+    @Test(arguments: Sweep.snrs)
     func fourFSKInTDMABursts(snr: Double) {
-        for seed in UInt64(31)...33 {
+        for seed in Sweep.seeds(31...33) {
             let m = Self.measured(.dmr, snr: snr, seed: seed)
             let label = "DMR at \(snr) dB, seed \(seed)"
             #expect(m.family == .fsk, "\(label): \(m.family) \(m.notes)")
@@ -106,7 +112,7 @@ import Testing
         }
     }
 
-    @Test(arguments: [20.0, 10.0])
+    @Test(arguments: Sweep.snrs)
     func pskOrderAndRate(snr: Double) {
         let cases: [(String, SynthSpec, Int, Double)] = [
             ("BPSK31", .psk31, 2, 31.25),
@@ -114,8 +120,9 @@ import Testing
             ("BPSK 1800", .psk(.init(order: 2, rate: 1800)), 2, 1800),
             ("8PSK 2400", .stanag4285, 8, 2400),
         ]
-        for (index, (name, spec, order, rate)) in cases.enumerated() {
-            for seed in UInt64(1)...2 {
+        // By default QPSK31 and 8PSK 2400 (the orders BPSK31's own row names too).
+        for (index, (name, spec, order, rate)) in Sweep.cases(cases, default: [1, 3]) {
+            for seed in Sweep.seeds(1...2) {
                 let m = Self.measured(spec, snr: snr, seed: UInt64(10 + 3 * index) + seed)
                 let label = "\(name) at \(snr) dB, seed \(seed)"
                 #expect(m.family == .psk, "\(label): \(m.family) \(m.familyConfidence) \(m.notes)")
@@ -126,10 +133,10 @@ import Testing
     }
 
     /// DRM-like OFDM (mode A, 41.67 Hz; mode B, 46.875 Hz; about 10 kHz) at 48 kS/s.
-    @Test(arguments: [20.0, 10.0])
+    @Test(arguments: Sweep.snrs)
     func drmLikeOFDMSpacing(snr: Double) {
         for (index, (spec, spacing)) in [(SynthSpec.drmModeA, 1000 / 24.0), (.drm, 46.875)].enumerated() {
-            for seed in UInt64(1)...2 {
+            for seed in Sweep.seeds(1...2) {
                 let m = Self.measured(spec, snr: snr, seed: UInt64(36 + 2 * index) + seed, offsetHz: 6000)
                 let label = "DRM \(spacing) Hz at \(snr) dB, seed \(seed)"
                 #expect(m.family == .ofdm, "\(label): \(m.family) \(m.notes)")
@@ -140,8 +147,9 @@ import Testing
         }
     }
 
-    /// DAB-like OFDM: 1536 carriers at 1 kHz (1.536 MHz) in a 2.048 MS/s capture.
-    @Test(arguments: [20.0, 10.0])
+    /// DAB-like OFDM: 1536 carriers at 1 kHz (1.536 MHz) in a 2.048 MS/s capture. With the matrix only: DAB's own
+    /// row names it by default (`IdentifyTests.eachRowIsNamed`).
+    @Test(.enabled(if: Sweep.full), arguments: Sweep.snrs)
     func dabLikeOFDMSpacing(snr: Double) {
         let m = Self.measured(.dab, sampleRate: 2_048_000, snr: snr, seed: 44, offsetHz: 0, seconds: 1,
                               fftSize: 2048)
@@ -178,8 +186,9 @@ import Testing
 
     /// A mode wider than the capture is named by family only (R5), its width the visible part's −20 dB width (a
     /// lower bound) and its SNR the visible band's (R14): DAB in a 1.024 MS/s capture, filling it (centred) or
-    /// running off its lower edge with noise beside its upper (400 kHz up: 880 kHz of DAB visible).
-    @Test(arguments: [20.0, 10.0])
+    /// running off its lower edge with noise beside its upper (400 kHz up: 880 kHz of DAB visible). With the matrix
+    /// only: `IdentifyTests.widerThanTheViewIsFamilyOnly` checks it through the identifier by default.
+    @Test(.enabled(if: Sweep.full), arguments: Sweep.snrs)
     func ofdmWiderThanTheViewIsFamilyOnly(snr: Double) {
         for (centre, visible) in [(0.0, 1_024_000.0), (400_000, 880_000)] {
             let capture = Self.narrowDAB(snr: snr, seed: 45, centreHz: centre)
@@ -212,9 +221,9 @@ import Testing
     }
 
     /// APRS: NFM carrying Bell 202 AFSK (1200 Bd, 1200/2200 Hz). The carrier is FM; the AFSK is a subcarrier.
-    @Test(arguments: [20.0, 10.0])
+    @Test(arguments: Sweep.snrs)
     func afskInsideNFM(snr: Double) {
-        for seed in UInt64(1)...2 {
+        for seed in Sweep.seeds(1...2) {
             let m = Self.measured(.aprs, snr: snr, seed: 45 + seed, offsetHz: 6000)
             let label = "APRS at \(snr) dB, seed \(seed)"
             #expect(m.family == .fm, "\(label): \(m.family) \(m.notes)")
@@ -224,9 +233,9 @@ import Testing
     }
 
     /// ACARS: AM carrying 2400 Bd MSK audio (1200/2400 Hz). Still AM, with the MSK as a subcarrier.
-    @Test(arguments: [20.0, 10.0])
+    @Test(arguments: Sweep.snrs)
     func mskInsideAM(snr: Double) {
-        for seed in UInt64(1)...2 {
+        for seed in Sweep.seeds(1...2) {
             let m = Self.measured(.acars, snr: snr, seed: 47 + seed, offsetHz: 6000)
             let label = "ACARS at \(snr) dB, seed \(seed)"
             #expect(m.family == .am, "\(label): \(m.family) \(m.notes)")
@@ -236,9 +245,9 @@ import Testing
 
     /// NOAA APT: FM carrying the 2400 Hz AM subcarrier (pointed at its centre line: the region grows over the
     /// comb of Bessel lines).
-    @Test(arguments: [20.0, 10.0])
+    @Test(arguments: Sweep.snrs)
     func aptSubcarrier(snr: Double) {
-        for seed in UInt64(1)...2 {
+        for seed in Sweep.seeds(1...2) {
             let m = Self.measured(.noaaAPT, sampleRate: 96_000, snr: snr, seed: 7 + seed, offsetHz: 6000)
             let label = "APT at \(snr) dB, seed \(seed)"
             #expect(m.family == .fm, "\(label): \(m.family) \(m.notes)")
@@ -247,10 +256,10 @@ import Testing
     }
 
     /// An FM signal's steady modulating tone is not a subcarrier (R15): a subcarrier carries its own modulation.
-    @Test(arguments: [20.0, 10.0])
+    @Test(arguments: Sweep.snrs)
     func steadyFMToneIsNotASubcarrier(snr: Double) {
         for (index, (tone, deviation)) in [(1000.0, 500.0), (2400, 3000)].enumerated() {
-            for seed in UInt64(1)...2 {
+            for seed in Sweep.seeds(1...2) {
                 let m = Self.measured(.fm(.tone(tone), deviationHz: deviation), snr: snr,
                                       seed: UInt64(3 * index) + seed)
                 let label = "\(tone) Hz tone at \(snr) dB, seed \(seed)"
@@ -261,14 +270,15 @@ import Testing
     }
 
     /// Analog signals never take a digital family.
-    @Test(arguments: [20.0, 10.0])
+    @Test(arguments: Sweep.snrs)
     func analogStaysAnalog(snr: Double) {
         let cases: [(SynthSpec, SignalFamily)] = [
             (.nfmVoice(deviationHz: 2500), .fm), (.nfmVoice(deviationHz: 5000), .fm), (.usbVoice, .usb),
             (.amVoice, .am), (.amBroadcast, .am), (.cw(wpm: 20), .ook), (.carrier, .carrier),
             (.fm(.tone(1000), deviationHz: 500), .fm), (.fm(.tone(400), deviationHz: 3000), .fm),
         ]
-        for (index, (spec, family)) in cases.enumerated() {
+        // By default one of each family: NFM voice, USB, AM, CW and a toned FM.
+        for (index, (spec, family)) in Sweep.cases(cases, default: [0, 2, 4, 5, 7]) {
             let m = Self.measured(spec, snr: snr, seed: UInt64(20 + index), fftSize: spec == .carrier ? 16_384 : 4096)
             #expect(m.family == family || m.family == .unknown, "\(spec) at \(snr) dB: \(m.family) \(m.notes)")
             #expect(![.fsk, .mfsk, .psk, .ofdm].contains(m.family), "\(spec) at \(snr) dB: \(m.family)")

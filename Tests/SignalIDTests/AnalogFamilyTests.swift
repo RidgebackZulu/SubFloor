@@ -7,7 +7,10 @@ import Testing
 /// Task 3's families through `SignalMeasurer.measure`, each synthesised at 20 and 10 dB and found the way the
 /// app finds it: the extent from `Extent.find` on an averaged spectrum is the seed. Seeds 1–50 only
 /// (thresholds were tuned on seeds ≥ 1000).
-@Suite struct AnalogFamilyTests {
+///
+/// A default run checks each test at 10 dB on its first seed (and the cross-check on a case per family);
+/// `SUBFLOOR_SIGNALID_MATRIX=1` runs every SNR, seed and case (`Sweep`, ruling R32).
+@Suite(.serialized) struct AnalogFamilyTests {
     /// Synthesises `spec` at `offsetHz`, seeds the measurement with its extent and measures it.
     static func measured(_ spec: SynthSpec, sampleRate fs: Double = 48_000, snr: Double, seed: UInt64,
                          offsetHz: Double = 3000, seconds: Double = 3, fftSize: Int = 4096) -> SignalMeasurement {
@@ -29,9 +32,9 @@ import Testing
         return abs(value / truth - 1) <= tolerance
     }
 
-    @Test(arguments: [20.0, 10.0])
+    @Test(arguments: Sweep.snrs)
     func noiseIsNoise(snr: Double) {
-        for seed in UInt64(1)...3 {
+        for seed in Sweep.seeds(1...3) {
             let iq = SignalSynth.make(.noise, sampleRate: 48_000, seconds: 3, snrDb: snr, seed: seed)
             let m = SignalMeasurer.measure(iq, sampleRate: 48_000, offsetHz: 3000, bandwidthHz: 2700, seconds: 3)
             #expect(m.family == .noise, "seed \(seed): \(m.family)")
@@ -39,9 +42,9 @@ import Testing
         }
     }
 
-    @Test(arguments: [20.0, 10.0])
+    @Test(arguments: Sweep.snrs)
     func carrier(snr: Double) {
-        for seed in UInt64(1)...3 {
+        for seed in Sweep.seeds(1...3) {
             let m = Self.measured(.carrier, snr: snr, seed: seed, offsetHz: 1234.5, fftSize: 16_384)
             #expect(m.family == .carrier, "seed \(seed): \(m.family) \(m.notes)")
             #expect(m.envelope == .steady)
@@ -49,10 +52,10 @@ import Testing
         }
     }
 
-    @Test(arguments: [20.0, 10.0])
+    @Test(arguments: Sweep.snrs)
     func cwKeyingSpeed(snr: Double) {
         for (index, (wpm, seconds)) in [(10.0, 4.0), (20, 3), (35, 3)].enumerated() {
-            for seed in UInt64(1)...2 {
+            for seed in Sweep.seeds(1...2) {
                 let m = Self.measured(.cw(wpm: wpm), snr: snr, seed: UInt64(10 * index) + seed, seconds: seconds,
                                       fftSize: 16_384)
                 #expect(m.family == .ook, "\(wpm) WPM seed \(seed): \(m.family) \(m.notes)")
@@ -62,10 +65,10 @@ import Testing
         }
     }
 
-    @Test(arguments: [20.0, 10.0])
+    @Test(arguments: Sweep.snrs)
     func amCarrierWithSymmetricSidebands(snr: Double) {
         for (spec, envelope) in [(SynthSpec.amVoice, EnvelopeKind.voice), (.amBroadcast, .steady)] {
-            for seed in UInt64(1)...3 {
+            for seed in Sweep.seeds(1...3) {
                 let m = Self.measured(spec, snr: snr, seed: seed)
                 #expect(m.family == .am, "\(spec) seed \(seed): \(m.family)")
                 #expect(m.envelope == envelope, "\(spec) seed \(seed): \(m.envelope)")
@@ -77,10 +80,10 @@ import Testing
         }
     }
 
-    @Test(arguments: [20.0, 10.0])
+    @Test(arguments: Sweep.snrs)
     func ssbSideband(snr: Double) {
         for (spec, family) in [(SynthSpec.usbVoice, SignalFamily.usb), (.lsbVoice, .lsb)] {
-            for seed in UInt64(1)...3 {
+            for seed in Sweep.seeds(1...3) {
                 let m = Self.measured(spec, snr: snr, seed: seed)
                 #expect(m.family == family, "\(family) seed \(seed): \(m.family)")
                 #expect(m.envelope == .voice)
@@ -95,10 +98,10 @@ import Testing
     /// percentile (its clipped audio, interpolated, overshoots the clip level), so 10% of nominal isn't a fair
     /// bound on every seed (tuning seeds: 0.955–1.148 at 20 and 10 dB). WFM's programme stays under its
     /// nominal peak and is held to 10% (`wfmPilot`).
-    @Test(arguments: [20.0, 10.0])
+    @Test(arguments: Sweep.snrs)
     func fmDeviation(snr: Double) {
         for deviation in [2500.0, 5000] {
-            for seed in UInt64(1)...3 {
+            for seed in Sweep.seeds(1...3) {
                 let m = Self.measured(.nfmVoice(deviationHz: deviation), snr: snr, seed: seed)
                 #expect(m.family == .fm, "\(deviation) Hz seed \(seed): \(m.family) \(m.notes)")
                 #expect(m.envelope == .steady)
@@ -108,9 +111,9 @@ import Testing
         }
     }
 
-    @Test(arguments: [20.0, 10.0])
+    @Test(arguments: Sweep.snrs)
     func wfmPilot(snr: Double) {
-        for seed in UInt64(1)...2 {
+        for seed in Sweep.seeds(1...2) {
             let m = Self.measured(.wfmBroadcast, sampleRate: 1_000_000, snr: snr, seed: seed, offsetHz: 100_000,
                                   seconds: 1)
             #expect(m.family == .wfm, "seed \(seed): \(m.family)")
@@ -121,11 +124,11 @@ import Testing
 
     /// MW broadcast in a crowded band: equal-strength stations 9 or 10 kHz either side (noise-free, so the
     /// SNR is the middle one's). The middle one is still AM, its width its own.
-    @Test(arguments: [20.0, 10.0])
+    @Test(arguments: Sweep.snrs)
     func crowdedMediumWaveIsStillAM(snr: Double) {
         let fs = 48_000.0
         for (index, spacing) in [9000.0, 10_000].enumerated() {
-            for seed in UInt64(1)...2 {
+            for seed in Sweep.seeds(1...2) {
                 let base = UInt64(40 + 10 * index) + 3 * seed
                 var iq = SignalSynth.make(.amBroadcast, sampleRate: fs, seconds: 3, snrDb: snr, seed: base)
                 for (k, offset) in [-spacing, spacing].enumerated() {
@@ -152,9 +155,9 @@ import Testing
 
     /// NOAA APT pointed at its centre: the extent takes one line of a comb of Bessel lines 2.4 kHz apart, whose
     /// amplitude moves with the image. Neither AM nor a carrier.
-    @Test(arguments: [20.0, 10.0])
+    @Test(arguments: Sweep.snrs)
     func aptCentreLineIsNotAM(snr: Double) {
-        for seed in UInt64(1)...6 {
+        for seed in Sweep.seeds(1...6) {
             let m = Self.measured(.noaaAPT, sampleRate: 96_000, snr: snr, seed: seed)
             #expect(m.family != .am && m.family != .carrier, "seed \(seed): \(m.family) \(m.notes)")
         }
@@ -162,7 +165,7 @@ import Testing
 
     /// Task 4's families are never taken for an analog one: each comes back as its own digital family, or
     /// `unknown` (FT8 in 3 s waits for the longer read). NOAA APT is FM carrying a subcarrier: `fm` or `unknown`.
-    @Test(arguments: [20.0, 10.0])
+    @Test(arguments: Sweep.snrs)
     func digitalFamiliesAreLeftAlone(snr: Double) {
         // (spec, sample rate, where the pointer rests relative to the centre: RTTY 850's centre is empty, family).
         let cases: [(SynthSpec, Double, Double, SignalFamily)] = [
@@ -175,7 +178,8 @@ import Testing
             // NOAA APT pointed at its centre: the extent takes one Bessel line of a ±17 kHz FM.
             (.noaaAPT, 96_000, 0, .fm),
         ]
-        for (index, (spec, fs, point, family)) in cases.enumerated() {
+        // By default RTTY (fsk), PSK31, DRM (ofdm), FT8 (unknown: it waits for the longer read) and APT (fm).
+        for (index, (spec, fs, point, family)) in Sweep.cases(cases, default: [0, 3, 7, 14, 17]) {
             let seed = UInt64(20 + index)
             let iq = SignalSynth.make(spec, sampleRate: fs, seconds: 3, snrDb: snr, offsetHz: 3000, seed: seed)
             let size = 4096

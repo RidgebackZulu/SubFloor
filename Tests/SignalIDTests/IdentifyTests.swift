@@ -6,7 +6,11 @@ import Testing
 /// Task 5: the mode table and the matcher, through `SignalIdentifier.identify(iq:…)` the way the app calls it (a
 /// capture, the point the pointer rests on, a longer read on request). Seeds 1–50 only (thresholds were tuned on
 /// seeds 1000–1099).
-@Suite struct IdentifyTests {
+///
+/// A default run names each row of the mode table once (its first placement) and runs the sweeps
+/// below on their first seed (the time signals at 5 MHz and 20 dB); `SUBFLOOR_SIGNALID_MATRIX=1` names every
+/// placement and runs every seed, frequency and SNR (`Sweep`, ruling R32).
+@Suite(.serialized) struct IdentifyTests {
     /// Where a catalogue entry is synthesised: the capture rate, its offset in the capture, where the pointer
     /// rests (on one tone of a wide-shift FSK), the signal's RF frequency (inside its row's hints, when it has
     /// any), and how much IQ the first pass gets (wideband captures are kept to 1 s).
@@ -110,8 +114,19 @@ import Testing
 
     // MARK: Every row
 
+    /// Each row's first placement (the time signal's last: WWV at 5 MHz, inside the 60 m broadcast band, R22), or with
+    /// the matrix every placement.
+    static var namedPlacements: [Int] {
+        guard !Sweep.full else { return Array(placements.indices) }
+        let wwv = placements.count - 1
+        return placements.indices.filter { i in
+            placements[i].name == placements[wwv].name ? i == wwv
+                : !placements[..<i].contains { $0.name == placements[i].name }
+        }
+    }
+
     /// Each row, synthesised at 20 dB at a frequency inside its hints, is named.
-    @Test(arguments: placements.indices)
+    @Test(arguments: namedPlacements)
     func eachRowIsNamed(index: Int) {
         let p = Self.placements[index]
         let id = Self.identified(p, snr: 20, seed: UInt64(1 + index % 50))
@@ -124,8 +139,9 @@ import Testing
     /// DMR (bursty, ±1.944 kHz) and P25 (continuous, ±1.8 kHz) are told apart; a continuous 4-FSK 4800 whose
     /// deviation sits between theirs is named neither, and both are listed. (The in-between case is a measurement:
     /// the measurer reads C4FM spacing within about 2%, so a synthesised one can land on either side.)
+    /// (By default the hand-made case alone: `eachRowIsNamed` names DMR and P25.)
     @Test func tdmaAndContinuousFourFSKAreToldApartOrNotNamed() {
-        for seed in UInt64(11)...12 {
+        for seed in UInt64(11)...12 where Sweep.full {
             let dmr = Self.placements.first { $0.name == "DMR" }!
             let dmrID = Self.identified(dmr, snr: 20, seed: seed)
             #expect(dmrID.best?.name == "DMR", "\(Self.describe(dmrID))")
@@ -150,7 +166,7 @@ import Testing
     /// the longer read and doesn't trust the carrier; 16 s names it. It is never named a carrier.
     @Test func wsprNeedsTheLongerRead() {
         let wspr = Self.placements.first { $0.name == "WSPR" }!
-        for seed in UInt64(21)...23 {
+        for seed in Sweep.seeds(21...23) {
             let first = Self.identified(wspr, snr: 20, seed: seed, longer: false)
             #expect(first.needsLongerRead, "seed \(seed): \(Self.describe(first))")
             #expect(first.best?.name != "WSPR", "seed \(seed): \(Self.describe(first))")
@@ -166,7 +182,7 @@ import Testing
     /// A true carrier waits for the longer read before it is trusted, then is (R13).
     @Test func aCarrierIsTrustedAfterTheLongerRead() {
         let carrier = Placement(name: "carrier", spec: .carrier, rfHz: 10_123_400)
-        for seed in UInt64(24)...25 {
+        for seed in Sweep.seeds(24...25) {
             let first = Self.identified(carrier, snr: 20, seed: seed, longer: false)
             #expect(first.needsLongerRead && first.measurement.family == .carrier
                     && first.measurement.familyConfidence < 0.7, "\(Self.describe(first))")
@@ -194,7 +210,7 @@ import Testing
     @Test func weakCWSNRAfterTheSlowPass() {
         for (index, wpm) in [20.0, 8, 40].enumerated() {
             let cw = Placement(name: "CW", spec: .cw(wpm: wpm), rfHz: 7_020_000)
-            for seed in UInt64(27 + 2 * index)...UInt64(28 + 2 * index) {
+            for seed in Sweep.seeds(UInt64(27 + 2 * index)...UInt64(28 + 2 * index)) {
                 let id = Self.identified(cw, snr: 10, seed: seed)
                 #expect(id.measurement.seconds >= 15, "\(wpm) WPM seed \(seed): no slow pass \(Self.describe(id))")
                 print(String(format: "weakCWSNRAfterTheSlowPass: %.0f WPM seed %d: SNR %.2f dB, width %.0f of %.0f Hz",
@@ -217,11 +233,13 @@ import Testing
             SignalIdentifier.identify(iq: iq, sampleRate: fs, captureCenterHz: 446_000_000 - 250_000,
                                       atHz: 446_000_000, bandwidthHz: nil, spectrumDb: nil, longer: nil)
         }
-        _ = run()
         let clock = ContinuousClock()
         var id = SignalIdentity(measurement: SignalMeasurement())
-        // The best of three, so a test run's other work on the cores doesn't count against it.
-        let elapsed = (0..<3).map { _ in clock.measure { id = run() } }.min()!
+        // Warmed, then the best of three, so a test run's other work on the cores doesn't count against it (a debug
+        // build checks the answer only: once).
+        let timed = AnalogFamilyTests.optimised()
+        if timed { _ = run() }
+        let elapsed = (0..<(timed ? 3 : 1)).map { _ in clock.measure { id = run() } }.min()!
         #expect(id.best?.name == "NFM voice", "\(Self.describe(id))")
         print("identifyFirstPassBudget: \(elapsed)")
         if AnalogFamilyTests.optimised() {
@@ -236,12 +254,14 @@ import Testing
     /// named "AM voice/broadcast", on the first pass or after the longer read: the first pass asks for the longer
     /// read and offers the time signal (and the broadcast AM where it fits too); the longer read names the time
     /// signal by its ticks (at 20 dB; at 10 dB it may miss them and name nothing), and never the tickless AM.
-    @Test(arguments: [2_500_000.0, 5_000_000, 10_000_000, 15_000_000, 3_330_000, 7_850_000])
+    /// (By default the tickless AM alone, at 5 MHz, WWV inside the 60 m broadcast band, and 20 dB: `eachRowIsNamed`
+    /// names the time signal there.)
+    @Test(arguments: Sweep.full ? [2_500_000.0, 5_000_000, 10_000_000, 15_000_000, 3_330_000, 7_850_000] : [5_000_000])
     func timeSignalsAreNeverNamedBroadcast(rfHz: Double) {
         let wideAM = SynthSpec.am(.program(lowHz: 100, highHz: 3000, pilotHz: nil), depth: 0.8)
-        for (index, spec) in [SynthSpec.timeSignal, wideAM].enumerated() {
+        for (index, spec) in Sweep.cases([SynthSpec.timeSignal, wideAM], default: [1]) {
             let p = Placement(name: "Time signal (WWV/WWVH/CHU)", spec: spec, rfHz: rfHz)
-            for snr in [20.0, 10] {
+            for snr in Sweep.full ? [20.0, 10] : [20] {
                 let seed = UInt64(41 + 2 * index + (snr == 20 ? 0 : 1))
                 let label = "\(spec.label) at \(rfHz / 1e6) MHz, \(snr) dB"
                 let first = Self.identified(p, snr: snr, seed: seed, longer: false)
@@ -274,7 +294,8 @@ import Testing
     @Test func confidenceNeverNamesBelowSeventy() {
         var cases: [(SignalMeasurement, Double)] = []
         // Real identities across the table, at a weak SNR where matches are partial.
-        for (index, p) in Self.placements.enumerated() where p.sampleRate <= 96_000 && index % 3 == 0 {
+        // Every third placement (by default every ninth).
+        for (index, p) in Self.placements.enumerated() where p.sampleRate <= 96_000 && index % (Sweep.full ? 3 : 9) == 0 {
             let id = Self.identified(p, snr: 6, seed: UInt64(30 + index % 20), longer: false)
             cases.append((id.measurement, p.rfHz))
         }

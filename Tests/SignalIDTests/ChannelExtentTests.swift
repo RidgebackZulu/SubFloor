@@ -16,7 +16,7 @@ func peakHz(_ db: [Float], binHz: Double, in range: ClosedRange<Double>) -> Doub
 /// FFT-shifted bin of `hz` in a spectrum of `size` bins.
 func bin(_ hz: Double, binHz: Double, size: Int) -> Int { size / 2 + Int((hz / binHz).rounded()) }
 
-@Suite struct ChannelExtentTests {
+@Suite(.serialized) struct ChannelExtentTests {
     /// The streaming extractor (Signal ID's longer read, fed off the ring a piece at a time) gives `extract`'s
     /// output, whatever the pieces: odd sizes, ones under a mixer block, ones across several.
     @Test func extractorMatchesExtractPieceByPiece() {
@@ -110,7 +110,7 @@ func bin(_ hz: Double, binHz: Double, size: Int) -> Int { size / 2 + Int((hz / b
             .drm,
         ]
         for (index, spec) in specs.enumerated() {
-            for seed in UInt64(1)...2 {
+            for seed in Sweep.seeds(1...2) {
                 let offset = -8000.0
                 let iq = SignalSynth.make(spec, sampleRate: fs, seconds: 3, snrDb: 10, offsetHz: offset,
                                           seed: UInt64(200 + 10 * index) + seed)

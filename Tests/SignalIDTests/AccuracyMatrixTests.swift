@@ -13,17 +13,16 @@ import Testing
 ///   the same seed's noise-free capture holds over the read (R17), within 15% for NFM voice (R9), 10% otherwise.
 /// - At 3 dB: a wrong name at ≥ 0.7 in ≤ 2% of cases.
 ///
-/// The full matrix (every SNR, 5 seeds a cell) runs with `SUBFLOOR_SIGNALID_MATRIX=1`; otherwise the always-on
-/// subset (ruling R20): 10 and 3 dB, one seed a cell, the captures of 96 kS/s or less (20 dB naming, WFM's and
-/// DAB's included, is `IdentifyTests.eachRowIsNamed`'s). Its targets must reach 90% where they have 10 cases or
-/// more, and where they have fewer every case must fall within twice its tolerance (rulings R23, R24); the full
-/// matrix's reach 95% at the spec's tolerances.
-@Suite struct AccuracyMatrixTests {
+/// Both run only with `SUBFLOOR_SIGNALID_MATRIX=1` (ruling R32: a default run leaves them out, so it doesn't starve
+/// the suites beside it; `IdentifyTests.eachRowIsNamed` names each row by default):
+/// - the full matrix (`accuracyMatrix`): every SNR, 5 seeds a cell; its targets reach 95% at the spec's tolerances;
+/// - the subset (`accuracySubset`, ruling R20's, once always on): 10 and 3 dB, one seed a cell, the captures of
+///   96 kS/s or less. Its targets must reach 90% where they have 10 cases or more, and where they have fewer every
+///   case must fall within twice its tolerance (rulings R23, R24).
+@Suite(.serialized) struct AccuracyMatrixTests {
     static let snrs = [20.0, 10, 6, 3]
-    /// `SUBFLOOR_SIGNALID_MATRIX=1`: the full matrix. Otherwise the always-on subset (ruling R20).
-    static var full: Bool { ProcessInfo.processInfo.environment["SUBFLOOR_SIGNALID_MATRIX"] == "1" }
-    static var seedsPerCell: Int { full ? 5 : 1 }
-    static var cellSNRs: [Double] { full ? snrs : [10, 3] }
+    static func seedsPerCell(full: Bool) -> Int { full ? 5 : 1 }
+    static func cellSNRs(full: Bool) -> [Double] { full ? snrs : [10, 3] }
 
     /// One identification and the truths it is judged against.
     struct Outcome: Sendable {
@@ -145,13 +144,23 @@ import Testing
         return o
     }
 
-    @Test func accuracyMatrix() async {
+    @Test(.enabled(if: Sweep.full)) func accuracyMatrix() async {
+        await Self.check(full: true)
+    }
+
+    @Test(.enabled(if: Sweep.full)) func accuracySubset() async {
+        await Self.check(full: false)
+    }
+
+    /// The full matrix, or the subset.
+    static func check(full: Bool) async {
         let clock = ContinuousClock()
         let start = clock.now
-        let entries = IdentifyTests.placements.indices.filter { Self.full || IdentifyTests.placements[$0].sampleRate <= 96_000 }
+        let entries = IdentifyTests.placements.indices.filter { full || IdentifyTests.placements[$0].sampleRate <= 96_000 }
+        let seedsPerCell = Self.seedsPerCell(full: full)
         let cases = entries.flatMap { index in
-            Self.cellSNRs.flatMap { snr in
-                (0..<Self.seedsPerCell).map { k in (index, snr, UInt64(1 + (Self.seedsPerCell * index + k) % 50)) }
+            Self.cellSNRs(full: full).flatMap { snr in
+                (0..<seedsPerCell).map { k in (index, snr, UInt64(1 + (seedsPerCell * index + k) % 50)) }
             }
         }
         let outcomes = await withTaskGroup(of: Outcome.self) { group in
@@ -166,16 +175,17 @@ import Testing
         let summary = Self.summary(outcomes)
         for line in summary.split(separator: "\n") { print(line) }
         // Long test logs can be cut short: SUBFLOOR_SIGNALID_MATRIX_OUT=<path> writes the summary there too.
-        if let path = ProcessInfo.processInfo.environment["SUBFLOOR_SIGNALID_MATRIX_OUT"] {
+        if full, let path = ProcessInfo.processInfo.environment["SUBFLOOR_SIGNALID_MATRIX_OUT"] {
             try? summary.write(toFile: path, atomically: true, encoding: .utf8)
         }
-        print("accuracyMatrix: \(outcomes.count) identifications in \(elapsed)")
+        let test = full ? "accuracyMatrix" : "accuracySubset"
+        print("\(test): \(outcomes.count) identifications in \(elapsed)")
 
-        for snr in Self.cellSNRs {
+        for snr in Self.cellSNRs(full: full) {
             let cell = outcomes.filter { $0.snr == snr }
             let wrong = cell.filter(\.wrongName)
             for o in wrong {
-                print("accuracyMatrix wrong name at \(snr) dB: \(IdentifyTests.placements[o.placement]) seed \(o.seed): "
+                print("\(test) wrong name at \(snr) dB: \(IdentifyTests.placements[o.placement]) seed \(o.seed): "
                       + IdentifyTests.describe(o.identity))
             }
             guard snr >= 10 else { continue }
@@ -187,14 +197,14 @@ import Testing
                 let judged = cell.flatMap(\.targets).filter { $0.0 == target }
                 guard !judged.isEmpty else { continue }
                 let met = Double(judged.filter(\.1).count) / Double(judged.count)
-                print(String(format: "accuracyMatrix: %@ at %.0f dB: %d of %d (%.1f%%)", target, snr,
+                print(String(format: "%@: %@ at %.0f dB: %d of %d (%.1f%%)", test, target, snr,
                              judged.filter(\.1).count, judged.count, 100 * met))
                 // The full matrix holds the spec's 95% at the spec's tolerances. The one-seed subset (R23, amended by
                 // R24) holds 90% where a target has 10 cases or more; with fewer, a rate can't be judged (at a true
                 // 95%, nine cases all pass only 63% of the time), so every case must instead fall within twice the
                 // tolerance (shift within 6%), which catches a broken measurement without failing on the spec's 5%.
-                if Self.full || judged.count >= 10 {
-                    let needed = ((Self.full ? 0.95 : 0.9) * Double(judged.count)).rounded(.up)
+                if full || judged.count >= 10 {
+                    let needed = ((full ? 0.95 : 0.9) * Double(judged.count)).rounded(.up)
                     #expect(Double(judged.filter(\.1).count) >= needed, "\(target) at \(snr) dB: \(met) of \(judged.count)")
                 } else {
                     for o in cell {
@@ -204,12 +214,12 @@ import Testing
                     }
                 }
             }
-            print(String(format: "accuracyMatrix: at %.0f dB family right %.1f%%, named right %.1f%%", snr,
+            print(String(format: "%@: at %.0f dB family right %.1f%%, named right %.1f%%", test, snr,
                          100 * family, 100 * named))
         }
         let weak = outcomes.filter { $0.snr == 3 }
         let wrongRate = Double(weak.filter(\.wrongName).count) / Double(weak.count)
-        print(String(format: "accuracyMatrix: wrong names at 3 dB: %d of %d (%.1f%%)", weak.filter(\.wrongName).count,
+        print(String(format: "%@: wrong names at 3 dB: %d of %d (%.1f%%)", test, weak.filter(\.wrongName).count,
                      weak.count, 100 * wrongRate))
         #expect(wrongRate <= 0.02, "wrong names at 3 dB: \(wrongRate)")
     }
