@@ -6,7 +6,7 @@ import Testing
 ///
 /// `SUBFLOOR_SIGNALID_MAKE_CLIPS=1` cuts the clips and spectra from the owner's recordings,
 /// `SUBFLOOR_SIGNALID_BASELINE=1` prints the score over every point, and `SUBFLOOR_SIGNALID_REAL=1` runs the points
-/// through the 1 MS/s read on the recordings themselves. `Fixtures/Real/truth_analysis.py` repeats the hand truth.
+/// through the 1 MS/s read on the recordings themselves and asserts the held-out targets there. `Fixtures/Real/truth_analysis.py` repeats the hand truth.
 @Suite(.serialized) struct RealCorpusTests {
     static let environment = ProcessInfo.processInfo.environment
 
@@ -63,10 +63,61 @@ import Testing
         try Self.printScore("baseline", parts: CorpusPart.allCases) { RealCorpus.hover($0, $1) }
     }
 
-    /// The same points through the 1 MS/s read, on the recordings themselves.
+    /// The targets on the held-out part, which is only ever scored, through the hover's path on clips. By default at
+    /// most 2 points per truth; `SUBFLOOR_SIGNALID_MATRIX=1` asserts over all of them. `fullRecordings` asserts the
+    /// same targets at the capture's own rate. The rows grow as the tasks that meet them land.
+    @Test func heldOutTargets() throws {
+        let held = try RealCorpus.points(.heldOut).filter { Self.heldOutTruths.contains($0.truth) }
+        let points = Sweep.full ? held : Self.subset(held, perTruth: 2)
+        let score = try RealCorpus.score(points: points) { clip, point in
+            let id = RealCorpus.hover(clip, point)
+            Self.expectHeldOut(id, point, "clip path")
+            return id
+        }
+        Self.expectTargets(score, "clip path")
+    }
+
+    /// The truths `heldOutTargets` holds to their targets so far.
+    static let heldOutTruths: Set<String> = ["none"]
+    /// The share right each truth must reach.
+    static let targets = ["none": 0.95]
+    /// No answer on an empty point may be wider than this.
+    static let widestEmptyAnswerHz = 100_000.0
+
+    /// At most `perTruth` points of each truth, spread over its points in manifest order.
+    static func subset(_ points: [CorpusPoint], perTruth: Int) -> [CorpusPoint] {
+        Dictionary(grouping: points, by: \.truth).values.flatMap { group -> [CorpusPoint] in
+            let step = max(1, group.count / perTruth)
+            return stride(from: 0, to: group.count, by: step).prefix(perTruth).map { group[$0] }
+        }
+    }
+
+    static func expectHeldOut(_ id: SignalIdentity, _ point: CorpusPoint, _ path: String) {
+        if point.truth == "none" {
+            #expect(id.measurement.occupiedBandwidthHz <= widestEmptyAnswerHz,
+                    "\(path): empty point \(point.atHz) Hz: \(id.label)")
+        }
+    }
+
+    static func expectTargets(_ score: [String: (right: Int, total: Int)], _ path: String) {
+        for (truth, target) in targets {
+            guard let s = score[truth] else {
+                Issue.record("\(path): nothing scored for \(truth)")
+                continue
+            }
+            #expect(Double(s.right) >= target * Double(s.total), "\(path): \(truth) \(s.right)/\(s.total)")
+        }
+    }
+
+    /// The same points through the capture's own read, on the recordings themselves: the owner's 1 MS/s, which the
+    /// clips' 62.5 kS/s must not hide. Prints every part's score and asserts the held-out targets. Every empty point;
+    /// `SUBFLOOR_SIGNALID_REAL_POINTS=n` keeps the first n points of each other truth, per part (the whole run is about
+    /// 30 minutes in a debug build).
     @Test(.enabled(if: environment["SUBFLOOR_SIGNALID_REAL"] == "1")) func fullRecordings() throws {
         let manifest = try RealCorpus.manifest()
-        try Self.printScore("fullRecordings", parts: CorpusPart.allCases) { clip, point in
+        let allowed = Self.environment["SUBFLOOR_SIGNALID_REAL_POINTS"].flatMap(Int.init)
+        var kept: [String: Int] = [:]
+        let identify = { (clip: CorpusClip, point: CorpusPoint) -> SignalIdentity in
             guard let recording = manifest.recordings.first(where: { $0.clips.contains { $0.name == clip.name } }),
                   let entry = recording.clips.first(where: { $0.name == clip.name }) else {
                 return SignalIdentity(measurement: SignalMeasurement(), note: "no recording")
@@ -76,6 +127,41 @@ import Testing
                                     spectrumDb: clip.captureSpectrumDb) { seconds in
                 (try? RealCorpus.readRecording(recording.file, seconds: max(0, end - seconds)..<end)) ?? []
             }
+        }
+        func trimmed(_ part: CorpusPart) throws -> [CorpusPoint] {
+            try RealCorpus.points(part).filter { point in
+                guard let allowed, point.truth != "none" else { return true }
+                let key = "\(part) \(point.truth)"
+                kept[key, default: 0] += 1
+                return kept[key]! <= allowed
+            }
+        }
+        for part in CorpusPart.allCases {
+            let points = try trimmed(part)
+            var answers: [String: [String: Int]] = [:]
+            var wrong: [String] = []
+            let score = try RealCorpus.score(points: points) { clip, point in
+                let id = identify(clip, point)
+                answers[point.truth, default: [:]][Self.shortLabel(id), default: 0] += 1
+                if RealCorpus.isWrongName(id, point) {
+                    wrong.append("\(point.truth) in \(point.clip) at \(point.atHz) Hz, \(point.endSeconds) s: \(id.label)")
+                }
+                if part == .heldOut { Self.expectHeldOut(id, point, "1 MS/s") }
+                return id
+            }
+            for truth in score.keys.sorted() {
+                let s = score[truth]!
+                print(String(format: "fullRecordings %@ %@: %d/%d right (%.0f%%)", part.rawValue, truth, s.right, s.total,
+                             100 * Double(s.right) / Double(max(1, s.total))))
+            }
+            for truth in answers.keys.sorted() {
+                let top = answers[truth]!.sorted { ($0.value, $1.key) > ($1.value, $0.key) }.prefix(6)
+                    .map { "\($0.key) ×\($0.value)" }
+                print("fullRecordings \(part.rawValue) \(truth) answers: \(top.joined(separator: "; "))")
+            }
+            print("fullRecordings \(part.rawValue) wrong names at 0.7 or more: \(wrong.count)")
+            for line in wrong.prefix(20) { print("fullRecordings wrong: \(line)") }
+            if part == .heldOut { Self.expectTargets(score, "1 MS/s") }
         }
     }
 

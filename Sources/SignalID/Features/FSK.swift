@@ -113,8 +113,8 @@ struct FSKFeatures {
             let top = multiple == 1 ? hi : min(hi, rate / (4 * Double(2 * half + 1)))
             let a = max(1, half)
             let inside = segments.compactMap { s -> Range<Int>? in
-                let r = max(s.lowerBound, a + lag)..<min(s.upperBound, n - a)
-                return r.count >= 64 ? r : nil
+                let start = max(s.lowerBound, a + lag), end = min(s.upperBound, n - a)
+                return end - start >= 64 ? start..<end : nil
             }
             guard let longest = inside.map(\.count).max() else { continue }
             let bottom = max(lo, 8 * rate / Double(longest))

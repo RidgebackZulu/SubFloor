@@ -193,10 +193,24 @@ public enum SignalIdentifier {
     /// The window the "Too weak" SNR is taken over when no extent is found (an SSB channel).
     static let defaultWindowHz = 2500.0
     static let searchBins = 4
-    /// The read's own spectra, coarse then fine, when the app's shows no extent.
-    static let spectrumBinHz = [12.0, 3.0]
+    /// The neighbourhood looked at around the point (`neighbourhoodMap`), and the share of a capture that counts:
+    /// its very edges are filter skirts.
     static let localWindowHz = 48_000.0
-    static let localCaptureFactor = 1.5
+    static let usableCaptureShare = 0.9
+    /// The map's resolutions. A frame 125 ms long sees FT8's tones (160 ms each) one at a time; a trace 50 Hz wide spans
+    /// several of its 8 Hz bins, and a 3 s read makes 47 rows: enough to average noise down to about ±0.7 dB in a bin.
+    static let mapBinHz = 8.0
+    static let mapHopSeconds = 0.0625
+    /// How far beyond what `TraceFinder` saw a measurement may look, for a narrow signal's skirts.
+    static let seedRoomHz = 60.0
+    static let seedRoomShare = 0.3
+    /// Energy over the noise across the default window that counts as too weak to identify (`tooWeak`).
+    static let weakSNRDb = -4.0...6.0
+    /// The spectrum looked at for a very wide signal when the app has none: bins of about 500 Hz.
+    static func wideSpectrum(_ iq: [Float], sampleRate: Double) -> [Float] {
+        let size = spectrumSize(sampleRate: sampleRate, binHz: 500)
+        return PowerSpectrum.average(iq, size: size, hop: size / 4)
+    }
 
     /// Names `m`, measured at `rfHz` (display Hz), from the mode table.
     public static func identify(_ m: SignalMeasurement, rfHz: Double) -> SignalIdentity {
@@ -301,10 +315,12 @@ public enum SignalIdentifier {
     }
 
     /// The whole identification at `atHz` (display Hz) in a capture centred on `captureCenterHz`:
-    /// - the signal's extent from `spectrumDb` (an averaged spectrum of the capture, FFT-shifted; worked out
-    ///   from the IQ at about 12 Hz a bin, then 3, when nil or when it shows nothing there), unless `bandwidthHz` (an agent's)
-    ///   gives it; none gives "Too weak to identify (SNR n dB)" when the default window holds energy over the
-    ///   local noise, "No signal" when not;
+    /// - where to measure: `bandwidthHz` (an agent's), honoured as it is; otherwise what the read shows around the point
+    ///   (`neighbourhoodMap`, `TraceFinder`): the area the point lies in, or a trace within `pointRadiusHz` of it, whose
+    ///   extent the measurement stays inside (`SignalMeasurer.Ceiling`). Nothing further out is looked for;
+    /// - a very wide signal the neighbourhood can't see the edges of, only on positive evidence (`WideOccupancy`) in
+    ///   `spectrumDb` (an averaged spectrum of the capture, FFT-shifted; worked out from the IQ when nil);
+    /// - nothing there gives "Too weak to identify (SNR n dB)" or "No signal" (`tooWeak`);
     /// - the newest 3 s measured (`SignalMeasurer`) and named (`identify(_:rfHz:)`); under 1 s of IQ is "Too soon
     ///   after tuning — try again";
     /// - when the slow-signal rules apply and `longer` is given, it is called (up to 16 s of IQ, ending where
@@ -312,11 +328,12 @@ public enum SignalIdentifier {
     ///   longest transmission in the read. A shorter read than asked for is used, and said in `note`. The longer
     ///   read's answer replaces the first's, a name the first gave included.
     ///
-    /// A cancelled task stops between stages (the extent, the measurement, each step of the longer read) and gets
+    /// A cancelled task stops between stages (the neighbourhood, the measurement, each step of the longer read) and gets
     /// `cancelledNote` with what was measured so far: an answer nobody is waiting for.
     public static func identify(iq: [Float], sampleRate: Double, captureCenterHz: Double, atHz: Double,
                                 bandwidthHz: Double?, spectrumDb: [Float]?,
-                                longer: (() -> (iq: [Float], seconds: Double)?)?) -> SignalIdentity {
+                                longer: (() -> (iq: [Float], seconds: Double)?)?,
+                                pointRadiusHz: Double = 60) -> SignalIdentity {
         let available = sampleRate > 0 ? Double(iq.count / 2) / sampleRate : 0
         guard available >= minimumSeconds else {
             return SignalIdentity(measurement: SignalMeasurement(family: .noise, seconds: available),
@@ -328,33 +345,32 @@ public enum SignalIdentifier {
         let first = iq.count <= firstFloats ? iq : Array(iq.suffix(firstFloats))
         let pointHz = atHz - captureCenterHz
 
-        // The seed: an agent's bandwidth, or the extent.
-        var seed: (offsetHz: Double, widthHz: Double)
+        // The seed: an agent's bandwidth, or what the neighbourhood shows at the point.
+        let seed: (offsetHz: Double, widthHz: Double)
+        // How wide the signal itself shows, where the seed's width holds more than that.
+        var coreHz: Double?
+        var ceiling = SignalMeasurer.Ceiling.none
         if let bandwidthHz {
             seed = (pointHz, bandwidthHz)
+            ceiling = .given
         } else {
-            // In a wide capture, first the point's own neighbourhood (`localExtent`); then the app's spectrum, then
-            // the read's own at about 12 Hz a bin, then at about 3 Hz (a narrow signal such as WSPR stands out only
-            // there; a wide one pointed between its tones only at the coarser).
-            var found = localExtent(first, sampleRate: sampleRate, pointHz: pointHz)
+            let map = neighbourhoodMap(first, sampleRate: sampleRate, pointHz: pointHz)
             if Task.isCancelled { return cancelled(SignalMeasurement(offsetHz: pointHz, seconds: seconds)) }
-            if found == nil { found = spectrumDb.flatMap { extent($0, sampleRate: sampleRate, pointHz: pointHz) } }
-            var spectra: [[Float]] = []
-            for binHz in spectrumBinHz where found == nil {
-                if Task.isCancelled { return cancelled(SignalMeasurement(offsetHz: pointHz, seconds: seconds)) }
-                let size = spectrumSize(sampleRate: sampleRate, binHz: binHz)
-                guard spectra.last?.count != size else { continue }
-                spectra.append(PowerSpectrum.average(first, size: size, hop: size / 4))
-                found = extent(spectra.last!, sampleRate: sampleRate, pointHz: pointHz)
+            let view = TraceFinder.find(map)
+            if let found = located(view, map: map, pointHz: pointHz, radiusHz: pointRadiusHz) {
+                seed = (found.offsetHz, found.widthHz)
+                coreHz = found.coreHz
+                ceiling = found.ceiling
+            } else if let wide = WideOccupancy.find(spectrumDb ?? wideSpectrum(first, sampleRate: sampleRate), iq: first,
+                                                    sampleRate: sampleRate, pointHz: pointHz) {
+                seed = wide
+            } else {
+                return tooWeak(map, pointHz: pointHz, seconds: seconds)
             }
-            guard let found else {
-                return tooWeak(spectrumDb ?? spectra[0], sampleRate: sampleRate, pointHz: pointHz, seconds: seconds)
-            }
-            seed = found
         }
 
         let m = SignalMeasurer.measure(first, sampleRate: sampleRate, offsetHz: seed.offsetHz,
-                                       bandwidthHz: seed.widthHz, seconds: seconds)
+                                       bandwidthHz: seed.widthHz, seconds: seconds, ceiling: ceiling)
         if Task.isCancelled { return cancelled(m) }
         let identity = identify(m, rfHz: captureCenterHz + m.offsetHz)
         guard identity.needsLongerRead, !Task.isCancelled, let read = longer?(), read.iq.count >= 2 else {
@@ -373,14 +389,14 @@ public enum SignalIdentifier {
             ModeTable.row($0.name)?.slotted == true
         } || (m.family == .unknown && ModeTable.rows.contains { $0.slotted && $0.hinted(captureCenterHz + m.offsetHz) })
         if slotted, let span = Transmissions.longest(long, sampleRate: sampleRate, offsetHz: m.offsetHz,
-                                                      bandwidthHz: max(m.occupiedBandwidthHz, seed.widthHz)) {
+                                                      bandwidthHz: coreHz ?? max(m.occupiedBandwidthHz, seed.widthHz)) {
             long = Array(long[(2 * span.lowerBound)..<(2 * span.upperBound)])
             readSeconds = Double(span.count) / sampleRate
             notes.append(String(format: "Measured over its longest transmission, %.1f s", readSeconds))
         }
         if Task.isCancelled { return cancelled(m) }
         let slow = SignalMeasurer.measure(long, sampleRate: sampleRate, offsetHz: seed.offsetHz,
-                                          bandwidthHz: seed.widthHz, seconds: readSeconds)
+                                          bandwidthHz: seed.widthHz, seconds: readSeconds, ceiling: ceiling)
         if Task.isCancelled { return cancelled(slow) }
         var refined = identify(slow, rfHz: captureCenterHz + slow.offsetHz)
         // The longer read has been made; only a shorter one than asked for leaves a need that more IQ could meet.
@@ -416,61 +432,200 @@ public enum SignalIdentifier {
                 Double(e.upperBin - e.lowerBin + 1) * binHz)
     }
 
-    /// The extent in a `localWindowHz` view around the point, for a capture over 1.5 times as wide: there the noise
-    /// is the point's own neighbourhood's. Across a whole capture a receiver's IF filter leaves the edges well under
-    /// the middle, and a whole-capture percentile takes the passband's own noise for a signal (the owner's 1.25 MS/s
-    /// IQ recording read as one "signal" 820 kHz wide wherever it was pointed). Nil when the capture is narrower,
-    /// or when the extent reaches the view's edge (a wider signal: the whole capture's spectra find it).
-    static func localExtent(_ iq: [Float], sampleRate: Double, pointHz: Double) -> (offsetHz: Double, widthHz: Double)? {
-        guard sampleRate >= localCaptureFactor * localWindowHz else { return nil }
-        let channel = Channel.extract(iq, sampleRate: sampleRate, offsetHz: pointHz, bandwidthHz: localWindowHz,
-                                      sharp: false)
-        for binHz in spectrumBinHz {
-            var size = 1024
-            while size < 65_536 && channel.rate / Double(size) > binHz { size *= 2 }
-            let full = PowerSpectrum.average(channel.samples, size: size, hop: size / 4)
-            let bin = channel.rate / Double(size)
-            let half = Int(0.45 * localWindowHz / bin)
-            let view = Array(full[(size / 2 - half)...(size / 2 + half)])
-            guard let e = Extent.find(spectrumDb: view, binHz: bin, nearBin: half, searchBins: searchBins) else { continue }
-            guard e.lowerBin > 2 && e.upperBin < view.count - 3 else { return nil }
-            return (pointHz + (Double(e.lowerBin + e.upperBin) / 2 - Double(half)) * bin,
-                    Double(e.upperBin - e.lowerBin + 1) * bin)
-        }
-        return nil
+    /// What `TraceFinder` reads around `pointHz`: the map of ±`localWindowHz` / 2 of it, as far as the capture goes, cut
+    /// to a channel first so a capture's rate makes no difference. The channel's rate only has to hold that span: its
+    /// filter passes twice what it is asked for before anything aliasing onto it matters (half of `localWindowHz` asked
+    /// for, 125 kS/s from 1 MS/s).
+    static func neighbourhoodMap(_ iq: [Float], sampleRate: Double, pointHz: Double) -> TimeFrequencyMap {
+        let edge = usableCaptureShare * sampleRate / 2
+        let lower = max(pointHz - localWindowHz / 2, -edge), upper = min(pointHz + localWindowHz / 2, edge)
+        let width = max(upper - lower, 0), centre = (lower + upper) / 2
+        let channel = Channel.extract(iq, sampleRate: sampleRate, offsetHz: centre, bandwidthHz: width / 2, sharp: false)
+        return TimeFrequencyMap.build(channel.samples, rate: channel.rate, centerOffsetHz: centre, binHz: mapBinHz,
+                                      hopSeconds: mapHopSeconds, halfSpanHz: width / 2)
     }
 
-    /// The FFT size for bins of about `binHz` (1024…16 384); the spectra are averaged over 75%-overlapped frames.
+    /// Where to measure for the point: the area it lies in, or the nearest trace within `radiusHz` (the strongest of
+    /// equals), with a neighbour whose power takes turns with it (RTTY's other tone). Nil when there is neither: nothing
+    /// further out is looked for.
+    ///
+    /// The extent keeps some room each side (`seedRoomHz` or `seedRoomShare` of its width), for skirts the read's
+    /// average can't show and the measurement's width settles on, but no more than halfway to whatever is next to it.
+    /// `coreHz` is the width without that room. A strong line with sidebands in view (`TraceFinder.hasSidebands`) has
+    /// shown it is more than the line: its extent is the sidebands', and only a start.
+    static func located(_ view: NeighbourhoodView, map: TimeFrequencyMap, pointHz: Double,
+                        radiusHz: Double) -> (offsetHz: Double, widthHz: Double, coreHz: Double,
+                                              ceiling: SignalMeasurer.Ceiling)? {
+        func distance(_ t: SignalTrace) -> Double { max(0, t.lowerHz - pointHz, pointHz - t.upperHz) }
+        var extent: (lower: Double, upper: Double)
+        var ceiling = SignalMeasurer.Ceiling.found(mayBeLine: true)
+        if let area = view.areas.first(where: { $0.lowerHz...$0.upperHz ~= pointHz }) {
+            extent = (area.lowerHz, area.upperHz)
+        } else {
+            let near = view.traces.filter { distance($0) <= radiusHz }
+            guard let trace = near.min(by: { (distance($0), -$0.snrDb) < (distance($1), -$1.snrDb) }) else { return nil }
+            extent = (trace.lowerHz, trace.upperHz)
+            let isLine = trace.upperHz - trace.lowerHz <= TraceFinder.steadyMaxHz
+            ceiling = .found(mayBeLine: isLine)
+            if isLine && TraceFinder.hasSidebands(trace, view) {
+                // On the read's average, out to where they stay over the noise on both sides.
+                let db = map.meanPower().map { 10 * log10(max($0, 1e-6)) }
+                let near = map.bin((trace.lowerHz + trace.upperHz) / 2)
+                if let wide = Extent.find(spectrumDb: db, binHz: map.binHz, nearBin: near, searchBins: searchBins) {
+                    return (map.offsetHz(Double(wide.lowerBin + wide.upperBin) / 2),
+                            Double(wide.upperBin - wide.lowerBin + 1) * map.binHz,
+                            Double(wide.upperBin - wide.lowerBin + 1) * map.binHz, .none)
+                }
+            }
+            // Its neighbours either side, when their power runs against its own: its other tones.
+            let below = view.traces.filter { $0.upperHz <= trace.lowerHz }.max { $0.upperHz < $1.upperHz }
+            let above = view.traces.filter { $0.lowerHz >= trace.upperHz }.min { $0.lowerHz < $1.lowerHz }
+            for other in [below, above].compactMap({ $0 })
+            where max(other.lowerHz - trace.upperHz, trace.lowerHz - other.upperHz) <= TraceFinder.turnsReachHz
+                && TraceFinder.takeTurns(trace, other, map: map) {
+                extent = (min(extent.lower, other.lowerHz), max(extent.upper, other.upperHz))
+                ceiling = .found(mayBeLine: false)
+            }
+        }
+        let room = max(seedRoomHz, seedRoomShare * (extent.upper - extent.lower))
+        var lower = extent.lower - room, upper = extent.upper + room
+        let others = view.traces.map { ($0.lowerHz, $0.upperHz) } + view.areas.map { ($0.lowerHz, $0.upperHz) }
+        for (_, high) in others where high < extent.lower { lower = max(lower, (high + extent.lower) / 2) }
+        for (low, _) in others where low > extent.upper { upper = min(upper, (low + extent.upper) / 2) }
+        return ((lower + upper) / 2, upper - lower, extent.upper - extent.lower, ceiling)
+    }
+
+    /// The FFT size for bins of about `binHz` (1024…16 384).
     static func spectrumSize(sampleRate: Double, binHz: Double) -> Int {
         var size = 1024
         while size < 16_384 && sampleRate / Double(size) > binHz { size *= 2 }
         return size
     }
 
-    /// No extent: "Too weak to identify (SNR n dB)" when the default window around the point holds energy over the
-    /// local noise (the median of the bins within ±10 windows, the window's own left out), "No signal" otherwise.
-    static func tooWeak(_ db: [Float], sampleRate: Double, pointHz: Double, seconds: Double) -> SignalIdentity {
-        let size = db.count
-        let binHz = sampleRate / Double(size)
-        let centre = size / 2 + Int((pointHz / binHz).rounded())
-        let half = max(1, Int(defaultWindowHz / 2 / binHz))
-        let window = max(0, centre - half)...min(size - 1, centre + half)
-        let power = db.map { pow(10, Double($0) / 10) }
-        let around = max(0, centre - 10 * half)...min(size - 1, centre + 10 * half)
-        let outside = around.filter { !window.contains($0) }.map { power[$0] }.sorted()
+    /// Nothing at the point: "Too weak to identify (SNR n dB)" when the default window around it holds energy over the
+    /// noise beside it (the median of the map's bins within ±10 windows, the window's own left out), in an averaged
+    /// spectrum (the map's rows by their own noise levels), "No signal" otherwise. The energy must come to something
+    /// a measurement can't quite read. Under `weakSNRDb` it is the band's own ripple, a real band's standing a dB or
+    /// two proud in places. Over it, something clear stands in the window but not at the point, and that isn't weak: a
+    /// strong signal beside an empty frequency doesn't make it a weak one.
+    static func tooWeak(_ map: TimeFrequencyMap, pointHz: Double, seconds: Double) -> SignalIdentity {
         var result = SignalMeasurement(offsetHz: pointHz, family: .noise, seconds: seconds)
-        guard !outside.isEmpty, !window.isEmpty else { return SignalIdentity(measurement: result, note: noSignalNote) }
+        let none = SignalIdentity(measurement: result, note: noSignalNote)
+        guard map.rows > 0, map.bins > 0 else { return none }
+        let power = map.meanPower(levelWeighted: true).map(Double.init)
+        let centre = map.bin(pointHz), half = max(1, Int(defaultWindowHz / 2 / map.binHz))
+        guard centre + half >= 0, centre - half < map.bins else { return none }
+        let window = max(0, centre - half)...min(map.bins - 1, centre + half)
+        let around = max(0, centre - 10 * half)...min(map.bins - 1, centre + 10 * half)
+        let outside = around.filter { !window.contains($0) }.map { power[$0] }.sorted()
+        guard !outside.isEmpty else { return none }
         let noise = outside[outside.count / 2]
         // The noise bins' own scatter, for the window's mean (its bins share leakage: half as many independent).
         let mean = outside.reduce(0, +) / Double(outside.count)
         let scatter = (outside.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Double(outside.count)).squareRoot()
         let excess = window.reduce(0) { $0 + power[$1] - noise }
-        let threshold = 3 * scatter * (2 * Double(window.count)).squareRoot()
-        guard noise > 0, excess > threshold else { return SignalIdentity(measurement: result, note: noSignalNote) }
+        guard noise > 0, excess > 3 * scatter * (2 * Double(window.count)).squareRoot() else { return none }
         let snr = 10 * log10(excess / (noise * Double(window.count)))
+        guard weakSNRDb ~= snr else { return none }
         result.snrDb = snr
         result.family = .unknown   // energy there, too weak to measure
         return SignalIdentity(measurement: result, note: String(format: "Too weak to identify (SNR %.0f dB)", snr))
+    }
+}
+
+/// Positive evidence for a signal too wide for the neighbourhood to show its edges. A receiver's own passband fills a
+/// capture with noise and looks like one signal hundreds of kHz wide, so being above the floor says nothing. Around the
+/// point the capture's spectrum (smoothed over 0.5% of it) makes a stretch within 6 dB of the point's level, at least
+/// 48 kHz wide, and one of these must hold:
+/// - **flat-topped with sharp edges:** it falls at least 15 dB within 2% of its width on each side, or on one if it
+///   runs off the capture on the other (DAB at a good SNR). A real passband takes many times that to fall 10 dB;
+/// - **a constant envelope:** the channel over everything above the floor there holds a signal whose power doesn't
+///   vary like noise (E|s|⁴/(E|s|²)² under 1.6, where noise gives 2) and the stretch holds at least a quarter of its
+///   power, so it isn't just a strong carrier elsewhere in the channel (WFM, whose bell-shaped spectrum never has sharp
+///   edges);
+/// - **a cyclic prefix:** edges of at least 6 dB within that 2%, not enough on their own (DAB at 10 dB has only 10 dB
+///   to fall), with OFDM's prefix seen in the channel.
+enum WideOccupancy {
+    static let flatDb = 6.0
+    static let fallDb = 15.0
+    static let edgeShare = 0.02
+    static let minWidthHz = 48_000.0
+    static let smoothingShare = 400
+    static let captureEdgeShare = 100
+    static let floorAboveDb = 3.0
+    static let minContrastDb = 6.0
+    static let maxConstantM4 = 1.6
+    static let minStretchShare = 0.25
+    static let shallowFallDb = 6.0
+    /// How much of the newest IQ the envelope and the prefix are read from.
+    static let evidenceSeconds = 0.25
+
+    static func find(_ db: [Float], iq: [Float], sampleRate: Double,
+                     pointHz: Double) -> (offsetHz: Double, widthHz: Double)? {
+        let n = db.count
+        guard n >= 64, sampleRate > minWidthHz else { return nil }
+        let binHz = sampleRate / Double(n)
+        let near = n / 2 + Int((pointHz / binHz).rounded())
+        guard near >= 0, near < n else { return nil }
+        let power = TraceFinder.smoothed(db.map { Float(pow(10, Double($0) / 10)) }, reach: max(1, n / smoothingShare))
+        let level = power.map { 10 * log10(max(Double($0), 1e-30)) }
+        let reach = max(2, Int(SignalIdentifier.localWindowHz / 2 / binHz))
+        let around = level[max(0, near - reach)...min(n - 1, near + reach)].sorted()
+        let top = around[around.count / 2]
+        func stretch(above threshold: Double) -> ClosedRange<Int> {
+            var low = near, high = near
+            while low > 0 && level[low - 1] >= threshold { low -= 1 }
+            while high < n - 1 && level[high + 1] >= threshold { high += 1 }
+            return low...high
+        }
+        let flat = stretch(above: top - flatDb)
+        guard Double(flat.count) * binHz >= minWidthHz else { return nil }
+        func answer(_ bins: ClosedRange<Int>) -> (offsetHz: Double, widthHz: Double) {
+            ((Double(bins.lowerBound + bins.upperBound) / 2 - Double(n / 2)) * binHz, Double(bins.count) * binHz)
+        }
+
+        // The edges: the level a step past each, where the capture goes on that far.
+        let step = max(1, Int(edgeShare * Double(flat.count)))
+        let margin = n / captureEdgeShare
+        let offLow = flat.lowerBound <= margin, offHigh = flat.upperBound >= n - 1 - margin
+        func falls(_ k: Int, by db: Double) -> Bool { k >= 0 && k < n && level[k] <= top - db }
+        func edges(fall db: Double) -> Bool {
+            !(offLow && offHigh) && (offLow || falls(flat.lowerBound - step, by: db))
+                && (offHigh || falls(flat.upperBound + step, by: db))
+        }
+        if edges(fall: fallDb) { return answer(flat) }
+
+        // What the channel holds.
+        let floor = level.sorted()[n / 20]
+        guard top - floor >= minContrastDb else { return nil }
+        let frames = min(iq.count / 2, Int(evidenceSeconds * sampleRate))
+        guard frames > 0 else { return nil }
+        let recent = iq.count / 2 == frames ? iq : Array(iq.suffix(2 * frames))
+        if edges(fall: shallowFallDb) {
+            let (centre, width) = answer(flat)
+            let channel = Channel.extract(recent, sampleRate: sampleRate, offsetHz: centre, bandwidthHz: width)
+            if OFDMFeatures(channel.samples, rate: channel.rate, occupiedHz: width)?.isOFDM == true { return answer(flat) }
+        }
+        let whole = stretch(above: floor + floorAboveDb)
+        let inFlat = flat.reduce(0.0) { $0 + Double(power[$1]) }, inWhole = whole.reduce(0.0) { $0 + Double(power[$1]) }
+        guard inFlat >= minStretchShare * inWhole else { return nil }
+        let (centre, width) = answer(whole)
+        let channel = Channel.extract(recent, sampleRate: sampleRate, offsetHz: centre, bandwidthHz: width)
+        guard momentRatio(channel.samples) < maxConstantM4 else { return nil }
+        return answer(whole)
+    }
+
+    /// E|s|⁴ / (E|s|²)².
+    static func momentRatio(_ z: [DSPComplex]) -> Double {
+        var m2 = 0.0, m4 = 0.0
+        for s in z {
+            let p = Double(s.real * s.real + s.imag * s.imag)
+            m2 += p
+            m4 += p * p
+        }
+        guard !z.isEmpty, m2 > 0 else { return .infinity }
+        m2 /= Double(z.count)
+        return m4 / Double(z.count) / (m2 * m2)
     }
 }
 

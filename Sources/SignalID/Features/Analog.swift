@@ -604,7 +604,11 @@ struct SidebandFeatures {
         let mirror: ClosedRange<Int> = tiltDb < 0
             ? max(0, occupied.lowerBound - width)...max(0, occupied.lowerBound - 1)
             : min(view.count - 1, occupied.upperBound + 1)...min(view.count - 1, occupied.upperBound + width)
-        let outside = view.signal(mirror).reduce(0, +)
+        // The other sideband would be as broad as this one: a neighbour's narrow line there isn't it (a tenth of the
+        // bins, the strongest, left out).
+        let beside = view.signal(mirror).sorted()
+        let kept = beside.prefix(max(1, beside.count * 9 / 10))
+        let outside = kept.reduce(0, +) * Double(beside.count) / Double(kept.count)
         let uncertainty = 3 * view.spread * view.noise * Double(mirror.count).squareRoot()
         asymmetryDb = 10 * log10(max(inside, 1e-30) / max(outside, uncertainty, 1e-30))
     }

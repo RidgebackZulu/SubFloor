@@ -6,9 +6,9 @@ import Foundation
 /// parameters. Pure and thread-safe.
 ///
 /// `iq` is interleaved IQ (the IQ snapshot format); the newest `seconds` of it are analysed. `offsetHz` and
-/// `bandwidthHz` place the signal relative to the capture centre (from `Extent.find` or an agent).
+/// `bandwidthHz` place the signal relative to the capture centre (from `TraceFinder` or an agent).
 ///
-/// **Window.** That extent is only a seed: at 10 dB an AM signal's extent is just its carrier, and an FM
+/// **Window.** Unless it comes with a `Ceiling`, that extent is only a seed: at 10 dB an AM signal's extent is just its carrier, and an FM
 /// signal's skirts lie under the noise. The measurer cuts a window 3 × the seed wide (at least 40 kHz: the
 /// widest AM it names with room for noise beside neighbours 9 kHz either side; at most 80% of the capture
 /// and not past its edge) and finds the signal's extent there:
@@ -175,16 +175,35 @@ public enum SignalMeasurer {
     static let firstViewFinest = 8.0
     static let refinedFinest = 4.0
 
+    /// What the seed's width means.
+    enum Ceiling: Equatable {
+        /// Only a start: the extent grows from it.
+        case none
+        /// An agent gave it: honoured as it is, the signal's extent never leaving it.
+        case given
+        /// `TraceFinder` bounded it: the extent doesn't grow along the spectrum past it, into whatever lies next to
+        /// it. Only what shows it is one signal takes it further: an FSK's other tone keyed in turn, and when
+        /// `mayBeLine` (an area, or a trace as narrow as a line, not a band of tones standing tall over its
+        /// neighbours' gaps), a carrier's symmetric sidebands or an FM tone's lines.
+        case found(mayBeLine: Bool)
+    }
+
     public static func measure(_ iq: [Float], sampleRate: Double, offsetHz: Double, bandwidthHz: Double,
                                seconds: Double) -> SignalMeasurement {
         measure(iq, sampleRate: sampleRate, offsetHz: offsetHz, bandwidthHz: bandwidthHz, seconds: seconds,
                 wholeView: false)
     }
 
+    static func measure(_ iq: [Float], sampleRate: Double, offsetHz: Double, bandwidthHz: Double, seconds: Double,
+                        ceiling: Ceiling) -> SignalMeasurement {
+        measure(iq, sampleRate: sampleRate, offsetHz: offsetHz, bandwidthHz: bandwidthHz, seconds: seconds,
+                wholeView: false, ceiling: ceiling)
+    }
+
     /// `wholeView`: the window is the capture's middle 90% instead of one placed on the seed (the second try for
     /// a signal that reaches the edge of a window the capture limits).
     static func measure(_ iq: [Float], sampleRate: Double, offsetHz: Double, bandwidthHz: Double,
-                        seconds: Double, wholeView: Bool) -> SignalMeasurement {
+                        seconds: Double, wholeView: Bool, ceiling: Ceiling = .none) -> SignalMeasurement {
         let available = iq.count / 2
         let n = min(available, Int((max(seconds, 0) * sampleRate).rounded()))
         var result = SignalMeasurement(offsetHz: offsetHz, seconds: sampleRate > 0 ? Double(n) / sampleRate : 0)
@@ -220,11 +239,11 @@ public enum SignalMeasurer {
         coarse.estimateNoise(excluding: widened(seedBins, by: 0.1, in: coarse))
         var found: Region?
         for _ in 0..<3 {
-            found = region(coarse, seed: seedBins)
+            found = region(coarse, seed: seedBins, ceiling: ceiling)
             guard let r = found else { break }
             coarse.estimateNoise(excluding: widened(r.bins, by: 0.1, in: coarse))
         }
-        found = region(coarse, seed: seedBins)
+        found = region(coarse, seed: seedBins, ceiling: ceiling)
         if Task.isCancelled { return cancelled() }
         // The capture limits the window: a signal reaching its edges is wider than the view (ruling R5). It is
         // measured again over the whole view first: there it reaches the capture's own edge, and whatever noise
@@ -236,7 +255,7 @@ public enum SignalMeasurer {
         }
         if capped && !wholeView && windowHz < wholeViewFraction * sampleRate && (found.map(reachesEdge) ?? true) {
             return measure(iq, sampleRate: sampleRate, offsetHz: offsetHz, bandwidthHz: bandwidthHz,
-                           seconds: seconds, wholeView: true)
+                           seconds: seconds, wholeView: true, ceiling: ceiling)
         }
         // A view the signal fills edge to edge (DAB in a 1 MS/s capture) shows no noise: nothing stands out of
         // it, or the "noise" found is the signal's own level. OFDM's cyclic prefix still shows, and gives the
@@ -269,14 +288,17 @@ public enum SignalMeasurer {
             result.notes.append("Nothing stands above the noise")
             return result
         }
-        // A line of a comb: the comb is the signal.
-        signalRegion = overComb(coarse, region: signalRegion)
-        // A wideband signal split at a narrow gap (OFDM's empty centre carrier): its other part joins it.
-        signalRegion = bridged(coarse, region: signalRegion)
-        // A wide-shift FSK whose extent took one tone: its twin joins it.
-        if let paired = fskTwin(window, coarse, region: signalRegion) {
-            signalRegion = paired.region
-            result.notes.append(String(format: "Tones %.0f Hz apart keyed in turn: one FSK", paired.separationHz))
+        if ceiling != .given {
+            // A line of a comb: the comb is the signal.
+            signalRegion = overComb(coarse, region: signalRegion)
+            // A wideband signal split at a narrow gap (OFDM's empty centre carrier): its other part joins it. The
+            // finder saw any such gap whole.
+            if ceiling == .none { signalRegion = bridged(coarse, region: signalRegion) }
+            // A wide-shift FSK whose extent took one tone: its twin joins it.
+            if let paired = fskTwin(window, coarse, region: signalRegion, contiguous: ceiling != .none) {
+                signalRegion = paired.region
+                result.notes.append(String(format: "Tones %.0f Hz apart keyed in turn: one FSK", paired.separationHz))
+            }
         }
 
         // The measurement spectrum: about 128 bins across the region the coarse view gave the signal, none finer
@@ -652,7 +674,7 @@ public enum SignalMeasurer {
 
     /// The signal around `seed` in the coarse view (see the type's notes), or nil when nothing there stands
     /// above the noise.
-    static func region(_ view: SpectrumView, seed: ClosedRange<Int>) -> Region? {
+    static func region(_ view: SpectrumView, seed: ClosedRange<Int>, ceiling: Ceiling = .none) -> Region? {
         let smoothing = 2
         let es = view.smoothedExcess(reach: smoothing)
         // Neighbouring bins share leakage and frames overlap: about half as many independent ones.
@@ -662,10 +684,8 @@ public enum SignalMeasurer {
         guard total >= detectSigma * view.spread * (2 * Double(seed.count)).squareRoot(),
               let first = seed.first(where: { es[$0] >= edge }),
               let last = seed.last(where: { es[$0] >= edge }) else { return nil }
-        var lo = first, hi = last
-        while lo > 0 && (es[lo - 1] >= edge || (lo > 1 && es[lo - 2] >= edge)) { lo -= 1 }
-        while hi < view.count - 1 && (es[hi + 1] >= edge || (hi < view.count - 2 && es[hi + 2] >= edge)) { hi += 1 }
-        var bins = lo...hi
+        let lo = first, hi = last
+        var bins = ceiling == .none ? grown(lo...hi, es: es, edge: edge) : lo...hi
         // Up to the next other signal (standing clearly out: 2 × the edge level) beyond a gap, short of its
         // smoothed skirt.
         func room(_ bins: ClosedRange<Int>) -> ClosedRange<Int> {
@@ -676,6 +696,8 @@ public enum SignalMeasurer {
             if b < view.count - 1 { b = max(bins.upperBound, b - smoothing - 1) }
             return a...b
         }
+        if ceiling == .given { return Region(bins: bins, room: bins) }
+        if ceiling == .found(mayBeLine: false) { return Region(bins: bins, room: room(bins)) }
 
         // A carrier line (the seed's own peak): symmetric sidebands about it belong to it.
         let top = seed.clamped(to: bins).max { view.power[$0] < view.power[$1] }!
@@ -741,6 +763,14 @@ public enum SignalMeasurer {
         guard outer >= sidebandStart else { return Region(bins: bins, comb: isComb(view, line: top), room: room(bins)) }
         bins = min(bins.lowerBound, top - outer)...max(bins.upperBound, top + outer)
         return Region(bins: bins, comb: isComb(view, line: top), room: room(bins))
+    }
+
+    /// `bins` grown outwards while the smoothed excess stays at the edge level (gaps of a bin bridged).
+    static func grown(_ bins: ClosedRange<Int>, es: [Double], edge: Double) -> ClosedRange<Int> {
+        var lo = bins.lowerBound, hi = bins.upperBound
+        while lo > 0 && (es[lo - 1] >= edge || (lo > 1 && es[lo - 2] >= edge)) { lo -= 1 }
+        while hi < es.count - 1 && (es[hi + 1] >= edge || (hi < es.count - 2 && es[hi + 2] >= edge)) { hi += 1 }
+        return lo...hi
     }
 
     /// A line with a symmetric pair of components within `combMaxHz`, beyond its skirt (8 bins out or more),
@@ -883,11 +913,14 @@ public enum SignalMeasurer {
     ///   70% of the blocks within a quarter of the separation of either, and 15% at each. Two carriers side by
     ///   side put it between them, or on the stronger.
     /// The pair's region and the tones' separation, or nil.
-    static func fskTwin(_ window: (samples: [DSPComplex], rate: Double), _ coarse: SpectrumView,
-                        region: Region) -> (region: Region, separationHz: Double)? {
+    /// `contiguous`: the region was held to a bound, so the tones are compared by what this one's spectrum shows of
+    /// it (a tone's whole width), not by the bound.
+    static func fskTwin(_ window: (samples: [DSPComplex], rate: Double), _ coarse: SpectrumView, region: Region,
+                        contiguous: Bool = false) -> (region: Region, separationHz: Double)? {
         let es = coarse.smoothedExcess(reach: 2)
         let edge = max(edgeSigma * coarse.spread * (2 / 5.0).squareRoot(), 0.02)
-        let bins = region.bins
+        var bins = region.bins
+        if contiguous { bins = grown(bins, es: es, edge: edge) }
         let peak = bins.map { coarse.power[$0] }.max() ?? 0
         let reach = Int(fskTwinMaxHz / coarse.binHz)
         let end = min(coarse.count - 1, bins.upperBound + reach)

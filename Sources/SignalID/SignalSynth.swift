@@ -254,6 +254,15 @@ public enum SignalSynth {
         return out
     }
 
+    /// `iq` with its level changed by `db` from `atSeconds` on, signal and noise alike: a receiver's gain changing.
+    public static func levelStep(_ iq: [Float], sampleRate: Double, atSeconds: Double, db: Double) -> [Float] {
+        var out = iq
+        let gain = Float(pow(10, db / 20))
+        let start = min(out.count, 2 * max(0, Int((atSeconds * sampleRate).rounded())))
+        for k in start..<out.count { out[k] *= gain }
+        return out
+    }
+
     /// The noise-free signal at unit mean power.
     static func render(_ spec: SynthSpec, sampleRate: Double, seconds: Double, offsetHz: Double = 0, seed: UInt64,
                        impairments: SynthImpairments = .none) -> [Float] {
