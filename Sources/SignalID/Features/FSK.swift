@@ -514,8 +514,8 @@ struct FSKFeatures {
 
 /// The frequency of a stretch of `length` samples: the peak of its spectrum (rectangular window, zero-padded
 /// 8 ×, log-parabola through the peak) within ±`limitHz` of 0 Hz: a steady tone's maximum-likelihood
-/// frequency.
-struct SymbolSpectrum {
+/// frequency. A class, so its FFT setup is made once per symbol length and destroyed with it.
+final class SymbolSpectrum {
     let length: Int
     let size: Int
     let rate: Double
@@ -531,6 +531,8 @@ struct SymbolSpectrum {
         setup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2))!
         reach = min(size / 2 - 2, max(2, Int(limitHz / (rate / Double(size)))))
     }
+
+    deinit { vDSP_destroy_fftsetup(setup) }
 
     func frequency(_ z: [DSPComplex], from: Int) -> Double? {
         var re = [Float](repeating: 0, count: size), im = [Float](repeating: 0, count: size)
@@ -692,7 +694,9 @@ struct ToneMixture {
 /// The audio's spectrum, less its noise, must be band-pass: 5% of its power below f₅ and f₅ at least 0.3 × the
 /// median frequency (an FSK signal's own frequency is a baseband pulse train, strongest near 0 Hz). Then:
 /// - a line standing 15 dB over the bins ±3–4 beside it and holding ≥ 10% of the audio's power is a tone
-///   subcarrier;
+///   subcarrier when it carries its own modulation: its envelope (the band ±10% of its frequency, at least
+///   ±100 Hz) varies, block CV over 2 × what noise alone gives + 0.1 (APT's image: 0.26–0.55; a steady FM
+///   tone: what the noise gives). A steady one is `steadyToneHz`, the modulating tone, not a subcarrier;
 /// - otherwise the band (f₅…f₉₅, half as wide again: about its −20 dB width) is mixed to 0 Hz and measured as
 ///   FSK (`FSKFeatures`): a clean one
 ///   (`isFSK`, its rate line 8 × its continuum) at a rate of at least a twentieth of the band (a few tones,
@@ -704,10 +708,19 @@ struct Subcarrier {
     static let minLineFraction = 0.1
     static let minLineContrast = 8.0
     static let bandWidening = 1.5
+    /// A tone subcarrier's band, for its envelope: ±10% of its frequency, at least ±100 Hz.
+    static let toneBandFraction = 0.2
+    static let minToneBandHz = 200.0
+    /// Its envelope's block CV must exceed what the noise gives (twice) by this to count as modulated.
+    static let minToneModulation = 0.1
 
+    /// The subcarrier's tones (empty for a steady tone).
     var tonesHz: [Double] = []
     var symbolRate: Double?
     var fsk: FSKFeatures?
+    /// A steady tone that is all the audio holds: the modulating tone of an FM test signal, not a subcarrier
+    /// (ruling R15), but it explains discrete frequencies all the same.
+    var steadyToneHz: Double?
 
     /// `noiseDensity(f)` is the noise's two-sided density in the audio at f (Hz² / Hz for a frequency).
     init?(audio: [Float], rate: Double, noiseDensity: (Double) -> Double) {
@@ -740,8 +753,20 @@ struct Subcarrier {
             let beside = (raw[peak - 4] + raw[peak - 3] + raw[peak + 3] + raw[peak + 4]) / 4
             let lobe = (peak - 2...peak + 2).reduce(0) { $0 + signal[$1] }
             if raw[peak] >= beside * pow(10, Self.lineContrastDb / 10) && lobe >= Self.minLineFraction * total {
-                let line = SpectralLine(p.suffix(from: Self.size / 2).map { $0 }, binHz: binHz, at: peak)
-                tonesHz = [line?.hz ?? Double(peak) * binHz]
+                let hz = SpectralLine(p.suffix(from: Self.size / 2).map { $0 }, binHz: binHz, at: peak)?.hz
+                    ?? Double(peak) * binHz
+                // Only a tone carrying its own modulation is a subcarrier (APT's is AM'd by the image); an FM
+                // signal's steady modulating tone isn't (ruling R15).
+                let width = max(Self.minToneBandHz, Self.toneBandFraction * hz)
+                let tone = Channel.extract(SignalMeasurer.interleaved(x), sampleRate: rate, offsetHz: hz,
+                                           bandwidthHz: width)
+                let noise = noiseDensity(hz) * Channel.noiseBandwidthHz(sampleRate: rate, bandwidthHz: width)
+                let envelope = EnvelopeFeatures(tone.samples, rate: tone.rate, bandwidthHz: width, noisePower: noise)
+                if envelope.blockCV > 2 * envelope.steadyCV + Self.minToneModulation {
+                    tonesHz = [hz]
+                } else {
+                    steadyToneHz = hz
+                }
                 return
             }
         }

@@ -28,7 +28,8 @@ import Foundation
 ///   more away, and the margin the measurement adds stops short of the next other signal;
 /// - a symmetric pair within 5 kHz, beyond the strongest bin's skirt, no more than 5 dB under it (stronger
 ///   than any AM's sidebands) makes that bin one of a comb, an FM tone's Bessel lines (APT seen on its
-///   centre line): if the measurement finds a line there, it is never `am` or `carrier`;
+///   centre line): if the measurement finds a line there, it is never `am` or `carrier`, and the region
+///   grows over the comb's lines (`overComb`), so the FM is measured whole;
 /// - a wide-shift FSK's extent may take one tone (RTTY 850, POCSAG's ±4.5 kHz): another signal within
 ///   ±12 kHz about as strong and as wide is its twin when the channel spanning both is one FSK
 ///   (`fskTwin`: a constant envelope, its frequency on one tone or the other), and the two become one region;
@@ -81,11 +82,11 @@ import Foundation
 /// 6. **fm / wfm:** a constant envelope (20 ms block CV within 2 × what noise alone gives, + 0.1, and
 ///    E|s|⁴/(E|s|²)² ≤ 1.1 with the noise taken out), a frequency spread ≥ 0.15 of half the occupied width,
 ///    and width × seconds ≥ 1000 independent samples. A subcarrier in the instantaneous frequency (APRS's
-///    AFSK, APT's 2400 Hz; looked for only where the frequencies are discrete) makes it FM whatever its
-///    distribution (in `subcarriersHz`, an AFSK's rate in
-///    `symbolRate`); otherwise a distribution with separate peaks or a kurtosis under 2.5 is discrete
-///    frequencies and is left `unknown`. WFM when ≥ 100 kHz wide, or ≥ 60 kHz with the 19 kHz stereo pilot
-///    in the demodulated baseband (then in `subcarriersHz`); `fmDeviationHz` either way.
+///    AFSK, APT's AM'd 2400 Hz; looked for only where the frequencies are discrete) makes it FM whatever its
+///    distribution (in `subcarriersHz`, an AFSK's rate in `symbolRate`), and so does a steady modulating
+///    tone (noted, not a subcarrier: R15); otherwise a distribution with separate peaks or a kurtosis under
+///    2.5 is discrete frequencies and is left `unknown`. WFM when ≥ 100 kHz wide, or ≥ 60 kHz with the
+///    19 kHz stereo pilot in the demodulated baseband (then in `subcarriersHz`); `fmDeviationHz` either way.
 /// 7. **usb / lsb:** no line (< 10%), a voice envelope (block CV ≥ 0.5 with ≥ 5% pauses), the passband's
 ///    power ≥ 15 dB over its mirror about the carrier side, and a tilt of at least 1 dB towards the carrier
 ///    side (voice is strongest at low audio frequencies): USB when the lower edge is the stronger.
@@ -101,6 +102,10 @@ import Foundation
 /// a 1 MS/s capture, 140 ms for 1 s of DAB at 2.048 MS/s.
 public enum SignalMeasurer {
     static let minimumSeconds = 0.2
+    /// The second window for a signal wider than the first: the capture's middle 90% (its edges are often
+    /// a filter's skirt).
+    static let wholeViewFraction = 0.9
+    static let widerThanTheView = "Signal wider than the view — bandwidth is a lower bound; family only"
     static let windowFactor = 3.0
     static let minimumWindowHz = 40_000.0
     static let coarseBins = 2048.0
@@ -142,6 +147,14 @@ public enum SignalMeasurer {
 
     public static func measure(_ iq: [Float], sampleRate: Double, offsetHz: Double, bandwidthHz: Double,
                                seconds: Double) -> SignalMeasurement {
+        measure(iq, sampleRate: sampleRate, offsetHz: offsetHz, bandwidthHz: bandwidthHz, seconds: seconds,
+                wholeView: false)
+    }
+
+    /// `wholeView`: the window is the capture's middle 90% instead of one placed on the seed (the second try for
+    /// a signal that reaches the edge of a window the capture limits).
+    static func measure(_ iq: [Float], sampleRate: Double, offsetHz: Double, bandwidthHz: Double,
+                        seconds: Double, wholeView: Bool) -> SignalMeasurement {
         let available = iq.count / 2
         let n = min(available, Int((max(seconds, 0) * sampleRate).rounded()))
         var result = SignalMeasurement(offsetHz: offsetHz, seconds: sampleRate > 0 ? Double(n) / sampleRate : 0)
@@ -151,18 +164,20 @@ public enum SignalMeasurer {
         }
         let recent = n == available ? iq : Array(iq[(2 * (available - n))...])
 
-        // The window: wide enough for the families' plausible widths, inside the capture.
+        // The window: wide enough for the families' plausible widths, inside the capture (or the whole view).
         let seed = max(bandwidthHz, 1)
         let edgeRoom = 2 * (sampleRate / 2 - abs(offsetHz))
-        let windowHz = max(min(max(windowFactor * seed, minimumWindowHz), 0.8 * sampleRate, edgeRoom),
-                           min(seed, 0.8 * sampleRate))
-        let window = Channel.extract(recent, sampleRate: sampleRate, offsetHz: offsetHz, bandwidthHz: windowHz,
+        let windowHz = wholeView ? wholeViewFraction * sampleRate
+            : max(min(max(windowFactor * seed, minimumWindowHz), 0.8 * sampleRate, edgeRoom),
+                  min(seed, 0.8 * sampleRate))
+        let windowCentre = wholeView ? 0 : offsetHz
+        let window = Channel.extract(recent, sampleRate: sampleRate, offsetHz: windowCentre, bandwidthHz: windowHz,
                                      sharp: false)
         let duration = Double(window.samples.count) / window.rate
 
         var coarse = SpectrumView(window.samples, rate: window.rate, binHz: windowHz / coarseBins,
                                   usableHz: windowHz)
-        let seedBins = coarse.bin(-seed / 2)...coarse.bin(seed / 2)
+        let seedBins = coarse.bin(offsetHz - windowCentre - seed / 2)...coarse.bin(offsetHz - windowCentre + seed / 2)
         // The seed's own bins left out from the start: a signal filling most of the window (DAB, 94% of a
         // 2 MS/s capture's) would otherwise be its own 10th percentile.
         coarse.estimateNoise(excluding: widened(seedBins, by: 0.1, in: coarse))
@@ -173,24 +188,51 @@ public enum SignalMeasurer {
             coarse.estimateNoise(excluding: widened(r.bins, by: 0.1, in: coarse))
         }
         found = region(coarse, seed: seedBins)
-        // The capture limits the window: a signal reaching its edges is wider than the view (ruling R5).
-        let capped = windowHz < max(windowFactor * seed, minimumWindowHz) - 1
-        guard var signalRegion = found else {
-            // Nothing stands out of a view a signal fills edge to edge (DAB in a 1 MS/s capture): its noise
-            // can't be seen, but OFDM's cyclic prefix still can.
-            if capped, let ofdm = OFDMFeatures(window.samples, rate: window.rate, occupiedHz: windowHz), ofdm.isOFDM {
-                result.family = .ofdm
-                result.envelope = .steady
-                result.familyConfidence = min(score(ofdm.contrast, OFDMFeatures.minContrast, 20), 0.6)
-                result.occupiedBandwidthHz = windowHz
-                result.notes.append("OFDM wider than the view: family only")
-                return result
+        // The capture limits the window: a signal reaching its edges is wider than the view (ruling R5). It is
+        // measured again over the whole view first: there it reaches the capture's own edge, and whatever noise
+        // the capture shows beside it is seen.
+        let capped = wholeView || windowHz < max(windowFactor * seed, minimumWindowHz) - 1
+        let edgeBins = max(3, coarse.count / 400)
+        func reachesEdge(_ r: Region) -> Bool {
+            r.bins.lowerBound <= edgeBins || r.bins.upperBound >= coarse.count - 1 - edgeBins
+        }
+        if capped && !wholeView && windowHz < wholeViewFraction * sampleRate && (found.map(reachesEdge) ?? true) {
+            return measure(iq, sampleRate: sampleRate, offsetHz: offsetHz, bandwidthHz: bandwidthHz,
+                           seconds: seconds, wholeView: true)
+        }
+        // A view the signal fills edge to edge (DAB in a 1 MS/s capture) shows no noise: nothing stands out of
+        // it, or the "noise" found is the signal's own level. OFDM's cyclic prefix still shows, and gives the
+        // in-band SNR (R14).
+        func filledView() -> SignalMeasurement? {
+            guard capped, let ofdm = OFDMFeatures(window.samples, rate: window.rate, occupiedHz: windowHz),
+                  ofdm.isOFDM, let snr = ofdm.prefixSNR(window.samples, rate: window.rate) else { return nil }
+            var filled = result
+            filled.family = .ofdm
+            filled.envelope = .steady
+            filled.familyConfidence = min(score(ofdm.contrast, OFDMFeatures.minContrast, 20), 0.6)
+            // The visible part's −20 dB width (no noise to take out: none can be seen).
+            let width = OccupiedWidth.fixedPoint(coarse.power, binHz: coarse.binHz, start: windowHz)
+            filled.occupiedBandwidthHz = width.widthHz
+            filled.snrDb = snr
+            if let bins = width.bins {
+                filled.offsetHz = windowCentre + coarse.hz(Double(bins.lowerBound + bins.upperBound) / 2)
             }
+            filled.notes.append(widerThanTheView)
+            filled.notes.append("OFDM: its cyclic prefix gives the SNR; family only")
+            return filled
+        }
+        if wholeView, found.map({ $0.bins.lowerBound <= edgeBins && $0.bins.upperBound >= coarse.count - 1 - edgeBins })
+            ?? true, let filled = filledView() {
+            return filled
+        }
+        guard var signalRegion = found else {
             result.family = .noise
             result.familyConfidence = 0.8
             result.notes.append("Nothing stands above the noise")
             return result
         }
+        // A line of a comb: the comb is the signal.
+        signalRegion = overComb(coarse, region: signalRegion)
         // A wideband signal split at a narrow gap (OFDM's empty centre carrier): its other part joins it.
         signalRegion = bridged(coarse, region: signalRegion)
         // A wide-shift FSK whose extent took one tone: its twin joins it.
@@ -257,7 +299,7 @@ public enum SignalMeasurer {
                                      threshold: total / Double(occupied.count) / 4)
         let signalPower = inBand / SpectrumView.enbw
         let noiseDensity = view.noise / (SpectrumView.enbw * view.binHz)
-        result.offsetHz = offsetHz + centreHz
+        result.offsetHz = windowCentre + centreHz
         result.occupiedBandwidthHz = occupiedHz
         result.bandwidth6dBHz = Double(six?.count ?? 0) * view.binHz
         result.snrDb = 10 * log10(signalPower / (noiseDensity * occupiedHz))
@@ -287,15 +329,14 @@ public enum SignalMeasurer {
                                       signalPower: signalPower, envelope: envelope)
         classify(&result, line: line, envelope: envelope, frequency: frequency, sidebands: sidebands,
                  keyedTwinHz: twin, comb: signalRegion.comb, digital: digital)
-        // Reaching the edge of a view the capture limits (its last 0.25%): family only (ruling R5).
-        let edgeBins = max(3, coarse.count / 400)
-        if capped && result.family != .noise && (signalRegion.bins.lowerBound <= edgeBins
-            || signalRegion.bins.upperBound >= coarse.count - 1 - edgeBins) {
+        // Reaching the edge of a view the capture limits: family only; the width and SNR are the visible part's,
+        // the width a lower bound (rulings R5, R14).
+        if capped && result.family != .noise && reachesEdge(signalRegion) {
             result = SignalMeasurement(offsetHz: result.offsetHz, occupiedBandwidthHz: result.occupiedBandwidthHz,
                                        bandwidth6dBHz: result.bandwidth6dBHz, snrDb: result.snrDb,
                                        envelope: result.envelope, family: result.family,
                                        familyConfidence: min(result.familyConfidence, 0.6), seconds: result.seconds,
-                                       notes: result.notes + ["Signal wider than the view: family only"])
+                                       notes: result.notes + [widerThanTheView])
         }
         return result
     }
@@ -460,8 +501,13 @@ public enum SignalMeasurer {
         return false
     }
 
-    /// A demodulated signal's subcarrier into `subcarriersHz` (and its rate, when it carries FSK).
+    /// A demodulated signal's subcarrier into `subcarriersHz` (and its rate, when it carries FSK); a steady
+    /// modulating tone only into the notes.
     static func addSubcarrier(_ sub: Subcarrier, to m: inout SignalMeasurement) {
+        if let tone = sub.steadyToneHz {
+            m.notes.append(String(format: "Modulated by a steady %.0f Hz tone", tone))
+            return
+        }
         m.subcarriersHz += sub.tonesHz
         if let rate = sub.symbolRate {
             m.symbolRate = rate
@@ -587,13 +633,52 @@ public enum SignalMeasurer {
     /// each at most `combBelowLineDb` under it: stronger than any AM's sidebands (a 100% sine's are 6 dB
     /// under the carrier), so the line is one of a comb, an FM tone's Bessel lines. Powers are summed over
     /// ±2 bins.
-    static func isComb(_ view: SpectrumView, line top: Int) -> Bool {
+    static func isComb(_ view: SpectrumView, line top: Int) -> Bool { combSpacing(view, line: top) != nil }
+
+    /// The nearest such pair's distance from the line, in bins, or nil when there is none.
+    static func combSpacing(_ view: SpectrumView, line top: Int) -> Int? {
         func lobe(_ k: Int) -> Double { (k - 2...k + 2).reduce(0) { $0 + max(0, view.power[$1] - view.noise) } }
         let limit = min(top, view.count - 1 - top) - 2
         let first = 8, last = min(limit, Int(combMaxHz / view.binHz))
-        guard first <= last else { return false }
+        guard first <= last else { return nil }
         let floor = lobe(top) * pow(10, -combBelowLineDb / 10)
-        return (first...last).contains { min(lobe(top - $0), lobe(top + $0)) >= floor }
+        return (first...last).first { min(lobe(top - $0), lobe(top + $0)) >= floor }
+    }
+
+    /// A comb's region (an FM tone's Bessel lines, APT seen on its centre line) grown over the comb: from the
+    /// strongest line outwards, step by the pair's spacing, while a line (6 dB over the bins 3 either side,
+    /// 10 dB over the noise) stands within a tenth of a step of where the next should be; one missing line is
+    /// stepped over (a Bessel line can vanish: APT's first pair at its index of 7). The region runs half a
+    /// step past the outermost lines found, as far as the view goes.
+    static func overComb(_ view: SpectrumView, region: Region) -> Region {
+        guard region.comb, let top = region.bins.max(by: { view.power[$0] < view.power[$1] }),
+              let step = combSpacing(view, line: top) else { return region }
+        let reach = max(2, step / 10)
+        func isLine(_ k: Int) -> Bool {
+            k - 3 >= 0 && k + 3 < view.count && view.power[k] >= 10 * view.noise
+                && view.power[k] >= 4 * max(view.power[k - 3], view.power[k + 3])
+        }
+        func outermost(_ direction: Int) -> Int {
+            var last = top, missed = 0
+            while missed < 2 {
+                let expected = last + direction * step * (missed + 1)
+                let window = (expected - reach)...(expected + reach)
+                guard window.lowerBound >= 0, window.upperBound < view.count,
+                      let peak = window.max(by: { view.power[$0] < view.power[$1] }) else { break }
+                if isLine(peak) {
+                    last = peak
+                    missed = 0
+                } else {
+                    missed += 1
+                }
+            }
+            return last
+        }
+        let low = max(0, outermost(-1) - step / 2), high = min(view.count - 1, outermost(1) + step / 2)
+        let bins = min(low, region.bins.lowerBound)...max(high, region.bins.upperBound)
+        guard bins != region.bins else { return region }
+        return Region(bins: bins, comb: true,
+                      room: max(0, bins.lowerBound - step)...min(view.count - 1, bins.upperBound + step))
     }
 
     /// A keyed signal's FSK twin: the strongest other signal in the window within ±max(3 kHz, 10 widths),

@@ -150,19 +150,65 @@ import Testing
         #expect(!m.notes.contains { $0.contains("wider than the view") }, "\(m.notes)")
     }
 
-    /// A mode wider than the capture is named by family only, with a note (ruling R5): DAB cut to 1.024 MS/s.
-    @Test func ofdmWiderThanTheViewIsFamilyOnly() {
-        let wide = SignalSynth.make(.dab, sampleRate: 2_048_000, seconds: 1, snrDb: 20, seed: 45)
-        // Low-passed to ±450 kHz, then every other sample: a 1.024 MS/s capture.
-        let filtered = Channel.extract(wide, sampleRate: 2_048_000, offsetHz: 0, bandwidthHz: 900_000)
-        let halved = stride(from: 0, to: filtered.samples.count, by: 2).map { filtered.samples[$0] }
-        let rate = filtered.rate / 2
-        #expect(rate < 1_536_000)
-        let iq = SignalMeasurer.interleaved(halved)
-        let m = SignalMeasurer.measure(iq, sampleRate: rate, offsetHz: 0, bandwidthHz: 0.8 * rate, seconds: 1)
-        #expect(m.family == .ofdm, "\(m.family) \(m.notes)")
-        #expect(m.notes.contains { $0.contains("wider than the view") }, "\(m.notes)")
-        #expect(m.ofdmSpacingHz == nil)
+    /// DAB (1.536 MHz) seen through a 1.024 MS/s capture centred `centreHz` from it: synthesised at 2.048 MS/s
+    /// for 1.024 s (2²¹ samples) and cut to the capture's band in the frequency domain (a brick wall, so nothing
+    /// aliases and the noise stays white).
+    static func narrowDAB(snr: Double, seed: UInt64, centreHz: Double) -> (iq: [Float], rate: Double) {
+        let wide = SignalSynth.make(.dab, sampleRate: 2_048_000, seconds: 1.024, snrDb: snr, seed: seed)
+        let n = wide.count / 2, m = n / 2
+        var re = (0..<n).map { wide[2 * $0] }, im = (0..<n).map { wide[2 * $0 + 1] }
+        FFT.transform(&re, &im)
+        let binHz = 2_048_000 / Double(n)
+        let shift = Int((centreHz / binHz).rounded())
+        var outRe = [Float](repeating: 0, count: m), outIm = [Float](repeating: 0, count: m)
+        for j in 0..<m {
+            let k = ((j < m / 2 ? j : j - m) + shift + n) % n
+            outRe[j] = re[k]
+            outIm[j] = im[k]
+        }
+        FFT.transform(&outRe, &outIm, inverse: true)
+        var iq = [Float](repeating: 0, count: 2 * m)
+        let scale = 1 / Float(n)
+        for j in 0..<m {
+            iq[2 * j] = outRe[j] * scale
+            iq[2 * j + 1] = outIm[j] * scale
+        }
+        return (iq, 1_024_000)
+    }
+
+    /// A mode wider than the capture is named by family only (R5), its width the visible part's −20 dB width (a
+    /// lower bound) and its SNR the visible band's (R14): DAB in a 1.024 MS/s capture, filling it (centred) or
+    /// running off its lower edge with noise beside its upper (400 kHz up: 880 kHz of DAB visible).
+    @Test(arguments: [20.0, 10.0])
+    func ofdmWiderThanTheViewIsFamilyOnly(snr: Double) {
+        for (centre, visible) in [(0.0, 1_024_000.0), (400_000, 880_000)] {
+            let capture = Self.narrowDAB(snr: snr, seed: 45, centreHz: centre)
+            let size = 2048
+            let binHz = capture.rate / Double(size)
+            let point = centre == 0 ? 0 : -200_000.0
+            let db = PowerSpectrum.average(capture.iq, size: size)
+            // Filling the capture, it has no extent (nothing beside it to stand over): the seed is then an
+            // agent's bandwidth, most of the view.
+            var width = 0.8 * capture.rate, offset = 0.0
+            if let extent = Extent.find(spectrumDb: db, binHz: binHz, nearBin: size / 2 + Int(point / binHz),
+                                        searchBins: 4) {
+                width = Double(extent.upperBin - extent.lowerBin + 1) * binHz
+                offset = (Double(extent.lowerBin + extent.upperBin) / 2 - Double(size / 2)) * binHz
+            } else if centre != 0 {
+                Issue.record("centre \(centre) at \(snr) dB: no extent")
+                continue
+            }
+            let m = SignalMeasurer.measure(capture.iq, sampleRate: capture.rate, offsetHz: offset, bandwidthHz: width,
+                                           seconds: 1)
+            let label = "centre \(centre) at \(snr) dB"
+            #expect(m.family == .ofdm, "\(label): \(m.family) \(m.notes)")
+            #expect(m.notes.contains { $0.contains("wider than the view — bandwidth is a lower bound") },
+                    "\(label): \(m.notes)")
+            #expect(m.ofdmSpacingHz == nil, "\(label): family only")
+            #expect(m.occupiedBandwidthHz > 0 && m.occupiedBandwidthHz <= 1.01 * visible,
+                    "\(label): \(m.occupiedBandwidthHz) Hz of \(visible) visible")
+            #expect(abs(m.snrDb - snr) <= 3, "\(label): SNR \(m.snrDb) \(m.notes) occ \(m.occupiedBandwidthHz)")
+        }
     }
 
     /// APRS: NFM carrying Bell 202 AFSK (1200 Bd, 1200/2200 Hz). The carrier is FM; the AFSK is a subcarrier.
@@ -188,15 +234,28 @@ import Testing
         }
     }
 
-    /// NOAA APT: FM carrying the 2400 Hz AM subcarrier.
+    /// NOAA APT: FM carrying the 2400 Hz AM subcarrier (pointed at its centre line: the region grows over the
+    /// comb of Bessel lines).
     @Test(arguments: [20.0, 10.0])
     func aptSubcarrier(snr: Double) {
         for seed in UInt64(1)...2 {
             let m = Self.measured(.noaaAPT, sampleRate: 96_000, snr: snr, seed: 7 + seed, offsetHz: 6000)
             let label = "APT at \(snr) dB, seed \(seed)"
-            #expect(m.family != .am && m.family != .carrier && m.family != .fsk, "\(label): \(m.family) \(m.notes)")
-            if m.family == .fm {
-                #expect(m.subcarriersHz.contains { abs($0 - 2400) <= 24 }, "\(label): \(m.subcarriersHz)")
+            #expect(m.family == .fm, "\(label): \(m.family) \(m.notes)")
+            #expect(m.subcarriersHz.contains { abs($0 / 2400 - 1) <= 0.02 }, "\(label): \(m.subcarriersHz)")
+        }
+    }
+
+    /// An FM signal's steady modulating tone is not a subcarrier (R15): a subcarrier carries its own modulation.
+    @Test(arguments: [20.0, 10.0])
+    func steadyFMToneIsNotASubcarrier(snr: Double) {
+        for (index, (tone, deviation)) in [(1000.0, 500.0), (2400, 3000)].enumerated() {
+            for seed in UInt64(1)...2 {
+                let m = Self.measured(.fm(.tone(tone), deviationHz: deviation), snr: snr,
+                                      seed: UInt64(3 * index) + seed)
+                let label = "\(tone) Hz tone at \(snr) dB, seed \(seed)"
+                #expect(m.subcarriersHz.isEmpty, "\(label): \(m.subcarriersHz) \(m.notes)")
+                #expect(![.fsk, .mfsk, .psk, .ofdm, .wfm].contains(m.family), "\(label): \(m.family)")
             }
         }
     }
