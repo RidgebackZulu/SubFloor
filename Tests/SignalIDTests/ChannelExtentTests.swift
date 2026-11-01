@@ -16,6 +16,8 @@ func peakHz(_ db: [Float], binHz: Double, in range: ClosedRange<Double>) -> Doub
 /// FFT-shifted bin of `hz` in a spectrum of `size` bins.
 func bin(_ hz: Double, binHz: Double, size: Int) -> Int { size / 2 + Int((hz / binHz).rounded()) }
 
+/// Task 2's channel and extent. `snrIsMeasuredInTheSignalsBandwidth` runs its first seed by default, both with
+/// `SUBFLOOR_SIGNALID_MATRIX=1` (`Sweep`, ruling R32).
 @Suite(.serialized) struct ChannelExtentTests {
     /// The streaming extractor (Signal ID's longer read, fed off the ring a piece at a time) gives `extract`'s
     /// output, whatever the pieces: odd sizes, ones under a mixer block, ones across several.
