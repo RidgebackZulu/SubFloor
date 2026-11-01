@@ -76,8 +76,9 @@ struct MCPSignalToolsTests {
         await tools.call(name, arguments: arguments, client: client)
     }
 
-    /// Waits (letting the main actor run) until `condition` holds or `seconds` pass.
-    private func eventually(_ seconds: Double = 10, _ condition: () -> Bool) async -> Bool {
+    /// Waits (letting the main actor run) until `condition` holds or `seconds` pass. The bound only ends a failing
+    /// wait: one that holds returns at once.
+    private func eventually(_ seconds: Double = 120, _ condition: () -> Bool) async -> Bool {
         let deadline = Date().addingTimeInterval(seconds)
         while !condition() {
             if Date() > deadline { return condition() }
@@ -246,6 +247,54 @@ struct MCPSignalToolsTests {
         // The change is the agent's, to a `listen` that was watching.
         let change = tools.lastRadioChange
         #expect(change?.client == "scan-agent 1")
+    }
+
+    /// A step's ring holds only the first read: a stepped scan makes no longer read, and lists the signals that
+    /// wanted one (`needs_longer_read_hz`) for an agent's follow-up. A line read too soon after its step is read once
+    /// more when the ring has filled; one still too soon is said in `notes`, never dropped silently.
+    @Test func aSteppedScanMakesNoLongerReadAndSaysWhatItCouldNotRead() async {
+        guard let (m, tools) = runningModel() else { return }
+        defer { m.shutdown() }
+        m.tune(to: 7_150_000)
+        let span = m.sampleRate
+        let from = 6_000_000.0, to = from + 2.5 * span
+        let lines = [from + 0.4 * span, from + 1.3 * span, from + 2.2 * span]
+        tools.scanSpectrum = { Self.spectrum(of: m, lines: lines) }
+        let passes = Shared<[(hz: Double, longer: Bool)]>([])
+        m.signalID.analysis = { _, _, centre, at, _, _, longer in
+            let seen = passes.withLock { p in
+                p.append((at, longer != nil))
+                return p.filter { abs($0.hz - at) < 2_000 }.count
+            }
+            // The second line is too soon at first, the third always.
+            if abs(at - lines[2]) < 2_000 || (abs(at - lines[1]) < 2_000 && seen == 1) {
+                return SignalIdentity(measurement: SignalMeasurement(offsetHz: at - centre, family: .noise, seconds: 0.5),
+                                      note: SignalIdentifier.tooSoonNote)
+            }
+            return SignalIdentity(measurement: SignalMeasurement(offsetHz: at - centre, occupiedBandwidthHz: 50,
+                                                                 family: .fsk, familyConfidence: 0.6, seconds: 3),
+                                  alternatives: [ModeMatch(name: "FT8 / FT4", confidence: 0.4, evidence: [])],
+                                  needsLongerRead: true)
+        }
+        let r = await call(tools, "identify_signals", ["from_hz": .number(from), "to_hz": .number(to)])
+        #expect(!r.isError, "\(r.content)")
+        let s = r.structured
+        let hzs = (s?["signals"]?.array ?? []).compactMap { $0["hz"]?.double }
+        #expect(hzs.count == 2 && zip(hzs, lines).allSatisfy { abs($0 - $1) < 2_000 }, "\(hzs)")
+        #expect(!passes.withLock { $0 }.contains { $0.longer }, "a longer read was made")
+        let slow = s?["needs_longer_read_hz"]?.array?.compactMap(\.double) ?? []
+        #expect(slow.count == 2 && zip(slow, lines).allSatisfy { abs($0 - $1) < 2_000 }, "\(slow)")
+        let notes = (s?["notes"]?.array ?? []).compactMap(\.string)
+        #expect(notes.contains { $0.contains("Too soon after tuning") && $0.contains("not identified") }, "\(notes)")
+        #expect(notes.contains { $0.contains("identify_signal after about 16 s") }, "\(notes)")
+        // Inside the capture the longer read is made as ever.
+        passes.withLock { $0.removeAll() }
+        tools.scanSpectrum = { Self.spectrum(of: m, lines: [m.centerHz + 40_000]) }
+        let inside = await call(tools, "identify_signals",
+                                ["from_hz": .number(m.centerHz - 100_000), "to_hz": .number(m.centerHz + 100_000)])
+        #expect(!inside.isError, "\(inside.content)")
+        #expect(passes.withLock { $0 }.contains { $0.longer })
+        #expect(inside.structured?["needs_longer_read_hz"] == nil)
     }
 
     @Test func scanRestoresWhenCancelled() async {

@@ -135,7 +135,9 @@ Then ask, for example:
 
 The **Event log** tab shows every call an agent makes. Agents never transmit, never delete a recording or
 your bookmarks, and every recording they start stops by itself. They can ask what a signal is, too: a scan
-steps the radio across a band and puts it back, but never while you're recording. Not built yet: recording at a
+steps the radio across a band and puts it back, but never while you're recording. A scan wider than the capture
+reads each step for only about 3 s, so slow signals such as FT8 and WSPR come back unnamed until the agent tunes to
+one and asks again. Not built yet: recording at a
 set time with no agent present, and a measured noise floor. Agents work around them for now.
 
 ## Build from source
@@ -147,6 +149,7 @@ scripts/bundle.sh                    # build build/SubFloor.app (with its icon)
 VERSION=0.1.0 SIGN_IDENTITY="Developer ID Application: …" scripts/make_dmg.sh   # signed release DMG
 python3 scripts/make_icon.py Sources/SubFloor/Resources/AppIcon.png   # redraw the icon (needs Pillow, NumPy)
 swift test                           # unit tests
+SUBFLOOR_SIGNALID_MATRIX=1 swift test --filter SignalIDTests   # also Signal ID's full accuracy matrix and sweeps
 SUBFLOOR_HW=1 swift test             # also run the RSP1B hardware smoke test
 ```
 
@@ -196,9 +199,9 @@ alternatives on the card. A point with nothing there says `No signal`, and a fai
 identify (SNR 4 dB)`. If a decoder you're running has already decoded the same signal in the last minute, the card
 says "confirmed by decode".
 
-The decoder panel's **Auto-detect** uses the same measurements to pick a decoder for each signal in the
-passband, and recognises RTTY (45.45, 50 and 75 Bd; 170, 425 and 850 Hz shift). Signal ID never starts a decoder
-by itself.
+The decoder panel's **Auto-detect** is separate: it has its own, narrower classifier, which looks only at the
+signals in the passband and the modes the decoders handle, to pick a decoder for each, and recognises RTTY
+(45.45, 50 and 75 Bd; 170, 425 and 850 Hz shift). Signal ID never starts a decoder by itself.
 
 ## Recording
 The save buffer is always running: each stream keeps its last 5–120 s (Settings, default 30 s) in

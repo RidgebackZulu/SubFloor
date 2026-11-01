@@ -162,7 +162,7 @@ struct SignalIDCard: View {
                 if let identity { model.tuneToIdentified(identity, atHz: atHz) } else { model.setVFO(atHz) }
                 close()
             }
-            .keyboardShortcut(.defaultAction)
+            // Not the default action: Return in the popover would retune and change the demod and passband.
             .help("Tune to the signal with the matched mode's demodulator")
             Button {
                 guard let identity, model.bookmarkIdentified(identity, atHz: atHz) != nil else { return }

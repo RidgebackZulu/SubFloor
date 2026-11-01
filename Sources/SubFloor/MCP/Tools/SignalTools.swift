@@ -4,11 +4,33 @@ import SignalID
 import SubFloorCore
 import Transcription
 
-/// A longer read `get_cursor` started whose first answer it returned: the first answer, for the calls that come
-/// while it runs.
+/// An identification `get_cursor` started: its first answer, for every call at the same point while it runs (one
+/// during its first pass waits for that pass instead of starting another; one during its longer read gets the first
+/// pass's answer).
 @MainActor
 final class CursorRead {
-    var first: SignalIdentity?
+    let first = FirstAnswer()
+}
+
+/// The first of several answers: every waiter gets whichever is resolved first.
+@MainActor
+final class FirstAnswer {
+    private var waiting: [CheckedContinuation<SignalIdentity?, Never>] = []
+    private var answered = false
+    private var value: SignalIdentity?
+
+    func wait() async -> SignalIdentity? {
+        if answered { return value }
+        return await withCheckedContinuation { waiting.append($0) }
+    }
+
+    func resolve(_ answer: SignalIdentity?) {
+        guard !answered else { return }
+        answered = true
+        value = answer
+        for continuation in waiting { continuation.resume(returning: answer) }
+        waiting = []
+    }
 }
 
 /// Signal ID for agents: `identify_signal`, `identify_signals`, and the `signal` of `get_cursor`'s cursors.
@@ -21,7 +43,8 @@ extension SubFloorTools {
                 SubFloor is at least 70% sure (RTTY, FT8, WSPR, DMR...), up to 3 other candidates, and whether a \
                 running decoder confirmed it. It never guesses: below 70% you get the family and its parameters. \
                 bandwidth_hz is the signal's width if you know it. Never retunes. Slow signals (under 50 Hz wide, \
-                keyed under 10 WPM, WSPR, FT8 slots) are read again over up to 16 s: that is in this answer. \
+                keyed under 10 WPM, WSPR, FT8 slots) are read again over up to 16 s: that is in this answer. With \
+                the radio stopped it reads what the IQ ring heard last. \
                 Returns {hz, label, family, name, confidence, parameters, alternatives, tune, ...}.
                 """, properties: [
                     "frequency": .frequencySchema("Display Hz, or a string like \"7.074 MHz\". Inside the capture."),
@@ -33,13 +56,17 @@ extension SubFloorTools {
                 (get_status: center_hz ± span_hz/2) it does not touch the radio. Across a wider range it steps the \
                 radio across it, one capture at a time (at most 60 steps), waiting at each until the IQ ring holds about \
                 3 s (up to 20 s), then identifying each line: about 4 s a step plus a fraction of a second a signal. \
-                It holds the radio lock and puts the VFO, mode, bandwidth and HamItUp back afterwards. The owner \
-                hears each step. It refuses while the owner is recording or Auto is on (a retune would split the \
+                A step's ring holds only that 3 s, so a stepped scan makes no longer read: slow signals (FT8, WSPR, \
+                slow CW, time signals) come back unnamed with needs_longer_read true (needs_longer_read_hz lists \
+                them); tune to one and call identify_signal after about 16 s. Inside the capture they get their \
+                longer read. It holds the radio lock and puts the VFO, mode, bandwidth and HamItUp back afterwards; \
+                each step restarts the owner's IQ pre-roll. The owner hears each step. It refuses while the owner \
+                is recording or Auto is on (a retune would split the \
                 file), and stops early, leaving the radio as it is, if the owner retunes or starts recording. \
                 min_snr_db (default 10) is how far a line stands over the floor; every such line is identified, \
                 up to max_signals (default 40, up to 200): then truncated is set with resume_from_hz, to call again \
                 from. Log what it finds with add_bookmark. Returns {signals: [{hz, level_dbfs, identity}], pieces, \
-                restored, stopped_early?, truncated?, resume_from_hz?}.
+                restored, stopped_early?, truncated?, resume_from_hz?, needs_longer_read_hz?, notes?}.
                 """, properties: [
                     "from_hz": .frequencySchema("Lower edge, display Hz."),
                     "to_hz": .frequencySchema("Upper edge, display Hz."),
@@ -121,7 +148,6 @@ extension SubFloorTools {
 
     func identifySignal(_ args: ToolArguments) async throws -> [String: JSONValue] {
         let m = model
-        try requireRunning()
         let hz = try args.required("frequency", args.frequency)
         let bandwidth = try args.double("bandwidth_hz", in: 1...max(m.sampleRate, 2))
         guard inCapture(hz) else {
@@ -131,6 +157,8 @@ extension SubFloorTools {
         let id = await m.signalID.identify(atHz: hz, bandwidthHz: bandwidth)
         try Task.checkCancellation()
         guard let id else {
+            // With the radio stopped the ring is read as it is: nil is an empty one.
+            guard m.isRunning else { throw ToolError("The radio is stopped and its IQ ring is empty: call start_radio first.") }
             throw ToolError("Nothing to read yet: the radio was just started or retuned, or the owner retuned meanwhile. Try again in a second.")
         }
         return identityJSON(id, signalHz: signalHz(id, askedHz: hz))
@@ -156,7 +184,6 @@ extension SubFloorTools {
 
     private func cursorSignal(atHz hz: Double, ageSeconds: Double?) async -> (JSONValue?, String?) {
         let short = FrequencyFormatter.short
-        guard model.isRunning else { return (nil, "The radio is stopped: nothing to read.") }
         if let age = ageSeconds, age > Self.mouseIdentifySeconds {
             return (nil, "The pointer last rested on the spectrum \(Int(age.rounded())) s ago, more than \(Int(Self.mouseIdentifySeconds)) s: not identified. Ask the owner to point at the signal, or call identify_signal with its frequency.")
         }
@@ -164,6 +191,8 @@ extension SubFloorTools {
             return (nil, "\(short(hz)) is outside the current capture: tune there first, then call identify_signal.")
         }
         guard let id = await quickIdentity(atHz: hz) else {
+            // With the radio stopped the ring is read as it is (what it heard last): nil is an empty one.
+            guard model.isRunning else { return (nil, "The radio is stopped and its IQ ring is empty: nothing to read.") }
             return (nil, "Nothing to read yet: the radio was just started or retuned. Try again in a second.")
         }
         return (.object(identityJSON(id, signalHz: signalHz(id, askedHz: hz))), nil)
@@ -171,43 +200,20 @@ extension SubFloorTools {
 
     /// The identity at `hz` without waiting for the longer read: when the first pass asks for one, its answer
     /// (`needsLongerRead`) is returned at once and the longer read finishes in the background, into the service's
-    /// cache for the next call. Calls that come while one runs get the first answer again, not another read.
+    /// cache for the next call. Calls that come while one runs (from its start) get its first answer, not another
+    /// read.
     func quickIdentity(atHz hz: Double) async -> SignalIdentity? {
         let key = Int((hz / 25).rounded())
-        if let running = cursorReads[key], let first = running.first { return first }
+        if let running = cursorReads[key] { return await running.first.wait() }
         let service = model.signalID
-        let gate = FirstAnswer()
         let read = CursorRead()
+        cursorReads[key] = read
         Task { @MainActor [weak self] in
-            let answer = await service.identify(atHz: hz) { first in
-                read.first = first
-                self?.cursorReads[key] = read
-                gate.resolve(first)
-            }
-            gate.resolve(answer)
+            let answer = await service.identify(atHz: hz) { read.first.resolve($0) }
+            read.first.resolve(answer)
             if let self, self.cursorReads[key] === read { self.cursorReads[key] = nil }
         }
-        return await gate.wait()
-    }
-
-    /// The first of several answers: the waiter gets whichever is resolved first.
-    @MainActor private final class FirstAnswer {
-        private var continuation: CheckedContinuation<SignalIdentity?, Never>?
-        private var answered = false
-        private var value: SignalIdentity?
-
-        func wait() async -> SignalIdentity? {
-            if answered { return value }
-            return await withCheckedContinuation { continuation = $0 }
-        }
-
-        func resolve(_ answer: SignalIdentity?) {
-            guard !answered else { return }
-            answered = true
-            value = answer
-            continuation?.resume(returning: answer)
-            continuation = nil
-        }
+        return await read.first.wait()
     }
 
     // MARK: identify_signals
@@ -397,15 +403,27 @@ extension SubFloorTools {
                         break pieceLoop
                     }
                     if interrupted(run) { break pieceLoop }
-                    let identity = await m.signalID.identify(atHz: peak.hz)
+                    // A stepped scan's ring holds only the first read since its step: no longer read is made.
+                    var identity = await m.signalID.identify(atHz: peak.hz, longerRead: !run.stepping)
                     try Task.checkCancellation()
+                    if identity?.note == SignalIdentifier.tooSoonNote {
+                        // The ring hadn't filled since a retune: once more when it has.
+                        guard try await waitForRing(run) else { break pieceLoop }
+                        identity = await m.signalID.identify(atHz: peak.hz, longerRead: !run.stepping)
+                        try Task.checkCancellation()
+                    }
                     guard let identity else {
                         if interrupted(run) { break pieceLoop }
                         note("\(short(peak.hz)): nothing to read.")
                         continue
                     }
                     let m1 = identity.measurement
-                    if m1.family != .noise {   // noise is "No signal": a line that was not one
+                    if m1.family == .noise {
+                        // "No signal" is a line that was not one; anything else (too soon after tuning) is said.
+                        if identity.note != SignalIdentifier.noSignalNote {
+                            note("\(short(peak.hz)): \(identity.note ?? identity.label); not identified.")
+                        }
+                    } else {
                         let hz = signalHz(identity, askedHz: peak.hz)
                         if m1.occupiedBandwidthHz > 0 {
                             let half = max(m1.occupiedBandwidthHz, m1.bandwidth6dBHz) / 2
@@ -439,6 +457,12 @@ extension SubFloorTools {
         if truncated {
             result["truncated"] = .bool(true)
             result["resume_from_hz"] = .hz(resume)
+        }
+        // A stepped scan made no longer reads: the signals that wanted one, for an agent's follow-up.
+        let slow = run.stepping ? found.filter(\.identity.needsLongerRead).map(\.hz).sorted() : []
+        if !slow.isEmpty {
+            result["needs_longer_read_hz"] = .array(slow.map { .hz($0) })
+            notes.append("\(slow.count) signal\(slow.count == 1 ? "" : "s") wanted a longer read than a stepped scan makes (needs_longer_read_hz): tune to one and call identify_signal after about 16 s.")
         }
         if !notes.isEmpty { result["notes"] = .array(notes.map { .string($0) }) }
         return result

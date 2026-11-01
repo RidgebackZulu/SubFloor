@@ -159,7 +159,7 @@ confirmed_by_decode, needs_longer_read, note}`:
 A signal under 50 Hz wide, keyed slower than 10 WPM, or a candidate that needs timing (WSPR, FT8/FT4 slots, fax
 lines, time ticks) is read again over up to 16 s of the ring; that is included in this answer. Less than 1 s of
 IQ since the last retune gives `Too soon after tuning — try again`: wait and call again. Results for a signal are
-kept 5 s.
+kept 5 s. With the radio stopped it reads what the IQ ring heard last; an empty ring is an error.
 
 ### `identify_signals`
 
@@ -176,8 +176,13 @@ Finds every signal across a range and identifies each. Use it to scan a band.
 - **Across a wider range** it retunes the radio, one capture at a time (about 90% of `span_hz` a step, at most 60
   steps), waiting at each until the IQ ring holds about 3 s since the retune (at most 20 s) and then identifying
   each line: about 4 s a step plus a fraction of a second a signal. It holds the radio lock so nothing else changes
-  it meanwhile. The owner hears every step. When it has finished (or fails, or is cancelled) it puts the VFO, mode,
-  bandwidth and HamItUp back. It does not change HamItUp itself: every frequency stays a display frequency.
+  it meanwhile. The owner hears every step, and each step restarts the owner's IQ pre-roll. When it has finished
+  (or fails, or is cancelled) it puts the VFO, mode, bandwidth and HamItUp back. It does not change HamItUp itself:
+  every frequency stays a display frequency.
+- **A stepped scan makes no longer read.** A step's IQ ring holds only the 3 s it waited for, so slow signals (FT8,
+  WSPR, slow CW, time signals) come back unnamed, with `needs_longer_read: true`, and are listed in
+  `needs_longer_read_hz`. To name one, `tune` there (its `identity.tune`) and call `identify_signal` after about
+  16 s. Inside the capture they get their longer read as `identify_signal` does.
 - **It refuses** while the owner is recording (audio or IQ) or Auto is on, because a retune would split their file
   or cut an Auto recording: the error reads "The owner is recording: scan only within the current view, or ask
   the owner". Scan inside the capture then, or ask. It also refuses while an IQ file is playing (a range outside
@@ -188,18 +193,21 @@ Finds every signal across a range and identifies each. Use it to scan a band.
   `stopped_early` says what happened and `restored` is false. Inside the capture only a change of the capture
   itself stops it.
 
-Returns `{from_hz, to_hz, signals, pieces, restored, stopped_early?, truncated?, resume_from_hz?, notes?}`:
+Returns `{from_hz, to_hz, signals, pieces, restored, stopped_early?, truncated?, resume_from_hz?,
+needs_longer_read_hz?, notes?}`:
 
 - `signals`: `[{hz, level_dbfs, identity}]`, lowest first. `hz` is the signal's centre and `level_dbfs` its peak in
   the spectrum; `identity` has the fields of `identify_signal` (without `hz`). A line inside an already identified
-  signal (a tone of an FSK, a sideband) is not listed twice, and a line that turns out to be noise is dropped.
+  signal (a tone of an FSK, a sideband) is not listed twice, and a line that turns out to be noise ("No signal") is
+  dropped. A line read too soon after a step is read again once the ring has filled; one that still can't be read is
+  said in `notes`.
   Every line over `min_snr_db` is looked at, however many there are. `at_receiver_centre: true` marks a line
   within a few bins of the capture's centre, where the receiver's own DC spike can show: treat it as doubtful.
 - `pieces`: the captures read. `restored`: the VFO, mode, bandwidth and HamItUp are as they were (true when it
   never moved the radio).
 - `truncated`: `max_signals` was reached, so there may be more above `resume_from_hz`: call `identify_signals`
-  again with `from_hz` set to it (and the same `to_hz`). `notes`: pieces skipped or points that could not be
-  read.
+  again with `from_hz` set to it (and the same `to_hz`). `needs_longer_read_hz`: the signals a stepped scan could
+  not give their longer read (see above). `notes`: pieces skipped, points that could not be read, and that list.
 
 Log what it finds with `add_bookmark`, in the `Identified` group the owner's own ID bookmarks use: `name` from
 `identity.name` (or `identity.family`), `notes` from `identity.label` and its parameters, and `frequency`, `mode`
