@@ -6,20 +6,23 @@ import Testing
 /// several variants) at 20, 10, 6 and 3 dB, through `SignalIdentifier.identify(iq:…)` with the slow pass, on seeds
 /// 1–50 (thresholds were tuned on seeds 1000–1099). Prints the confusion summary.
 ///
-/// - At ≥ 10 dB: family right ≥ 95%; symbol rate within 1%, 2-FSK shift within 3% and bandwidth within 10% in ≥ 95%
-///   of the cases that carry them; named right ≥ 90%. Bandwidth: against the noise-free render of the same seed for
-///   randomly modulated families (ruling R8), CW and carriers at 20 dB only (R10), never for a mode wider than the
-///   view; skirted keying (rectangular FSK, CW, the time signal's ticks) is judged apart and recorded as a known
-///   issue (see `Outcome.skirted`). FM deviation within 15% for NFM voice (R9), 10% for WFM.
+/// - At ≥ 10 dB: family right ≥ 95%; symbol rate within 1%, 2-FSK shift within 3%, bandwidth within 10% and FM
+///   deviation within its tolerance in ≥ 95% of the cases that carry them; named right ≥ 90%. Bandwidth: against
+///   the noise-free render of the same seed for randomly modulated families (ruling R8: voice, programme, APT and fax
+///   video), CW and carriers at 20 dB only (R10), never for a mode wider than the view. Deviation: against the peak
+///   the same seed's noise-free capture holds over the read (R17), within 15% for NFM voice (R9), 10% otherwise.
 /// - At 3 dB: a wrong name at ≥ 0.7 in ≤ 2% of cases.
 ///
-/// The full matrix (5 seeds a cell) runs with `SUBFLOOR_SIGNALID_MATRIX=1`; otherwise 2 seeds a cell.
+/// The full matrix (every SNR, 5 seeds a cell) runs with `SUBFLOOR_SIGNALID_MATRIX=1`; otherwise the always-on
+/// subset (ruling R20): 10 and 3 dB, one seed a cell, the captures of 96 kS/s or less (20 dB naming, WFM's and
+/// DAB's included, is `IdentifyTests.eachRowIsNamed`'s). Its targets may fall two cases short of 95% (one-seed
+/// cells); the full matrix's may not.
 @Suite struct AccuracyMatrixTests {
     static let snrs = [20.0, 10, 6, 3]
-    /// What bandwidth is held to (the spec's 95% is a known issue for it), set from the tuning seeds' 92% (20 dB)
-    /// and 87% (10 dB).
-    static let regressionFloor: [String: [Double: Double]] = ["bandwidth": [20: 0.85, 10: 0.80]]
-    static var seedsPerCell: Int { ProcessInfo.processInfo.environment["SUBFLOOR_SIGNALID_MATRIX"] == "1" ? 5 : 2 }
+    /// `SUBFLOOR_SIGNALID_MATRIX=1`: the full matrix. Otherwise the always-on subset (ruling R20).
+    static var full: Bool { ProcessInfo.processInfo.environment["SUBFLOOR_SIGNALID_MATRIX"] == "1" }
+    static var seedsPerCell: Int { full ? 5 : 1 }
+    static var cellSNRs: [Double] { full ? snrs : [10, 3] }
 
     /// One identification and the truths it is judged against.
     struct Outcome: Sendable {
@@ -32,10 +35,6 @@ import Testing
         var shift: Double?
         var bandwidth: Double?
         var deviation: (value: Double, tolerance: Double)?
-        /// Its −20 dB edges are keying sidebands that fall slowly (rectangular FSK's sinc skirts, CW's, the time
-        /// signal's 1 kHz ticks at a far lower average level): at 10–20 dB they lie under the noise, so the width
-        /// reads narrow. Judged apart, as a known issue.
-        var skirted = false
 
         var name: String { IdentifyTests.placements[placement].name }
         var familyRight: Bool { identity.measurement.family == family }
@@ -52,10 +51,7 @@ import Testing
             var out: [(String, Bool)] = []
             if let rate { out.append(("rate", Self.within(m.symbolRate, rate, 0.01))) }
             if let shift { out.append(("shift", Self.within(m.fskShiftHz, shift, 0.03))) }
-            if let bandwidth {
-                out.append((skirted ? "bandwidth (skirted)" : "bandwidth",
-                            Self.within(m.occupiedBandwidthHz, bandwidth, 0.10)))
-            }
+            if let bandwidth { out.append(("bandwidth", Self.within(m.occupiedBandwidthHz, bandwidth, 0.10))) }
             if let deviation { out.append(("deviation", Self.within(m.fmDeviationHz, deviation.value, deviation.tolerance))) }
             return out
         }
@@ -101,6 +97,20 @@ import Testing
         return OccupiedBandwidth.width(db, binHz: p.sampleRate / Double(size), start: 2 * p.spec.nominalBandwidthHz)
     }
 
+    /// The peak deviation of the noise-free capture over the span the measurement read: its instantaneous
+    /// frequency's 99.9th-percentile excursion from its mean (the measurer's definition of the peak).
+    static func noiseFreeDeviation(_ p: IdentifyTests.Placement, seed: UInt64, seconds: Double) -> Double {
+        let long = p.sampleRate <= 96_000 ? IdentifyTests.longSeconds : p.seconds
+        let clean = SignalSynth.make(p.spec, sampleRate: p.sampleRate, seconds: long, snrDb: .infinity,
+                                     offsetHz: p.offsetHz, seed: seed)
+        let channel = Channel.extract(Array(clean.suffix(2 * Int(seconds * p.sampleRate))), sampleRate: p.sampleRate,
+                                      offsetHz: p.offsetHz, bandwidthHz: 1.25 * p.spec.occupiedBandwidthHz)
+        let f = FrequencyFeatures.discriminator(channel.samples, rate: channel.rate).dropFirst(64).dropLast(64)
+        let mean = f.reduce(0) { $0 + Double($1) } / Double(f.count)
+        let excursions = f.map { abs(Double($0) - mean) }.sorted()
+        return excursions[Int(0.999 * Double(excursions.count - 1))]
+    }
+
     static func outcome(_ index: Int, snr: Double, seed: UInt64) -> Outcome {
         let p = IdentifyTests.placements[index]
         let id = IdentifyTests.identified(p, snr: snr, seed: seed)
@@ -117,22 +127,24 @@ import Testing
         default:
             if !wider { o.bandwidth = p.spec.occupiedBandwidthHz }
         }
-        switch p.spec {
-        case .fsk(let f): o.skirted = f.gaussianBT == nil
-        case .cw, .am(.timeTicks, _): o.skirted = true
-        default: break
+        // Deviation against the peak the same seed's noise-free capture holds over the read (R17): within 15% for
+        // NFM voice (R9), 10% otherwise.
+        if o.familyRight, let measured = id.measurement.fmDeviationHz, measured > 0, case .fm(let audio, _) = p.spec {
+            switch audio {
+            case .voice: o.deviation = (noiseFreeDeviation(p, seed: seed, seconds: id.measurement.seconds), 0.15)
+            case .program: o.deviation = (noiseFreeDeviation(p, seed: seed, seconds: id.measurement.seconds), 0.10)
+            default: break
+            }
         }
-        // Deviation against the nominal: within 15% for NFM voice (R9), 10% for WFM.
-        if case .fm(.voice, let deviation) = p.spec { o.deviation = (deviation, 0.15) }
-        if case .fm(.program, let deviation) = p.spec { o.deviation = (deviation, 0.10) }
         return o
     }
 
     @Test func accuracyMatrix() async {
         let clock = ContinuousClock()
         let start = clock.now
-        let cases = IdentifyTests.placements.indices.flatMap { index in
-            Self.snrs.flatMap { snr in
+        let entries = IdentifyTests.placements.indices.filter { Self.full || IdentifyTests.placements[$0].sampleRate <= 96_000 }
+        let cases = entries.flatMap { index in
+            Self.cellSNRs.flatMap { snr in
                 (0..<Self.seedsPerCell).map { k in (index, snr, UInt64(1 + (Self.seedsPerCell * index + k) % 50)) }
             }
         }
@@ -145,10 +157,15 @@ import Testing
             return all.sorted { ($0.placement, -$0.snr, $0.seed) < ($1.placement, -$1.snr, $1.seed) }
         }
         let elapsed = clock.now - start
-        print(Self.summary(outcomes))
+        let summary = Self.summary(outcomes)
+        for line in summary.split(separator: "\n") { print(line) }
+        // Long test logs can be cut short: SUBFLOOR_SIGNALID_MATRIX_OUT=<path> writes the summary there too.
+        if let path = ProcessInfo.processInfo.environment["SUBFLOOR_SIGNALID_MATRIX_OUT"] {
+            try? summary.write(toFile: path, atomically: true, encoding: .utf8)
+        }
         print("accuracyMatrix: \(outcomes.count) identifications in \(elapsed)")
 
-        for snr in Self.snrs {
+        for snr in Self.cellSNRs {
             let cell = outcomes.filter { $0.snr == snr }
             let wrong = cell.filter(\.wrongName)
             for o in wrong {
@@ -160,30 +177,15 @@ import Testing
             #expect(family >= 0.95, "family right at \(snr) dB: \(family)")
             let named = Double(cell.filter { $0.named == $0.name }.count) / Double(cell.count)
             #expect(named >= 0.90, "named right at \(snr) dB: \(named)")
-            for target in ["rate", "shift", "bandwidth", "deviation", "bandwidth (skirted)"] {
+            for target in ["rate", "shift", "bandwidth", "deviation"] {
                 let judged = cell.flatMap(\.targets).filter { $0.0 == target }
                 guard !judged.isEmpty else { continue }
                 let met = Double(judged.filter(\.1).count) / Double(judged.count)
                 print(String(format: "accuracyMatrix: %@ at %.0f dB: %d of %d (%.1f%%)", target, snr,
                              judged.filter(\.1).count, judged.count, 100 * met))
-                switch target {
-                case "bandwidth (skirted)":
-                    withKnownIssue("skirted keying's −20 dB edges lie under the noise", isIntermittent: true) {
-                        #expect(met >= 0.95, "\(target) at \(snr) dB: \(met) of \(judged.count)")
-                    }
-                case "bandwidth", "deviation":
-                    // Short of the spec's 95% on the tuning seeds (see the report): narrow signals' widths are
-                    // resolution-limited on a 3 s read, and a seed's programme may not reach full deviation in 1 s.
-                    // Bandwidth is held to a floor against regressions; the 95% is a known issue for both.
-                    if let floor = Self.regressionFloor[target]?[snr] {
-                        #expect(met >= floor, "\(target) at \(snr) dB: \(met) of \(judged.count)")
-                    }
-                    withKnownIssue("\(target) within tolerance in under 95% of cases", isIntermittent: true) {
-                        #expect(met >= 0.95, "\(target) at \(snr) dB: \(met) of \(judged.count)")
-                    }
-                default:
-                    #expect(met >= 0.95, "\(target) at \(snr) dB: \(met) of \(judged.count)")
-                }
+                // The subset's cells are one seed: it may fall two cases short of 95% (the full matrix may not).
+                let needed = (0.95 * Double(judged.count)).rounded(.up) - (Self.full ? 0 : 2)
+                #expect(Double(judged.filter(\.1).count) >= needed, "\(target) at \(snr) dB: \(met) of \(judged.count)")
             }
             print(String(format: "accuracyMatrix: at %.0f dB family right %.1f%%, named right %.1f%%", snr,
                          100 * family, 100 * named))

@@ -184,8 +184,8 @@ import Testing
         #expect(id.note?.contains("8.0 s") == true, "\(id.note ?? "no note")")
     }
 
-    /// Weak CW: its SNR reads 1–5 dB high on 3 s (the occupied width reads narrow under the noise, R12); the slow
-    /// pass reads it again, and its SNR is then within 2 dB.
+    /// Weak CW: its SNR read 1–5 dB high on 3 s, the occupied width narrow under the noise (R12). The slow pass reads
+    /// it again and its width comes from its keying speed (R16), and its SNR is then within −2/+4 dB (R18).
     @Test func weakCWSNRAfterTheSlowPass() {
         for (index, wpm) in [20.0, 8, 40].enumerated() {
             let cw = Placement(name: "CW", spec: .cw(wpm: wpm), rfHz: 7_020_000)
@@ -195,12 +195,9 @@ import Testing
                 print(String(format: "weakCWSNRAfterTheSlowPass: %.0f WPM seed %d: SNR %.2f dB, width %.0f of %.0f Hz",
                              wpm, seed, id.measurement.snrDb, id.measurement.occupiedBandwidthHz,
                              cw.spec.occupiedBandwidthHz))
-                // R12, not met at 20 and 8 WPM: 16 s doesn't lift the −20 dB edges out of the noise either (their
-                // keying sidebands sit 10 dB under it), so the width still reads narrow and the SNR high by the
-                // ratio (+1…+3.5 dB). Reported as a concern, not loosened.
-                withKnownIssue("R12: weak CW's SNR after the slow pass is still the narrow width's", isIntermittent: true) {
-                    #expect(abs(id.measurement.snrDb - 10) <= 2, "\(wpm) WPM seed \(seed): SNR \(id.measurement.snrDb)")
-                }
+                // R18 (superseding R12's 2 dB): within −2/+4 dB after the slow pass.
+                let error = id.measurement.snrDb - 10
+                #expect(error >= -2 && error <= 4, "\(wpm) WPM seed \(seed): SNR \(id.measurement.snrDb)")
             }
         }
     }
@@ -332,48 +329,98 @@ import Testing
 
     // MARK: Real recordings
 
+    /// The owner's IQ recording (R19, the spec's "one IQ WAV", `SubFloor_20261028_134251Z_11112500Hz_IQ.wav`):
+    /// 6 s channelised to 78 125 S/s around 11.180 MHz, through the app's own IQ path. It holds no voice at
+    /// 11.175 MHz (its USB passband is flat noise, level with its neighbours, every second of the 17 s) but a comb of
+    /// interference lines about 19.4 kHz apart, one at 11.1862 MHz. The passband is "No signal"; the line is never
+    /// named.
+    @Test func realIQRecording() throws {
+        let capture = try Self.iqFixture("SubFloor_20261028_134251Z_IQ_11180000Hz_78125Sps_6s")
+        let first = Array(capture.iq.suffix(2 * Int(3 * capture.rate)))
+        let voiceBand = SignalIdentifier.identify(iq: first, sampleRate: capture.rate, captureCenterHz: 11_180_000,
+                                                  atHz: 11_176_500, bandwidthHz: nil, spectrumDb: nil,
+                                                  longer: { (capture.iq, 6) })
+        #expect(voiceBand.best == nil && voiceBand.note == "No signal", "\(Self.describe(voiceBand))")
+        let line = SignalIdentifier.identify(iq: first, sampleRate: capture.rate, captureCenterHz: 11_180_000,
+                                             atHz: 11_186_200, bandwidthHz: nil, spectrumDb: nil,
+                                             longer: { (capture.iq, 6) })
+        #expect(line.best == nil, "\(Self.describe(line))")
+        #expect(line.measurement.occupiedBandwidthHz > 0 && line.measurement.occupiedBandwidthHz < 6000,
+                "the line is found locally, not the capture's whole passband: \(Self.describe(line))")
+        print("realIQRecording: 11.1765 MHz \(Self.describe(voiceBand)); 11.1862 MHz \(Self.describe(line))")
+    }
+
+    /// HFGCS activity at 11.175 MHz in the owner's hour-long IQ capture `captures/SubFloor_20261027_150938Z_11125000Hz_IQ.wav`
+    /// (found by scanning it for voice-band excess; 2040–2047.5 s, channelised to 62 500 S/s around 11.178 MHz).
+    /// Never a wrong name. It measures as an unknown 3.7–4 kHz signal: see the report.
+    @Test func realIQCaptureVoiceBand() throws {
+        let capture = try Self.iqFixture("SubFloor_20261027_150938Z_IQ_11178000Hz_62500Sps_7.5s")
+        for end in [3.0, 4.5, 6.0, 7.5] {
+            let slice = Array(capture.iq[(2 * Int((end - 3) * capture.rate))..<(2 * Int(end * capture.rate))])
+            let id = SignalIdentifier.identify(iq: slice, sampleRate: capture.rate, captureCenterHz: 11_178_000,
+                                               atHz: 11_176_500, bandwidthHz: nil, spectrumDb: nil, longer: nil)
+            #expect(id.best == nil || id.best?.name == "SSB voice (USB/LSB)", "to \(end) s: \(Self.describe(id))")
+            print("realIQCaptureVoiceBand to \(end) s: \(Self.describe(id))")
+        }
+    }
+
     /// SubFloor's own audio recordings, turned back into IQ (`AnalyticAudio`): 30 s of 11.175 MHz USB voice (HFGCS,
-    /// its speech confirmed by the transcription fixtures), and an FT8 clip from 14.074 MHz. Never a wrong name; the
-    /// names themselves are known issues (see the report): the recording's audio AGC lifts the noise between words to
-    /// the speech level, so the voice reads 1–2 dB over its passband floor, and the FT8 clip is 8 s of a crowded slot.
-    @Test func realRecordingsIdentify() throws {
+    /// its speech confirmed by the transcription fixtures). The recording's audio AGC lifts the noise between words to
+    /// the speech level, so the voice reads 1–2 dB over its passband floor: never a wrong name (see the report).
+    @Test func realAudioVoiceIsNeverWronglyNamed() throws {
         let voice = try Self.fixture("SubFloor_20261028_140122Z_11175000Hz_USB_30s")
         let (iq, rate) = AnalyticAudio.iq(fromSSBAudio: voice.samples, sampleRate: voice.rate)
-        // Each 3 s window the squelch left open (no muted run): never another name; SSB voice where it holds speech.
-        var named = 0, windows = 0
         for end in stride(from: 3.0, through: 30.0, by: 1.0) {
             let start = Int((end - 3) * rate), stop = Int(end * rate)
-            let open = voice.samples[start..<stop].filter { $0 == 0 }.count < Int(0.01 * rate)
             let id = SignalIdentifier.identify(iq: Array(iq[(2 * start)..<(2 * stop)]), sampleRate: rate,
                                                captureCenterHz: 11_175_000, atHz: 11_176_500, bandwidthHz: nil,
                                                spectrumDb: nil, longer: nil)
             #expect(id.best == nil || id.best?.name == "SSB voice (USB/LSB)", "window to \(end) s: \(Self.describe(id))")
-            print("realRecordingsIdentify voice to \(end) s\(open ? "" : " (muted in part)"): \(Self.describe(id))")
-            if open {
-                windows += 1
-                if id.best?.name == "SSB voice (USB/LSB)" { named += 1 }
-            }
+            print("realAudioVoiceIsNeverWronglyNamed to \(end) s: \(Self.describe(id))")
         }
-        withKnownIssue("AGC'd recording: the voice reads at 1–2 dB over its own passband floor") {
-            #expect(named * 2 >= windows, "named in \(named) of \(windows) open windows")
-        }
+    }
 
+    /// An FT8 clip from 14.074 MHz (8 s of the :30 slot): pointed at one transmission's track, the strongest
+    /// narrow (about 50 Hz) plateau in the averaged spectrum. Never a wrong name; FT8 itself is a known issue (see the
+    /// report: the tracks stand about 5 dB over the AGC'd passband).
+    @Test func realFT8Track() throws {
         let ft8 = try Self.fixture("SubFloor_20261028_015635Z_14074000Hz_USB_FT8")
-        let (ft8IQ, ft8Rate) = AnalyticAudio.iq(fromSSBAudio: ft8.samples, sampleRate: ft8.rate)
-        // The strongest signal in the passband (200–3000 Hz).
-        let size = 2048
-        let db = PowerSpectrum.average(ft8IQ, size: size, hop: size / 4)
-        let binHz = ft8Rate / Double(size)
-        let peak = ((size / 2 + Int(200 / binHz))...(size / 2 + Int(3000 / binHz))).max { db[$0] < db[$1] }!
-        let audioHz = Double(peak - size / 2) * binHz
-        let id = SignalIdentifier.identify(iq: Array(ft8IQ.suffix(2 * Int(3 * ft8Rate))), sampleRate: ft8Rate,
+        let (iq, rate) = AnalyticAudio.iq(fromSSBAudio: ft8.samples, sampleRate: ft8.rate)
+        let audioHz = Self.strongestTrack(iq, rate: rate)
+        let id = SignalIdentifier.identify(iq: Array(iq.suffix(2 * Int(3 * rate))), sampleRate: rate,
                                            captureCenterHz: 14_074_000, atHz: 14_074_000 + audioHz, bandwidthHz: nil,
-                                           spectrumDb: nil, longer: { (ft8IQ, Double(ft8IQ.count / 2) / ft8Rate) })
-        print("realRecordingsIdentify FT8 at \(audioHz) Hz: \(Self.describe(id))")
+                                           spectrumDb: nil, longer: { (iq, Double(iq.count / 2) / rate) })
+        print("realFT8Track at \(audioHz) Hz: \(Self.describe(id))")
         #expect(id.best == nil || id.best?.name == "FT8 / FT4", "FT8 at \(audioHz) Hz: \(Self.describe(id))")
-        withKnownIssue("8 s of a crowded FT8 slot: overlapping signals measure as one unknown") {
+        withKnownIssue("A real FT8 track about 5 dB over an AGC'd passband, 8 s: its FSK doesn't show") {
             #expect(id.best?.name == "FT8 / FT4", "FT8 at \(audioHz) Hz: \(Self.describe(id))")
         }
+    }
+
+    /// The audio frequency (200–3000 Hz) of the strongest ~50 Hz plateau: the mean over ±22 Hz against the mean
+    /// 43–70 Hz either side, in a spectrum of about 2 Hz bins.
+    static func strongestTrack(_ iq: [Float], rate: Double) -> Double {
+        let size = 4096
+        let power = PowerSpectrum.average(iq, size: size, maxFrames: 4096, hop: size / 8).map { pow(10, Double($0) / 10) }
+        let bin = rate / Double(size)
+        var best = (hz: 0.0, contrast: -Double.infinity)
+        for k in (size / 2 + Int(200 / bin))..<(size / 2 + Int(3000 / bin)) {
+            var inner = 0.0, outer = 0.0
+            for j in (k - 11)...(k + 11) { inner += power[j] / 23 }
+            for j in (k - 36)...(k - 22) { outer += power[j] / 30 }
+            for j in (k + 22)...(k + 36) { outer += power[j] / 30 }
+            if inner / outer > best.contrast { best = (Double(k - size / 2) * bin, inner / outer) }
+        }
+        return best.hz
+    }
+
+    /// A 16-bit stereo (I, Q) WAV fixture, as interleaved Floats in ±1.
+    static func iqFixture(_ name: String) throws -> (iq: [Float], rate: Double) {
+        let url = try #require(Bundle.module.url(forResource: name, withExtension: "wav", subdirectory: "Fixtures"))
+        let data = try Data(contentsOf: url)
+        let rate = Double(data[24..<28].withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) })
+        let iq = data[44...].withUnsafeBytes { raw in raw.bindMemory(to: Int16.self).map { Float(Int16(littleEndian: $0)) / 32768 } }
+        return (iq, rate)
     }
 
     /// A 16-bit mono WAV fixture, as Floats in ±1.

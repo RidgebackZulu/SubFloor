@@ -56,6 +56,9 @@ public struct SignalMeasurement: Codable, Sendable, Equatable {
     /// A period in the demodulated signal from 0.2 to 2 s (HF fax lines, a time signal's second ticks), found
     /// on a read of 6 s or more (the slow pass). Nil when there is none or the read is shorter.
     public var modulationPeriodSeconds: Double?
+    /// The −20 dB edges lie within 3 dB of the noise or under it, so the measured width reads narrow; where the
+    /// family's parameters fix the width it is taken from them instead (noted "bandwidth from parameters").
+    public var edgesUnderNoise: Bool
     /// Length of IQ analysed.
     public var seconds: Double
     /// Evidence and caveats, for the ID card.
@@ -67,7 +70,8 @@ public struct SignalMeasurement: Codable, Sendable, Equatable {
                 toneSpacingHz: Double? = nil, pskOrder: Int? = nil, ofdmSpacingHz: Double? = nil,
                 fmDeviationHz: Double? = nil, cwWPM: Double? = nil, burstPeriodSeconds: Double? = nil,
                 burstDuty: Double? = nil, subcarriersHz: [Double] = [], seconds: Double = 0, notes: [String] = [],
-                audioEnvelope: EnvelopeKind? = nil, modulationPeriodSeconds: Double? = nil) {
+                audioEnvelope: EnvelopeKind? = nil, modulationPeriodSeconds: Double? = nil,
+                edgesUnderNoise: Bool = false) {
         self.offsetHz = offsetHz
         self.occupiedBandwidthHz = occupiedBandwidthHz
         self.bandwidth6dBHz = bandwidth6dBHz
@@ -88,6 +92,7 @@ public struct SignalMeasurement: Codable, Sendable, Equatable {
         self.subcarriersHz = subcarriersHz
         self.audioEnvelope = audioEnvelope
         self.modulationPeriodSeconds = modulationPeriodSeconds
+        self.edgesUnderNoise = edgesUnderNoise
         self.seconds = seconds
         self.notes = notes
     }

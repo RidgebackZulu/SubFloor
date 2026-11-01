@@ -48,7 +48,10 @@ import Foundation
 /// - `offsetHz` is the carrier line when there is one in the middle of the band (AM, CW, a carrier, FM with
 ///   pauses), otherwise the middle of the occupied band;
 /// - `snrDb` is the signal's power within the occupied band over the noise power there (for bursty signals the
-///   mean over the capture, as the averaged spectrum sees it).
+///   mean over the capture, as the averaged spectrum sees it);
+/// - `edgesUnderNoise` when the −20 dB level is within 3 dB of the noise or under it: then a family whose measured
+///   parameters fix its width (wide-shift FSK, PSK under 300 Bd, CW, FM carrying one tone subcarrier) takes the
+///   width from them (`ParameterWidth`, ruling R16), the SNR over that width, noted "bandwidth from parameters".
 ///
 /// **Family.** The signal is cut out at 1.25 × its occupied width (`Channel.extract`, centred as above, from
 /// at most the newest 2²¹ samples of the view: about 1 s of a WFM signal at 2 MS/s, plenty) and its
@@ -311,6 +314,7 @@ public enum SignalMeasurer {
         result.occupiedBandwidthHz = occupiedHz
         result.bandwidth6dBHz = Double(six?.count ?? 0) * view.binHz
         result.snrDb = 10 * log10(signalPower / (noiseDensity * occupiedHz))
+        result.edgesUnderNoise = total * view.binHz / (100 * occupiedHz) < ParameterWidth.edgeNoiseFactor * view.noise
 
         // The signal's own channel, from at most the newest `maxFeatureSamples` of the view.
         let channelHz = max(channelFactor * occupiedHz, Double(mapped.count) * view.binHz, 20)
@@ -362,6 +366,8 @@ public enum SignalMeasurer {
                                        familyConfidence: min(result.familyConfidence, 0.6), seconds: result.seconds,
                                        notes: result.notes + [widerThanTheView])
         }
+        // Edges under the noise: a family whose parameters fix its width takes it from them (R16).
+        ParameterWidth.apply(to: &result)
         return result
     }
 

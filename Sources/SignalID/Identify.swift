@@ -192,6 +192,8 @@ public enum SignalIdentifier {
     static let searchBins = 4
     /// The read's own spectra, coarse then fine, when the app's shows no extent.
     static let spectrumBinHz = [12.0, 3.0]
+    static let localWindowHz = 48_000.0
+    static let localCaptureFactor = 1.5
 
     /// Names `m`, measured at `rfHz` (display Hz), from the mode table.
     public static func identify(_ m: SignalMeasurement, rfHz: Double) -> SignalIdentity {
@@ -250,6 +252,9 @@ public enum SignalIdentifier {
         }
         let alternatives = ranked.map(\.match).filter { $0.name != best?.name && $0.confidence >= alternativeThreshold }
             .prefix(maxAlternatives)
+        // A named FSK whose shift doesn't show how it is keyed (WSPR, MFSK16, FT8/FT4, Olivia): its width from its
+        // parameters and its standard's keying, where the edges sit under the noise (R16).
+        if let best, let shaping = ModeTable.row(best.name)?.shaping { ParameterWidth.apply(to: &m, shaping: shaping) }
         return SignalIdentity(measurement: m, best: best, alternatives: Array(alternatives), needsLongerRead: longer,
                               note: wider)
     }
@@ -263,7 +268,8 @@ public enum SignalIdentifier {
     ///   after tuning — try again";
     /// - when the slow-signal rules apply and `longer` is given, it is called (up to 16 s of IQ, ending where
     ///   `iq` ends) and the signal measured and named again from the same extent: a slot mode (FT8, FT4) over its
-    ///   longest transmission in the read. A shorter read than asked for is used, and said in `note`.
+    ///   longest transmission in the read. A shorter read than asked for is used, and said in `note`. The longer
+    ///   read's answer replaces the first's, a name the first gave included.
     public static func identify(iq: [Float], sampleRate: Double, captureCenterHz: Double, atHz: Double,
                                 bandwidthHz: Double?, spectrumDb: [Float]?,
                                 longer: (() -> (iq: [Float], seconds: Double)?)?) -> SignalIdentity {
@@ -281,9 +287,11 @@ public enum SignalIdentifier {
         if let bandwidthHz {
             seed = (pointHz, bandwidthHz)
         } else {
-            // The app's spectrum, then the read's own at about 12 Hz a bin, then at about 3 Hz (a narrow signal
-            // such as WSPR stands out only there; a wide one pointed between its tones only at the coarser).
-            var found = spectrumDb.flatMap { extent($0, sampleRate: sampleRate, pointHz: pointHz) }
+            // In a wide capture, first the point's own neighbourhood (`localExtent`); then the app's spectrum, then
+            // the read's own at about 12 Hz a bin, then at about 3 Hz (a narrow signal such as WSPR stands out only
+            // there; a wide one pointed between its tones only at the coarser).
+            var found = localExtent(first, sampleRate: sampleRate, pointHz: pointHz)
+            if found == nil { found = spectrumDb.flatMap { extent($0, sampleRate: sampleRate, pointHz: pointHz) } }
             var spectra: [[Float]] = []
             for binHz in spectrumBinHz where found == nil {
                 let size = spectrumSize(sampleRate: sampleRate, binHz: binHz)
@@ -321,11 +329,6 @@ public enum SignalIdentifier {
         let slow = SignalMeasurer.measure(long, sampleRate: sampleRate, offsetHz: seed.offsetHz,
                                           bandwidthHz: seed.widthHz, seconds: readSeconds)
         var refined = identify(slow, rfHz: captureCenterHz + slow.offsetHz)
-        // The longer read didn't confirm a name the first pass gave: that stands, said so.
-        if refined.best == nil, identity.best != nil, slow.family == .unknown || slow.family == .noise {
-            refined = identity
-            notes.append("The longer read didn't confirm it")
-        }
         refined.needsLongerRead = false
         if let note = refined.note { notes.insert(note, at: 0) }
         refined.note = notes.isEmpty ? nil : notes.joined(separator: "; ")
@@ -344,6 +347,30 @@ public enum SignalIdentifier {
               let e = Extent.find(spectrumDb: db, binHz: binHz, nearBin: near, searchBins: searchBins) else { return nil }
         return ((Double(e.lowerBin + e.upperBin) / 2 - Double(size / 2)) * binHz,
                 Double(e.upperBin - e.lowerBin + 1) * binHz)
+    }
+
+    /// The extent in a `localWindowHz` view around the point, for a capture over 1.5 times as wide: there the noise
+    /// is the point's own neighbourhood's. Across a whole capture a receiver's IF filter leaves the edges well under
+    /// the middle, and a whole-capture percentile takes the passband's own noise for a signal (the owner's 1.25 MS/s
+    /// IQ recording read as one "signal" 820 kHz wide wherever it was pointed). Nil when the capture is narrower,
+    /// or when the extent reaches the view's edge (a wider signal: the whole capture's spectra find it).
+    static func localExtent(_ iq: [Float], sampleRate: Double, pointHz: Double) -> (offsetHz: Double, widthHz: Double)? {
+        guard sampleRate >= localCaptureFactor * localWindowHz else { return nil }
+        let channel = Channel.extract(iq, sampleRate: sampleRate, offsetHz: pointHz, bandwidthHz: localWindowHz,
+                                      sharp: false)
+        for binHz in spectrumBinHz {
+            var size = 1024
+            while size < 65_536 && channel.rate / Double(size) > binHz { size *= 2 }
+            let full = PowerSpectrum.average(channel.samples, size: size, hop: size / 4)
+            let bin = channel.rate / Double(size)
+            let half = Int(0.45 * localWindowHz / bin)
+            let view = Array(full[(size / 2 - half)...(size / 2 + half)])
+            guard let e = Extent.find(spectrumDb: view, binHz: bin, nearBin: half, searchBins: searchBins) else { continue }
+            guard e.lowerBin > 2 && e.upperBin < view.count - 3 else { return nil }
+            return (pointHz + (Double(e.lowerBin + e.upperBin) / 2 - Double(half)) * bin,
+                    Double(e.upperBin - e.lowerBin + 1) * bin)
+        }
+        return nil
     }
 
     /// The FFT size for bins of about `binHz` (1024…16 384); the spectra are averaged over 75%-overlapped frames.

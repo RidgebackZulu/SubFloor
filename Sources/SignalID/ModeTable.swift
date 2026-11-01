@@ -20,9 +20,13 @@ public struct ModeRow: Sendable {
     let needsTiming: Bool
     /// Transmits in slots with silence between (FT8, FT4): the longer read measures one transmission.
     let slotted: Bool
+    /// How its FSK is keyed by its standard (WSPR and MFSK16 rectangular, FT8/FT4 and Olivia Gaussian): when
+    /// named, its width comes from its parameters where the edges sit under the noise (`ParameterWidth`, R16).
+    let shaping: ParameterWidth.Shaping?
 
     init(_ name: String, _ families: Set<SignalFamily>, partial: [SignalFamily: Double] = [:],
-         _ variants: [[ModeFeature]], hints: [ModeHint] = [], needsTiming: Bool = false, slotted: Bool = false) {
+         _ variants: [[ModeFeature]], hints: [ModeHint] = [], needsTiming: Bool = false, slotted: Bool = false,
+         shaping: ParameterWidth.Shaping? = nil) {
         self.name = name
         self.families = families
         self.partialFamilies = partial
@@ -30,6 +34,7 @@ public struct ModeRow: Sendable {
         self.hints = hints
         self.needsTiming = needsTiming
         self.slotted = slotted
+        self.shaping = shaping
     }
 
     /// Whether `rfHz` lies in any of the row's hint ranges.
@@ -194,15 +199,18 @@ public enum ModeTable {
                  [tones([4]), rate([12_000 / 576], 0.03), ModeFeature(.spacing([12_000 / 576], tolerance: 0.05))]],
                 hints: [ModeHint("FT8/FT4 frequency", dials(ft8Dials, 0, 3200) + dials(ft4Dials, 0, 3200),
                                  outside: 0.05)],
-                needsTiming: true, slotted: true),
+                needsTiming: true, slotted: true, shaping: .gaussian([8: 2, 4: 1])),
         ModeRow("WSPR", [.fsk],
                 [[tones([4]), rate([12_000 / 8192], 0.03), ModeFeature(.spacing([12_000 / 8192], tolerance: 0.06)),
                   width(3...15, softness: 0.5)]],
-                hints: [ModeHint("WSPR frequency", dials(wsprDials, 1350, 1650), outside: 0.1)], needsTiming: true),
+                hints: [ModeHint("WSPR frequency", dials(wsprDials, 1350, 1650), outside: 0.1)], needsTiming: true,
+                shaping: .rectangular),
         ModeRow("Olivia", [.fsk, .mfsk],
-                [[tones([4, 8, 16, 32, 64]), ModeFeature(.spacingIsRate), ModeFeature(.oliviaConfiguration, weight: 2)]]),
+                [[tones([4, 8, 16, 32, 64]), ModeFeature(.spacingIsRate), ModeFeature(.oliviaConfiguration, weight: 2)]],
+                shaping: .gaussian([0: 1])),
         ModeRow("MFSK16", [.mfsk, .fsk],
-                [[tones([16]), rate([15.625]), ModeFeature(.spacing([15.625], tolerance: 0.04))]]),
+                [[tones([16]), rate([15.625]), ModeFeature(.spacing([15.625], tolerance: 0.04))]],
+                shaping: .rectangular),
         ModeRow("ALE (MIL-STD-188-141)", [.fsk],
                 [[tones([8]), rate([125]), ModeFeature(.spacing([250], tolerance: 0.04))]]),
         ModeRow("STANAG 4285", [.psk], [[ModeFeature(.pskOrder([8])), rate([2400]), width(2200...3400)]]),
