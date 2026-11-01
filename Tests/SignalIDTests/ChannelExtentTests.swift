@@ -17,6 +17,36 @@ func peakHz(_ db: [Float], binHz: Double, in range: ClosedRange<Double>) -> Doub
 func bin(_ hz: Double, binHz: Double, size: Int) -> Int { size / 2 + Int((hz / binHz).rounded()) }
 
 @Suite struct ChannelExtentTests {
+    /// The streaming extractor (Signal ID's longer read, fed off the ring a piece at a time) gives `extract`'s
+    /// output, whatever the pieces: odd sizes, ones under a mixer block, ones across several.
+    @Test func extractorMatchesExtractPieceByPiece() {
+        let fs = 2_000_000.0
+        let iq = SignalSynth.make(.rtty(baud: 50, shiftHz: 850), sampleRate: fs, seconds: 0.4, snrDb: 20,
+                                  offsetHz: 37_000, seed: 13)
+        for sharp in [true, false] {
+            let whole = Channel.extract(iq, sampleRate: fs, offsetHz: 37_000, bandwidthHz: 48_000, sharp: sharp)
+            for pieceFrames in [1_000, 4_096, 9_999, 300_000] {
+                let extractor = ChannelExtractor(sampleRate: fs, offsetHz: 37_000, bandwidthHz: 48_000, sharp: sharp)
+                iq.withUnsafeBufferPointer { p in
+                    var start = 0
+                    while start < p.count {
+                        let end = min(start + 2 * pieceFrames, p.count)
+                        extractor.feed(UnsafeBufferPointer(rebasing: p[start..<end]))
+                        start = end
+                    }
+                }
+                let out = extractor.finish()
+                #expect(out.rate == whole.rate)
+                #expect(out.samples.count == 2 * whole.samples.count, "\(pieceFrames)-frame pieces")
+                var worst: Float = 0
+                for (k, z) in whole.samples.enumerated() where 2 * k + 1 < out.samples.count {
+                    worst = max(worst, abs(out.samples[2 * k] - z.real), abs(out.samples[2 * k + 1] - z.imag))
+                }
+                #expect(worst < 1e-5, "\(pieceFrames)-frame pieces, sharp \(sharp): off by \(worst)")
+            }
+        }
+    }
+
     @Test func channelCentresAndDecimates() {
         let fs = 2_000_000.0
         let fsk = SignalSynth.make(.rtty(baud: 50, shiftHz: 850), sampleRate: fs, seconds: 2, snrDb: 20,

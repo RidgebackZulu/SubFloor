@@ -74,6 +74,46 @@ import Testing
         #expect(r.snapshot(lastSeconds: 3)?.frames == 1_000)
     }
 
+    /// The chunked read hands over `snapshot`'s frames, oldest first, a piece at a time.
+    @Test(arguments: [SampleFormat.int16, .float32])
+    func chunkedSnapshotGivesTheSnapshotsFrames(format: SampleFormat) throws {
+        let r = makeIQ(format: format)
+        defer { r.shutdown() }
+        let total = 4_000_000
+        func ramp(_ k: Int) -> Float { Float(k) / Float(total) }
+        push(r, frames: 0..<total, i: ramp, q: { -ramp($0) })
+        let whole = try #require(r.snapshot(lastSeconds: 3))
+        var pieces: [Int] = []
+        var joined: [Float] = []
+        let read = try #require(r.snapshot(lastSeconds: 3, chunkFrames: 700_000) { piece in
+            pieces.append(piece.count / 2)
+            joined.append(contentsOf: piece)
+            return true
+        })
+        #expect(read.frames == 3_000_000 && read.sampleRate == 1_000_000)
+        #expect(pieces == [700_000, 700_000, 700_000, 700_000, 200_000])
+        #expect(joined == whole.samples)
+        // Stopped by its visitor: nil.
+        #expect(r.snapshot(lastSeconds: 3, chunkFrames: 700_000) { _ in false } == nil)
+    }
+
+    @Test func chunkedSnapshotStopsAtTheRetune() throws {
+        let r = makeIQ()
+        defer { r.shutdown() }
+        r.setContext(RecordingContext(frequencyHz: 14_100_000, label: "IQ", hardware: "test"))
+        push(r, frames: 0..<2_000_000, i: { _ in 0.25 }, q: { _ in 0.25 })
+        r.setContext(RecordingContext(frequencyHz: 7_100_000, label: "IQ", hardware: "test"))
+        #expect(r.snapshot(lastSeconds: 16, chunkFrames: 100_000) { _ in true } == nil)
+        push(r, frames: 0..<500_000, i: { _ in -0.5 }, q: { _ in -0.5 })
+        var all = true
+        let read = try #require(r.snapshot(lastSeconds: 16, chunkFrames: 100_000) { piece in
+            all = all && piece.allSatisfy { abs($0 + 0.5) <= 1e-4 }
+            return true
+        })
+        #expect(read.frames == 500_000)
+        #expect(all)
+    }
+
     @Test(arguments: [(SampleFormat.int16, Float(1e-4)), (.int24, 1e-6), (.float32, 1e-6)])
     func snapshotConvertsEachFormat(format: SampleFormat, tolerance: Float) throws {
         let r = makeIQ(rate: 10_000, format: format)

@@ -203,6 +203,13 @@ public enum SignalMeasurer {
         let windowCentre = wholeView ? 0 : offsetHz
         let window = Channel.extract(recent, sampleRate: sampleRate, offsetHz: windowCentre, bandwidthHz: windowHz,
                                      sharp: false)
+        // A cancelled task gets what was measured so far (between the stages: the window, the region, the
+        // measurement view, the features).
+        func cancelled() -> SignalMeasurement {
+            result.notes.append(SignalIdentifier.cancelledNote)
+            return result
+        }
+        if Task.isCancelled { return cancelled() }
         let duration = Double(window.samples.count) / window.rate
 
         var coarse = SpectrumView(window.samples, rate: window.rate, binHz: windowHz / coarseBins,
@@ -218,6 +225,7 @@ public enum SignalMeasurer {
             coarse.estimateNoise(excluding: widened(r.bins, by: 0.1, in: coarse))
         }
         found = region(coarse, seed: seedBins)
+        if Task.isCancelled { return cancelled() }
         // The capture limits the window: a signal reaching its edges is wider than the view (ruling R5). It is
         // measured again over the whole view first: there it reaches the capture's own edge, and whatever noise
         // the capture shows beside it is seen.
@@ -295,6 +303,7 @@ public enum SignalMeasurer {
             lowHz = middle - regionHz / 2
             highHz = middle + regionHz / 2
         }
+        if Task.isCancelled { return cancelled() }
         guard let fitted else {
             result.family = .noise
             result.familyConfidence = 0.6
@@ -330,12 +339,14 @@ public enum SignalMeasurer {
                                       bandwidthHz: channelHz)
         let channelNoise = noiseDensity * Channel.noiseBandwidthHz(sampleRate: viewSamples.rate,
                                                                    bandwidthHz: channelHz)
+        if Task.isCancelled { return cancelled() }
         let envelope = EnvelopeFeatures(channel.samples, rate: channel.rate, bandwidthHz: channelHz,
                                         noisePower: channelNoise)
         let frequency = FrequencyFeatures(channel.samples, rate: channel.rate, occupiedHz: occupiedHz,
                                           channelHz: channelHz, noiseDensity: noiseDensity,
                                           signalPower: signalPower,
                                           lineSearchHz: occupiedHz >= 40_000 ? [19_000] : [])
+        if Task.isCancelled { return cancelled() }
         let sidebands = SidebandFeatures(view, occupied: occupied)
         let twin = envelope.keying == nil ? nil
             : keyedTwin(window, coarse, region: signalRegion.bins, centreHz: centreHz, channelHz: channelHz,
@@ -346,6 +357,7 @@ public enum SignalMeasurer {
                                           Channel.noiseCorrelation(sampleRate: rate, bandwidthHz: channelHz, lag: lag)
                                       },
                                       signalPower: signalPower, envelope: envelope)
+        if Task.isCancelled { return cancelled() }
         classify(&result, line: line, envelope: envelope, frequency: frequency, sidebands: sidebands,
                  keyedTwinHz: twin, comb: signalRegion.comb, digital: digital)
         // A period in the demodulated signal (fax lines, second ticks), on a read long enough to show it.

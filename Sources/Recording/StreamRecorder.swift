@@ -55,6 +55,20 @@ public struct IQSnapshot: Sendable {
     }
 }
 
+/// What a chunked snapshot (`StreamRecorder.snapshot(lastSeconds:chunkFrames:_:)`) handed over.
+public struct IQRead: Sendable, Equatable {
+    public var frames: Int
+    public var sampleRate: Double
+    /// When the last frame was heard.
+    public var endTime: Date
+
+    public init(frames: Int, sampleRate: Double, endTime: Date) {
+        self.frames = frames
+        self.sampleRate = sampleRate
+        self.endTime = endTime
+    }
+}
+
 public enum RecordingNames {
     /// `SubFloor_20261022_143000Z_14074000Hz_USB` — SDR#'s shape, so other software (and SubFloor's
     /// own IQ file source) read the frequency out of the name.
@@ -465,6 +479,47 @@ public final class StreamRecorder: @unchecked Sendable {
         }
         guard !samples.isEmpty else { return nil }
         return IQSnapshot(samples: samples, sampleRate: setup.sampleRate, endTime: end)
+    }
+
+    /// `snapshot(lastSeconds:)`'s frames (the same span, fixed when it is called: never from before the last
+    /// retune or `clearHistory`), handed to `visit` oldest first as interleaved floats, at most `chunkFrames` at a
+    /// time: only one piece is held, for a read too long to copy whole (Signal ID's 16 s at the radio's rate).
+    /// `visit` returns false to stop. Nil when there is nothing to read, when `visit` stopped, or when the ring
+    /// overwrote frames not read yet or the recorder was reconfigured meanwhile (what was visited is then
+    /// incomplete). Any thread: each piece blocks `push` for one memcpy.
+    public func snapshot(lastSeconds: Double, chunkFrames: Int,
+                         _ visit: (UnsafeBufferPointer<Float>) -> Bool) -> IQRead? {
+        let (setup, plan) = producer.withLock { ($0.setup, $0.plan) }
+        guard lastSeconds > 0, chunkFrames > 0, let setup, let plan, setup.channels == 2 else { return nil }
+        let layout = setup.layout, format = layout.sampleFormat, bpf = layout.bytesPerFrame
+        let wanted = Int((lastSeconds * setup.sampleRate).rounded()) * bpf
+        guard let span = producer.withLock({ p -> (start: Int, end: Int, time: Date)? in
+            guard p.setup?.layout == layout, p.plan == plan else { return nil }
+            let end = ring.head
+            return (ring.rewind(bytes: wanted), end, p.now())
+        }), span.end > span.start else { return nil }
+
+        let pieceBytes = min(chunkFrames * bpf, span.end - span.start)
+        let bytes = UnsafeMutableRawBufferPointer.allocate(byteCount: pieceBytes, alignment: 16)
+        defer { bytes.deallocate() }
+        memset(bytes.baseAddress!, 0, bytes.count)   // faults it in before `push` is blocked for a copy
+        let floats = UnsafeMutableBufferPointer<Float>.allocate(capacity: pieceBytes / format.bytesPerSample)
+        defer { floats.deallocate() }
+        var position = span.start
+        while position < span.end {
+            let want = min(pieceBytes, span.end - position)
+            let piece = UnsafeMutableRawBufferPointer(rebasing: bytes[0..<want])
+            let copied = producer.withLock { p -> Int? in
+                guard p.setup?.layout == layout, p.plan == plan else { return nil }
+                let (n, skipped) = ring.read(from: &position, into: piece)
+                return skipped == 0 ? n : nil
+            }
+            guard let copied, copied == want else { return nil }
+            let count = copied / format.bytesPerSample
+            format.decode(bytes.baseAddress!, count: count, into: floats.baseAddress!)
+            guard visit(UnsafeBufferPointer(rebasing: floats[0..<count])) else { return nil }
+        }
+        return IQRead(frames: (span.end - span.start) / bpf, sampleRate: setup.sampleRate, endTime: span.time)
     }
 
     private func enqueue(_ c: Command) {

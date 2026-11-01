@@ -74,6 +74,21 @@ struct SignalIDServiceTests {
         }
     }
 
+    /// The longer read from `snap`: its newest `lastSeconds`, a piece at a time.
+    private static func chunks(_ snap: IQSnapshot) -> SignalIDService.ChunkProvider {
+        { lastSeconds, chunkFrames, visit in
+            let frames = min(snap.frames, Int((lastSeconds * snap.sampleRate).rounded()))
+            let iq = snap.samples.suffix(2 * frames)
+            var start = iq.startIndex
+            while start < iq.endIndex {
+                let end = min(start + 2 * chunkFrames, iq.endIndex)
+                guard iq[start..<end].withUnsafeBufferPointer(visit) else { return nil }
+                start = end
+            }
+            return IQRead(frames: frames, sampleRate: snap.sampleRate, endTime: snap.endTime)
+        }
+    }
+
     /// The real identifier, counting its runs.
     private static func counting(_ runs: Locked<Int>) -> SignalIDService.Analysis {
         { iq, rate, centre, at, width, spectrum, longer in
@@ -99,7 +114,9 @@ struct SignalIDServiceTests {
     @Test func identifiesAtAFrequency() async throws {
         guard let m = runningModel() else { return }
         defer { m.shutdown() }
-        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.rtty(), seconds: 3, offsetHz: 5_000))
+        let snap = Self.snapshot(.rtty(), seconds: 3, offsetHz: 5_000)
+        m.signalID.snapshotProvider = Self.provider(snap)
+        m.signalID.chunkProvider = Self.chunks(snap)
         let id = try #require(await m.signalID.identify(atHz: m.centerHz + 5_000))
         #expect(id.best?.name == "RTTY", "\(id.label)")
         #expect(abs(id.measurement.offsetHz - 5_000) < 50, "\(id.measurement.offsetHz)")
@@ -122,7 +139,9 @@ struct SignalIDServiceTests {
         guard let m = runningModel() else { return }
         defer { m.shutdown() }
         let runs = Locked(0)
-        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.rtty(), seconds: 3, offsetHz: 5_000))
+        let snap = Self.snapshot(.rtty(), seconds: 3, offsetHz: 5_000)
+        m.signalID.snapshotProvider = Self.provider(snap)
+        m.signalID.chunkProvider = Self.chunks(snap)
         m.signalID.analysis = Self.counting(runs)
         let first = try #require(await m.signalID.identify(atHz: m.centerHz + 5_000))
         let near = try #require(await m.signalID.identify(atHz: m.centerHz + 5_040))
@@ -192,6 +211,74 @@ struct SignalIDServiceTests {
         m.signalID.analysis = Self.stub(alternatives: [ft8], widthHz: 50)
         let stale = try #require(await m.signalID.identify(atHz: rf))
         #expect(!stale.confirmedByDecode && stale.best == nil)
+    }
+
+    /// R26: the longer read is never held at the radio's rate. A 16 s read of a 2 MS/s capture comes off the ring
+    /// in pieces of at most 0.5 s and is cut to a 48 kHz channel around the signal as it comes: the second pass
+    /// gets 16 s at 250 kS/s (32 MB), centred on the signal, with the signal where it should be in it, and its
+    /// measurement comes back in the capture's frame.
+    @Test func longerReadIsChannelisedPieceByPiece() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let fs = 2_000_000.0, signalHz = 10_000.0, toneHz = 11_000.0   // a tone 1 kHz above the signal's centre
+        let firstAsked = Locked(0.0)
+        m.signalID.snapshotProvider = { seconds in
+            firstAsked.withLock { $0 = max($0, seconds) }
+            return IQSnapshot(samples: [Float](repeating: 0, count: 2 * Int(seconds * fs)), sampleRate: fs,
+                              endTime: Date())
+        }
+        // Whole cycles in each 1M-frame piece, so piece after piece is one continuous tone.
+        let piece = (0..<1_000_000).flatMap { k -> [Float] in
+            let phase = 2 * Double.pi * toneHz * Double(k) / fs
+            return [Float(cos(phase)), Float(sin(phase))]
+        }
+        let largestPiece = Locked(0), asked = Locked(0.0)
+        m.signalID.chunkProvider = { seconds, chunkFrames, visit in
+            asked.withLock { $0 = seconds }
+            let frames = Int((seconds * fs).rounded())
+            var done = 0
+            while done < frames {
+                let n = min(chunkFrames, frames - done, piece.count / 2)
+                largestPiece.withLock { $0 = max($0, n) }
+                guard piece[0..<(2 * n)].withUnsafeBufferPointer(visit) else { return nil }
+                done += n
+            }
+            return IQRead(frames: frames, sampleRate: fs, endTime: Date())
+        }
+        let second = Locked<(frames: Int, rate: Double, centre: Double, longer: Int, toneDb: Double)?>(nil)
+        m.signalID.analysis = { iq, rate, centre, _, _, _, longer in
+            guard rate < fs else {
+                return SignalIdentity(measurement: SignalMeasurement(offsetHz: signalHz, occupiedBandwidthHz: 50,
+                                                                     family: .carrier, seconds: 3),
+                                      needsLongerRead: true)
+            }
+            // The tone's level at +1 kHz in the channel, over a quieter frequency's (dB).
+            func level(_ hz: Double) -> Double {
+                var re = 0.0, im = 0.0
+                for k in 0..<25_000 {
+                    let w = -2 * Double.pi * hz * Double(k) / rate
+                    re += Double(iq[2 * k]) * cos(w) - Double(iq[2 * k + 1]) * sin(w)
+                    im += Double(iq[2 * k]) * sin(w) + Double(iq[2 * k + 1]) * cos(w)
+                }
+                return re * re + im * im
+            }
+            let toneDb = 10 * log10(level(toneHz - signalHz) / max(level(-(toneHz - signalHz)), 1e-30))
+            second.withLock { $0 = (iq.count / 2, rate, centre, longer?()?.iq.count ?? 0, toneDb) }
+            return SignalIdentity(measurement: SignalMeasurement(offsetHz: 3, occupiedBandwidthHz: 50,
+                                                                 family: .carrier, seconds: 16))
+        }
+        let id = try #require(await m.signalID.identify(atHz: m.centerHz + signalHz))
+        let got = try #require(second.withLock { $0 })
+        #expect(firstAsked.withLock { $0 } < 3.1)   // the full rate only for the first pass's 3 s
+        #expect(asked.withLock { $0 } >= 16)
+        #expect(largestPiece.withLock { $0 } <= 1_000_000)
+        #expect(got.rate == 250_000)
+        #expect(got.frames == 4_000_000, "\(got.frames)")
+        #expect(2 * got.frames * MemoryLayout<Float>.size <= 32 << 20)
+        #expect(got.longer == 2 * got.frames)
+        #expect(got.centre == m.centerHz + signalHz)
+        #expect(got.toneDb > 40, "\(got.toneDb) dB")
+        #expect(id.measurement.offsetHz == signalHz + 3)
     }
 
     /// The snapshot and the analysis run off the main thread, and the main actor keeps running meanwhile: a probe

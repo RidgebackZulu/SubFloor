@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import Testing
 @testable import SignalID
 
@@ -328,6 +329,55 @@ import Testing
         var unnamed = sitor
         unnamed.symbolRate = 57
         #expect(SignalIdentifier.identify(unnamed, rfHz: 8_000_000).label == "2-FSK · 57 Bd · 850 Hz shift")
+    }
+
+    /// A cancelled identification stops between stages instead of running its pass to the end (a hover that moved
+    /// on): the first pass on 3 s at 2 MS/s, cancelled once it is under way, returns in a fraction of the time a
+    /// whole pass takes. Under heavy load the pass can finish before the cancel lands: that run is tolerated.
+    @Test func cancellingStopsPromptly() async {
+        let fs = 2_000_000.0
+        let iq = SignalSynth.make(.nfmVoice(deviationHz: 5000), sampleRate: fs, seconds: 3, snrDb: 20,
+                                  offsetHz: 250_000, seed: 7)
+        @Sendable func run() -> SignalIdentity {
+            SignalIdentifier.identify(iq: iq, sampleRate: fs, captureCenterHz: 446_000_000 - 250_000,
+                                      atHz: 446_000_000, bandwidthHz: nil, spectrumDb: nil, longer: nil)
+        }
+        let clock = ContinuousClock()
+        let full = clock.measure { _ = run() }
+        let started = Atomic<Bool>(false)
+        let task = Task.detached { () -> (SignalIdentity, ContinuousClock.Instant) in
+            started.store(true, ordering: .releasing)
+            return (run(), ContinuousClock.now)
+        }
+        while !started.load(ordering: .acquiring) { await Task.yield() }
+        try? await Task.sleep(for: .milliseconds(20))
+        let cancelledAt = clock.now
+        task.cancel()
+        let (id, finished) = await task.value
+        guard finished > cancelledAt else {
+            print("cancellingStopsPromptly: the pass finished before the cancel (tolerated, load)")
+            return
+        }
+        let after = finished - cancelledAt
+        print("cancellingStopsPromptly: full \(full), returned \(after) after the cancel")
+        #expect(id.note == SignalIdentifier.cancelledNote, "\(Self.describe(id))")
+        #expect(after < full / 2, "returned \(after) after the cancel; a full pass takes \(full)")
+    }
+
+    /// Cancelled while the longer read is being fetched (the app's hover moved on): the slow pass is not run, the
+    /// answer is the first pass's measurement with the cancelled note.
+    @Test func cancellingSkipsTheSlowPass() async {
+        let wspr = Self.placements.first { $0.name == "WSPR" }!
+        let (iq, read) = Self.capture(wspr, snr: 20, seed: 26)
+        let id = await Task.detached {
+            SignalIdentifier.identify(iq: iq, sampleRate: wspr.sampleRate, captureCenterHz: wspr.captureCenterHz,
+                                      atHz: wspr.rfHz, bandwidthHz: nil, spectrumDb: nil) {
+                withUnsafeCurrentTask { $0?.cancel() }
+                return read()
+            }
+        }.value
+        #expect(id.note == SignalIdentifier.cancelledNote, "\(Self.describe(id))")
+        #expect(id.measurement.seconds <= 3.01, "\(id.measurement.seconds)")
     }
 
     /// Noise gives "No signal"; a signal too weak for an extent gives its SNR from a default window.

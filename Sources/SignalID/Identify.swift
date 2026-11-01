@@ -310,6 +310,9 @@ public enum SignalIdentifier {
     ///   `iq` ends) and the signal measured and named again from the same extent: a slot mode (FT8, FT4) over its
     ///   longest transmission in the read. A shorter read than asked for is used, and said in `note`. The longer
     ///   read's answer replaces the first's, a name the first gave included.
+    ///
+    /// A cancelled task stops between stages (the extent, the measurement, each step of the longer read) and gets
+    /// `cancelledNote` with what was measured so far: an answer nobody is waiting for.
     public static func identify(iq: [Float], sampleRate: Double, captureCenterHz: Double, atHz: Double,
                                 bandwidthHz: Double?, spectrumDb: [Float]?,
                                 longer: (() -> (iq: [Float], seconds: Double)?)?) -> SignalIdentity {
@@ -331,9 +334,11 @@ public enum SignalIdentifier {
             // the read's own at about 12 Hz a bin, then at about 3 Hz (a narrow signal such as WSPR stands out only
             // there; a wide one pointed between its tones only at the coarser).
             var found = localExtent(first, sampleRate: sampleRate, pointHz: pointHz)
+            if Task.isCancelled { return cancelled(SignalMeasurement(offsetHz: pointHz, seconds: seconds)) }
             if found == nil { found = spectrumDb.flatMap { extent($0, sampleRate: sampleRate, pointHz: pointHz) } }
             var spectra: [[Float]] = []
             for binHz in spectrumBinHz where found == nil {
+                if Task.isCancelled { return cancelled(SignalMeasurement(offsetHz: pointHz, seconds: seconds)) }
                 let size = spectrumSize(sampleRate: sampleRate, binHz: binHz)
                 guard spectra.last?.count != size else { continue }
                 spectra.append(PowerSpectrum.average(first, size: size, hop: size / 4))
@@ -347,8 +352,11 @@ public enum SignalIdentifier {
 
         let m = SignalMeasurer.measure(first, sampleRate: sampleRate, offsetHz: seed.offsetHz,
                                        bandwidthHz: seed.widthHz, seconds: seconds)
+        if Task.isCancelled { return cancelled(m) }
         let identity = identify(m, rfHz: captureCenterHz + m.offsetHz)
-        guard identity.needsLongerRead, let read = longer?(), read.iq.count >= 2 else { return identity }
+        guard identity.needsLongerRead, !Task.isCancelled, let read = longer?(), read.iq.count >= 2 else {
+            return Task.isCancelled ? cancelled(m) : identity
+        }
 
         // The longer read, from the same seed.
         var long = read.iq
@@ -367,14 +375,23 @@ public enum SignalIdentifier {
             readSeconds = Double(span.count) / sampleRate
             notes.append(String(format: "Measured over its longest transmission, %.1f s", readSeconds))
         }
+        if Task.isCancelled { return cancelled(m) }
         let slow = SignalMeasurer.measure(long, sampleRate: sampleRate, offsetHz: seed.offsetHz,
                                           bandwidthHz: seed.widthHz, seconds: readSeconds)
+        if Task.isCancelled { return cancelled(slow) }
         var refined = identify(slow, rfHz: captureCenterHz + slow.offsetHz)
         // The longer read has been made; only a shorter one than asked for leaves a need that more IQ could meet.
         refined.needsLongerRead = refined.needsLongerRead && snapshotSeconds < longSeconds - 0.1
         if let note = refined.note { notes.insert(note, at: 0) }
         refined.note = notes.isEmpty ? nil : notes.joined(separator: "; ")
         return refined
+    }
+
+    /// The note on an identification its task's cancellation cut short.
+    public static let cancelledNote = "Cancelled"
+
+    static func cancelled(_ m: SignalMeasurement) -> SignalIdentity {
+        SignalIdentity(measurement: m, note: cancelledNote)
     }
 
     // MARK: Extent

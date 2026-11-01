@@ -37,10 +37,10 @@ final class TuneBarrier: Sendable {
 /// Signal ID in the app: names the signal at a display frequency from the newest IQ in the recorder's pre-roll ring
 /// (`StreamRecorder.snapshot`), with `SignalIdentifier.identify`.
 ///
-/// **Off the main actor.** The snapshot (a copy of up to 16 s of IQ) and the analysis run in a detached task, given
-/// only Sendable values; awaiting `identify` from a task that is then cancelled cancels it (the longer read is not
-/// started, the answer dropped). The main actor reads the model (running, the spectrum, the decode log) and the
-/// cache only.
+/// **Off the main actor.** The snapshots and the analysis run in a detached task, given only Sendable values;
+/// awaiting `identify` from a task that is then cancelled cancels it: the identifier stops between its stages, the
+/// longer read between pieces, and the answer is dropped. The main actor reads the model (running, the spectrum,
+/// the decode log) and the cache only.
 ///
 /// **The IQ and its centre.** Everything is in display Hz: the mode table's band hints are, and with HamItUp on the
 /// radio is tuned `Upconverter.loHz` above. `AppModel` brackets every clear of the IQ history (a hardware retune, an
@@ -50,8 +50,15 @@ final class TuneBarrier: Sendable {
 /// `settleSeconds`: the pipeline carries old-centre samples past it. Under a second left gives the identifier's
 /// "Too soon after tuning — try again".
 ///
-/// **The longer read.** When the identifier asks for it (`needsLongerRead`), up to `longSeconds` are read from the
-/// ring, still off the main actor. A ring holding less gives what it holds, which the identifier says in `note`.
+/// **The longer read** (ruling R26). The first pass is 3 s at the radio's rate. When it asks for more
+/// (`needsLongerRead`), up to `longSeconds` are read off the ring a piece at a time (`chunkProvider`, at most
+/// `chunkSeconds` or `maxChunkFrames` each) and each piece cut down as it comes (`ChannelExtractor`) to a channel
+/// around the signal, `minimumChannelHz` or `channelWidths` × its width if wider: the read is never held at the
+/// radio's rate (16 s at 2 MS/s would be 256 MB; the channel's is 32 MB, `longReadBudgetBytes` at most, a wider
+/// channel's read shortened to fit). The identifier then runs again on the channel, at its own rate and centre,
+/// with the channel as its longer read; its measurement is put back in the capture's frame. A ring holding less
+/// gives what it holds (its oldest `settleSeconds` dropped when it reaches back to a retune), which the identifier
+/// says in `note`.
 ///
 /// **Cache.** An answer with an extent (and no longer read still wanted) is kept `cacheSeconds`, over the extent it
 /// found (and the point asked about): a point on the same signal reuses it. A retune empties it.
@@ -67,6 +74,10 @@ final class TuneBarrier: Sendable {
 final class SignalIDService {
     /// Up to `lastSeconds` of the ring's newest IQ (`StreamRecorder.snapshot`), any thread.
     typealias SnapshotProvider = @Sendable (_ lastSeconds: Double) -> IQSnapshot?
+    /// The same span handed over a piece of at most `chunkFrames` at a time
+    /// (`StreamRecorder.snapshot(lastSeconds:chunkFrames:_:)`), any thread.
+    typealias ChunkProvider = @Sendable (_ lastSeconds: Double, _ chunkFrames: Int,
+                                         _ visit: (UnsafeBufferPointer<Float>) -> Bool) -> IQRead?
     /// `SignalIdentifier.identify(iq:sampleRate:captureCenterHz:atHz:bandwidthHz:spectrumDb:longer:)`.
     typealias Analysis = @Sendable (_ iq: [Float], _ sampleRate: Double, _ captureCenterHz: Double, _ atHz: Double,
                                     _ bandwidthHz: Double?, _ spectrumDb: [Float]?,
@@ -76,6 +87,13 @@ final class SignalIDService {
     nonisolated static let longSeconds = 16.0
     /// Pipeline latency: IQ this long after a retune's barrier may still be the old centre's.
     nonisolated static let settleSeconds = 0.05
+    nonisolated static let chunkSeconds = 0.5
+    nonisolated static let maxChunkFrames = 1 << 20
+    /// The longer read's channel: at least this wide, or this many times the signal's width.
+    nonisolated static let minimumChannelHz = 48_000.0
+    nonisolated static let channelWidths = 4.0
+    /// The longer read's channelised IQ at most (interleaved floats).
+    nonisolated static let longReadBudgetBytes = 32 << 20
     static let cacheSeconds = 5.0
     /// A slot decode confirms for this long after its slot ended.
     static let decodeSeconds = 60.0
@@ -92,6 +110,8 @@ final class SignalIDService {
 
     /// Test hook: where the IQ comes from (`AppModel` points it at its IQ recorder).
     @ObservationIgnored var snapshotProvider: SnapshotProvider = { _ in nil }
+    /// Test hook: where the longer read comes from.
+    @ObservationIgnored var chunkProvider: ChunkProvider = { _, _, _ in nil }
     /// Test hook: the analysis (the identifier).
     @ObservationIgnored var analysis: Analysis = { iq, rate, centre, at, width, spectrum, longer in
         SignalIdentifier.identify(iq: iq, sampleRate: rate, captureCenterHz: centre, atHz: at, bandwidthHz: width,
@@ -117,6 +137,7 @@ final class SignalIDService {
     func attach(to model: AppModel, recorder: StreamRecorder) {
         self.model = model
         snapshotProvider = { [recorder] in recorder.snapshot(lastSeconds: $0) }
+        chunkProvider = { [recorder] in recorder.snapshot(lastSeconds: $0, chunkFrames: $1, $2) }
     }
 
     // MARK: Identify
@@ -133,9 +154,9 @@ final class SignalIDService {
         }
 
         let spectrum = model.spectrumSnapshot()
-        let provider = snapshotProvider, analysis = self.analysis, barrier = tuning
+        let provider = snapshotProvider, chunks = chunkProvider, analysis = self.analysis, barrier = tuning
         let task = Task.detached(priority: .userInitiated) {
-            Self.run(atHz: atHz, bandwidthHz: bandwidthHz, spectrum: spectrum, provider: provider,
+            Self.run(atHz: atHz, bandwidthHz: bandwidthHz, spectrum: spectrum, provider: provider, chunks: chunks,
                      analysis: analysis, barrier: barrier)
         }
         let result = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
@@ -158,9 +179,9 @@ final class SignalIDService {
     /// The first read, the analysis and (on request) the longer read: off the main actor. Nil when there is no IQ,
     /// the radio retuned meanwhile, or the task was cancelled.
     private nonisolated static func run(atHz: Double, bandwidthHz: Double?, spectrum: SpectrumSnapshot?,
-                                        provider: @escaping SnapshotProvider, analysis: Analysis,
+                                        provider: SnapshotProvider, chunks: ChunkProvider, analysis: Analysis,
                                         barrier: TuneBarrier) -> (SignalIdentity, TuneBarrier.State)? {
-        guard let (first, state) = read(firstSeconds, provider: provider, barrier: barrier, sequence: nil) else {
+        guard case (var first, let state)? = read(firstSeconds, provider: provider, barrier: barrier) else {
             return nil
         }
         // The app's spectrum, when it is of this capture (the identifier works out its own otherwise).
@@ -168,24 +189,71 @@ final class SignalIDService {
             abs(s.centerHz - state.centerHz) < 0.5 && abs(s.spanHz - first.sampleRate) < 0.5 && s.average.count >= 8
                 ? s.average : nil
         }
-        let longer = { () -> (iq: [Float], seconds: Double)? in
-            guard !Task.isCancelled,
-                  let (long, _) = read(longSeconds, provider: provider, barrier: barrier, sequence: state.sequence),
-                  long.sampleRate == first.sampleRate else { return nil }
-            return (long.samples, Double(long.frames) / long.sampleRate)
+        let identity = analysis(first.samples, first.sampleRate, state.centerHz, atHz, bandwidthHz, spectrumDb, nil)
+        guard !Task.isCancelled else { return nil }
+        guard identity.needsLongerRead else { return (identity, state) }
+
+        // The longer read, on the channel around what the first pass measured.
+        let rate = first.sampleRate
+        first.samples = []   // not held through the longer read
+        let m = identity.measurement
+        guard let long = longerRead(offsetHz: m.offsetHz, widthHz: max(m.occupiedBandwidthHz, bandwidthHz ?? 0),
+                                    tuning: state, sampleRate: rate, chunks: chunks, barrier: barrier) else {
+            return Task.isCancelled ? nil : (identity, state)
         }
-        let identity = analysis(first.samples, first.sampleRate, state.centerHz, atHz, bandwidthHz, spectrumDb, longer)
-        return Task.isCancelled ? nil : (identity, state)
+        var refined = analysis(long.iq, long.sampleRate, state.centerHz + long.offsetHz, atHz, bandwidthHz, nil,
+                               { (long.iq, long.seconds) })
+        guard !Task.isCancelled else { return nil }
+        refined.measurement.offsetHz += long.offsetHz   // back in the capture's frame
+        return (refined, state)
+    }
+
+    /// The longer read's channel: interleaved IQ at `sampleRate`, centred `offsetHz` from the capture centre.
+    struct LongRead: Sendable {
+        var iq: [Float]
+        var sampleRate: Double
+        var offsetHz: Double
+        var seconds: Double
+    }
+
+    /// Up to `longSeconds` (fewer for a channel too wide for `longReadBudgetBytes`) of the ring, read a piece at a
+    /// time and cut to the channel around `offsetHz` (`widthHz` wide, the signal's) as it comes, in the tuning
+    /// `tuning`. A read that reaches back to the barrier loses its oldest `settleSeconds`. Nil when there is no
+    /// IQ, the radio retuned, or the task was cancelled.
+    nonisolated static func longerRead(offsetHz: Double, widthHz: Double, tuning: TuneBarrier.State,
+                                       sampleRate: Double, chunks: ChunkProvider,
+                                       barrier: TuneBarrier) -> LongRead? {
+        guard barrier.current == tuning, sampleRate > 0 else { return nil }
+        let windowHz = max(minimumChannelHz, channelWidths * widthHz)
+        let extractor = ChannelExtractor(sampleRate: sampleRate, offsetHz: offsetHz, bandwidthHz: windowHz,
+                                         sharp: false)
+        // A capture no wider than the channel needs no cutting.
+        let whole = extractor.rate >= sampleRate
+        let rate = whole ? sampleRate : extractor.rate
+        let seconds = min(longSeconds, Double(longReadBudgetBytes / 8) / rate)
+        let asked = seconds + settleSeconds
+        var copied: [Float] = []
+        let read = chunks(asked, min(Int(chunkSeconds * sampleRate), maxChunkFrames)) { piece in
+            guard !Task.isCancelled else { return false }
+            if whole { copied.append(contentsOf: piece) } else { extractor.feed(piece) }
+            return true
+        }
+        guard let read, read.sampleRate == sampleRate, barrier.current == tuning else { return nil }
+        var iq = whole ? copied : extractor.finish().samples
+        // The oldest `settleSeconds` of a read reaching back to the barrier, and anything over `seconds`.
+        let settle = read.frames < Int((asked * sampleRate).rounded()) ? Int((settleSeconds * rate).rounded()) : 0
+        let keep = max(0, min(iq.count / 2 - settle, Int((seconds * rate).rounded())))
+        iq.removeFirst(iq.count - 2 * keep)
+        return LongRead(iq: iq, sampleRate: rate, offsetHz: whole ? 0 : offsetHz, seconds: Double(keep) / rate)
     }
 
     /// Up to `seconds` of the ring's IQ and the tuning it was heard at. A read shorter than asked for reaches back
     /// to the last barrier, and loses its oldest `settleSeconds`. Retried while the barrier moves; nil when there is
-    /// no IQ, or (`sequence` given) the tuning is no longer that one.
-    private nonisolated static func read(_ seconds: Double, provider: SnapshotProvider, barrier: TuneBarrier,
-                                         sequence: Int?) -> (IQSnapshot, TuneBarrier.State)? {
+    /// no IQ.
+    private nonisolated static func read(_ seconds: Double, provider: SnapshotProvider,
+                                         barrier: TuneBarrier) -> (IQSnapshot, TuneBarrier.State)? {
         for _ in 0..<100 {
             let before = barrier.current
-            if let sequence, before.sequence != sequence { return nil }
             guard before.sequence % 2 == 0 else {
                 Thread.sleep(forTimeInterval: 0.002)
                 continue

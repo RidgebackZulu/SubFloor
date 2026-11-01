@@ -14,6 +14,9 @@ import Foundation
 /// With `sharp` false the last stage is only an anti-alias stage too: ±bandwidth/2 is kept clean, but what
 /// lies beyond it up to the output's Nyquist frequency is left in. Far cheaper at high input rates, for a
 /// view that only reads its middle band (Signal ID's analysis window).
+///
+/// A cancelled task's extraction stops early (between mixer blocks), its output cut short: the caller is
+/// abandoning the work anyway.
 public struct Channel {
     /// The lowest output rate.
     public static let minimumRate = 8000.0
@@ -33,7 +36,7 @@ public struct Channel {
             iq.withUnsafeBufferPointer { raw in
                 raw.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: n) { z in
                     var start = 0
-                    while start < n {
+                    while start < n && !Task.isCancelled {
                         let m = min(block.count, n - start)
                         block.withUnsafeMutableBufferPointer { b in
                             b.baseAddress!.update(from: z + start, count: m)
@@ -79,7 +82,7 @@ public struct Channel {
     }
 
     /// The stages and the output rate.
-    private static func plan(sampleRate: Double, bandwidthHz: Double,
+    static func plan(sampleRate: Double, bandwidthHz: Double,
                              sharp: Bool = true) -> (stages: [Stage], rate: Double) {
         let bandwidth = min(max(bandwidthHz, 1), sampleRate)
         let factors = DecimationPlan.stages(inputRate: sampleRate, minimumRate: max(4 * bandwidth, minimumRate))
@@ -138,6 +141,107 @@ public struct Channel {
             let skip = delay / factor
             let wanted = (n + factor - 1) / factor
             return Array(out[skip..<min(out.count, skip + wanted)])
+        }
+    }
+}
+
+/// `Channel.extract` fed a piece at a time, for a capture too long to hold at its input rate (Signal ID's longer
+/// read off the IQ ring): the same output, whatever the pieces' sizes, holding only the output so far, one mixer
+/// block and each stage's filter state. The output is interleaved IQ at `rate`.
+public final class ChannelExtractor {
+    /// The output sample rate.
+    public let rate: Double
+    private let stages: [Channel.Stage]
+    private let decimators: [ComplexDecimator]
+    private var mixer: BlockMixer
+    /// Input not yet a whole mixer block: the mixer's phase carries over whole blocks only.
+    private var block: [DSPComplex]
+    private var blockFill = 0
+    /// Per stage: inputs taken, leading outputs still to drop (its delay), outputs passed on, new outputs.
+    private var taken: [Int]
+    private var toSkip: [Int]
+    private var passed: [Int]
+    private var scratch: [[DSPComplex]]
+    private var samples: [Float] = []
+
+    public init(sampleRate: Double, offsetHz: Double, bandwidthHz: Double, sharp: Bool = true,
+                expectedInputFrames: Int = 0) {
+        let (stages, rate) = Channel.plan(sampleRate: sampleRate, bandwidthHz: bandwidthHz, sharp: sharp)
+        self.stages = stages
+        self.rate = rate
+        decimators = stages.map { ComplexDecimator(taps: $0.taps, factor: $0.factor) }
+        mixer = BlockMixer(frequency: -offsetHz, sampleRate: sampleRate)
+        block = [DSPComplex](repeating: DSPComplex(real: 0, imag: 0), count: BlockMixer.blockSize)
+        taken = Array(repeating: 0, count: stages.count)
+        toSkip = stages.map { ($0.taps.count - 1) / 2 / $0.factor }
+        passed = Array(repeating: 0, count: stages.count)
+        scratch = Array(repeating: [], count: stages.count)
+        let factor = stages.reduce(1) { $0 * $1.factor }
+        samples.reserveCapacity(2 * (expectedInputFrames / factor + 2))
+    }
+
+    /// The next piece of interleaved IQ.
+    public func feed(_ iq: UnsafeBufferPointer<Float>) {
+        let n = iq.count / 2
+        guard n > 0, let base = iq.baseAddress else { return }
+        base.withMemoryRebound(to: DSPComplex.self, capacity: n) { z in
+            var start = 0
+            while start < n {
+                let m = min(BlockMixer.blockSize - blockFill, n - start)
+                block.withUnsafeMutableBufferPointer { b in (b.baseAddress! + blockFill).update(from: z + start, count: m) }
+                blockFill += m
+                start += m
+                if blockFill == BlockMixer.blockSize { mixBlock() }
+            }
+        }
+    }
+
+    /// The output: every piece fed, the filters' tails flushed. The extractor is spent afterwards.
+    public func finish() -> (samples: [Float], rate: Double) {
+        if blockFill > 0 { mixBlock() }
+        for s in stages.indices {
+            // As `Stage.run`: zeros through the filter for its delay, the output cut to one per `factor` inputs.
+            let zeros = [DSPComplex](repeating: DSPComplex(real: 0, imag: 0),
+                                     count: (stages[s].taps.count - 1) / 2 + stages[s].factor)
+            scratch[s].removeAll(keepingCapacity: true)
+            zeros.withUnsafeBufferPointer { decimators[s].process($0, into: &scratch[s]) }
+            deliver(s, limit: (taken[s] + stages[s].factor - 1) / stages[s].factor)
+        }
+        defer { samples = [] }
+        return (samples, rate)
+    }
+
+    private func mixBlock() {
+        block.withUnsafeMutableBufferPointer { b in
+            mixer.mix(b.baseAddress!, count: blockFill)
+            run(0, UnsafeBufferPointer(rebasing: b[0..<blockFill]))
+        }
+        blockFill = 0
+    }
+
+    private func run(_ s: Int, _ x: UnsafeBufferPointer<DSPComplex>) {
+        taken[s] += x.count
+        scratch[s].removeAll(keepingCapacity: true)
+        decimators[s].process(x, into: &scratch[s])
+        deliver(s)
+    }
+
+    /// Stage `s`'s new outputs, less its delay, to the next stage (or the output): at most `limit` in all.
+    private func deliver(_ s: Int, limit: Int = .max) {
+        var out = scratch[s][...]
+        let drop = min(toSkip[s], out.count)
+        toSkip[s] -= drop
+        out = out.dropFirst(drop).prefix(max(0, limit - passed[s]))
+        passed[s] += out.count
+        guard !out.isEmpty else { return }
+        out.withUnsafeBufferPointer { p in
+            if s + 1 < stages.count {
+                run(s + 1, p)
+            } else {
+                p.baseAddress!.withMemoryRebound(to: Float.self, capacity: 2 * p.count) {
+                    samples.append(contentsOf: UnsafeBufferPointer(start: $0, count: 2 * p.count))
+                }
+            }
         }
     }
 }
