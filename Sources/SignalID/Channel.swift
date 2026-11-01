@@ -78,6 +78,14 @@ public struct Channel {
         return sum / squares
     }
 
+    /// The output rate a channel `bandwidthHz` wide cut from `sampleRate` has (the input's, when it doesn't
+    /// decimate). Plans no filters.
+    public static func outputRate(sampleRate: Double, bandwidthHz: Double) -> Double {
+        let bandwidth = min(max(bandwidthHz, 1), sampleRate)
+        return DecimationPlan.stages(inputRate: sampleRate, minimumRate: max(4 * bandwidth, minimumRate))
+            .reduce(sampleRate) { $0 / Double($1) }
+    }
+
     /// The stages and the output rate.
     static func plan(sampleRate: Double, bandwidthHz: Double,
                      sharp: Bool = true) -> (stages: [Stage], rate: Double) {

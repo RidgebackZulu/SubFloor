@@ -204,7 +204,7 @@ public enum SignalIdentifier {
         var longer = false
         let longEnough = m.seconds >= longRead
         if m.family == .noise {
-            return SignalIdentity(measurement: m, note: "No signal")
+            return SignalIdentity(measurement: m, note: noSignalNote)
         }
         // R13: a carrier on a short read could be WSPR's tones; it waits for the longer read.
         if m.family == .carrier && m.seconds < SignalMeasurer.minRefineSeconds {
@@ -320,10 +320,12 @@ public enum SignalIdentifier {
         let available = sampleRate > 0 ? Double(iq.count / 2) / sampleRate : 0
         guard available >= minimumSeconds else {
             return SignalIdentity(measurement: SignalMeasurement(family: .noise, seconds: available),
-                                  note: "Too soon after tuning — try again")
+                                  note: tooSoonNote)
         }
         let seconds = min(firstSeconds, available)
-        let first = Array(iq.suffix(2 * Int((seconds * sampleRate).rounded())))
+        // The newest 3 s: the read itself when it is no longer (the app's is 3 s), never a second copy of it.
+        let firstFloats = 2 * Int((seconds * sampleRate).rounded())
+        let first = iq.count <= firstFloats ? iq : Array(iq.suffix(firstFloats))
         let pointHz = atHz - captureCenterHz
 
         // The seed: an agent's bandwidth, or the extent.
@@ -388,6 +390,11 @@ public enum SignalIdentifier {
         return refined
     }
 
+    /// The note when there is nothing at the point.
+    public static let noSignalNote = "No signal"
+    /// The note when the IQ since the last retune is too short to read (under `minimumSeconds`).
+    public static let tooSoonNote = "Too soon after tuning — try again"
+
     /// The note on an identification its task's cancellation cut short.
     public static let cancelledNote = "Cancelled"
 
@@ -398,7 +405,7 @@ public enum SignalIdentifier {
     // MARK: Extent
 
     /// The extent around `pointHz` in an FFT-shifted spectrum of the whole capture.
-    static func extent(_ db: [Float], sampleRate: Double, pointHz: Double) -> (offsetHz: Double, widthHz: Double)? {
+    public static func extent(_ db: [Float], sampleRate: Double, pointHz: Double) -> (offsetHz: Double, widthHz: Double)? {
         let size = db.count
         guard size >= 8 else { return nil }
         let binHz = sampleRate / Double(size)
@@ -452,14 +459,14 @@ public enum SignalIdentifier {
         let around = max(0, centre - 10 * half)...min(size - 1, centre + 10 * half)
         let outside = around.filter { !window.contains($0) }.map { power[$0] }.sorted()
         var result = SignalMeasurement(offsetHz: pointHz, family: .noise, seconds: seconds)
-        guard !outside.isEmpty, !window.isEmpty else { return SignalIdentity(measurement: result, note: "No signal") }
+        guard !outside.isEmpty, !window.isEmpty else { return SignalIdentity(measurement: result, note: noSignalNote) }
         let noise = outside[outside.count / 2]
         // The noise bins' own scatter, for the window's mean (its bins share leakage: half as many independent).
         let mean = outside.reduce(0, +) / Double(outside.count)
         let scatter = (outside.reduce(0) { $0 + ($1 - mean) * ($1 - mean) } / Double(outside.count)).squareRoot()
         let excess = window.reduce(0) { $0 + power[$1] - noise }
         let threshold = 3 * scatter * (2 * Double(window.count)).squareRoot()
-        guard noise > 0, excess > threshold else { return SignalIdentity(measurement: result, note: "No signal") }
+        guard noise > 0, excess > threshold else { return SignalIdentity(measurement: result, note: noSignalNote) }
         let snr = 10 * log10(excess / (noise * Double(window.count)))
         result.snrDb = snr
         result.family = .unknown   // energy there, too weak to measure

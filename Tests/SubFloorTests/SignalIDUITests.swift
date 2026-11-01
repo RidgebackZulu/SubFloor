@@ -50,7 +50,9 @@ struct SignalIDUITests {
         return m
     }
 
-    private func eventually(_ seconds: Double = 10, _ condition: () -> Bool) async -> Bool {
+    /// Waits (letting the main actor run) until `condition` holds or `seconds` pass. The bound only ends a failing
+    /// wait: one that holds returns at once, however loaded the run (I2).
+    private func eventually(_ seconds: Double = 120, _ condition: () -> Bool) async -> Bool {
         let deadline = Date().addingTimeInterval(seconds)
         while !condition() {
             if Date() > deadline {
@@ -90,16 +92,17 @@ struct SignalIDUITests {
         }
     }
 
-    /// A stub analysis: a 250 Hz RTTY centred where it was asked, counting its runs.
-    /// With `holdLongerRead`, the longer read's analysis waits until that flag is cleared.
-    private static func rtty(runs: Locked<Int>? = nil, needsLongerRead: Bool = false, firstAfter first: Double = 0,
+    /// A stub analysis: a 250 Hz RTTY centred where it was asked, counting its runs. With `holdFirst` the first pass,
+    /// with `holdLongerRead` the longer read's analysis, waits until that flag is cleared: a state the test holds,
+    /// never one it has to catch in a window. A wait ends too when its identification is cancelled (the service runs
+    /// one at a time: a cancelled one must not hold the next), or after 120 s.
+    private static func rtty(runs: Locked<Int>? = nil, needsLongerRead: Bool = false, holdFirst: Locked<Bool>? = nil,
                              holdLongerRead: Locked<Bool>? = nil) -> SignalIDService.Analysis {
         { _, _, centre, at, _, _, longer in
             runs?.withLock { $0 += 1 }
-            if longer == nil, first > 0 { Thread.sleep(forTimeInterval: first) }
-            if longer != nil, let hold = holdLongerRead {
-                let deadline = Date().addingTimeInterval(20)
-                while hold.withLock({ $0 }), Date() < deadline { Thread.sleep(forTimeInterval: 0.005) }
+            if let hold = longer == nil ? holdFirst : holdLongerRead {
+                let deadline = Date().addingTimeInterval(120)
+                while hold.withLock({ $0 }), !Task.isCancelled, Date() < deadline { Thread.sleep(forTimeInterval: 0.005) }
             }
             return SignalIdentity(measurement: SignalMeasurement(offsetHz: at - centre, occupiedBandwidthHz: 250,
                                                                  snrDb: 22, envelope: .steady, family: .fsk,
@@ -148,7 +151,7 @@ struct SignalIDUITests {
         let runs = Locked(0)
         let dwells = Locked(0), open = Locked(false)
         m.signalID.snapshotProvider = Self.provider(Self.snapshot(seconds: 3.1))
-        // No extent: nothing is cached, so every identification that starts is a run.
+        // Every identification that starts is a run (the points differ: none reuses another's answer).
         m.signalID.analysis = { _, _, centre, at, _, _, _ in
             runs.withLock { $0 += 1 }
             return SignalIdentity(measurement: SignalMeasurement(offsetHz: at - centre, family: .noise, seconds: 3),
@@ -181,12 +184,13 @@ struct SignalIDUITests {
         let snap = Self.snapshot(seconds: 3.1)
         m.signalID.snapshotProvider = Self.provider(snap)
         m.signalID.chunkProvider = Self.chunks(snap)
-        let hold = Locked(true)
-        m.signalID.analysis = Self.rtty(needsLongerRead: true, firstAfter: 0.4, holdLongerRead: hold)
+        let holdFirst = Locked(true), hold = Locked(true)
+        m.signalID.analysis = Self.rtty(needsLongerRead: true, holdFirst: holdFirst, holdLongerRead: hold)
 
         m.hover(at: CGPoint(x: 0.5, y: 0.2), viewSize: Self.view)
         #expect(await eventually { m.signalID.hoverPending })
-        #expect(!m.signalID.hoverMeasuring)
+        #expect(!m.signalID.hoverMeasuring && m.signalID.hoverIdentity == nil)
+        holdFirst.withLock { $0 = false }
         #expect(await eventually { m.signalID.hoverIdentity != nil })
         #expect(m.signalID.hoverMeasuring)
         #expect(!m.signalID.hoverPending)
@@ -402,7 +406,7 @@ struct SignalIDUITests {
         m.signalID.snapshotProvider = Self.provider(snap)
         m.signalID.chunkProvider = Self.chunks(snap)
         let hold = Locked(true)
-        m.signalID.analysis = Self.rtty(needsLongerRead: true, firstAfter: 0.3, holdLongerRead: hold)
+        m.signalID.analysis = Self.rtty(needsLongerRead: true, holdLongerRead: hold)
         let hz = m.centerHz + 4_000
         m.signalID.openCard(at: CGPoint(x: 400, y: 100), hz: hz)
         var card = try #require(m.signalID.card)
@@ -418,6 +422,27 @@ struct SignalIDUITests {
         #expect(abs(card.signalHz - hz) < 1e-6)
         m.signalID.closeCard()
         #expect(m.signalID.card == nil)
+    }
+
+    /// A retune while the card's longer read runs drops that read: the first answer stays, saying so, and the card
+    /// is no longer measuring.
+    @Test func aCardWhoseLongerReadIsCutSaysSo() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let snap = Self.snapshot(seconds: 3.1)
+        m.signalID.snapshotProvider = Self.provider(snap)
+        m.signalID.chunkProvider = Self.chunks(snap)
+        let hold = Locked(true)
+        m.signalID.analysis = Self.rtty(needsLongerRead: true, holdLongerRead: hold)
+        m.signalID.openCard(at: CGPoint(x: 400, y: 100), hz: m.centerHz + 4_000)
+        #expect(await eventually { m.signalID.card?.measuring == true })
+        m.signalID.retuneBegins()
+        m.signalID.retuned(displayCenterHz: m.centerHz)
+        hold.withLock { $0 = false }
+        #expect(await eventually { m.signalID.card?.measuring == false })
+        let card = try #require(m.signalID.card)
+        #expect(card.identity?.best?.name == "RTTY")
+        #expect(card.identity?.note == SignalIDService.longerReadCutNote, "\(card.identity?.note ?? "no note")")
     }
 
     @Test func cardWithNoRadioSaysSo() async throws {
