@@ -1,0 +1,91 @@
+truth	part	atHz	toneZeroHz	onSeconds	points	counted	how
+2-FSK	tuning	11687797.0			8	8	tones 11687797 and 11688646 Hz by spectrogram, 849 Hz apart, on throughout, power correlation -0.41; 75 Bd by tone runs near 13, 26 ms, confirmed to 1% by keying lines over the whole recording: squared change of the demodulated frequency peaks at 75.00 Hz (99x median), tone-power difference at 75.00 Hz (673x), edge-phase coherence at 75.00 Bd
+2-FSK	tuning	11688646.0			8	8	tones 11687797 and 11688646 Hz by spectrogram, 849 Hz apart, on throughout, power correlation -0.41; 75 Bd by tone runs near 13, 26 ms, confirmed to 1% by keying lines over the whole recording: squared change of the demodulated frequency peaks at 75.00 Hz (99x median), tone-power difference at 75.00 Hz (673x), edge-phase coherence at 75.00 Bd
+FT4	heldOut	14079994.8	14079963.5	16.19	2	1	FT4 sync: all 4 Costas arrays correlate at 20.83 Hz, 48 ms (score 1.76; over the whole map, noise reaches 1.0 at 99.99%); spectrogram shows 5.0 s on from 16.19 s
+FT4	heldOut	14080000.1	14079968.8	31.17	2	1	FT4 sync: all 4 Costas arrays correlate at 20.83 Hz, 48 ms (score 1.15; over the whole map, noise reaches 1.0 at 99.99%); spectrogram shows 5.0 s on from 31.17 s
+FT4	heldOut	14080177.1	14080145.8	23.64	2	1	FT4 sync: all 4 Costas arrays correlate at 20.83 Hz, 48 ms (score 1.39; over the whole map, noise reaches 1.0 at 99.99%); spectrogram shows 5.0 s on from 23.64 s
+FT4	tuning	14080192.8	14080161.5	9.05	2	1	hand: spectrogram trace of 4 tones, on about 5 s from 9.05 s in FT4 slot 18:18:52.5Z; its Costas arrays are at the noise limit (the first or last only), receiver gain being 20 dB down 10.3 to 12.3 s
+FT4	heldOut	14080250.1	14080218.8	16.16	2	1	FT4 sync: all 4 Costas arrays correlate at 20.83 Hz, 48 ms (score 1.24; over the whole map, noise reaches 1.0 at 99.99%); spectrogram shows 5.0 s on from 16.16 s
+FT4	heldOut	14080250.1	14080218.8	31.15	2	1	FT4 sync: all 4 Costas arrays correlate at 20.83 Hz, 48 ms (score 1.30; over the whole map, noise reaches 1.0 at 99.99%); spectrogram shows 5.0 s on from 31.15 s
+FT4	heldOut	14080390.7	14080359.4	15.44	2	1	FT4 sync: first and last Costas arrays correlate at 20.83 Hz, 48 ms (score 1.80, over the 1.4 noise limit of that search; gain down over the middle ones); spectrogram shows about 5 s on from 15.44 s
+FT4	heldOut	14080390.7	14080359.4	30.46	2	1	FT4 sync: all 4 Costas arrays correlate at 20.83 Hz, 48 ms (score 2.33; over the whole map, noise reaches 1.0 at 99.99%); spectrogram shows 5.0 s on from 30.46 s
+FT4	heldOut	14080546.8	14080515.6	23.7	2	1	FT4 sync: all 4 Costas arrays correlate at 20.83 Hz, 48 ms (score 1.09; over the whole map, noise reaches 1.0 at 99.99%); spectrogram shows 5.0 s on from 23.70 s
+FT4	heldOut	14080619.8	14080588.5	23.8	2	1	FT4 sync: all 4 Costas arrays correlate at 20.83 Hz, 48 ms (score 2.40; over the whole map, noise reaches 1.0 at 99.99%); spectrogram shows 5.0 s on from 23.80 s
+FT4	tuning	14080625.1	14080593.8	8.8	2	1	FT4 sync: first and last Costas arrays correlate at 20.83 Hz, 48 ms (score 1.92, over the 1.4 noise limit of that search; gain down over the middle ones); spectrogram shows about 5 s on from 8.80 s
+FT4	heldOut	14080848.9	14080817.7	31.25	2	1	FT4 sync: all 4 Costas arrays correlate at 20.83 Hz, 48 ms (score 2.69; over the whole map, noise reaches 1.0 at 99.99%); spectrogram shows 5.0 s on from 31.25 s
+FT4	heldOut	14080859.3	14080828.1	16.22	2	1	FT4 sync: all 4 Costas arrays correlate at 20.83 Hz, 48 ms (score 2.14; over the whole map, noise reaches 1.0 at 99.99%); spectrogram shows 5.0 s on from 16.22 s
+FT4	tuning	14081567.8	14081536.5	8.64	2	1	hand: spectrogram trace of 4 tones, on about 5 s from 8.64 s in FT4 slot 18:18:52.5Z; its Costas arrays are at the noise limit (the first or last only), receiver gain being 20 dB down 10.3 to 12.3 s
+FT4	heldOut	14081598.9	14081567.7	23.71	2	1	FT4 sync: all 4 Costas arrays correlate at 20.83 Hz, 48 ms (score 1.41; over the whole map, noise reaches 1.0 at 99.99%); spectrogram shows 5.0 s on from 23.71 s
+FT8	heldOut	14073146.7	14073124.8	30.96	3	3	"decoded by FT8Modem: ""KI4KWR AJ0Z R+01"" (radio text), slot 18:19:15Z"
+FT8	heldOut	14073148.2	14073126.3	16.14	5	4	"decoded by FT8Modem: ""CQ AB9GK EN54"" (radio text), slot 18:19:00Z"
+FT8	tuning	14073150.0	14073128.1	1.0	4	2	FT8 sync: middle and last Costas arrays correlate here on a spectrogram (score 2.34; the same search on the next slot finds its decodes at 2.0 to 4.5), tx from 1.00 s; not decoded: receiver gain 20 dB down until 6.1 s and 10.3 to 12.3 s
+FT8	heldOut	14073183.5	14073161.6	31.65	3	3	"decoded by FT8Modem: ""VE2AO KC8ZPI EN73"" (radio text), slot 18:19:15Z"
+FT8	heldOut	14073257.6	14073235.7	16.74	5	4	"decoded by FT8Modem: ""N0AMY K0GIG EN03"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14073258.8	14073236.9	31.02	3	3	"decoded by FT8Modem: ""KC0VYS N8LNH EN80"" (radio text), slot 18:19:15Z"
+FT8	tuning	14073261.0	14073239.1	1.38	4	3	FT8 sync: middle and last Costas arrays correlate here on a spectrogram (score 2.75; the same search on the next slot finds its decodes at 2.0 to 4.5), tx from 1.38 s; not decoded: receiver gain 20 dB down until 6.1 s and 10.3 to 12.3 s
+FT8	heldOut	14073273.4	14073251.5	16.49	5	4	"decoded by FT8Modem: ""HH2JR K9FE EN51"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14073326.1	14073304.2	16.43	5	4	"decoded by FT8Modem: ""AE4YN KK4TCE FM18"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14073326.5	14073304.6	31.36	3	3	"decoded by FT8Modem: ""CQ ID AE4YN FM08"" (radio text), slot 18:19:15Z"
+FT8	heldOut	14073375.9	14073354.0	16.35	5	4	"decoded by FT8Modem: ""AK6OZ KA6LJR RR73"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14073462.5	14073440.6	16.43	5	4	"decoded by FT8Modem: ""NR0K F6BIA JN18"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14073536.4	14073514.5	16.42	5	4	"decoded by FT8Modem: ""OK1VKP KD2VRL -11"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14073558.2	14073536.3	31.37	3	3	"decoded by FT8Modem: ""K6AXS N3DLY RR73"" (radio text), slot 18:19:15Z"
+FT8	tuning	14073561.0	14073539.1	1.38	4	3	FT8 sync: middle and last Costas arrays correlate here on a spectrogram (score 3.55; the same search on the next slot finds its decodes at 2.0 to 4.5), tx from 1.38 s; not decoded: receiver gain 20 dB down until 6.1 s and 10.3 to 12.3 s
+FT8	heldOut	14073600.3	14073578.4	17.13	5	4	"decoded by FT8Modem: ""NA4DQ KR4HBQ R+11"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14073624.1	14073602.2	31.43	3	3	"decoded by FT8Modem: ""CQ KD8DLX EM99"" (radio text), slot 18:19:15Z"
+FT8	heldOut	14073655.0	14073633.1	16.48	5	4	"decoded by FT8Modem: ""OK1VKP KK2A EM75"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14073737.4	14073715.5	16.36	5	4	"decoded by FT8Modem: ""AJ0Z KI4KWR +07"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14073799.0	14073777.1	31.41	3	3	"decoded by FT8Modem: ""N6BCC KG0GG EM97"" (radio text), slot 18:19:15Z"
+FT8	heldOut	14073801.6	14073779.7	16.37	5	4	"decoded by FT8Modem: ""CQ N6BCC CM97"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14073872.4	14073850.5	16.41	5	4	"decoded by FT8Modem: ""K2BDE W4MAA 73"" (radio text), slot 18:19:00Z"
+FT8	tuning	14073878.1	14073856.2	1.48	4	3	FT8 sync: middle and last Costas arrays correlate here on a spectrogram (score 2.08; the same search on the next slot finds its decodes at 2.0 to 4.5), tx from 1.48 s; not decoded: receiver gain 20 dB down until 6.1 s and 10.3 to 12.3 s
+FT8	heldOut	14073890.7	14073868.8	31.43	3	3	"decoded by FT8Modem: ""K9PC K4TMR +08"" (radio text), slot 18:19:15Z"
+FT8	heldOut	14073957.6	14073935.7	31.4	3	3	"decoded by FT8Modem: ""KJ5LLO N4BBA FM05"" (radio text), slot 18:19:15Z"
+FT8	tuning	14073961.0	14073939.1	1.38	4	3	FT8 sync: middle and last Costas arrays correlate here on a spectrogram (score 2.30; the same search on the next slot finds its decodes at 2.0 to 4.5), tx from 1.38 s; not decoded: receiver gain 20 dB down until 6.1 s and 10.3 to 12.3 s
+FT8	heldOut	14073983.1	14073961.2	16.42	5	4	"decoded by FT8Modem: ""CQ KD3ACB FM29"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14074021.7	14073999.8	31.42	3	3	"decoded by FT8Modem: ""DL2AMD <...> -10"" (radio text), slot 18:19:15Z"
+FT8	tuning	14074102.4	14074080.5	1.62	4	3	"decoded by FT8Modem: ""W5ALR KC8ZPI 73"" (radio text), slot 18:18:45Z"
+FT8	heldOut	14074114.0	14074092.1	31.35	3	3	"decoded by FT8Modem: ""CQ N3SD EN90"" (radio text), slot 18:19:15Z"
+FT8	heldOut	14074120.0	14074098.1	16.4	5	4	"decoded by FT8Modem: ""KA1MWP KW8CW EM75"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14074153.5	14074131.6	16.44	5	4	"decoded by FT8Modem: ""KA1MWP W9MDM 73"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14074223.0	14074201.1	16.43	5	4	"decoded by FT8Modem: ""KJ5JXE N8KWC -12"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14074257.0	14074235.1	31.38	3	3	"decoded by FT8Modem: ""KC0VYS KF8BRC EM98"" (radio text), slot 18:19:15Z"
+FT8	heldOut	14074384.7	14074362.8	31.36	3	3	"decoded by FT8Modem: ""KU0W WY0R 73"" (radio text), slot 18:19:15Z"
+FT8	tuning	14074387.5	14074365.6	1.36	4	3	FT8 sync: middle and last Costas arrays correlate here on a spectrogram (score 4.26; the same search on the next slot finds its decodes at 2.0 to 4.5), tx from 1.36 s; not decoded: receiver gain 20 dB down until 6.1 s and 10.3 to 12.3 s
+FT8	heldOut	14074488.7	14074466.8	31.4	3	3	"decoded by FT8Modem: ""VE3JKN KE7WVV DM56"" (radio text), slot 18:19:15Z"
+FT8	heldOut	14074554.3	14074532.4	30.94	3	3	"decoded by FT8Modem: ""VE3JKN KB0YLQ EN40"" (radio text), slot 18:19:15Z"
+FT8	tuning	14074557.5	14074535.6	1.0	4	2	"decoded by FT8Modem: ""VE3JKN KB0YLQ EN40"" (radio text), slot 18:18:45Z"
+FT8	heldOut	14074645.2	14074623.3	31.18	3	3	"decoded by FT8Modem: ""CQ KB2DJJ FN21"" (radio text), slot 18:19:15Z"
+FT8	heldOut	14074681.4	14074659.5	15.38	5	4	"decoded by FT8Modem: ""CQ KF0WAP EN26"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14074708.2	14074686.3	31.44	3	3	"decoded by FT8Modem: ""KU0W WB0LQW DN70"" (radio text), slot 18:19:15Z"
+FT8	heldOut	14074710.3	14074688.4	17.22	5	4	"decoded by FT8Modem: ""CQ KC0MFW EN21"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14074851.9	14074830.0	16.4	5	4	"decoded by FT8Modem: ""WY0R KU0W RR73"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14074931.7	14074909.8	16.44	5	4	"decoded by FT8Modem: ""9A6R KG9OH EN52"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14074940.5	14074918.6	31.27	3	3	"decoded by FT8Modem: ""CQ KW9U EN51"" (radio text), slot 18:19:15Z"
+FT8	tuning	14074942.2	14074920.3	1.28	4	2	FT8 sync: middle and last Costas arrays correlate here on a spectrogram (score 2.41; the same search on the next slot finds its decodes at 2.0 to 4.5), tx from 1.28 s; not decoded: receiver gain 20 dB down until 6.1 s and 10.3 to 12.3 s
+FT8	heldOut	14074945.2	14074923.3	18.64	5	4	"decoded by FT8Modem: ""NR0K N0DOW EN26"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14075058.9	14075037.0	16.17	5	4	"decoded by FT8Modem: ""N0XRG WI0O EN35"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14075145.3	14075123.4	31.37	3	3	"decoded by FT8Modem: ""EC1DD N1MC EN31"" (radio text), slot 18:19:15Z"
+FT8	tuning	14075148.1	14075126.2	1.37	4	3	"decoded by FT8Modem: ""IW0RLC N1MC 73"" (radio text), slot 18:18:45Z"
+FT8	heldOut	14075218.9	14075197.0	31.49	3	3	"decoded by FT8Modem: ""CQ N3TBB FN20"" (radio text), slot 18:19:15Z"
+FT8	heldOut	14075229.6	14075207.7	16.37	5	4	"decoded by FT8Modem: ""OK1VKP K9PC EN61"" (radio text), slot 18:19:00Z"
+FT8	tuning	14075268.8	14075246.9	1.4	4	3	FT8 sync: middle and last Costas arrays correlate here on a spectrogram (score 2.42; the same search on the next slot finds its decodes at 2.0 to 4.5), tx from 1.40 s; not decoded: receiver gain 20 dB down until 6.1 s and 10.3 to 12.3 s
+FT8	heldOut	14075369.0	14075347.1	16.47	5	4	"decoded by FT8Modem: ""KK4NHC KB4GM FM16"" (radio text), slot 18:19:00Z"
+FT8	heldOut	14075422.6	14075400.7	31.64	3	3	"decoded by FT8Modem: ""SV1DKR K9TC -24"" (radio text), slot 18:19:15Z"
+FT8	tuning	14075425.0	14075403.1	1.58	4	3	FT8 sync: middle and last Costas arrays correlate here on a spectrogram (score 3.77; the same search on the next slot finds its decodes at 2.0 to 4.5), tx from 1.58 s; not decoded: receiver gain 20 dB down until 6.1 s and 10.3 to 12.3 s
+FT8	heldOut	14076174.7	14076152.8	16.46	5	4	"decoded by FT8Modem: ""CQ N7CAR EM73"" (radio text), slot 18:19:00Z"
+comb	tuning	14076917.0			12	10	steady line on the spectrogram through the whole recording, its level following the receiver gain; lines repeat about every 19.3 kHz on the capture spectrum (18.98 kHz locally, with 20.05 kHz steps), doubled 1.04 kHz apart. Not yet proved a comb: InterferenceComb, Task 5
+comb	tuning	14077955.0			12	10	steady line on the spectrogram through the whole recording, its level following the receiver gain; lines repeat about every 19.3 kHz on the capture spectrum (18.98 kHz locally, with 20.05 kHz steps), doubled 1.04 kHz apart. Not yet proved a comb: InterferenceComb, Task 5
+none	tuning	11672000.0			4	4	no trace on a spectrogram of the whole recording within 500 Hz, and no steady line over 7 dB in the average; faint lines of 3 to 7 dB do lie within it. Brief bursts reach about 9.5 dB over 0.5 s of averaged frames and 18 dB in a single 0.5 s FFT, with one bin over 8 dB in at most 4 half-seconds of a clip: none is a signal
+none	tuning	11676500.0			4	4	no trace on a spectrogram of the whole recording within 500 Hz, and no steady line over 7 dB in the average; faint lines of 3 to 7 dB do lie within it. Brief bursts reach about 9.5 dB over 0.5 s of averaged frames and 18 dB in a single 0.5 s FFT, with one bin over 8 dB in at most 4 half-seconds of a clip: none is a signal
+none	tuning	11681000.0			4	4	no trace on a spectrogram of the whole recording within 500 Hz, and no steady line over 7 dB in the average; faint lines of 3 to 7 dB do lie within it. Brief bursts reach about 9.5 dB over 0.5 s of averaged frames and 18 dB in a single 0.5 s FFT, with one bin over 8 dB in at most 4 half-seconds of a clip: none is a signal
+none	tuning	11689350.0			4	4	no trace on a spectrogram of the whole recording within 500 Hz, and no steady line over 7 dB in the average; faint lines of 3 to 7 dB do lie within it. Brief bursts reach about 9.5 dB over 0.5 s of averaged frames and 18 dB in a single 0.5 s FFT, with one bin over 8 dB in at most 4 half-seconds of a clip: none is a signal
+none	tuning	11709100.0			4	4	no trace on a spectrogram of the whole recording within 500 Hz, and no steady line over 7 dB in the average; faint lines of 3 to 7 dB do lie within it. Brief bursts reach about 9.5 dB over 0.5 s of averaged frames and 18 dB in a single 0.5 s FFT, with one bin over 8 dB in at most 4 half-seconds of a clip: none is a signal
+none	tuning	11711300.0			4	4	no trace on a spectrogram of the whole recording within 500 Hz, and no steady line over 7 dB in the average; faint lines of 3 to 7 dB do lie within it. Brief bursts reach about 9.5 dB over 0.5 s of averaged frames and 18 dB in a single 0.5 s FFT, with one bin over 8 dB in at most 4 half-seconds of a clip: none is a signal
+none	tuning	14072200.0			6	6	no trace on a spectrogram of the whole recording within 500 Hz, and no steady line over 7 dB in the average; faint lines of 3 to 7 dB do lie within it. Brief bursts reach about 9.5 dB over 0.5 s of averaged frames and 18 dB in a single 0.5 s FFT, with one bin over 8 dB in at most 4 half-seconds of a clip: none is a signal
+none	tuning	14082700.0			6	6	no trace on a spectrogram of the whole recording within 500 Hz, and no steady line over 7 dB in the average; faint lines of 3 to 7 dB do lie within it. Brief bursts reach about 9.5 dB over 0.5 s of averaged frames and 18 dB in a single 0.5 s FFT, with one bin over 8 dB in at most 4 half-seconds of a clip: none is a signal
+none	tuning	14086000.0			6	6	no trace on a spectrogram of the whole recording within 500 Hz, and no steady line over 7 dB in the average; faint lines of 3 to 7 dB do lie within it. Brief bursts reach about 9.5 dB over 0.5 s of averaged frames and 18 dB in a single 0.5 s FFT, with one bin over 8 dB in at most 4 half-seconds of a clip: none is a signal
+none	tuning	14090000.0			6	6	no trace on a spectrogram of the whole recording within 500 Hz, and no steady line over 7 dB in the average; faint lines of 3 to 7 dB do lie within it. Brief bursts reach about 9.5 dB over 0.5 s of averaged frames and 18 dB in a single 0.5 s FFT, with one bin over 8 dB in at most 4 half-seconds of a clip: none is a signal
+none	tuning	14093200.0			6	6	no trace on a spectrogram of the whole recording within 500 Hz, and no steady line over 7 dB in the average; faint lines of 3 to 7 dB do lie within it. Brief bursts reach about 9.5 dB over 0.5 s of averaged frames and 18 dB in a single 0.5 s FFT, with one bin over 8 dB in at most 4 half-seconds of a clip: none is a signal
+none	tuning	14100000.0			6	6	no trace on a spectrogram of the whole recording within 500 Hz, and no steady line over 7 dB in the average; faint lines of 3 to 7 dB do lie within it. Brief bursts reach about 9.5 dB over 0.5 s of averaged frames and 18 dB in a single 0.5 s FFT, with one bin over 8 dB in at most 4 half-seconds of a clip: none is a signal
+not FSK	tuning	11685864.0			8	8	strong steady line at 11685864 Hz with sidelines, 25 to 30 dB over the noise throughout, no second tone taking turns with it: on the same pattern as the 14 MHz comb lines

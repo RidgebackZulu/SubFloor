@@ -144,9 +144,15 @@ enum RealCorpus {
     /// right per truth: a signal truth's windows count only while it is transmitting.
     static func score(_ part: CorpusPart?, identify: (CorpusClip, CorpusPoint) -> SignalIdentity) throws
         -> [String: (right: Int, total: Int)] {
+        try score(points: points(part), identify: identify)
+    }
+
+    /// The same, over the given points that count.
+    static func score(points: [CorpusPoint], identify: (CorpusClip, CorpusPoint) -> SignalIdentity) throws
+        -> [String: (right: Int, total: Int)] {
         let clips = try clips()
         var out: [String: (right: Int, total: Int)] = [:]
-        for point in try points(part) where counts(point) {
+        for point in points where counts(point) {
             guard let clip = clips.first(where: { $0.name == point.clip }) else { throw CorpusError.missing(point.clip) }
             let right = isRight(identify(clip, point), point)
             out[point.truth, default: (0, 0)].total += 1

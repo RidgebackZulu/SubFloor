@@ -4,8 +4,9 @@ import Testing
 
 /// The score on real signals: the corpus (`RealCorpus`) is sound, and what Signal ID makes of it.
 ///
-/// `SUBFLOOR_SIGNALID_MAKE_CLIPS=1` cuts the clips and spectra from the owner's recordings, and
-/// `SUBFLOOR_SIGNALID_REAL=1` runs the points through the 1 MS/s read on the recordings themselves.
+/// `SUBFLOOR_SIGNALID_MAKE_CLIPS=1` cuts the clips and spectra from the owner's recordings,
+/// `SUBFLOOR_SIGNALID_BASELINE=1` prints the score over every point, and `SUBFLOOR_SIGNALID_REAL=1` runs the points
+/// through the 1 MS/s read on the recordings themselves. `Fixtures/Real/truth_analysis.py` repeats the hand truth.
 @Suite(.serialized) struct RealCorpusTests {
     static let environment = ProcessInfo.processInfo.environment
 
@@ -45,11 +46,21 @@ import Testing
         #expect(held.startUTC == ISO8601DateFormatter().date(from: "2026-11-01T18:19:00Z"))
     }
 
-    /// The before picture: what the identifier makes of the corpus, per truth and per part. Asserts nothing. A default
-    /// run scores the tuning part; `SUBFLOOR_SIGNALID_BASELINE=1` every point, about 5 CPU-minutes in a debug build.
-    @Test func baselineScore() throws {
-        let parts: [CorpusPart] = Self.environment["SUBFLOOR_SIGNALID_BASELINE"] == "1" ? CorpusPart.allCases : [.tuning]
-        try Self.printScore("baseline", parts: parts) { RealCorpus.hover($0, $1) }
+    /// The corpus loads and scores: one counted point of each truth, through the hover's path.
+    @Test func scoresOnePointPerTruth() throws {
+        var picks: [String: CorpusPoint] = [:]
+        for point in try RealCorpus.points(.tuning) where RealCorpus.counts(point) && picks[point.truth] == nil {
+            picks[point.truth] = point
+        }
+        #expect(Set(picks.keys) == ["FT8", "FT4", "2-FSK", "none", "comb", "not FSK"])
+        let score = try RealCorpus.score(points: Array(picks.values)) { RealCorpus.hover($0, $1) }
+        for truth in picks.keys { #expect(score[truth]?.total == 1, "\(truth) wasn't scored") }
+    }
+
+    /// The before picture: what the identifier makes of the corpus, per truth and per part. Asserts nothing, and takes
+    /// about 5 CPU-minutes in a debug build.
+    @Test(.enabled(if: environment["SUBFLOOR_SIGNALID_BASELINE"] == "1")) func baselineScore() throws {
+        try Self.printScore("baseline", parts: CorpusPart.allCases) { RealCorpus.hover($0, $1) }
     }
 
     /// The same points through the 1 MS/s read, on the recordings themselves.

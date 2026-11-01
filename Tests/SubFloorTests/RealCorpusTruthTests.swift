@@ -7,7 +7,11 @@ import Testing
 /// The FT8 truth in the real-signal corpus (`Tests/SignalIDTests/Fixtures/Real`), from SubFloor's own decoder, kept
 /// apart from the code it scores: each clip is SSB-demodulated around the FT8 group and its 15 s slots decoded. A
 /// decode's message passed the LDPC and CRC, so it proves FT8, and its frequency says where the trace is.
-@Suite struct RealCorpusTruthTests {
+///
+/// It takes about 30 CPU-seconds in a debug build, and the truth only changes with the manifest, so it runs only with
+/// `SUBFLOOR_SIGNALID_REAL=1`.
+@Suite(.enabled(if: ProcessInfo.processInfo.environment["SUBFLOOR_SIGNALID_REAL"] == "1"))
+struct RealCorpusTruthTests {
     /// Dial for the demodulation: the display reads low, and this puts the group (14.0731–14.0762 MHz) at
     /// about 1100–4200 Hz of audio.
     static let dialHz = 14_072_000.0
