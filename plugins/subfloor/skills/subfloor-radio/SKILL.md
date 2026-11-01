@@ -172,11 +172,11 @@ S/N 12 dB, English"), never rename, move or delete them.
 
 **Scanning a band** (for example 4–7 MHz for digital signals): `identify_signals {from_hz, to_hz}` does it in one
 call. Inside the capture (`get_status`: `center_hz ± span_hz/2`) it only reads. Over a wider range it steps the
-radio across it, a step of 90% of `span_hz` at a time and about 4 s a step, so the owner hears the tuning move: say
-so before you start. When it finishes it puts the VFO, mode, bandwidth and HamItUp
-back. It will not run while the owner is recording or has Auto on ("The owner is recording: scan only within the
-current view, or ask the owner"): scan inside the capture then, or ask. If the owner retunes during it, it stops
-and tells you (`stopped_early`).
+radio across it, a step of 90% of `span_hz` at a time and about 4 s a step plus a fraction of a second a signal,
+so the owner hears the tuning move: say so before you start. When it finishes it puts the VFO, mode, bandwidth
+and HamItUp back. It will not run while the owner is recording or has Auto on ("The owner is recording: scan only within the
+current view, or ask the owner"): scan inside the capture then, or ask. If the owner retunes, changes the mode or bandwidth,
+or starts recording during it, it stops and tells you (`stopped_early`) and leaves the radio as the owner has it.
 
 For each entry in `signals` (lowest first): `identity` is the `identify_signal` answer. Skip the ones that are not
 what you are after (broadcast AM, voice), and for each that is, `add_bookmark` in the group `Identified` (the one
@@ -189,7 +189,9 @@ the owner's own ID bookmarks use) or a scan-specific group such as `"Scan 4–7 
 - **notes**: `identity.label`, the confidence and alternatives, `confirmed_by_decode`, the SNR, the UTC time, and
   that SubFloor identified it.
 
-If `truncated` is true there were more than `max_signals`: scan narrower pieces. Tell the owner how many you found
+A line marked `at_receiver_centre` may be the receiver's own DC spike, not a signal: say so. If `truncated` is
+true, `max_signals` was reached: carry on with `identify_signals {from_hz: resume_from_hz, to_hz: <the same>}`
+(bookmark what you have first), or ask for a narrower range. Tell the owner how many you found
 and what stayed unnamed. A signal worth a closer look: `tune` to its `identity.tune` settings and `listen`.
 
 ## 7. FT8 maps

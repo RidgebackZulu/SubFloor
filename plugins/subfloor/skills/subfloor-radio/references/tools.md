@@ -170,28 +170,35 @@ Finds every signal across a range and identifies each. Use it to scan a band.
 | `from_hz` **(required)** | number or string | Lower edge, display Hz. |
 | `to_hz` **(required)** | number or string | Upper edge, display Hz. |
 | `min_snr_db` | number | A line must stand this many dB over the floor (default 10, 0–60). |
-| `max_signals` | integer | At most this many signals (default 40, 1–200); it stops there (`truncated`). |
+| `max_signals` | integer | At most this many signals (default 40, 1–200); it stops there (`truncated`, `resume_from_hz`). |
 
 - **Inside the current capture** it does not touch the radio.
 - **Across a wider range** it retunes the radio, one capture at a time (about 90% of `span_hz` a step, at most 60
-  steps), dwelling about 3.5 s on each so the IQ ring fills, and holds the radio lock so nothing else changes it
-  meanwhile. The owner hears every step. When it has finished (or fails, or is cancelled) it puts the VFO, mode,
+  steps), waiting at each until the IQ ring holds about 3 s since the retune (at most 20 s) and then identifying
+  each line: about 4 s a step plus a fraction of a second a signal. It holds the radio lock so nothing else changes
+  it meanwhile. The owner hears every step. When it has finished (or fails, or is cancelled) it puts the VFO, mode,
   bandwidth and HamItUp back. It does not change HamItUp itself: every frequency stays a display frequency.
 - **It refuses** while the owner is recording (audio or IQ) or Auto is on, because a retune would split their file
   or cut an Auto recording: the error reads "The owner is recording: scan only within the current view, or ask
   the owner". Scan inside the capture then, or ask. It also refuses while an IQ file is playing (a range outside
   it), or a range the RSP1B cannot reach.
-- **It stops early** if the owner retunes (or stops the radio) meanwhile, keeps what it found and leaves the radio
-  where the owner put it: `stopped_early` says what happened and `restored` is false.
+- **It stops early** if the radio is changed under it (the VFO, mode, bandwidth, capture or HamItUp, or it is
+  stopped), or, when it steps, a recording or Auto is started. It checks before every step and before putting the
+  radio back, keeps what it found and writes nothing more to the radio, so the owner's change stands:
+  `stopped_early` says what happened and `restored` is false. Inside the capture only a change of the capture
+  itself stops it.
 
-Returns `{from_hz, to_hz, signals, pieces, restored, stopped_early?, truncated?, notes?}`:
+Returns `{from_hz, to_hz, signals, pieces, restored, stopped_early?, truncated?, resume_from_hz?, notes?}`:
 
 - `signals`: `[{hz, level_dbfs, identity}]`, lowest first. `hz` is the signal's centre and `level_dbfs` its peak in
   the spectrum; `identity` has the fields of `identify_signal` (without `hz`). A line inside an already identified
   signal (a tone of an FSK, a sideband) is not listed twice, and a line that turns out to be noise is dropped.
+  Every line over `min_snr_db` is looked at, however many there are. `at_receiver_centre: true` marks a line
+  within a few bins of the capture's centre, where the receiver's own DC spike can show: treat it as doubtful.
 - `pieces`: the captures read. `restored`: the VFO, mode, bandwidth and HamItUp are as they were (true when it
   never moved the radio).
-- `truncated`: more signals were there than `max_signals`. `notes`: pieces skipped or points that could not be
+- `truncated`: `max_signals` was reached, so there may be more above `resume_from_hz`: call `identify_signals`
+  again with `from_hz` set to it (and the same `to_hz`). `notes`: pieces skipped or points that could not be
   read.
 
 Log what it finds with `add_bookmark`, in the `Identified` group the owner's own ID bookmarks use: `name` from

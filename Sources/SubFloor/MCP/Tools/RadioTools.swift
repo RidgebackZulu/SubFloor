@@ -331,7 +331,8 @@ struct SpectrumSlice {
     /// Strongest first. `hz` is the strongest bin's in the peak's point.
     let peaks: [Peak]
 
-    init(_ s: SpectrumSnapshot, from: Double, to: Double, points: Int) {
+    /// `maxPeaks`: how many peaks to list (a scan asks for all of them; the tool's own answer stops at 20).
+    init(_ s: SpectrumSnapshot, from: Double, to: Double, points: Int, maxPeaks: Int = SpectrumSlice.maxPeaks) {
         let n = s.average.count, w = (to - from) / Double(points)
         var levels = [Float](repeating: 0, count: points), best = [Int](repeating: 0, count: points)
         for k in 0..<points {
@@ -359,7 +360,7 @@ struct SpectrumSlice {
                 && (i == top || levels[i] >= levels[i + 1])
         }.sorted { levels[$0] > levels[$1] }
         var peaks: [Peak] = [], taken: [ClosedRange<Int>] = []
-        for i in candidates where peaks.count < Self.maxPeaks && !taken.contains(where: { $0.contains(i) }) {
+        for i in candidates where peaks.count < maxPeaks && !taken.contains(where: { $0.contains(i) }) {
             let floor = levels[i] - Self.peakDb
             var l = i, r = i
             while l > 0 && levels[l - 1] >= floor { l -= 1 }

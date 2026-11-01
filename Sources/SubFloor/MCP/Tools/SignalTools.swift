@@ -31,12 +31,15 @@ extension SubFloorTools {
             SubFloorTool("identify_signals", title: "Identify every signal in a range", readOnly: false, locksRadio: false, description: """
                 Find every signal from from_hz to to_hz (display Hz) and identify each. Inside the current capture \
                 (get_status: center_hz ± span_hz/2) it does not touch the radio. Across a wider range it steps the \
-                radio across it, one capture at a time, dwelling about 3.5 s on each so the IQ fills (at most 60 \
-                pieces), holds the radio lock, and puts the VFO, mode, bandwidth and HamItUp back afterwards. The \
-                owner hears each step. It refuses while the owner is recording or Auto is on (a retune would split \
-                the file), and it stops early, without undoing, if the owner retunes. min_snr_db (default 10) is \
-                how far a line stands over the floor; max_signals (default 40, up to 200). Log what it finds with \
-                add_bookmark. Returns {signals: [{hz, level_dbfs, identity}], pieces, restored, stopped_early?}.
+                radio across it, one capture at a time (at most 60 steps), waiting at each until the IQ ring holds about \
+                3 s (up to 20 s), then identifying each line: about 4 s a step plus a fraction of a second a signal. \
+                It holds the radio lock and puts the VFO, mode, bandwidth and HamItUp back afterwards. The owner \
+                hears each step. It refuses while the owner is recording or Auto is on (a retune would split the \
+                file), and stops early, leaving the radio as it is, if the owner retunes or starts recording. \
+                min_snr_db (default 10) is how far a line stands over the floor; every such line is identified, \
+                up to max_signals (default 40, up to 200): then truncated is set with resume_from_hz, to call again \
+                from. Log what it finds with add_bookmark. Returns {signals: [{hz, level_dbfs, identity}], pieces, \
+                restored, stopped_early?, truncated?, resume_from_hz?}.
                 """, properties: [
                     "from_hz": .frequencySchema("Lower edge, display Hz."),
                     "to_hz": .frequencySchema("Upper edge, display Hz."),
@@ -57,7 +60,7 @@ extension SubFloorTools {
         let m = id.measurement
         var out: [String: JSONValue] = [
             "label": .string(id.label),
-            "family": .string(id.summary["Family"] ?? "Unknown"),
+            "family": .string(SignalIdentity.familyName(m)),
             "name": id.best.map { .string($0.name) }.orNull,
             "confidence": id.best.map { Self.round2(Double($0.confidence)) }.orNull,
             "family_confidence": Self.round2(Double(m.familyConfidence)),
@@ -209,10 +212,14 @@ extension SubFloorTools {
 
     // MARK: identify_signals
 
-    /// The most pieces a scan steps through (about 3.5 s each).
+    /// The most pieces a scan steps through (about 4 s each).
     static let scanMaxPieces = 60
     /// A scan's wait for the IQ ring: the first pass reads this much, and the 50 ms it drops after a retune.
     static let scanRingSeconds = SignalIDService.firstSeconds + SignalIDService.settleSeconds + 0.05
+    /// The finest a scan reads a piece: points across it (the spectrum's own bins, up to this many).
+    static let scanMaxPoints = 16_384
+    /// A line this many bins from the capture's centre may be the receiver's own DC spike.
+    static let dcBins = 4.0
     /// The most a scan lists as its own notes.
     private static let maxScanNotes = 10
 
@@ -233,26 +240,55 @@ extension SubFloorTools {
                           bandwidthHz: m.bandwidthHz, hamitup: m.upconverter.enabled, loHz: m.upconverter.loHz)
     }
 
-    /// How far a scan has gone with the radio: whether it moved it, and whether the owner took it over.
+    /// A scan's state: whether it moved the radio, what it left it as, and whether it has been told to stop.
     private final class ScanRun {
+        /// The scan steps the radio (it is not inside the capture).
+        let stepping: Bool
         var stepped = false
+        /// The radio is the owner's now: nothing more is written to it, and it is not restored.
         var abandoned = false
+        var stopped: String?
+        /// The tuning the scan left, or began with: a difference is someone else's doing.
+        var expected: ScanTuning
+
+        init(stepping: Bool, expected: ScanTuning) {
+            self.stepping = stepping
+            self.expected = expected
+        }
     }
 
-    /// Why the owner has taken the radio from a scan that left it as `expected`, or nil. A scan inside the capture
-    /// (`strict` false) minds only a change of the capture itself: the VFO is the owner's.
-    private func ownerChange(from expected: ScanTuning, strict: Bool) -> String? {
+    /// What has changed since `expected` that a scan must give way to, or nil: a different tuning, mode, bandwidth,
+    /// capture or HamItUp, or the radio stopped; and, for a scan that steps, a recording or Auto that has started
+    /// (a retune would split the IQ file or cut the Auto recording). A scan inside the capture (`stepping` false)
+    /// minds only a change of the capture itself: the VFO is the owner's to move.
+    private func change(since expected: ScanTuning, stepping: Bool) -> String? {
         let now = scanTuning()
-        guard now != expected else { return nil }
-        if !now.running { return "The radio was stopped by the owner." }
         let short = FrequencyFormatter.short
-        if strict || now.centerHz != expected.centerHz || now.hamitup != expected.hamitup || now.loHz != expected.loHz {
-            if now.vfoHz != expected.vfoHz { return "The owner retuned to \(short(now.vfoHz))." }
-            if now.mode != expected.mode { return "The owner changed the mode to \(now.mode.label)." }
-            if now.bandwidthHz != expected.bandwidthHz { return "The owner changed the bandwidth." }
-            return "The owner changed the capture or HamItUp."
+        if now != expected {
+            if !now.running { return "The radio was stopped." }
+            if stepping || now.centerHz != expected.centerHz || now.hamitup != expected.hamitup || now.loHz != expected.loHz {
+                if now.vfoHz != expected.vfoHz { return "The radio was retuned to \(short(now.vfoHz))." }
+                if now.mode != expected.mode { return "The mode was changed to \(now.mode.label)." }
+                if now.bandwidthHz != expected.bandwidthHz { return "The bandwidth was changed." }
+                return "The capture or HamItUp was changed."
+            }
+        }
+        if stepping {
+            model.refreshRecordingStatus()
+            if model.recordingStatus.values.contains(where: \.isRecording) { return "A recording was started." }
+            if model.autoRecordEnabled { return "Auto-record was turned on." }
         }
         return nil
+    }
+
+    /// The one check every radio write and every answer goes through: true when the scan must stop (and says why in
+    /// `run.stopped`). Once stopped it stays stopped. A scan that steps then leaves the radio as it found it.
+    private func interrupted(_ run: ScanRun) -> Bool {
+        if run.stopped != nil { return true }
+        guard let why = change(since: run.expected, stepping: run.stepping) else { return false }
+        run.stopped = why
+        run.abandoned = run.stepping
+        return true
     }
 
     /// The tool: validates, then scans. Inside the capture it doesn't touch the radio and takes no lock; across a
@@ -307,81 +343,79 @@ extension SubFloorTools {
             }
         }
 
-        let start = scanTuning(), run = ScanRun()
-        var found: [(hz: Double, level: Float, identity: SignalIdentity)] = []
+        let start = scanTuning(), run = ScanRun(stepping: !within, expected: scanTuning())
+        var found: [(hz: Double, level: Float, atCentre: Bool, identity: SignalIdentity)] = []
         var extents: [ClosedRange<Double>] = []
         var notes: [String] = []
-        var stopped: String?, truncated = false, scanned = 0
+        var truncated = false, resume = from, scanned = 0
         func note(_ text: String) { if notes.count < Self.maxScanNotes { notes.append(text) } }
 
         do {
             pieceLoop: for k in 0..<pieces {
+                try Task.checkCancellation()
+                if interrupted(run) { break pieceLoop }
                 var cover = from...to
-                var expected = start
                 if !within {
                     let width = (to - from) / Double(pieces)
                     cover = (from + Double(k) * width)...(from + Double(k + 1) * width)
+                    // The signals found are the limit: the rest of the range is for another call.
+                    if found.count >= maxSignals {
+                        truncated = true
+                        resume = cover.lowerBound
+                        break pieceLoop
+                    }
                     // The capture's centre at the piece's middle: the VFO sits a DC offset above it.
                     m.tune(to: (cover.lowerBound + cover.upperBound) / 2 + TuningPlanner.dcOffset(sampleRate: span),
                            keepZoom: true)
                     run.stepped = true
                     noteRadioChange(by: client)
-                    expected = scanTuning()
-                    if let why = try await waitForRing(expected) {
-                        stopped = why
-                        run.abandoned = true
-                        break pieceLoop
-                    }
+                    run.expected = scanTuning()
+                    guard try await waitForRing(run) else { break pieceLoop }
                 }
-                guard let snap = try await spectrumAtCapture(expected, strict: !within) else {
-                    if let why = ownerChange(from: expected, strict: !within) {
-                        stopped = why
-                        run.abandoned = !within
-                        break pieceLoop
-                    }
+                guard let snap = try await spectrumAtCapture(run) else {
+                    if run.stopped != nil || interrupted(run) { break pieceLoop }
                     note("No spectrum for \(short(cover.lowerBound)) – \(short(cover.upperBound)): skipped.")
                     continue
                 }
                 scanned += 1
 
-                // The lines of this piece: the usable part of the capture, within what was asked.
+                // The lines of this piece: the usable part of the capture, within what was asked, at the spectrum's
+                // own resolution, every one over the floor, lowest first.
                 let edge = within ? 0 : span * (0.5 - TuningPlanner.usableFraction)
                 let lo = max(cover.lowerBound, snap.lowerHz + edge), hi = min(cover.upperBound, snap.upperHz - edge)
                 guard hi - lo > 16 * snap.binHz else { continue }
-                let points = min(2048, max(16, Int(((hi - lo) / snap.binHz).rounded())))
-                let slice = SpectrumSlice(snap, from: lo, to: hi, points: points)
+                let points = min(Self.scanMaxPoints, max(16, Int(((hi - lo) / snap.binHz).rounded())))
+                let slice = SpectrumSlice(snap, from: lo, to: hi, points: points, maxPeaks: points)
                 let floor = slice.levels.sorted()[points / 2]
-                for peak in slice.peaks where peak.level >= floor + Float(minSNR) {
-                    if found.count >= maxSignals {
-                        truncated = true
-                        break pieceLoop
-                    }
+                let lines = slice.peaks.filter { $0.level >= floor + Float(minSNR) }.sorted { $0.hz < $1.hz }
+                for peak in lines {
                     // A line inside a signal already identified (a tone of an FSK, a sideband) is that signal.
                     if extents.contains(where: { $0.contains(peak.hz) }) { continue }
-                    if let why = ownerChange(from: expected, strict: !within) {
-                        stopped = why
-                        run.abandoned = !within
+                    if found.count >= maxSignals {
+                        truncated = true
+                        resume = max(from, peak.hz - 2 * snap.binHz)
                         break pieceLoop
                     }
+                    if interrupted(run) { break pieceLoop }
                     let identity = await m.signalID.identify(atHz: peak.hz)
                     try Task.checkCancellation()
                     guard let identity else {
-                        if let why = ownerChange(from: expected, strict: !within) {
-                            stopped = why
-                            run.abandoned = !within
-                            break pieceLoop
-                        }
+                        if interrupted(run) { break pieceLoop }
                         note("\(short(peak.hz)): nothing to read.")
                         continue
                     }
                     let m1 = identity.measurement
-                    if m1.family == .noise { continue }   // "No signal": a line that was not one
-                    let hz = signalHz(identity, askedHz: peak.hz)
-                    if m1.occupiedBandwidthHz > 0 {
-                        let half = max(m1.occupiedBandwidthHz, m1.bandwidth6dBHz) / 2
-                        extents.append((hz - half)...(hz + half))
+                    if m1.family != .noise {   // noise is "No signal": a line that was not one
+                        let hz = signalHz(identity, askedHz: peak.hz)
+                        if m1.occupiedBandwidthHz > 0 {
+                            let half = max(m1.occupiedBandwidthHz, m1.bandwidth6dBHz) / 2
+                            extents.append((hz - half)...(hz + half))
+                        }
+                        // The receiver's centre carries a residual zero-IF DC spike.
+                        found.append((hz, peak.level, abs(peak.hz - snap.centerHz) <= Self.dcBins * snap.binHz, identity))
                     }
-                    found.append((hz, peak.level, identity))
+                    // The answer stands, but the owner's change since means no more of the scan.
+                    if interrupted(run) { break pieceLoop }
                 }
             }
         } catch {
@@ -393,62 +427,68 @@ extension SubFloorTools {
         var result: [String: JSONValue] = [
             "from_hz": .hz(from), "to_hz": .hz(to),
             "signals": .array(found.sorted { $0.hz < $1.hz }.map { f in
-                .object(["hz": .hz(f.hz), "level_dbfs": .db(f.level),
-                         "identity": .object(identityJSON(f.identity, signalHz: f.hz, includeHz: false))])
+                var entry: [String: JSONValue] = ["hz": .hz(f.hz), "level_dbfs": .db(f.level),
+                                                  "identity": .object(identityJSON(f.identity, signalHz: f.hz, includeHz: false))]
+                if f.atCentre { entry["at_receiver_centre"] = .bool(true) }
+                return .object(entry)
             }),
             "pieces": .number(Double(scanned)),
             "restored": .bool(restored),
         ]
-        if let stopped { result["stopped_early"] = .string(stopped) }
-        if truncated { result["truncated"] = .bool(true) }
+        if let stopped = run.stopped { result["stopped_early"] = .string(stopped) }
+        if truncated {
+            result["truncated"] = .bool(true)
+            result["resume_from_hz"] = .hz(resume)
+        }
         if !notes.isEmpty { result["notes"] = .array(notes.map { .string($0) }) }
         return result
     }
 
     /// Waits until the IQ ring holds the first pass's read since the last retune, up to `ringWaitLimit` (then the
-    /// answer says how much it read). Returns why to stop if the owner took the radio meanwhile.
-    private func waitForRing(_ expected: ScanTuning) async throws -> String? {
+    /// answer says how much it read). False if the scan has to stop meanwhile.
+    private func waitForRing(_ run: ScanRun) async throws -> Bool {
         let deadline = ContinuousClock.now + ringWaitLimit
         while !ringReady(Self.scanRingSeconds) {
-            if let why = ownerChange(from: expected, strict: true) { return why }
+            if interrupted(run) { return false }
             if ContinuousClock.now >= deadline { break }
             try await Task.sleep(for: .milliseconds(100))
         }
-        return ownerChange(from: expected, strict: true)
+        return !interrupted(run)
     }
 
     /// The averaged spectrum of the capture the radio has now: the app's frames from before a retune carry the old
-    /// centre, so it waits (up to 3 s) for one that is the new capture's. Nil if none comes.
-    private func spectrumAtCapture(_ expected: ScanTuning, strict: Bool) async throws -> SpectrumSnapshot? {
+    /// centre, so it waits (up to 3 s) for one that is the new capture's. Nil if none comes, or the scan must stop.
+    private func spectrumAtCapture(_ run: ScanRun) async throws -> SpectrumSnapshot? {
         let m = model
         let deadline = ContinuousClock.now + .seconds(3)
         while true {
             if let s = scanSpectrum(), abs(s.centerHz - m.centerHz) < 0.5, abs(s.spanHz - m.sampleRate) < 0.5,
                s.average.count >= 64 {
-                return s
+                return interrupted(run) ? nil : s
             }
-            if ownerChange(from: expected, strict: strict) != nil || ContinuousClock.now >= deadline { return nil }
+            if interrupted(run) || ContinuousClock.now >= deadline { return nil }
             try await Task.sleep(for: .milliseconds(50))
         }
     }
 
-    /// Puts the VFO, mode, bandwidth and HamItUp back (and the capture where it was) after a scan that stepped.
-    /// Not when the owner took the radio over meanwhile: that is theirs. Returns whether the radio is as it began.
+    /// Puts the VFO, mode, bandwidth and HamItUp back (and the capture where it was) after a scan that stepped,
+    /// unless the radio has become someone else's meanwhile (checked here too, last of all, so nothing is written
+    /// over it). Returns whether the radio is as it began; a scan that never moved it always is.
     @discardableResult
     private func restoreScan(_ start: ScanTuning, _ run: ScanRun, client: String) -> Bool {
-        let m = model
-        if run.stepped && !run.abandoned {
-            if m.upconverter.enabled != start.hamitup { m.setUpconverter(start.hamitup) }
-            if m.mode != start.mode { m.setMode(start.mode) }
-            // The capture where it was, then the VFO inside it where it was.
-            m.tune(to: start.centerHz + TuningPlanner.dcOffset(sampleRate: m.sampleRate), keepZoom: true)
-            m.setVFO(start.vfoHz)
-            if m.bandwidthHz != start.bandwidthHz { m.setBandwidth(start.bandwidthHz) }
-            noteRadioChange(by: client)
-        }
-        let now = scanTuning()
+        guard run.stepped else { return true }
+        if !run.abandoned { _ = interrupted(run) }
         guard !run.abandoned else { return false }
-        return !run.stepped || (now.vfoHz == start.vfoHz && now.mode == start.mode
-            && now.bandwidthHz == start.bandwidthHz && now.hamitup == start.hamitup)
+        let m = model
+        if m.upconverter.enabled != start.hamitup { m.setUpconverter(start.hamitup) }
+        if m.mode != start.mode { m.setMode(start.mode) }
+        // The capture where it was, then the VFO inside it where it was.
+        m.tune(to: start.centerHz + TuningPlanner.dcOffset(sampleRate: m.sampleRate), keepZoom: true)
+        m.setVFO(start.vfoHz)
+        if m.bandwidthHz != start.bandwidthHz { m.setBandwidth(start.bandwidthHz) }
+        noteRadioChange(by: client)
+        let now = scanTuning()
+        return now.vfoHz == start.vfoHz && now.mode == start.mode && now.bandwidthHz == start.bandwidthHz
+            && now.hamitup == start.hamitup
     }
 }

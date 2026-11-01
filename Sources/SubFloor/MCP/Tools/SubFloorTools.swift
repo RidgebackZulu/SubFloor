@@ -107,6 +107,8 @@ final class SubFloorTools: MCPToolProvider {
                 return .ok(.object(fields))
             } catch let e as ToolError {
                 return .failure(e.message)
+            } catch is CancellationError {
+                return .failure("\(name) was cancelled.")
             } catch {
                 return .failure("\(name) failed: \(error.localizedDescription)")
             }

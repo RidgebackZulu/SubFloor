@@ -59,7 +59,7 @@ struct MCPSignalToolsTests {
     }
 
     /// A stub analysis: a 100 Hz wide RTTY, centred where it was asked.
-    private static func rtty(widthHz: Double = 100, seconds: Double = 0) -> SignalIDService.Analysis {
+    private nonisolated static func rtty(widthHz: Double = 100, seconds: Double = 0) -> SignalIDService.Analysis {
         { _, _, centre, at, _, _, _ in
             if seconds > 0 { Thread.sleep(forTimeInterval: seconds) }
             return SignalIdentity(measurement: SignalMeasurement(offsetHz: at - centre, occupiedBandwidthHz: widthHz,
@@ -197,6 +197,12 @@ struct MCPSignalToolsTests {
         let two = await call(tools, "identify_signals", range.merging(["max_signals": .number(2)]) { a, _ in a })
         #expect(two.structured?["signals"]?.array?.count == 2)
         #expect(two.structured?["truncated"]?.bool == true)
+        // It says where to go on from: past the second line, not past the third.
+        let resume = two.structured?["resume_from_hz"]?.double ?? 0
+        #expect(resume > lines[1] + 1_000 && resume <= lines[2], "\(resume)")
+        let rest = await call(tools, "identify_signals", ["from_hz": .number(resume), "to_hz": .number(m.centerHz + 450_000)])
+        #expect(rest.structured?["signals"]?.array?.count == 1)
+        #expect(rest.structured?["truncated"] == nil)
         // The lines stand 30 dB over the floor: 40 dB asks for more than there is.
         let strict = await call(tools, "identify_signals", range.merging(["min_snr_db": .number(40)]) { a, _ in a })
         #expect(strict.structured?["signals"]?.array == [])
@@ -264,6 +270,7 @@ struct MCPSignalToolsTests {
         }
         let r = await task.value
         #expect(r.isError)
+        #expect(r.content.contains("cancelled"), "\(r.content)")
         #expect(Tuning(m) == before)
         #expect(m.centerHz == centre)
         // The lock is free again: the next call does not wait.
@@ -329,7 +336,7 @@ struct MCPSignalToolsTests {
         let r = await call(tools, "identify_signals", ["from_hz": .number(from), "to_hz": .number(from + 2.5 * span)])
         #expect(!r.isError, "\(r.content)")
         let s = r.structured
-        #expect(s?["stopped_early"]?.string?.contains("owner") == true, "\(String(describing: s?["stopped_early"]))")
+        #expect(s?["stopped_early"]?.string?.contains("retuned") == true, "\(String(describing: s?["stopped_early"]))")
         // What the first piece found is kept; the owner's tuning is left alone, not fought.
         #expect(s?["pieces"]?.double == 1)
         #expect(s?["signals"]?.array?.count == 1)
@@ -361,6 +368,185 @@ struct MCPSignalToolsTests {
                              ["from_hz": .number(7_000_000), "to_hz": .number(7_100_000)])
         #expect(off.isError)
         #expect(off.content.contains("start_radio"))
+    }
+
+
+    // MARK: Giving way to the owner
+
+    /// A stepped scan of three pieces with a line in each, during whose first identify `owner` acts on the model
+    /// (as a click or a key would, between the scan's awaits). Returns the result and the centre the scan had parked
+    /// the radio at when the owner acted.
+    private func scanWithOwnerActing(_ m: AppModel, _ tools: SubFloorTools, parked: Shared<Double>,
+                                     _ owner: @escaping @MainActor () -> Void) async -> MCPToolResult {
+        let span = m.sampleRate, from = 6_000_000.0
+        let lines = [from + 0.4 * span, from + 1.3 * span, from + 2.2 * span]
+        tools.scanSpectrum = { Self.spectrum(of: m, lines: lines) }
+        let calls = Shared(0)
+        m.signalID.analysis = { _, _, centre, at, _, _, _ in
+            if calls.withLock({ n -> Int in n += 1; return n }) == 1 {
+                Task { @MainActor in
+                    parked.withLock { $0 = m.centerHz }
+                    owner()
+                }
+                Thread.sleep(forTimeInterval: 0.2)   // the owner acts while this identify runs
+            }
+            return Self.rtty()(Array<Float>(), 48_000, centre, at, nil, nil, nil)
+        }
+        return await call(tools, "identify_signals", ["from_hz": .number(from), "to_hz": .number(from + 2.5 * span)])
+    }
+
+    /// The scan stops at once, keeps its first piece's signal, and neither steps on nor restores over the owner.
+    private func expectStopped(_ r: MCPToolResult, _ m: AppModel, parked: Double, saying fragment: String,
+                               sourceLocation: SourceLocation = #_sourceLocation) {
+        #expect(!r.isError, "\(r.content)", sourceLocation: sourceLocation)
+        let s = r.structured
+        #expect(s?["stopped_early"]?.string?.contains(fragment) == true, "\(String(describing: s?["stopped_early"]))",
+                sourceLocation: sourceLocation)
+        #expect(s?["signals"]?.array?.count == 1, sourceLocation: sourceLocation)
+        #expect(s?["pieces"]?.double == 1, sourceLocation: sourceLocation)
+        #expect(s?["restored"]?.bool == false, sourceLocation: sourceLocation)
+        // No second step, and no restore: the capture is where the first piece left it.
+        #expect(m.centerHz == parked, sourceLocation: sourceLocation)
+    }
+
+    @Test func scanGivesWayToAClickInsideTheCapture() async {
+        guard let (m, tools) = runningModel() else { return }
+        defer { m.shutdown() }
+        m.tune(to: 7_150_000)
+        let parked = Shared(0.0), target = Shared(0.0)
+        let r = await scanWithOwnerActing(m, tools, parked: parked) {
+            target.withLock { $0 = m.centerHz + 250_000 }
+            m.setVFO(m.centerHz + 250_000)
+        }
+        expectStopped(r, m, parked: parked.withLock { $0 }, saying: "retuned")
+        #expect(m.vfoHz == target.withLock { $0 })
+    }
+
+    @Test func scanGivesWayToAModeChange() async {
+        guard let (m, tools) = runningModel() else { return }
+        defer { m.shutdown() }
+        m.setMode(.lsb)
+        m.tune(to: 7_150_000)
+        let parked = Shared(0.0)
+        let r = await scanWithOwnerActing(m, tools, parked: parked) { m.setMode(.cw) }
+        expectStopped(r, m, parked: parked.withLock { $0 }, saying: "mode")
+        #expect(m.mode == .cw)
+    }
+
+    @Test func scanGivesWayToABandwidthChange() async {
+        guard let (m, tools) = runningModel() else { return }
+        defer { m.shutdown() }
+        m.setMode(.usb)
+        m.tune(to: 7_150_000)
+        let parked = Shared(0.0)
+        let r = await scanWithOwnerActing(m, tools, parked: parked) { m.setBandwidth(1_234) }
+        expectStopped(r, m, parked: parked.withLock { $0 }, saying: "bandwidth")
+        #expect(m.bandwidthHz == 1_234)
+    }
+
+    @Test func scanGivesWayToARecordingStartedMidScan() async {
+        guard let (m, tools) = runningModel() else { return }
+        defer { m.shutdown() }
+        m.tune(to: 7_150_000)
+        let parked = Shared(0.0)
+        let r = await scanWithOwnerActing(m, tools, parked: parked) { m.startRecording(.audio) }
+        defer { m.stopRecording(.audio) }
+        expectStopped(r, m, parked: parked.withLock { $0 }, saying: "recording")
+        #expect(m.isRecording(.audio))
+    }
+
+    @Test func scanGivesWayToAutoTurnedOnMidScan() async {
+        guard let (m, tools) = runningModel() else { return }
+        defer { m.shutdown() }
+        m.tune(to: 7_150_000)
+        let parked = Shared(0.0)
+        let r = await scanWithOwnerActing(m, tools, parked: parked) { m.autoRecordEnabled = true }
+        defer { m.autoRecordEnabled = false }
+        expectStopped(r, m, parked: parked.withLock { $0 }, saying: "Auto")
+    }
+
+    /// The owner clicks during the very last identify: the restore that follows is not written over it.
+    @Test func scanDoesNotRestoreOverAClickDuringTheLastIdentify() async {
+        guard let (m, tools) = runningModel() else { return }
+        defer { m.shutdown() }
+        m.tune(to: 7_150_000)
+        let span = m.sampleRate, from = 6_000_000.0
+        tools.scanSpectrum = { Self.spectrum(of: m, lines: [from + 2.2 * span]) }   // in the last piece only
+        let target = Shared(0.0), parked = Shared(0.0)
+        m.signalID.analysis = { _, _, centre, at, _, _, _ in
+            Task { @MainActor in
+                parked.withLock { $0 = m.centerHz }
+                target.withLock { $0 = m.centerHz + 250_000 }
+                m.setVFO(m.centerHz + 250_000)
+            }
+            Thread.sleep(forTimeInterval: 0.2)
+            return Self.rtty()([], 48_000, centre, at, nil, nil, nil)
+        }
+        let r = await call(tools, "identify_signals", ["from_hz": .number(from), "to_hz": .number(from + 2.5 * span)])
+        #expect(r.structured?["signals"]?.array?.count == 1)
+        #expect(r.structured?["stopped_early"]?.string?.contains("retuned") == true)
+        #expect(r.structured?["restored"]?.bool == false)
+        #expect(m.vfoHz == target.withLock { $0 })
+        #expect(m.centerHz == parked.withLock { $0 })
+    }
+
+    /// An owner change just before the scan would put the radio back: it is not put back over it.
+    @Test func scanDoesNotRestoreOverAnOwnerChangeAtTheEnd() async {
+        guard let (m, tools) = runningModel() else { return }
+        defer { m.shutdown() }
+        m.tune(to: 7_150_000)
+        let span = m.sampleRate, from = 6_000_000.0
+        tools.scanSpectrum = { Self.spectrum(of: m, lines: [from + 0.4 * span]) }
+        let lastPiece = Shared(0)
+        let target = Shared(0.0)
+        // The owner clicks while the last piece's ring fills; there is nothing left to identify there.
+        tools.ringReady = { _ in
+            if lastPiece.withLock({ n -> Int in n += 1; return n }) == 3 {
+                target.withLock { $0 = m.centerHz + 50_000 }
+                m.setVFO(m.centerHz + 50_000)
+            }
+            return true
+        }
+        let r = await call(tools, "identify_signals", ["from_hz": .number(from), "to_hz": .number(from + 2.5 * span)])
+        #expect(r.structured?["stopped_early"]?.string?.contains("retuned") == true)
+        #expect(r.structured?["restored"]?.bool == false)
+        #expect(m.vfoHz == target.withLock { $0 })
+    }
+
+    // MARK: Every line
+
+    @Test func scanFindsEveryLineOfABusyPiece() async {
+        guard let (m, tools) = runningModel() else { return }
+        defer { m.shutdown() }
+        // 36 lines in one capture: well over the 20 a spectrum reply lists.
+        let lines = (0..<36).map { m.centerHz - 360_000 + Double($0) * 20_000 }
+        tools.scanSpectrum = { Self.spectrum(of: m, lines: lines) }
+        let r = await call(tools, "identify_signals", ["from_hz": .number(m.centerHz - 400_000), "to_hz": .number(m.centerHz + 400_000)])
+        #expect(!r.isError, "\(r.content)")
+        let hzs = (r.structured?["signals"]?.array ?? []).compactMap { $0["hz"]?.double }
+        #expect(hzs.count == 36, "\(hzs.count)")
+        for (hz, line) in zip(hzs, lines) { #expect(abs(hz - line) < 1_000) }
+        #expect(r.structured?["truncated"] == nil)
+        // The same band across pieces keeps every line too.
+        m.tune(to: 7_150_000)
+        let span = m.sampleRate, from = 6_000_000.0
+        let busy = (0..<75).map { from + 20_000 + Double($0) * 0.0333 * span }
+        tools.scanSpectrum = { Self.spectrum(of: m, lines: busy) }
+        let wide = await call(tools, "identify_signals", ["from_hz": .number(from), "to_hz": .number(from + 2.5 * span),
+                                                          "max_signals": .number(200)])
+        #expect((wide.structured?["signals"]?.array?.count ?? 0) == busy.count, "\(wide.structured?["signals"]?.array?.count ?? 0)")
+    }
+
+    @Test func scanMarksALineAtTheReceiverCentre() async {
+        guard let (m, tools) = runningModel() else { return }
+        defer { m.shutdown() }
+        let lines = [m.centerHz - 200_000, m.centerHz + 100, m.centerHz + 300_000]
+        tools.scanSpectrum = { Self.spectrum(of: m, lines: lines) }
+        let r = await call(tools, "identify_signals", ["from_hz": .number(m.centerHz - 450_000), "to_hz": .number(m.centerHz + 450_000)])
+        let found = r.structured?["signals"]?.array ?? []
+        #expect(found.count == 3)
+        #expect(found.compactMap { $0["at_receiver_centre"]?.bool } == [true])
+        #expect(found[1]["at_receiver_centre"]?.bool == true)
     }
 
     // MARK: get_cursor
@@ -425,6 +611,7 @@ struct MCPSignalToolsTests {
     /// `needs_longer_read`, and the longer read finishes behind it into the cache.
     @Test func cursorDoesNotWaitForTheLongerRead() async {
         let runs = Shared(0)
+        let longReadDone = Shared(false)
         let analysis: SignalIDService.Analysis = { iq, rate, centre, at, width, spectrum, longer in
             let n = runs.withLock { n -> Int in n += 1; return n }
             var id = SignalIdentity(measurement: SignalMeasurement(offsetHz: at - centre, occupiedBandwidthHz: 30, snrDb: 20,
@@ -434,6 +621,7 @@ struct MCPSignalToolsTests {
             } else {
                 Thread.sleep(forTimeInterval: 1.5)   // the longer read, slowly
                 id.best = ModeMatch(name: "WSPR", confidence: 0.9, evidence: [])
+                longReadDone.withLock { $0 = true }
             }
             return id
         }
@@ -441,10 +629,9 @@ struct MCPSignalToolsTests {
         defer { m.shutdown() }
         m.setMode(.usb)
         m.tune(to: m.centerHz + 20_000)
-        let started = Date()
         let first = await call(tools, "get_cursor")
-        let took = Date().timeIntervalSince(started)
-        #expect(took < 1.2, "took \(took) s")
+        // The call returned while the longer read was still running, not after it.
+        #expect(!longReadDone.withLock { $0 })
         let signal = first.structured?["vfo"]?["signal"]
         #expect(signal?["needs_longer_read"]?.bool == true, "\(String(describing: signal))")
         #expect(signal?["name"] == .null)
@@ -456,6 +643,8 @@ struct MCPSignalToolsTests {
         let later = await call(tools, "get_cursor")
         #expect(later.structured?["vfo"]?["signal"]?["name"]?.string == "WSPR")
         #expect(later.structured?["vfo"]?["signal"]?["needs_longer_read"]?.bool == false)
+        // From the cache: the first pass and the longer read were the only two analyses.
+        #expect(runs.withLock { $0 } == 2)
     }
 
     // MARK: Descriptors

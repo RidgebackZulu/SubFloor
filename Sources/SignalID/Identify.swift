@@ -82,7 +82,7 @@ public struct SignalIdentity: Codable, Sendable, Equatable {
     }
 
     /// The family as the line shows it: `2-FSK`, `BPSK`, `USB` …
-    static func familyName(_ m: SignalMeasurement) -> String {
+    public static func familyName(_ m: SignalMeasurement) -> String {
         switch m.family {
         case .noise: "Noise"
         case .carrier: "Carrier"
