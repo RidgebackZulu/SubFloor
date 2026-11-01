@@ -20,7 +20,10 @@ private final class Locked<Value: Sendable>: Sendable {
 
 /// Task 8: the hover line and the right-click ID card. A demo-source model with a stub analysis where the test
 /// is about the UI, not the identifier; the card and the line drawn offscreen.
+/// One test at a time: most run the demo radio (a core each in a debug build), and two dozen of them at once beside
+/// the rest of the suite starved it (I2, ruling R32).
 @MainActor
+@Suite(.serialized)
 struct SignalIDUITests {
     private static let view = CGSize(width: 1000, height: 500)
 

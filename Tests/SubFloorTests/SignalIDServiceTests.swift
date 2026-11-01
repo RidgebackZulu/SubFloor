@@ -19,7 +19,10 @@ private final class Locked<Value: Sendable>: Sendable {
 /// Task 7: Signal ID in the app. A demo-source model; the IQ is a synth snapshot through
 /// `SignalIDService.snapshotProvider` (and the analysis a stub through `analysis` where the test is about the
 /// service, not the identifier), except `readsTheRingAtTheDisplayCentre`, which reads the demo source's own ring.
+/// One test at a time: most run the demo radio (a core each in a debug build), and two dozen of them at once beside
+/// the rest of the suite starved it (I2, ruling R32).
 @MainActor
+@Suite(.serialized)
 struct SignalIDServiceTests {
     private static let view = CGSize(width: 1000, height: 500)
 
