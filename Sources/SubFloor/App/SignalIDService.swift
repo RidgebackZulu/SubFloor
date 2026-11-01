@@ -43,8 +43,9 @@ final class SignalIDExecutor: TaskExecutor {
     private let queue = DispatchQueue(label: "app.subfloor.signal-id", qos: .userInitiated)
 
     func enqueue(_ job: consuming ExecutorJob) {
-        let job = UnownedJob(job), executor = asUnownedTaskExecutor()
-        queue.async { job.runSynchronously(on: executor) }
+        let job = UnownedJob(job)
+        // Held by the job until it has run: a service let go meanwhile doesn't take its executor with it.
+        queue.async { [self] in job.runSynchronously(on: asUnownedTaskExecutor()) }
     }
 }
 

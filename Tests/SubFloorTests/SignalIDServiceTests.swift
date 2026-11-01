@@ -425,12 +425,15 @@ struct SignalIDServiceTests {
         // The peak, from the same read made directly: the channel as reserved before the read (and never
         // outgrown, so never reallocated by doubling) and one piece, its bytes and its floats (at most float32's
         // 8 bytes a frame each).
+        // (Off the main actor: 16 s at 2 MS/s through the channel would hold up every main-actor test meanwhile.)
         let barrier = TuneBarrier()
         barrier.end(centerHz: m.centerHz)
-        guard case .read(let long) = SignalIDService.longerRead(offsetHz: signalHz, widthHz: 50,
-                                                                tuning: barrier.current, sampleRate: fs,
-                                                                chunks: m.signalID.chunkProvider,
-                                                                barrier: barrier) else {
+        let chunks = m.signalID.chunkProvider
+        let direct = await Task.detached {
+            SignalIDService.longerRead(offsetHz: signalHz, widthHz: 50, tuning: barrier.current, sampleRate: fs,
+                                       chunks: chunks, barrier: barrier)
+        }.value
+        guard case .read(let long) = direct else {
             Issue.record("no longer read")
             return
         }
@@ -632,13 +635,15 @@ struct SignalIDServiceTests {
         guard let m = runningModel() else { return }
         defer { m.shutdown() }
         let fs = 10_000_000.0, toneHz = 1_234_560.0   // whole cycles in each 1 M-frame piece: one continuous tone
-        var wave = [Float](repeating: 0, count: 2_000_000)
-        for k in 0..<1_000_000 {
-            let phase = 2 * Double.pi * toneHz * Double(k) / fs
-            wave[2 * k] = Float(0.1 * cos(phase))
-            wave[2 * k + 1] = Float(0.1 * sin(phase))
-        }
-        let tone = wave
+        let tone = await Task.detached {   // off the main actor, as everything heavy here
+            var wave = [Float](repeating: 0, count: 2_000_000)
+            for k in 0..<1_000_000 {
+                let phase = 2 * Double.pi * toneHz * Double(k) / fs
+                wave[2 * k] = Float(0.1 * cos(phase))
+                wave[2 * k + 1] = Float(0.1 * sin(phase))
+            }
+            return wave
+        }.value
         let wholeAsked = Locked(0.0), largestPiece = Locked(0), analysed = Locked<(floats: Int, rate: Double)?>(nil)
         m.signalID.snapshotProvider = { seconds in
             wholeAsked.withLock { $0 = max($0, seconds) }
@@ -679,21 +684,14 @@ struct SignalIDServiceTests {
         #expect(input.floats * MemoryLayout<Float>.size <= 32 << 20, "\(input.floats) floats analysed")
         #expect(id.measurement.family == .carrier, "\(id.label)")
         #expect(abs(id.measurement.offsetHz - toneHz) < 5, "\(id.measurement.offsetHz)")
-        // The read's peak, from the same read made directly: the channel as reserved (never outgrown) and one piece,
-        // its floats and the ring's int16.
-        let barrier = TuneBarrier()
-        barrier.end(centerHz: m.centerHz)
+        // The read's peak: the channel as the read reserves it (sized once for what it asks; that it is never
+        // outgrown is `longerReadIsChannelisedPieceByPiece`'s) and one piece, its floats and the ring's int16.
         let plan = try #require(SignalIDService.firstChannel(pointHz: toneHz, bandwidthHz: nil, spectrumDb: nil, rate: fs))
-        guard case .read(let first) = SignalIDService.channelRead(seconds: SignalIDService.firstSeconds,
-                                                                  offsetHz: plan.offsetHz, windowHz: plan.windowHz,
-                                                                  tuning: barrier.current, sampleRate: fs,
-                                                                  chunks: chunks, barrier: barrier) else {
-            Issue.record("no channel read")
-            return
-        }
-        let channelBytes = first.reservedFloats * MemoryLayout<Float>.size
+        let extractor = ChannelExtractor(sampleRate: fs, offsetHz: plan.offsetHz, bandwidthHz: plan.windowHz, sharp: false)
+        extractor.reserve(inputFrames: Int(((SignalIDService.firstSeconds + SignalIDService.settleSeconds) * fs).rounded()))
+        let channelBytes = extractor.reservedFloats * MemoryLayout<Float>.size
         let pieceBytes = largestPiece.withLock { $0 } * (8 + 4)
-        #expect(!first.grew)
+        #expect(extractor.rate == input.rate)
         #expect(channelBytes + pieceBytes <= 64 << 20, "peak \(channelBytes + pieceBytes) bytes")
     }
 
