@@ -16,7 +16,8 @@ import Testing
 /// The full matrix (every SNR, 5 seeds a cell) runs with `SUBFLOOR_SIGNALID_MATRIX=1`; otherwise the always-on
 /// subset (ruling R20): 10 and 3 dB, one seed a cell, the captures of 96 kS/s or less (20 dB naming, WFM's and
 /// DAB's included, is `IdentifyTests.eachRowIsNamed`'s). Its targets must reach 90% where they have 10 cases or
-/// more and pass every case where they have fewer (ruling R23); the full matrix's reach 95%.
+/// more, and where they have fewer every case must fall within twice its tolerance (rulings R23, R24); the full
+/// matrix's reach 95% at the spec's tolerances.
 @Suite struct AccuracyMatrixTests {
     static let snrs = [20.0, 10, 6, 3]
     /// `SUBFLOOR_SIGNALID_MATRIX=1`: the full matrix. Otherwise the always-on subset (ruling R20).
@@ -45,14 +46,19 @@ import Testing
             return abs(value / truth - 1) <= tolerance
         }
         /// Each target this case carries, and whether it was met (only judged when the family is right).
-        var targets: [(String, Bool)] {
+        var targets: [(String, Bool)] { targets(toleranceScale: 1) }
+
+        /// The same, each tolerance scaled by `toleranceScale`.
+        func targets(toleranceScale k: Double) -> [(String, Bool)] {
             guard familyRight else { return [] }
             let m = identity.measurement
             var out: [(String, Bool)] = []
-            if let rate { out.append(("rate", Self.within(m.symbolRate, rate, 0.01))) }
-            if let shift { out.append(("shift", Self.within(m.fskShiftHz, shift, 0.03))) }
-            if let bandwidth { out.append(("bandwidth", Self.within(m.occupiedBandwidthHz, bandwidth, 0.10))) }
-            if let deviation { out.append(("deviation", Self.within(m.fmDeviationHz, deviation.value, deviation.tolerance))) }
+            if let rate { out.append(("rate", Self.within(m.symbolRate, rate, k * 0.01))) }
+            if let shift { out.append(("shift", Self.within(m.fskShiftHz, shift, k * 0.03))) }
+            if let bandwidth { out.append(("bandwidth", Self.within(m.occupiedBandwidthHz, bandwidth, k * 0.10))) }
+            if let deviation {
+                out.append(("deviation", Self.within(m.fmDeviationHz, deviation.value, k * deviation.tolerance)))
+            }
             return out
         }
     }
@@ -183,11 +189,20 @@ import Testing
                 let met = Double(judged.filter(\.1).count) / Double(judged.count)
                 print(String(format: "accuracyMatrix: %@ at %.0f dB: %d of %d (%.1f%%)", target, snr,
                              judged.filter(\.1).count, judged.count, 100 * met))
-                // R23: the full matrix holds the spec's 95%; the one-seed subset 90% where a target has 10 cases or
-                // more, every case where it has fewer.
-                let n = Double(judged.count)
-                let needed = Self.full ? (0.95 * n).rounded(.up) : judged.count >= 10 ? (0.9 * n).rounded(.up) : n
-                #expect(Double(judged.filter(\.1).count) >= needed, "\(target) at \(snr) dB: \(met) of \(judged.count)")
+                // The full matrix holds the spec's 95% at the spec's tolerances. The one-seed subset (R23, amended by
+                // R24) holds 90% where a target has 10 cases or more; with fewer, a rate can't be judged (at a true
+                // 95%, nine cases all pass only 63% of the time), so every case must instead fall within twice the
+                // tolerance (shift within 6%), which catches a broken measurement without failing on the spec's 5%.
+                if Self.full || judged.count >= 10 {
+                    let needed = ((Self.full ? 0.95 : 0.9) * Double(judged.count)).rounded(.up)
+                    #expect(Double(judged.filter(\.1).count) >= needed, "\(target) at \(snr) dB: \(met) of \(judged.count)")
+                } else {
+                    for o in cell {
+                        for (name, ok) in o.targets(toleranceScale: 2) where name == target {
+                            #expect(ok, "\(target) at \(snr) dB outside twice its tolerance: \(IdentifyTests.placements[o.placement]) seed \(o.seed)")
+                        }
+                    }
+                }
             }
             print(String(format: "accuracyMatrix: at %.0f dB family right %.1f%%, named right %.1f%%", snr,
                          100 * family, 100 * named))
