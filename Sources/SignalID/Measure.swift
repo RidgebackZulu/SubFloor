@@ -13,8 +13,8 @@ import Foundation
 /// widest AM it names with room for noise beside neighbours 9 kHz either side; at most 80% of the capture
 /// and not past its edge) and finds the signal's extent there:
 /// - an averaged spectrum (2048 bins across the window, 75%-overlapped Blackman-Harris frames) gives the noise:
-///   anchored on the 10th percentile of the bins (first all of them, then those outside the signal), so a
-///   crowded band's neighbours don't lift it (`SpectrumView.estimateNoise`);
+///   anchored on the 10th percentile of the bins (first those outside the seed, then those outside the
+///   signal), so a crowded band's neighbours don't lift it (`SpectrumView.estimateNoise`);
 /// - the signal is the bins of the seed standing 4 σ over the noise (σ: a noise bin's spread, smoothed over
 ///   5 bins), grown outwards while they stay there; nothing in the seed 5 σ over the noise (summed over its
 ///   bins) is noise;
@@ -28,7 +28,13 @@ import Foundation
 ///   more away, and the margin the measurement adds stops short of the next other signal;
 /// - a symmetric pair within 5 kHz, beyond the strongest bin's skirt, no more than 5 dB under it (stronger
 ///   than any AM's sidebands) makes that bin one of a comb, an FM tone's Bessel lines (APT seen on its
-///   centre line): if the measurement finds a line there, it is never `am` or `carrier`.
+///   centre line): if the measurement finds a line there, it is never `am` or `carrier`;
+/// - a wide-shift FSK's extent may take one tone (RTTY 850, POCSAG's ±4.5 kHz): another signal within
+///   ±12 kHz about as strong and as wide is its twin when the channel spanning both is one FSK
+///   (`fskTwin`: a constant envelope, its frequency on one tone or the other), and the two become one region;
+/// - a view the capture limits, which the signal reaches the edge of, gives the family only, with a note
+///   ("wider than the view", ruling R5). A signal filling such a view leaves no noise to see; OFDM's cyclic
+///   prefix shows anyway, and gives `ofdm` alone.
 ///
 /// **Bandwidth and SNR.** On a second spectrum about 64 bins across the signal (zoomed in on narrow ones,
 /// coarser for wide ones, at least 4 / seconds), the noise is subtracted and:
@@ -51,30 +57,48 @@ import Foundation
 /// 2. **ook:** a two-level envelope (`Keying`) with a carrier line holding ≥ 20% of the power; `cwWPM` =
 ///    1.2 / the Morse unit. Not when another tone within ±max(3 kHz, 10 widths), no more than 10 dB weaker,
 ///    is keyed in turn with it (envelopes correlated ≤ −0.3): that is one tone of an FSK whose extent took
-///    only this tone, left `unknown`. Two-level without a line is someone else's (envelope `bursty`; the
-///    burst rules are Task 4's).
+///    only this tone (and `fskTwin` didn't pair), left `unknown`. Two-level without a line is someone
+///    else's (envelope `bursty`).
 /// 3. **am:** a carrier line (15 dB over the continuum beside it) holding ≥ 50% of the power (a 100% sine
 ///    AM's holds 2/3), sidebands holding ≥ 2%, and modulation in phase with the carrier: `inPhase` (in-phase
-///    over quadrature variance, less one) ≥ 0.25. Not a line of a comb.
+///    over quadrature variance, less one) ≥ 0.25. Not a line of a comb. A subcarrier in its envelope
+///    (`Subcarrier`: ACARS's MSK) goes in `subcarriersHz`, its rate in `symbolRate`.
 /// 4. **carrier:** a line holding ≥ 97% of the power (FM with long pauses holds about 90%), not of a comb.
-/// 5. **fm / wfm:** a constant envelope (20 ms block CV within 2 × what noise alone gives, + 0.1, and
+/// 5. **ofdm / fsk / mfsk / psk** (`digitalFamily`; not for a voice envelope), on the signal's on-time
+///    (`Bursts`: a two-level envelope's on runs; with a regular period the envelope is `bursty` and
+///    `burstPeriodSeconds` and `burstDuty` are set whatever the family). E|s|⁴/(E|s|²)² over that time, the
+///    noise taken out, says which apply:
+///    - **ofdm** (1.5…2.8, a Gaussian-like amplitude): a cyclic prefix (`OFDMFeatures`) gives
+///      `ofdmSpacingHz`;
+///    - **fsk / mfsk** (≤ 1.15, constant; discrete frequencies, as rule 6 tells them, or bursts): a clean
+///      tone grid at a symbol rate (`FSKFeatures.isFSK`, its rate
+///      line 8 × its continuum), and no subcarrier in the instantaneous frequency (an FM signal carrying
+///      AFSK has a rate line too). `symbolRate`, `toneCount`, `toneSpacingHz` and, for 2 tones,
+///      `fskShiftHz`; more than 8 tones is `mfsk`;
+///    - **psk** (1.05…2.0, filtered): a symbol-rate line in |x|² 6 × its continuum and a line in the
+///      symbols' n-th power (`PSKFeatures`) give `pskOrder` and `symbolRate`.
+///    These come before FM, so an FSK or PSK never falls through to `fm`.
+/// 6. **fm / wfm:** a constant envelope (20 ms block CV within 2 × what noise alone gives, + 0.1, and
 ///    E|s|⁴/(E|s|²)² ≤ 1.1 with the noise taken out), a frequency spread ≥ 0.15 of half the occupied width,
-///    and width × seconds ≥ 1000 independent samples. A distribution with separate peaks or a kurtosis
-///    under 2.5 is discrete frequencies, FSK's, and is left `unknown`. WFM when ≥ 100 kHz wide, or ≥ 60 kHz
-///    with the 19 kHz stereo pilot in the demodulated baseband (then in `subcarriersHz`); `fmDeviationHz`
-///    either way.
-/// 6. **usb / lsb:** no line (< 10%), a voice envelope (block CV ≥ 0.5 with ≥ 5% pauses), the passband's
+///    and width × seconds ≥ 1000 independent samples. A subcarrier in the instantaneous frequency (APRS's
+///    AFSK, APT's 2400 Hz; looked for only where the frequencies are discrete) makes it FM whatever its
+///    distribution (in `subcarriersHz`, an AFSK's rate in
+///    `symbolRate`); otherwise a distribution with separate peaks or a kurtosis under 2.5 is discrete
+///    frequencies and is left `unknown`. WFM when ≥ 100 kHz wide, or ≥ 60 kHz with the 19 kHz stereo pilot
+///    in the demodulated baseband (then in `subcarriersHz`); `fmDeviationHz` either way.
+/// 7. **usb / lsb:** no line (< 10%), a voice envelope (block CV ≥ 0.5 with ≥ 5% pauses), the passband's
 ///    power ≥ 15 dB over its mirror about the carrier side, and a tilt of at least 1 dB towards the carrier
 ///    side (voice is strongest at low audio frequencies): USB when the lower edge is the stronger.
-/// 7. Otherwise `unknown`.
+/// 8. Otherwise `unknown`.
 ///
-/// **Envelope:** `keyed` (OOK), `bursty` (two-level without a line), `voice` (block CV ≥ 0.5 with pauses;
-/// for AM, of its in-phase modulation), `steady` otherwise; `none` for noise.
+/// **Envelope:** `keyed` (OOK), `bursty` (two-level without a line, or a regular burst period), `voice`
+/// (block CV ≥ 0.5 with pauses; for AM, of its in-phase modulation), `steady` otherwise; `none` for noise.
 ///
 /// Thresholds were tuned on synthesiser seeds ≥ 1000, kept apart from the asserting tests (seeds 1–50).
 ///
-/// Cost for 3 s (release build, Apple Silicon): 10–30 ms for an HF signal in a 48 kHz capture, about 55 ms
-/// for a 12.5 kHz signal in a 2 MS/s capture, about 80 ms for WFM in a 1 MS/s capture.
+/// Cost for 3 s (release build, Apple Silicon): 10–60 ms for an HF signal in a 48 kHz capture (P25 and 8PSK
+/// the dearest), about 50 ms for NFM voice and 100 ms for POCSAG in a 2 MS/s capture, about 80 ms for WFM in
+/// a 1 MS/s capture, 140 ms for 1 s of DAB at 2.048 MS/s.
 public enum SignalMeasurer {
     static let minimumSeconds = 0.2
     static let windowFactor = 3.0
@@ -103,6 +127,18 @@ public enum SignalMeasurer {
     static let combBelowLineDb = 5.0
     static let twinBelowDb = 10.0
     static let maxTwinCorrelation = -0.3
+    static let fskTwinMaxHz = 12_000.0
+    static let fskTwinPeakDb = 6.0
+    static let minFSKTwinShare = 0.15
+    static let minFSKTwinTones = 0.7
+    static let maxFSKTwinM4 = 1.3
+    static let maxFSKM4 = 1.15
+    static let minPSKM4 = 1.05
+    static let maxPSKM4 = 2.0
+    static let ofdmM4 = 1.5...2.8
+    static let minFSKLineContrast = 8.0
+    static let minPSKLineContrast = 6.0
+    static let minPSKPowerLine = 0.12
 
     public static func measure(_ iq: [Float], sampleRate: Double, offsetHz: Double, bandwidthHz: Double,
                                seconds: Double) -> SignalMeasurement {
@@ -127,7 +163,9 @@ public enum SignalMeasurer {
         var coarse = SpectrumView(window.samples, rate: window.rate, binHz: windowHz / coarseBins,
                                   usableHz: windowHz)
         let seedBins = coarse.bin(-seed / 2)...coarse.bin(seed / 2)
-        coarse.estimateNoise(excluding: nil)
+        // The seed's own bins left out from the start: a signal filling most of the window (DAB, 94% of a
+        // 2 MS/s capture's) would otherwise be its own 10th percentile.
+        coarse.estimateNoise(excluding: widened(seedBins, by: 0.1, in: coarse))
         var found: Region?
         for _ in 0..<3 {
             found = region(coarse, seed: seedBins)
@@ -135,11 +173,30 @@ public enum SignalMeasurer {
             coarse.estimateNoise(excluding: widened(r.bins, by: 0.1, in: coarse))
         }
         found = region(coarse, seed: seedBins)
-        guard let signalRegion = found else {
+        // The capture limits the window: a signal reaching its edges is wider than the view (ruling R5).
+        let capped = windowHz < max(windowFactor * seed, minimumWindowHz) - 1
+        guard var signalRegion = found else {
+            // Nothing stands out of a view a signal fills edge to edge (DAB in a 1 MS/s capture): its noise
+            // can't be seen, but OFDM's cyclic prefix still can.
+            if capped, let ofdm = OFDMFeatures(window.samples, rate: window.rate, occupiedHz: windowHz), ofdm.isOFDM {
+                result.family = .ofdm
+                result.envelope = .steady
+                result.familyConfidence = min(score(ofdm.contrast, OFDMFeatures.minContrast, 20), 0.6)
+                result.occupiedBandwidthHz = windowHz
+                result.notes.append("OFDM wider than the view: family only")
+                return result
+            }
             result.family = .noise
             result.familyConfidence = 0.8
             result.notes.append("Nothing stands above the noise")
             return result
+        }
+        // A wideband signal split at a narrow gap (OFDM's empty centre carrier): its other part joins it.
+        signalRegion = bridged(coarse, region: signalRegion)
+        // A wide-shift FSK whose extent took one tone: its twin joins it.
+        if let paired = fskTwin(window, coarse, region: signalRegion) {
+            signalRegion = paired.region
+            result.notes.append(String(format: "Tones %.0f Hz apart keyed in turn: one FSK", paired.separationHz))
         }
 
         // The measurement spectrum: about 64 bins across the signal.
@@ -161,7 +218,13 @@ public enum SignalMeasurer {
         }
         let mapped = view.bin(coarse.hz(Double(signalRegion.bins.lowerBound)) - viewCentre)...view.bin(
             coarse.hz(Double(signalRegion.bins.upperBound)) - viewCentre)
-        view.estimateNoise(excluding: widened(mapped, by: 0.1, in: view))
+        let excluded = widened(mapped, by: 0.1, in: view)
+        view.estimateNoise(excluding: excluded)
+        // A coarser view of a signal that fills the window (DAB) has too few bins beside it for its own noise:
+        // the coarse view's density serves.
+        if view.binHz > coarse.binHz && view.count - excluded.count < max(16, view.count / 5) {
+            view.useNoise(of: coarse)
+        }
         // The margin beyond the signal stops short of anything else.
         let room = view.bin(coarse.hz(Double(signalRegion.room.lowerBound)) - viewCentre)...view.bin(
             coarse.hz(Double(signalRegion.room.upperBound)) - viewCentre)
@@ -216,8 +279,24 @@ public enum SignalMeasurer {
         let twin = envelope.keying == nil ? nil
             : keyedTwin(window, coarse, region: signalRegion.bins, centreHz: centreHz, channelHz: channelHz,
                         occupiedHz: occupiedHz)
+        let digital = DigitalEvidence(channel.samples, rate: channel.rate, occupiedHz: occupiedHz,
+                                      noiseDensity: noiseDensity, noisePower: channelNoise,
+                                      noiseCorrelation: { [rate = viewSamples.rate] lag in
+                                          Channel.noiseCorrelation(sampleRate: rate, bandwidthHz: channelHz, lag: lag)
+                                      },
+                                      signalPower: signalPower, envelope: envelope)
         classify(&result, line: line, envelope: envelope, frequency: frequency, sidebands: sidebands,
-                 keyedTwinHz: twin, comb: signalRegion.comb)
+                 keyedTwinHz: twin, comb: signalRegion.comb, digital: digital)
+        // Reaching the edge of a view the capture limits (its last 0.25%): family only (ruling R5).
+        let edgeBins = max(3, coarse.count / 400)
+        if capped && result.family != .noise && (signalRegion.bins.lowerBound <= edgeBins
+            || signalRegion.bins.upperBound >= coarse.count - 1 - edgeBins) {
+            result = SignalMeasurement(offsetHz: result.offsetHz, occupiedBandwidthHz: result.occupiedBandwidthHz,
+                                       bandwidth6dBHz: result.bandwidth6dBHz, snrDb: result.snrDb,
+                                       envelope: result.envelope, family: result.family,
+                                       familyConfidence: min(result.familyConfidence, 0.6), seconds: result.seconds,
+                                       notes: result.notes + ["Signal wider than the view: family only"])
+        }
         return result
     }
 
@@ -225,7 +304,7 @@ public enum SignalMeasurer {
 
     static func classify(_ m: inout SignalMeasurement, line: Line, envelope: EnvelopeFeatures,
                          frequency: FrequencyFeatures, sidebands: SidebandFeatures, keyedTwinHz: Double? = nil,
-                         comb: Bool = false) {
+                         comb: Bool = false, digital: DigitalEvidence? = nil) {
         let steady = envelope.blockCV <= 2 * envelope.steadyCV + 0.1
         let constant = envelope.amplitudeM4 <= maxConstantM4
         let voice = envelope.blockCV >= 0.5 && envelope.pauseFraction >= 0.05 && envelope.keying == nil
@@ -266,6 +345,7 @@ public enum SignalMeasurer {
                                      score(line.sidebandFraction, minSidebandFraction, 0.04))
             m.notes.append(String(format: "Carrier with symmetric sidebands (%.0f%% of the power)",
                                   100 * line.sidebandFraction))
+            if let sub = digital?.amSubcarrier { addSubcarrier(sub, to: &m) }
             return
         }
         // 4. Carrier.
@@ -276,10 +356,16 @@ public enum SignalMeasurer {
             m.notes.append("Unmodulated carrier")
             return
         }
-        // 5. FM.
+        // 5. FSK, MFSK, PSK and OFDM.
+        // Discrete frequencies (separate peaks, or a kurtosis under 2.5): what FSK and an FM subcarrier show.
+        // A continuous signal without them (FM voice) isn't searched for either, which keeps it cheap.
+        let discrete = frequency.tonal || frequency.kurtosis < minKurtosis
+        if let digital, !voice, digitalFamily(&m, digital, discrete: discrete) { return }
+        // 6. FM (one carrying a subcarrier is FM whatever its frequencies' distribution).
         if steady && constant && frequency.spread >= minSpread
             && m.occupiedBandwidthHz * m.seconds >= minFMSamples {
-            guard !frequency.tonal && frequency.kurtosis >= minKurtosis else {
+            let subcarrier = discrete ? digital?.fmSubcarrier : nil
+            guard subcarrier != nil || (!frequency.tonal && frequency.kurtosis >= minKurtosis) else {
                 m.notes.append("Constant envelope with discrete frequencies (FSK-like)")
                 return
             }
@@ -287,7 +373,13 @@ public enum SignalMeasurer {
             m.fmDeviationHz = frequency.deviationHz
             m.envelope = .steady
             if let pilot { m.subcarriersHz.append(pilot) }
-            let shape = min(score(frequency.spread, minSpread, 0.25), score(frequency.kurtosis, minKurtosis, 3.5),
+            if let subcarrier { addSubcarrier(subcarrier, to: &m) }
+            // A subcarrier's tones make the distribution discrete: its own strength stands in for the kurtosis.
+            let discrete = subcarrier.map { sub in
+                sub.fsk.map { score($0.lineContrast, Subcarrier.minLineContrast, 30) } ?? 1
+            }
+            let shape = min(score(frequency.spread, minSpread, 0.25),
+                            discrete ?? score(frequency.kurtosis, minKurtosis, 3.5),
                             score(maxConstantM4 - envelope.amplitudeM4, 0, 0.1))
             if m.occupiedBandwidthHz >= 100_000 || (pilot != nil && m.occupiedBandwidthHz >= 60_000) {
                 m.family = .wfm
@@ -300,7 +392,7 @@ public enum SignalMeasurer {
             }
             return
         }
-        // 6. SSB.
+        // 7. SSB.
         if voice && line.fraction < 0.1 && sidebands.asymmetryDb >= 15 && abs(sidebands.tiltDb) >= minTiltDb {
             m.family = sidebands.tiltDb < 0 ? .usb : .lsb
             m.envelope = .voice
@@ -309,6 +401,74 @@ public enum SignalMeasurer {
             m.notes.append(String(format: "One sideband, %.0f dB over its mirror; tilted %.1f dB",
                                   sidebands.asymmetryDb, sidebands.tiltDb))
             return
+        }
+    }
+
+    /// The digital families, tried in turn on the signal's on-time (its bursts', when it has them); false
+    /// when none fits. FSK is only looked for in discrete frequencies (`discrete`) or bursts. A two-level
+    /// envelope with a regular period is `bursty`, its period and duty reported whatever the family.
+    static func digitalFamily(_ m: inout SignalMeasurement, _ digital: DigitalEvidence, discrete: Bool) -> Bool {
+        if let bursts = digital.bursts, let period = bursts.periodSeconds {
+            m.envelope = .bursty
+            m.burstPeriodSeconds = period
+            m.burstDuty = bursts.duty
+        }
+        let m4 = digital.amplitudeM4
+        // OFDM: a Gaussian-like amplitude and a cyclic prefix.
+        if ofdmM4.contains(m4), let ofdm = digital.ofdm, ofdm.isOFDM {
+            m.family = .ofdm
+            m.ofdmSpacingHz = ofdm.spacingHz
+            m.familyConfidence = min(score(ofdm.contrast, OFDMFeatures.minContrast, 15),
+                                     score(ofdm.correlation, OFDMFeatures.minCorrelation, 0.08))
+            m.notes.append(String(format: "Cyclic prefix every %.2f ms: OFDM, carriers %.2f Hz apart",
+                                  1000 / ofdm.spacingHz, ofdm.spacingHz))
+            return true
+        }
+        // FSK: constant envelope, a symbol-rate line, symbols on a tone grid; not FM carrying a subcarrier.
+        if m4 <= maxFSKM4, discrete || digital.bursts != nil, let fsk = digital.fsk,
+           fsk.isFSK(minContrast: minFSKLineContrast),
+           digital.fmSubcarrier == nil {
+            m.family = fsk.toneCount > 8 ? .mfsk : .fsk
+            m.symbolRate = fsk.symbolRate
+            m.toneCount = fsk.toneCount
+            m.toneSpacingHz = fsk.spacingHz
+            if fsk.toneCount == 2 { m.fskShiftHz = fsk.spacingHz }
+            if m.envelope != .bursty { m.envelope = .steady }
+            // Tones seen over the tones counted: MFSK's unseen tones make the count less sure.
+            let seen = Double(fsk.tones.count) / Double(fsk.toneCount)
+            m.familyConfidence = min(score(fsk.lineContrast, minFSKLineContrast, 30),
+                                     score(fsk.onGrid, FSKFeatures.minOnGrid, 0.95),
+                                     score(ToneMixture.maxScatter - fsk.scatter, 0, 0.2),
+                                     score(seen, 0.5, 0.9), score(maxFSKM4 + 0.1 - m4, 0, 0.1))
+            m.notes.append(String(format: "%d tones %.1f Hz apart at %.2f Bd (%d seen)", fsk.toneCount,
+                                  fsk.spacingHz, fsk.symbolRate, fsk.tones.count))
+            return true
+        }
+        // PSK: an sⁿ line at the symbols (none for s itself: a carrier) and a symbol-rate line in |x|².
+        if (minPSKM4...maxPSKM4).contains(m4), let psk = digital.psk, psk.lineContrast >= minPSKLineContrast,
+           let order = psk.order(threshold: minPSKPowerLine) {
+            m.family = .psk
+            m.pskOrder = order
+            m.symbolRate = psk.symbolRate
+            if m.envelope != .bursty { m.envelope = .steady }
+            m.familyConfidence = min(score(psk.lineContrast, minPSKLineContrast, 30),
+                                     score(psk.powerLines[order] ?? 0, minPSKPowerLine, 0.6))
+            m.notes.append(String(format: "%d-PSK at %.2f Bd (s^%d line %.2f)", order, psk.symbolRate, order,
+                                  psk.powerLines[order] ?? 0))
+            return true
+        }
+        return false
+    }
+
+    /// A demodulated signal's subcarrier into `subcarriersHz` (and its rate, when it carries FSK).
+    static func addSubcarrier(_ sub: Subcarrier, to m: inout SignalMeasurement) {
+        m.subcarriersHz += sub.tonesHz
+        if let rate = sub.symbolRate {
+            m.symbolRate = rate
+            m.notes.append(String(format: "Subcarrier FSK at %.1f Bd: %@ Hz", rate,
+                                  sub.tonesHz.map { String(format: "%.0f", $0) }.joined(separator: "/")))
+        } else {
+            m.notes.append(String(format: "Subcarrier tone at %.0f Hz", sub.tonesHz.first ?? 0))
         }
     }
 
@@ -472,9 +632,138 @@ public enum SignalMeasurer {
         return twinHz - centreHz
     }
 
+    /// A region without a carrier line, grown across narrow gaps: beyond each edge, within max(3 bins, 1% of
+    /// its width), another run over the edge level (gaps of 2 bins bridged) at least a quarter as wide and as
+    /// dense within a factor of 2 (mean excess over the noise) is the same signal: OFDM's empty centre carrier
+    /// splits it at fine resolution. Separate signals have wider gaps, or differ in level or width.
+    static func bridged(_ view: SpectrumView, region: Region) -> Region {
+        let es = view.smoothedExcess(reach: 2)
+        let edge = max(edgeSigma * view.spread * (2 / 5.0).squareRoot(), 0.02)
+        var bins = region.bins
+        let top = bins.max { view.power[$0] < view.power[$1] }!
+        if top >= 3 && top + 3 < view.count
+            && view.power[top] >= max(view.power[top - 3], view.power[top + 3]) * pow(10, lineContrastDb / 10) {
+            return region
+        }
+        func mean(_ r: ClosedRange<Int>) -> Double { r.reduce(0) { $0 + es[$1] } / Double(r.count) }
+        for _ in 0..<4 {
+            let gap = max(3, bins.count / 100)
+            var grown = false
+            for direction in [-1, 1] {
+                let start = direction < 0 ? bins.lowerBound : bins.upperBound
+                guard let next = (1...gap).map({ start + direction * $0 })
+                    .first(where: { $0 >= 0 && $0 < view.count && es[$0] >= edge }) else { continue }
+                var end = next
+                while end + direction >= 0 && end + direction < view.count
+                        && (es[end + direction] >= edge
+                            || (end + 2 * direction >= 0 && end + 2 * direction < view.count
+                                && es[end + 2 * direction] >= edge)) {
+                    end += direction
+                }
+                let run = min(next, end)...max(next, end)
+                let ratio = mean(run) / max(mean(bins), 1e-12)
+                guard run.count * 4 >= bins.count, ratio >= 0.5, ratio <= 2 else { continue }
+                bins = min(bins.lowerBound, run.lowerBound)...max(bins.upperBound, run.upperBound)
+                grown = true
+            }
+            if !grown { break }
+        }
+        guard bins != region.bins else { return region }
+        return Region(bins: bins, comb: region.comb,
+                      room: min(region.room.lowerBound, bins.lowerBound)...max(region.room.upperBound, bins.upperBound))
+    }
+
+    /// A wide-shift FSK whose extent took one tone (RTTY 850, POCSAG's ±4.5 kHz): the other signal within
+    /// ±12 kHz in the coarse view (bins over the edge level, gaps of 2 bins bridged), its peak within 6 dB of
+    /// this one's and its width within 2 ×, is its twin when the channel spanning both shows one FSK:
+    /// - a constant envelope (E|s|⁴/(E|s|²)² ≤ 1.3 with the noise taken out; two stations side by side beat);
+    /// - a frequency (in blocks of about 1 / (2 × a tone's width)) that sits at one tone or the other: at least
+    ///   70% of the blocks within a quarter of the separation of either, and 15% at each. Two carriers side by
+    ///   side put it between them, or on the stronger.
+    /// The pair's region and the tones' separation, or nil.
+    static func fskTwin(_ window: (samples: [DSPComplex], rate: Double), _ coarse: SpectrumView,
+                        region: Region) -> (region: Region, separationHz: Double)? {
+        let es = coarse.smoothedExcess(reach: 2)
+        let edge = max(edgeSigma * coarse.spread * (2 / 5.0).squareRoot(), 0.02)
+        let bins = region.bins
+        let peak = bins.map { coarse.power[$0] }.max() ?? 0
+        let reach = Int(fskTwinMaxHz / coarse.binHz)
+        let end = min(coarse.count - 1, bins.upperBound + reach)
+        var runs: [ClosedRange<Int>] = []
+        var k = max(0, bins.lowerBound - reach)
+        while k <= end {
+            guard es[k] >= edge, abs(k - bins.lowerBound) > 1, abs(k - bins.upperBound) > 1, !bins.contains(k) else {
+                k += 1
+                continue
+            }
+            var j = k
+            while j + 1 <= end, !bins.contains(j + 1), !bins.contains(min(end, j + 2)),
+                  es[j + 1] >= edge || (j + 2 <= end && es[j + 2] >= edge) { j += 1 }
+            runs.append(k...j)
+            k = j + 1
+        }
+        let ratio = pow(10, fskTwinPeakDb / 10)
+        let candidates = runs.filter { run in
+            let p = run.map { coarse.power[$0] }.max() ?? 0
+            let widths = Double(run.count) / Double(bins.count)
+            return p >= peak / ratio && p <= peak * ratio && widths >= 0.5 && widths <= 2
+        }
+        func strength(_ run: ClosedRange<Int>) -> Double { abs(log((run.map { coarse.power[$0] }.max() ?? 1) / peak)) }
+        guard let other = candidates.min(by: { strength($0) < strength($1) }) else { return nil }
+
+        let aHz = coarse.hz(Double(bins.lowerBound + bins.upperBound) / 2)
+        let bHz = coarse.hz(Double(other.lowerBound + other.upperBound) / 2)
+        let separation = abs(bHz - aHz)
+        let toneHz = Double(max(bins.count, other.count)) * coarse.binHz
+        let bandwidth = separation + 1.25 * toneHz
+        let channel = Channel.extract(interleaved(window.samples), sampleRate: window.rate,
+                                      offsetHz: (aHz + bHz) / 2, bandwidthHz: bandwidth)
+        let z = channel.samples
+        guard z.count > 1000 else { return nil }
+        // Constant envelope.
+        let noise = coarse.noise / (SpectrumView.enbw * coarse.binHz)
+            * Channel.noiseBandwidthHz(sampleRate: window.rate, bandwidthHz: bandwidth)
+        var m2 = 0.0, m4 = 0.0
+        for s in z {
+            let p = Double(s.real * s.real + s.imag * s.imag)
+            m2 += p
+            m4 += p * p
+        }
+        m2 /= Double(z.count)
+        m4 /= Double(z.count)
+        let s2 = max(m2 - noise, 1e-30)
+        guard (m4 - 4 * s2 * noise - 2 * noise * noise) / (s2 * s2) <= maxFSKTwinM4 else { return nil }
+        // Its frequency sits on one tone or the other.
+        let (pr, pi) = FSKFeatures.lagProducts(z)
+        let block = max(1, Int(channel.rate / (2 * toneHz)))
+        var low = 0, high = 0, blocks = 0
+        var start = 0
+        while start + block <= z.count {
+            var re: Float = 0, im: Float = 0
+            pr.withUnsafeBufferPointer { vDSP_sve($0.baseAddress! + start, 1, &re, vDSP_Length(block)) }
+            pi.withUnsafeBufferPointer { vDSP_sve($0.baseAddress! + start, 1, &im, vDSP_Length(block)) }
+            let f = atan2(Double(im), Double(re)) * channel.rate / (2 * .pi)
+            if abs(f + separation / 2) < separation / 4 { low += 1 }
+            if abs(f - separation / 2) < separation / 4 { high += 1 }
+            blocks += 1
+            start += block
+        }
+        guard blocks > 0 else { return nil }
+        let lowShare = Double(low) / Double(blocks), highShare = Double(high) / Double(blocks)
+        guard lowShare >= minFSKTwinShare, highShare >= minFSKTwinShare,
+              lowShare + highShare >= minFSKTwinTones else { return nil }
+        let union = min(bins.lowerBound, other.lowerBound)...max(bins.upperBound, other.upperBound)
+        let room = min(region.room.lowerBound, max(0, other.lowerBound - other.count))...max(
+            region.room.upperBound, min(coarse.count - 1, other.upperBound + other.count))
+        return (Region(bins: union, room: room), separation)
+    }
+
+    /// `bins` widened by `fraction` of their count each side (at least 2 bins), but never past leaving a
+    /// quarter of what lay outside them (a signal filling most of the view still has noise beside it to see).
     static func widened(_ bins: ClosedRange<Int>, by fraction: Double, in view: SpectrumView) -> ClosedRange<Int> {
+        let below = bins.lowerBound, above = view.count - 1 - bins.upperBound
         let extra = max(2, Int(Double(bins.count) * fraction))
-        return max(0, bins.lowerBound - extra)...min(view.count - 1, bins.upperBound + extra)
+        return (bins.lowerBound - min(extra, below * 3 / 4))...(bins.upperBound + min(extra, above * 3 / 4))
     }
 
     static func interleaved(_ z: [DSPComplex]) -> [Float] {
@@ -524,4 +813,80 @@ struct Line {
         contrastDb = 10 * log10(max(view.power[top] - view.noise, 1e-30)
                                 / max(continuum, view.noise * view.spread, 1e-30))
     }
+}
+
+/// The signal's channel, and what the digital rules measure in it, each worked out only when a rule asks.
+final class DigitalEvidence {
+    let z: [DSPComplex]
+    let rate: Double
+    let occupiedHz: Double
+    /// Complex noise density, and the channel's noise power.
+    let noiseDensity: Double
+    let noisePower: Double
+    /// The channel noise's correlation `lag` samples apart.
+    let noiseCorrelation: (Int) -> Double
+    let signalPower: Double
+    let envelope: EnvelopeFeatures
+
+    init(_ z: [DSPComplex], rate: Double, occupiedHz: Double, noiseDensity: Double, noisePower: Double,
+         noiseCorrelation: @escaping (Int) -> Double, signalPower: Double, envelope: EnvelopeFeatures) {
+        self.z = z
+        self.rate = rate
+        self.occupiedHz = occupiedHz
+        self.noiseDensity = noiseDensity
+        self.noisePower = noisePower
+        self.noiseCorrelation = noiseCorrelation
+        self.signalPower = signalPower
+        self.envelope = envelope
+    }
+
+    /// Bursts when the envelope is two-level with silence inside the capture.
+    lazy var bursts: Bursts? = envelope.runs.flatMap { Bursts($0, sampleCount: z.count) }
+    /// Where the signal is on: its bursts, or all of it.
+    var segments: [Range<Int>] { bursts?.segments ?? [0..<z.count] }
+
+    /// E|s|⁴ / (E|s|²)² over the segments, with the noise's share taken out (1: a constant envelope).
+    lazy var amplitudeM4: Double = {
+        var m2 = 0.0, m4 = 0.0, count = 0
+        for segment in segments {
+            for k in segment {
+                let p = Double(z[k].real * z[k].real + z[k].imag * z[k].imag)
+                m2 += p
+                m4 += p * p
+            }
+            count += segment.count
+        }
+        guard count > 0 else { return 0 }
+        m2 /= Double(count)
+        m4 /= Double(count)
+        let s2 = max(m2 - noisePower, 1e-30)
+        return (m4 - 4 * s2 * noisePower - 2 * noisePower * noisePower) / (s2 * s2)
+    }()
+
+    lazy var fsk: FSKFeatures? = FSKFeatures(z, rate: rate, occupiedHz: occupiedHz, segments: segments,
+                                             noisePower: noisePower, signalPower: signalPower,
+                                             noiseCorrelation: noiseCorrelation)
+    lazy var psk: PSKFeatures? = PSKFeatures(z, rate: rate, occupiedHz: occupiedHz, segments: segments)
+    lazy var ofdm: OFDMFeatures? = OFDMFeatures(z, rate: rate, occupiedHz: occupiedHz)
+
+    /// In the instantaneous frequency (its noise rises as f²: N0 / (2 Ps) × f²).
+    lazy var fmSubcarrier: Subcarrier? = {
+        let scale = noiseDensity / (2 * signalPower)
+        return Subcarrier(audio: FrequencyFeatures.discriminator(z, rate: rate), rate: rate,
+                          noiseDensity: { scale * $0 * $0 })
+    }()
+
+    /// In the envelope (its noise is the in-phase half of the channel's: N0 / 2).
+    lazy var amSubcarrier: Subcarrier? = {
+        var magnitude = [Float](repeating: 0, count: z.count)
+        z.withUnsafeBufferPointer { p in
+            p.baseAddress!.withMemoryRebound(to: Float.self, capacity: 2 * z.count) { f in
+                var split = DSPSplitComplex(realp: UnsafeMutablePointer(mutating: f),
+                                            imagp: UnsafeMutablePointer(mutating: f + 1))
+                vDSP_zvabs(&split, 2, &magnitude, 1, vDSP_Length(z.count))
+            }
+        }
+        let density = noiseDensity / 2
+        return Subcarrier(audio: magnitude, rate: rate, noiseDensity: { _ in density })
+    }()
 }

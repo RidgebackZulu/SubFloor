@@ -64,6 +64,20 @@ public struct Channel {
         return rate * Double(stages.last!.factor) * squares / (sum * sum)
     }
 
+    /// The (sharp) channel's noise correlation `lag` output samples apart: white noise in comes out with
+    /// E[n[k] · n*[k − lag]] = this × E|n|² (real, the filter being symmetric about 0 Hz). It is the last
+    /// stage's, one output sample being `factor` of its input samples.
+    public static func noiseCorrelation(sampleRate: Double, bandwidthHz: Double, lag outputs: Int = 1) -> Double {
+        let (stages, _) = plan(sampleRate: sampleRate, bandwidthHz: bandwidthHz)
+        let taps = stages.last!.taps.map(Double.init)
+        let lag = stages.last!.factor * outputs
+        let squares = taps.reduce(0) { $0 + $1 * $1 }
+        guard squares > 0, lag < taps.count else { return 0 }
+        var sum = 0.0
+        for k in 0..<(taps.count - lag) { sum += taps[k] * taps[k + lag] }
+        return sum / squares
+    }
+
     /// The stages and the output rate.
     private static func plan(sampleRate: Double, bandwidthHz: Double,
                              sharp: Bool = true) -> (stages: [Stage], rate: Double) {

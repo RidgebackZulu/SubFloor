@@ -32,6 +32,8 @@ struct EnvelopeFeatures {
     /// a carrier), about 1.2–1.6 for filtered PSK, 2 for OFDM, 4 or so for SSB voice.
     var amplitudeM4 = 0.0
     var keying: Keying?
+    /// The envelope's two levels and runs, when it has two (keying and bursts are read from them).
+    var runs: EnvelopeRuns?
 
     init(_ z: [DSPComplex], rate: Double, bandwidthHz: Double, noisePower: Double) {
         let n = z.count
@@ -63,7 +65,8 @@ struct EnvelopeFeatures {
 
         let modulation = inPhaseSplit(z, rate: rate)
         (modulationCV, modulationPauseFraction) = Self.variation(modulation)
-        keying = Keying(power, rate: rate, bandwidthHz: bandwidthHz)
+        runs = EnvelopeRuns(power, rate: rate, bandwidthHz: bandwidthHz)
+        keying = runs.flatMap(Keying.init)
     }
 
     /// Splits each 10 ms block about its mean phasor into in-phase and quadrature; sets `inPhase` and returns
@@ -162,44 +165,18 @@ struct Keying {
     var levelCV = 0.0
 
     init?(_ power: [Float], rate: Double, bandwidthHz: Double) {
-        let step = max(1, Int((Self.stepSeconds * rate).rounded()))
-        let stepSeconds = Double(step) / rate
-        var amplitude = EnvelopeFeatures.blockMeans(power, length: step).map { Double($0) }
-        guard amplitude.count >= 200 else { return nil }
-        // Smooth over ~1/bandwidth (at least 1 step), then to amplitude.
-        let reach = max(0, Int((0.5 / max(bandwidthHz, 1) / stepSeconds).rounded()))
-        if reach > 0 {
-            let prefix = OccupiedWidth.prefixSums(amplitude)
-            amplitude = amplitude.indices.map { k in
-                let lo = max(0, k - reach), hi = min(amplitude.count - 1, k + reach)
-                return (prefix[hi + 1] - prefix[lo]) / Double(hi - lo + 1)
-            }
-        }
-        amplitude = amplitude.map { $0.squareRoot() }
-        guard let split = Self.otsu(amplitude) else { return nil }
-        let on = amplitude.filter { $0 >= split }.sorted()
-        let off = amplitude.filter { $0 < split }.sorted()
-        guard !on.isEmpty, !off.isEmpty else { return nil }
-        onLevel = on[on.count / 2]
-        offLevel = off[off.count / 2]
-        duty = Double(on.count) / Double(amplitude.count)
-        guard offLevel < Self.maxOffRatio * onLevel, duty >= 0.1, duty <= 0.9 else { return nil }
+        guard let envelope = EnvelopeRuns(power, rate: rate, bandwidthHz: bandwidthHz) else { return nil }
+        self.init(envelope)
+    }
 
-        let high = offLevel + 0.6 * (onLevel - offLevel), low = offLevel + 0.4 * (onLevel - offLevel)
-        var runs: [(on: Bool, length: Int)] = []
-        var state = amplitude[0] >= split
-        var length = 0
-        for a in amplitude {
-            let next = state ? a >= low : a > high
-            if next != state {
-                runs.append((state, length))
-                state = next
-                length = 0
-            }
-            length += 1
-        }
-        runs.append((state, length))
-        runs = Self.merged(runs, shorterThan: max(3, Self.median(runs.map(\.length)) / 4))
+    init?(_ envelope: EnvelopeRuns) {
+        onLevel = envelope.onLevel
+        offLevel = envelope.offLevel
+        duty = envelope.duty
+        guard offLevel < Self.maxOffRatio * onLevel, duty >= 0.1, duty <= 0.9 else { return nil }
+        let runs = envelope.runs
+        let amplitude = envelope.amplitude
+        let stepSeconds = envelope.stepSeconds
         // Each whole mark's level: its middle 60%.
         var levels: [Double] = []
         var position = runs.first?.length ?? 0

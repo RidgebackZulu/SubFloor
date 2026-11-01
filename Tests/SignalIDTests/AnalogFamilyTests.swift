@@ -160,21 +160,22 @@ import Testing
         }
     }
 
-    /// Task 4's families must not be taken for these: `unknown`, or at worst a weak `fm` for a constant
-    /// envelope FSK.
+    /// Task 4's families are never taken for an analog one: each comes back as its own digital family, or
+    /// `unknown` (FT8 in 3 s waits for the longer read). NOAA APT is FM carrying a subcarrier: `fm` or `unknown`.
     @Test(arguments: [20.0, 10.0])
     func digitalFamiliesAreLeftAlone(snr: Double) {
-        // (spec, sample rate, where the pointer rests relative to the centre: RTTY 850's centre is empty).
-        let cases: [(SynthSpec, Double, Double)] = [
-            (.rtty(baud: 45.45, shiftHz: 170), 48_000, 0), (.rtty(baud: 50, shiftHz: 850), 48_000, 425),
-            (.navtex, 48_000, 0), (.psk31, 48_000, 0), (.qpsk31, 48_000, 0), (.hfdl, 48_000, 0),
-            (.stanag4285, 48_000, 0), (.drm, 48_000, 0), (.p25, 48_000, 0), (.ysf, 48_000, 0), (.dstar, 48_000, 0),
-            (.ale, 48_000, 0), (.olivia(), 48_000, 0), (.mfsk16, 48_000, 0), (.ft8(), 48_000, 0), (.dmr, 48_000, 0),
-            (.ais, 96_000, 0),
+        // (spec, sample rate, where the pointer rests relative to the centre: RTTY 850's centre is empty, family).
+        let cases: [(SynthSpec, Double, Double, SignalFamily)] = [
+            (.rtty(baud: 45.45, shiftHz: 170), 48_000, 0, .fsk), (.rtty(baud: 50, shiftHz: 850), 48_000, 425, .fsk),
+            (.navtex, 48_000, 0, .fsk), (.psk31, 48_000, 0, .psk), (.qpsk31, 48_000, 0, .psk), (.hfdl, 48_000, 0, .psk),
+            (.stanag4285, 48_000, 0, .psk), (.drm, 48_000, 0, .ofdm), (.p25, 48_000, 0, .fsk), (.ysf, 48_000, 0, .fsk),
+            (.dstar, 48_000, 0, .fsk), (.ale, 48_000, 0, .fsk), (.olivia(), 48_000, 0, .mfsk),
+            (.mfsk16, 48_000, 0, .mfsk),
+            (.ft8(), 48_000, 0, .unknown), (.dmr, 48_000, 0, .fsk), (.ais, 96_000, 0, .fsk),
             // NOAA APT pointed at its centre: the extent takes one Bessel line of a ±17 kHz FM.
-            (.noaaAPT, 96_000, 0),
+            (.noaaAPT, 96_000, 0, .fm),
         ]
-        for (index, (spec, fs, point)) in cases.enumerated() {
+        for (index, (spec, fs, point, family)) in cases.enumerated() {
             let seed = UInt64(20 + index)
             let iq = SignalSynth.make(spec, sampleRate: fs, seconds: 3, snrDb: snr, offsetHz: 3000, seed: seed)
             let size = 4096
@@ -188,8 +189,8 @@ import Testing
             let width = Double(extent.upperBin - extent.lowerBin + 1) * binHz
             let centre = (Double(extent.lowerBin + extent.upperBin) / 2 - Double(size / 2)) * binHz
             let m = SignalMeasurer.measure(iq, sampleRate: fs, offsetHz: centre, bandwidthHz: width, seconds: 3)
-            let leftAlone = m.family == .unknown || (m.family == .fm && m.familyConfidence <= 0.5)
-            #expect(leftAlone, "\(spec) at \(snr) dB: \(m.family) \(m.familyConfidence) \(m.notes)")
+            #expect(m.family == family || m.family == .unknown,
+                    "\(spec) at \(snr) dB: \(m.family) \(m.familyConfidence) \(m.notes)")
         }
     }
 
