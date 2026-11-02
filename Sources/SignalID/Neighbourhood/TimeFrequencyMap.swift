@@ -8,10 +8,15 @@ import Foundation
 /// frequency resolution and the same scatter in the noise. Each frame is zero-padded to a power of two, and the map's
 /// bins are that spectrum's nearest ones `binHz` apart.
 ///
-/// Each row is its own moment's power over that moment's noise level. The level is the row's median, less the median's
-/// bias for noise (a bin's power in noise is exponential: its median is ln 2 of its mean), so a bin of noise averages
-/// 0 dB over rows and a level jump across the band leaves the rows alike.
+/// Each row is its own moment's power over that moment's noise level. The level is the row's 20th percentile, less
+/// that percentile's bias for noise (a bin's power in noise is exponential: its 20th percentile is −ln 0.8 of its mean), so
+/// a bin of noise averages 0 dB over rows and a level jump across the band leaves the rows alike. A low percentile
+/// because a crowded view is mostly signals: its median would be one of them, and they would read as noise.
 struct TimeFrequencyMap {
+    /// Which of a row's bins, sorted, gives its noise level, and what that percentile is of noise's mean.
+    static let noiseShare = 0.2
+    static let noiseBias = -log(0.8)
+
     let binHz: Double
     let hopSeconds: Double
     /// Bin 0, relative to the capture centre.
@@ -55,10 +60,10 @@ struct TimeFrequencyMap {
         vDSP_svesq(window, 1, &energy, vDSP_Length(frame))
         var scale = 1 / energy.squareRoot()
         vDSP_vsmul(window, 1, &scale, &window, 1, vDSP_Length(frame))
-        // Each map bin's place in the FFT's (unshifted) output.
-        let picks = (0..<bins).map { b -> Int in
+        // Each map bin's place in the FFT's (unshifted) output, counting from 1 as vDSP does.
+        let picks = (0..<bins).map { b -> vDSP_Length in
             let k = Int((Double(b - half) * binHz * Double(size) / rate).rounded())
-            return (k + size) % size
+            return vDSP_Length((k + size) % size + 1)
         }
 
         var relative = [Float](repeating: 0, count: rows * bins)
@@ -66,7 +71,8 @@ struct TimeFrequencyMap {
         var re = [Float](repeating: 0, count: size), im = [Float](repeating: 0, count: size)
         var power = [Float](repeating: 0, count: size)
         var row = [Float](repeating: 0, count: bins), sorted = row
-        let medianOfNoise = Float(M_LN2)
+        let quantile = min(bins - 1, Int(Self.noiseShare * Double(bins)))
+        let bias = Float(Self.noiseBias)
         for r in 0..<rows {
             z.withUnsafeBufferPointer { samples in
                 re.withUnsafeMutableBufferPointer { rp in
@@ -82,10 +88,10 @@ struct TimeFrequencyMap {
                     }
                 }
             }
-            for b in 0..<bins { row[b] = power[picks[b]] }
+            vDSP_vgathr(power, picks, 1, &row, 1, vDSP_Length(bins))
             sorted = row
             vDSP_vsort(&sorted, vDSP_Length(bins), 1)
-            let level = max(sorted[bins / 2] / medianOfNoise, 1e-20)
+            let level = max(sorted[quantile] / bias, 1e-20)
             noise[r] = 10 * log10(level / Float(rate))
             relative.withUnsafeMutableBufferPointer { out in
                 let start = out.baseAddress! + r * bins

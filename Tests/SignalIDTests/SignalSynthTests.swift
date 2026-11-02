@@ -225,7 +225,8 @@ private func runs(_ x: [Float], above threshold: Float) -> [(start: Int, length:
 
     @Test func everyCatalogueEntrySynthesises() {
         #expect(Set(SynthSpec.catalogue.map(\.name)).count == 30)
-        for (index, entry) in SynthSpec.catalogue.enumerated() {
+        let catalogue = SynthSpec.catalogue
+        for (index, entry) in Sweep.cases(catalogue, default: Array(stride(from: 0, to: catalogue.count, by: 3))) {
             let fs = max(2 * entry.spec.minimumSampleRate, 8000)
             let iq = SignalSynth.make(entry.spec, sampleRate: fs, seconds: 0.5, snrDb: 10, offsetHz: 0.05 * fs,
                                       seed: UInt64(index))

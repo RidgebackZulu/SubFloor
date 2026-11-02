@@ -184,8 +184,10 @@ public enum SignalMeasurer {
         /// `TraceFinder` bounded it: the extent doesn't grow along the spectrum past it, into whatever lies next to
         /// it. Only what shows it is one signal takes it further: an FSK's other tone keyed in turn, and when
         /// `mayBeLine` (an area, or a trace as narrow as a line, not a band of tones standing tall over its
-        /// neighbours' gaps), a carrier's symmetric sidebands or an FM tone's lines.
-        case found(mayBeLine: Bool)
+        /// neighbours' gaps), a carrier's symmetric sidebands or an FM tone's lines. Sidebands stay `within` those
+        /// offsets from the capture centre: the edges of what else the finder saw. `grows`: the finder saw the seed's
+        /// own sidebands, and the extent follows them along the spectrum, as far as `within`.
+        case found(mayBeLine: Bool, within: ClosedRange<Double>, grows: Bool = false)
     }
 
     public static func measure(_ iq: [Float], sampleRate: Double, offsetHz: Double, bandwidthHz: Double,
@@ -237,13 +239,19 @@ public enum SignalMeasurer {
         // The seed's own bins left out from the start: a signal filling most of the window (DAB, 94% of a
         // 2 MS/s capture's) would otherwise be its own 10th percentile.
         coarse.estimateNoise(excluding: widened(seedBins, by: 0.1, in: coarse))
+        var bound: ClosedRange<Int>?
+        if case .found(_, let within, _) = ceiling {
+            let low = within.lowerBound.isFinite ? coarse.bin(within.lowerBound - windowCentre) : 0
+            let high = within.upperBound.isFinite ? coarse.bin(within.upperBound - windowCentre) : coarse.count - 1
+            bound = low...high
+        }
         var found: Region?
         for _ in 0..<3 {
-            found = region(coarse, seed: seedBins, ceiling: ceiling)
+            found = region(coarse, seed: seedBins, ceiling: ceiling, bound: bound)
             guard let r = found else { break }
             coarse.estimateNoise(excluding: widened(r.bins, by: 0.1, in: coarse))
         }
-        found = region(coarse, seed: seedBins, ceiling: ceiling)
+        found = region(coarse, seed: seedBins, ceiling: ceiling, bound: bound)
         if Task.isCancelled { return cancelled() }
         // The capture limits the window: a signal reaching its edges is wider than the view (ruling R5). It is
         // measured again over the whole view first: there it reaches the capture's own edge, and whatever noise
@@ -674,7 +682,8 @@ public enum SignalMeasurer {
 
     /// The signal around `seed` in the coarse view (see the type's notes), or nil when nothing there stands
     /// above the noise.
-    static func region(_ view: SpectrumView, seed: ClosedRange<Int>, ceiling: Ceiling = .none) -> Region? {
+    static func region(_ view: SpectrumView, seed: ClosedRange<Int>, ceiling: Ceiling = .none,
+                       bound: ClosedRange<Int>? = nil) -> Region? {
         let smoothing = 2
         let es = view.smoothedExcess(reach: smoothing)
         // Neighbouring bins share leakage and frames overlap: about half as many independent ones.
@@ -685,7 +694,12 @@ public enum SignalMeasurer {
               let first = seed.first(where: { es[$0] >= edge }),
               let last = seed.last(where: { es[$0] >= edge }) else { return nil }
         let lo = first, hi = last
-        var bins = ceiling == .none ? grown(lo...hi, es: es, edge: edge) : lo...hi
+        var bins = lo...hi
+        if ceiling == .none { bins = grown(bins, es: es, edge: edge) }
+        if case .found(_, _, grows: true) = ceiling {
+            bins = grown(bins, es: es, edge: edge)
+            if let bound { bins = bins.clamped(to: bound) }
+        }
         // Up to the next other signal (standing clearly out: 2 × the edge level) beyond a gap, short of its
         // smoothed skirt.
         func room(_ bins: ClosedRange<Int>) -> ClosedRange<Int> {
@@ -697,7 +711,7 @@ public enum SignalMeasurer {
             return a...b
         }
         if ceiling == .given { return Region(bins: bins, room: bins) }
-        if ceiling == .found(mayBeLine: false) { return Region(bins: bins, room: room(bins)) }
+        if case .found(mayBeLine: false, _, _) = ceiling { return Region(bins: bins, room: room(bins)) }
 
         // A carrier line (the seed's own peak): symmetric sidebands about it belong to it.
         let top = seed.clamped(to: bins).max { view.power[$0] < view.power[$1] }!
@@ -705,7 +719,9 @@ public enum SignalMeasurer {
         guard top - s >= 0, top + s < view.count,
               view.power[top] >= max(view.power[top - s], view.power[top + s]) * pow(10, lineContrastDb / 10)
         else { return Region(bins: bins, comb: isComb(view, line: top), room: room(bins)) }
-        let limit = min(top, view.count - 1 - top)
+        // As far as the mirror goes: the view, and what the finder saw beside this signal.
+        var limit = min(top, view.count - 1 - top)
+        if let bound { limit = min(limit, top - bound.lowerBound - 1, bound.upperBound - top - 1) }
         // Other lines as strong as this one (within 5 dB) 5 kHz or more away are other stations (MW at 9 or
         // 10 kHz, airband 8.33, HF 5): the growth stops halfway to them. Nearer ones stay (an FSK's tones; a
         // comb is caught below).
@@ -747,11 +763,11 @@ public enum SignalMeasurer {
         }
         // Strong symmetric neighbours: within 5 kHz, an FM tone's comb; farther out, other stations, so
         // this one's sidebands end halfway to them. A neighbour on one side only ends them short of it.
-        let ceiling = view.power[top] * pow(10, -sidebandBelowLineDb / 10)
-        for d in sidebandStart...outer where view.power[top - d] > ceiling || view.power[top + d] > ceiling {
+        let underLine = view.power[top] * pow(10, -sidebandBelowLineDb / 10)
+        for d in sidebandStart...outer where view.power[top - d] > underLine || view.power[top + d] > underLine {
             let left = (d - 2...d + 2).map { view.power[top - min($0, limit)] }.max()!
             let right = (d - 2...d + 2).map { view.power[top + min($0, limit)] }.max()!
-            guard min(left, right) > ceiling else {
+            guard min(left, right) > underLine else {
                 outer = d - s - wide - 1
                 break
             }

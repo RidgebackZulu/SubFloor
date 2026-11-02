@@ -1,3 +1,4 @@
+import Accelerate
 import DSPCore
 import Foundation
 import Testing
@@ -252,10 +253,21 @@ enum RealCorpus {
             throw CorpusError.badWAV(url.lastPathComponent)
         }
         let end = min(data.count, chunk.offset + chunk.size)
-        let iq = data[chunk.offset..<end].withUnsafeBytes { raw in
-            raw.bindMemory(to: Int16.self).map { Float(Int16(littleEndian: $0)) / 32768 }
+        return (floats(data[chunk.offset..<end]), chunk.format.rate)
+    }
+
+    /// Little-endian 16-bit samples as Floats in ±1, by vDSP: the clips load in a default test run.
+    static func floats(_ data: Data) -> [Float] {
+        let count = data.count / 2
+        var out = [Float](repeating: 0, count: count)
+        data.withUnsafeBytes { raw in
+            let samples = raw.bindMemory(to: Int16.self)
+            guard let base = samples.baseAddress else { return }
+            vDSP_vflt16(base, 1, &out, 1, vDSP_Length(count))
         }
-        return (iq, chunk.format.rate)
+        var scale: Float = 32768
+        vDSP_vsdiv(out, 1, &scale, &out, 1, vDSP_Length(count))
+        return out
     }
 
     /// Where a WAV's `data` chunk lies, and its format. Doesn't assume the data starts at 44.
@@ -306,6 +318,6 @@ enum RealCorpus {
         guard first < last else { return [] }
         try handle.seek(toOffset: UInt64(chunk.offset + 4 * first))
         let data = try handle.read(upToCount: 4 * (last - first)) ?? Data()
-        return data.withUnsafeBytes { raw in raw.bindMemory(to: Int16.self).map { Float(Int16(littleEndian: $0)) / 32768 } }
+        return floats(data)
     }
 }

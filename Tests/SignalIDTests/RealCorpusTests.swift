@@ -46,8 +46,9 @@ import Testing
         #expect(held.startUTC == ISO8601DateFormatter().date(from: "2026-11-01T18:19:00Z"))
     }
 
-    /// The corpus loads and scores: one counted point of each truth, through the hover's path.
-    @Test func scoresOnePointPerTruth() throws {
+    /// The corpus loads and scores: one counted point of each truth, through the hover's path. (`heldOutTargets` does
+    /// the same on the other part by default.)
+    @Test(.enabled(if: Sweep.full)) func scoresOnePointPerTruth() throws {
         var picks: [String: CorpusPoint] = [:]
         for point in try RealCorpus.points(.tuning) where RealCorpus.counts(point) && picks[point.truth] == nil {
             picks[point.truth] = point
@@ -63,22 +64,26 @@ import Testing
         try Self.printScore("baseline", parts: CorpusPart.allCases) { RealCorpus.hover($0, $1) }
     }
 
-    /// The targets on the held-out part, which is only ever scored, through the hover's path on clips. By default at
-    /// most 2 points per truth; `SUBFLOOR_SIGNALID_MATRIX=1` asserts over all of them. `fullRecordings` asserts the
+    /// The targets on the held-out part, which is only ever scored, through the hover's path on clips, and no wrong name
+    /// on any truth. By default every empty point and 2 of FT8, whose windows are the most likely to be misnamed;
+    /// `SUBFLOOR_SIGNALID_MATRIX=1` asserts over all of them. `fullRecordings` asserts the
     /// same targets at the capture's own rate. The rows grow as the tasks that meet them land.
     @Test func heldOutTargets() throws {
-        let held = try RealCorpus.points(.heldOut).filter { Self.heldOutTruths.contains($0.truth) }
-        let points = Sweep.full ? held : Self.subset(held, perTruth: 2)
+        let held = try RealCorpus.points(.heldOut)
+        // A share of 95% means nothing over 2 points, and an empty point costs little: all of them, always.
+        let points = Sweep.full ? held : held.filter { $0.truth == "none" }
+            + Self.subset(held.filter { $0.truth == "FT8" }, perTruth: 2)
+        var wrong: [String] = []
         let score = try RealCorpus.score(points: points) { clip, point in
             let id = RealCorpus.hover(clip, point)
             Self.expectHeldOut(id, point, "clip path")
+            if RealCorpus.isWrongName(id, point) { wrong.append("\(point.truth) at \(point.atHz) Hz: \(id.label)") }
             return id
         }
         Self.expectTargets(score, "clip path")
+        #expect(wrong.isEmpty, "clip path: wrong names at 0.7 or more: \(wrong)")
     }
 
-    /// The truths `heldOutTargets` holds to their targets so far.
-    static let heldOutTruths: Set<String> = ["none"]
     /// The share right each truth must reach.
     static let targets = ["none": 0.95]
     /// No answer on an empty point may be wider than this.
@@ -136,18 +141,27 @@ import Testing
                 return kept[key]! <= allowed
             }
         }
+        let clips = try RealCorpus.clips()
         for part in CorpusPart.allCases {
             let points = try trimmed(part)
             var answers: [String: [String: Int]] = [:]
             var wrong: [String] = []
-            let score = try RealCorpus.score(points: points) { clip, point in
-                let id = identify(clip, point)
-                answers[point.truth, default: [:]][Self.shortLabel(id), default: 0] += 1
+            func note(_ id: SignalIdentity, _ point: CorpusPoint) {
                 if RealCorpus.isWrongName(id, point) {
                     wrong.append("\(point.truth) in \(point.clip) at \(point.atHz) Hz, \(point.endSeconds) s: \(id.label)")
                 }
+            }
+            let score = try RealCorpus.score(points: points) { clip, point in
+                let id = identify(clip, point)
+                answers[point.truth, default: [:]][Self.shortLabel(id), default: 0] += 1
+                note(id, point)
                 if part == .heldOut { Self.expectHeldOut(id, point, "1 MS/s") }
                 return id
+            }
+            // The windows that don't count towards a score can still hold a wrong name.
+            for point in points where !RealCorpus.counts(point) {
+                let clip = try #require(clips.first { $0.name == point.clip })
+                note(identify(clip, point), point)
             }
             for truth in score.keys.sorted() {
                 let s = score[truth]!
@@ -161,7 +175,33 @@ import Testing
             }
             print("fullRecordings \(part.rawValue) wrong names at 0.7 or more: \(wrong.count)")
             for line in wrong.prefix(20) { print("fullRecordings wrong: \(line)") }
+            #expect(wrong.isEmpty, "1 MS/s \(part): wrong names at 0.7 or more: \(wrong)")
             if part == .heldOut { Self.expectTargets(score, "1 MS/s") }
+        }
+    }
+
+    /// A strong carrier added to the real 1 MS/s read, 120 kHz from an empty point: still `No signal` there.
+    @Test(.enabled(if: environment["SUBFLOOR_SIGNALID_REAL"] == "1")) func aCarrierElsewhereInARealRead() throws {
+        let manifest = try RealCorpus.manifest()
+        let recording = try #require(manifest.recordings.first { $0.tag == "14MHz" })
+        let clip = try #require(try RealCorpus.clips().first { $0.part == .tuning && $0.name.hasPrefix("14MHz") })
+        let start = try #require(recording.span(.tuning)).lowerBound
+        let read = try RealCorpus.readRecording(recording.file, seconds: (start + 6)..<(start + 9))
+        var total = 0.0
+        for sample in read { total += Double(sample * sample) }
+        total /= Double(read.count / 2)
+        let pointHz = 14_072_200 - recording.captureCenterHz
+        for times in [0.0, 1, 3, 10, 30, 100] {
+            var iq = read
+            TraceFinderTests.addCarrier(to: &iq, offsetHz: pointHz + 120_000, rate: recording.captureRate,
+                                        amplitude: Float((times * total).squareRoot()))
+            for spectrum in [clip.captureSpectrumDb, nil] {
+                let id = SignalIdentifier.identify(iq: iq, sampleRate: recording.captureRate,
+                                                   captureCenterHz: recording.captureCenterHz, atHz: 14_072_200,
+                                                   bandwidthHz: nil, spectrumDb: spectrum, longer: nil)
+                #expect(id.note == SignalIdentifier.noSignalNote && id.measurement.occupiedBandwidthHz == 0,
+                        "\(times) × the read's power: \(id.label)")
+            }
         }
     }
 

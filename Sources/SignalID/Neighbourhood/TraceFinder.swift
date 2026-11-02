@@ -33,7 +33,8 @@ struct NeighbourhoodView {
 
 /// Reads a `TimeFrequencyMap`: which frequencies hold something, and whether that is a narrow line or a wider area.
 ///
-/// Each bin's power is averaged over the read (noise averages 0 dB in every bin, whatever the receiver's gain did).
+/// Each bin's power is averaged over the read (noise averages 0 dB in every bin, whatever the receiver's gain did; in a
+/// view too crowded for that, `quietLevel` puts it right).
 /// **Areas** come from that smoothed over about 100 Hz: at least 500 Hz above 3 dB and 6 dB somewhere. A stretch of
 /// separate lines in deep valleys that holds its power steady from moment to moment isn't one (a band of FT8 stations):
 /// a voice's power comes in syllables, and a wideband mode has no valleys. **Traces** are the rest, from the average
@@ -48,6 +49,8 @@ enum TraceFinder {
     static let traceReachHz = 16.0
     /// For areas (about 100 Hz in all).
     static let areaReachHz = 48.0
+    static let quietShare = 0.05
+    static let quietBelowDb = 3.0
     static let edgeDb = 3.0
     static let lineDb = 8.0
     static let plateauDb = 4.5
@@ -64,12 +67,23 @@ enum TraceFinder {
     /// measure −0.9; separate stations on the corpus's tuning part stayed over −0.46.
     static let turnsCorrelation = -0.5
     static let turnsReachHz = 1500.0
+    /// An FSK's tones stand about alike. (FM's carrier and sidebands take turns too, far apart in level.)
+    static let turnsWithinDb = 10.0
     /// How alike the two sides of a signal's sidebands are, in where they lie and how wide.
     static let sidebandMatch = 0.1
-    /// A line's sidebands start this alike and this near it, and stand this far under it.
-    static let lineSidebandMatch = 0.2
+    /// An area's sidebands stand this far under it; a line's, when they are lines too, as AM's by a tone do.
+    static let sidebandUnderAreaDb = 3.0
+    static let lineSidebandBelowDb = 5.0
+    /// A line's sidebands start this near it and, when wider than lines, stand this far under it (`hasSidebands`).
     static let sidebandReachHz = 1000.0
     static let sidebandBelowLineDb = 15.0
+    static let lineSidebandHz = 16.0
+    static let lineSidebandMatchDb = 3.0
+    static let wideSidebandHz = 40.0
+    static let wideSidebandShare = 0.3
+    static let wideSidebandWidths = 2.2
+    /// A trace this far up isn't a weak signal's (`isClear`).
+    static let clearDb = 10.0
     /// A stretch of at least this many separated lines, with steady power, is a band of them.
     static let bandMinLines = 3
     /// How evenly an MFSK's tones are spaced, and how much of each step a tone fills.
@@ -92,9 +106,12 @@ enum TraceFinder {
     static func find(_ map: TimeFrequencyMap) -> NeighbourhoodView {
         let noise = median(map.noiseDbPerHz)
         guard map.rows > 0, map.bins >= 16 else { return NeighbourhoodView(traces: [], areas: [], noiseDb: Double(noise)) }
-        let power = map.meanPower()
+        var power = map.meanPower()
+        let areaReach = Int((areaReachHz / map.binHz).rounded())
+        let quiet = quietLevel(smoothed(power, reach: areaReach))
+        if quiet != 1 { power = power.map { $0 / quiet } }
         let fine = smoothed(power, reach: Int((traceReachHz / map.binHz).rounded()))
-        let coarse = smoothed(power, reach: Int((areaReachHz / map.binHz).rounded()))
+        let coarse = smoothed(power, reach: areaReach)
         let edge = linear(edgeDb)
 
         var areas: [OccupiedArea] = []
@@ -102,7 +119,7 @@ enum TraceFinder {
         for run in runs(coarse, above: edge) where Double(run.count) * map.binHz >= areaMinHz {
             guard run.map({ coarse[$0] }).max()! >= linear(areaDetectDb) else { continue }
             guard !isBandOfLines(run, map: map, power: power, fine: fine) else { continue }
-            let onTimes = self.onTimes(run, map: map)
+            let onTimes = self.onTimes(run, map: map, quiet: quiet)
             guard total(onTimes) >= minOnSeconds else { continue }
             areas.append(OccupiedArea(lowerHz: map.offsetHz(Double(run.lowerBound)), upperHz: map.offsetHz(Double(run.upperBound)),
                                       snrDb: snr(power, run), onTimes: onTimes))
@@ -113,7 +130,7 @@ enum TraceFinder {
         for run in runs(fine, above: edge) where !taken.contains(where: { $0.overlaps(run) }) {
             for piece in split(run, fine: fine) {
                 guard let bins = traceBins(piece, power: power, fine: fine, map: map) else { continue }
-                let onTimes = self.onTimes(bins, map: map)
+                let onTimes = self.onTimes(bins, map: map, quiet: quiet)
                 guard total(onTimes) >= minOnSeconds else { continue }
                 let width = Double(bins.count - 1) * map.binHz
                 let seconds = map.frameSeconds + Double(map.rows - 1) * map.hopSeconds
@@ -123,19 +140,31 @@ enum TraceFinder {
                                           steady: width <= steadyMaxHz && total(onTimes) >= steadyOnShare * seconds))
             }
         }
-        return NeighbourhoodView(traces: traces, areas: joiningSidebands(areas), noiseDb: Double(noise))
+        return NeighbourhoodView(traces: traces, areas: joiningSidebands(areas),
+                                 noiseDb: Double(noise) + 10 * log10(Double(quiet)))
     }
 
     // MARK: Pieces
 
-    /// Whether two traces' power runs against each other from moment to moment: one signal's tones.
-    static func takeTurns(_ a: SignalTrace, _ b: SignalTrace, map: TimeFrequencyMap) -> Bool {
-        correlation(a, b, map: map) <= turnsCorrelation
+    /// What the map's quietest stretches read, when that is well under its noise level: a view so crowded that even a
+    /// row's 20th percentile lies among signals (stations 10 kHz apart with 2 kHz gaps) has its true noise in those gaps.
+    /// 1 otherwise: a real band's ripple is a dB or so.
+    static func quietLevel(_ coarse: [Float]) -> Float {
+        var sorted = coarse
+        vDSP_vsort(&sorted, vDSP_Length(sorted.count), 1)
+        let quiet = sorted[Int(quietShare * Double(sorted.count))]
+        return quiet < linear(-quietBelowDb) ? max(quiet, 1e-6) : 1
     }
 
-    static func correlation(_ a: SignalTrace, _ b: SignalTrace, map: TimeFrequencyMap) -> Double {
-        func band(_ t: SignalTrace) -> ClosedRange<Int>? {
-            let low = max(0, map.bin(t.lowerHz)), high = min(map.bins - 1, map.bin(t.upperHz))
+    /// Whether two traces' power runs against each other from moment to moment: one signal's tones.
+    static func takeTurns(_ a: SignalTrace, _ b: SignalTrace, map: TimeFrequencyMap) -> Bool {
+        correlation(a.lowerHz...a.upperHz, b.lowerHz...b.upperHz, map: map) <= turnsCorrelation
+    }
+
+    /// The correlation of two bands' power over the rows.
+    static func correlation(_ a: ClosedRange<Double>, _ b: ClosedRange<Double>, map: TimeFrequencyMap) -> Double {
+        func band(_ hz: ClosedRange<Double>) -> ClosedRange<Int>? {
+            let low = max(0, map.bin(hz.lowerBound)), high = min(map.bins - 1, map.bin(hz.upperBound))
             return low <= high ? low...high : nil
         }
         guard let bandA = band(a), let bandB = band(b), map.rows >= 8 else { return 0 }
@@ -153,17 +182,58 @@ enum TraceFinder {
         return xx > 0 && yy > 0 ? xy / (xx * yy).squareRoot() : 0
     }
 
-    /// A line well over what lies next to it on each side, that lying at the same distance on both: a carrier's sidebands
-    /// (narrow FM's, weak and broken up at 10 dB). A line's own neighbours aren't so matched.
-    static func hasSidebands(_ line: SignalTrace, _ view: NeighbourhoodView) -> Bool {
-        let beside = view.traces.filter { $0 != line }.map { (lower: $0.lowerHz, upper: $0.upperHz, snr: $0.snrDb) }
-            + view.areas.map { (lower: $0.lowerHz, upper: $0.upperHz, snr: $0.snrDb) }
+    /// A trace that says plainly it is its own signal, in `tooWeak`'s window: as narrow as a line, or well up. What is
+    /// left of a weak voice reads as pieces wider and fainter than that.
+    static func isClear(_ trace: SignalTrace) -> Bool {
+        trace.upperHz - trace.lowerHz <= steadyMaxHz || trace.snrDb >= clearDb
+    }
+
+    /// Something the view holds besides a given line.
+    struct Neighbour {
+        var lower, upper, snrDb: Double
+        var isLine: Bool { upper - lower <= steadyMaxHz }
+    }
+
+    /// Whether two neighbours, `down` and `up` Hz from a line, could be its sidebands: mirror images about it.
+    /// - Lines (AM by a steady tone): at the same distance to within two map bins and the same strength to within 3 dB.
+    ///   Only by construction do separate stations line up so closely.
+    /// - Anything wider (voice on narrow FM, data on AM): at the same distance to within `wideSidebandShare` or five map
+    ///   bins, and as wide as each other to within twice. Their edges are where a fading level crosses a threshold.
+    static func mirror(_ a: Neighbour, down: Double, _ b: Neighbour, up: Double) -> Bool {
+        guard a.isLine == b.isLine else { return false }
+        if a.isLine { return abs(down - up) <= lineSidebandHz && abs(a.snrDb - b.snrDb) <= lineSidebandMatchDb }
+        let widthA = a.upper - a.lower, widthB = b.upper - b.lower
+        return abs(down - up) <= max(wideSidebandHz, wideSidebandShare * max(down, up))
+            && max(widthA, widthB) <= wideSidebandWidths * min(widthA, widthB)
+    }
+
+    /// Everything in the view but `line`, and when a line is given, without what it has for sidebands: from the line
+    /// outwards, each pair that mirrors. The first thing with no mirror image is another signal, and so is all beyond it.
+    static func beside(_ view: NeighbourhoodView, line: SignalTrace?) -> [Neighbour] {
+        var all = view.traces.filter { $0 != line }.map { Neighbour(lower: $0.lowerHz, upper: $0.upperHz, snrDb: $0.snrDb) }
+            + view.areas.map { Neighbour(lower: $0.lowerHz, upper: $0.upperHz, snrDb: $0.snrDb) }
+        guard let line else { return all }
         let centre = (line.lowerHz + line.upperHz) / 2
-        guard let below = beside.filter({ $0.upper < line.lowerHz }).max(by: { $0.upper < $1.upper }),
-              let above = beside.filter({ $0.lower > line.upperHz }).min(by: { $0.lower < $1.lower }) else { return false }
+        while let below = all.filter({ $0.upper < line.lowerHz }).max(by: { $0.upper < $1.upper }),
+              let above = all.filter({ $0.lower > line.upperHz }).min(by: { $0.lower < $1.lower }),
+              max(below.snrDb, above.snrDb) <= line.snrDb - lineSidebandBelowDb,
+              mirror(below, down: centre - below.upper, above, up: above.lower - centre) {
+            all.removeAll { $0.lower == below.lower || $0.lower == above.lower }
+        }
+        return all
+    }
+
+    /// Whether what lies next to a line, on each side, is its sidebands: under it, near it, and mirrored. Wider than lines
+    /// they must stand well under it (voice on narrow FM, weak and broken up at 10 dB).
+    static func hasSidebands(_ line: SignalTrace, _ view: NeighbourhoodView) -> Bool {
+        let all = beside(view, line: nil), centre = (line.lowerHz + line.upperHz) / 2
+        let rest = all.filter { $0.lower != line.lowerHz || $0.upper != line.upperHz }
+        guard let below = rest.filter({ $0.upper < line.lowerHz }).max(by: { $0.upper < $1.upper }),
+              let above = rest.filter({ $0.lower > line.upperHz }).min(by: { $0.lower < $1.lower }) else { return false }
         let down = centre - below.upper, up = above.lower - centre
-        return abs(down - up) <= lineSidebandMatch * max(down, up) && max(down, up) <= sidebandReachHz
-            && max(below.snr, above.snr) <= line.snrDb - sidebandBelowLineDb
+        let under = line.snrDb - max(below.snrDb, above.snrDb)
+        guard max(down, up) <= sidebandReachHz, mirror(below, down: down, above, up: up) else { return false }
+        return below.isLine && above.isLine ? under >= lineSidebandBelowDb : under >= sidebandBelowLineDb
     }
 
     /// An area with a weaker one at the same distance each side holds its sidebands (FM carrying AFSK): one area.
@@ -177,7 +247,7 @@ enum TraceFinder {
             let widthLow = low.upperHz - low.lowerHz, widthHigh = high.upperHz - high.lowerHz
             guard abs(below - above) <= sidebandMatch * max(below, above),
                   abs(widthLow - widthHigh) <= sidebandMatch * max(widthLow, widthHigh),
-                  low.snrDb < middle.snrDb, high.snrDb < middle.snrDb else {
+                  max(low.snrDb, high.snrDb) <= middle.snrDb - sidebandUnderAreaDb else {
                 k += 1
                 continue
             }
@@ -301,13 +371,13 @@ enum TraceFinder {
 
     static func total(_ times: [ClosedRange<Double>]) -> Double { times.reduce(0) { $0 + $1.upperBound - $1.lowerBound } }
 
-    /// When `band` is on, in seconds within the read.
-    static func onTimes(_ band: ClosedRange<Int>, map: TimeFrequencyMap) -> [ClosedRange<Double>] {
-        let levels = map.bandPower(band)
+    /// When `band` is on, in seconds within the read, with the map's noise taken to read `quiet`.
+    static func onTimes(_ band: ClosedRange<Int>, map: TimeFrequencyMap, quiet: Float) -> [ClosedRange<Double>] {
+        let levels = map.bandPower(band).map { $0 / quiet }
         guard !levels.isEmpty else { return [] }
         let sorted = levels.sorted()
         let low = max(sorted[levels.count / 10], 1), high = sorted[levels.count * 9 / 10]
-        let threshold = high >= Float(onContrast) * low ? (low * high).squareRoot() : min(1 + 0.5 * (low - 1), low)
+        let threshold = high >= Float(onContrast) * low ? (low * high).squareRoot() : 1 + 0.5 * (low - 1)
         var out: [ClosedRange<Int>] = []
         var start: Int?, last = -1
         for (r, level) in levels.enumerated() where level >= threshold {
@@ -354,10 +424,21 @@ extension TimeFrequencyMap {
 
     /// The band's mean power in each row, as a share of the noise.
     func bandPower(_ band: ClosedRange<Int>) -> [Float] {
-        (0..<rows).map { r in
-            var sum: Float = 0
-            for b in band { sum += pow(10, relativeDb[r * bins + b] / 10) }
-            return sum / Float(band.count)
+        let count = band.count
+        var row = [Float](repeating: 0, count: count)
+        let base = [Float](repeating: 10, count: count)
+        var tenth: Float = 0.1
+        var length = Int32(count)
+        return relativeDb.withUnsafeBufferPointer { db in
+            (0..<rows).map { r in
+                vDSP_vsmul(db.baseAddress! + r * bins + band.lowerBound, 1, &tenth, &row, 1, vDSP_Length(count))
+                row.withUnsafeMutableBufferPointer { out in
+                    vvpowf(out.baseAddress!, UnsafePointer(out.baseAddress!), base, &length)
+                }
+                var mean: Float = 0
+                vDSP_meanv(row, 1, &mean, vDSP_Length(count))
+                return mean
+            }
         }
     }
 }
