@@ -648,7 +648,7 @@ final class SignalIDService {
         case .cw: "CW"
         case .psk31: "PSK31 / PSK63"
         case .rtty: "RTTY"
-        case .ft8: "FT8 / FT4"
+        case .ft8: "FT8"
         case .wspr: "WSPR"
         }
     }

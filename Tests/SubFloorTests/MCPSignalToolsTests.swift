@@ -273,7 +273,7 @@ struct MCPSignalToolsTests {
             }
             return SignalIdentity(measurement: SignalMeasurement(offsetHz: at - centre, occupiedBandwidthHz: 50,
                                                                  family: .fsk, familyConfidence: 0.6, seconds: 3),
-                                  alternatives: [ModeMatch(name: "FT8 / FT4", confidence: 0.4, evidence: [])],
+                                  alternatives: [ModeMatch(name: "FT8", confidence: 0.4, evidence: [])],
                                   needsLongerRead: true)
         }
         let r = await call(tools, "identify_signals", ["from_hz": .number(from), "to_hz": .number(to)])

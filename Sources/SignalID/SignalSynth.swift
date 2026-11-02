@@ -28,7 +28,7 @@ public enum SynthSpec: Sendable, Hashable {
     case psk(PSK)
     /// OFDM with a cyclic prefix.
     case ofdm(OFDM)
-    /// The inner signal keyed on and off on a fixed schedule (TDMA bursts, FT8/FT4/WSPR slots).
+    /// The inner signal keyed on and off on a fixed schedule (TDMA bursts, FT8, FT4 and WSPR slots).
     indirect case bursts(SynthSpec, Bursts)
 
     /// What modulates an AM or FM carrier. Every kind is peak-normalised to ±1.
@@ -268,6 +268,17 @@ public enum SignalSynth {
     public static func fading(toneIndex: Int, depthDb: Double, rateHz: Double = 0.5) -> SynthImpairments {
         SynthImpairments(fadeDepthDb: depthDb, fadeRateHz: rateHz, fadingToneIndex: toneIndex)
     }
+
+    /// When a capture `seconds` long of `spec` ends by UTC, its bursts' schedule on UTC boundaries as a slot mode's is
+    /// (each period starting on a whole multiple of it, counted from `slotEpoch`), read by a clock `clockErrorSeconds`
+    /// fast. Nil for a spec without bursts.
+    public static func endTime(_ spec: SynthSpec, seconds: Double, clockErrorSeconds: Double = 0) -> Date? {
+        guard case .bursts(_, let bursts) = spec else { return nil }
+        return Date(timeIntervalSince1970: slotEpoch + bursts.captureStartSeconds + seconds + clockErrorSeconds)
+    }
+
+    /// 2026-11-01 18:00:00 UTC: a whole number of 2 min, 15 s and 7.5 s slots since 1970.
+    public static let slotEpoch = 1_793_556_000.0
 
     /// `iq` with its level changed by `db` from `atSeconds` on, signal and noise alike: a receiver's gain changing.
     public static func levelStep(_ iq: [Float], sampleRate: Double, atSeconds: Double, db: Double) -> [Float] {

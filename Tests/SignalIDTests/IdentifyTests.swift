@@ -40,7 +40,8 @@ import Testing
         case "RTTY": p.rfHz = 14_085_000
         case "NAVTEX / SITOR-B": p.rfHz = 518_000
         case "PSK31 / PSK63": p.rfHz = 14_071_000
-        case "FT8 / FT4": p.rfHz = spec.label.hasPrefix("FT4") ? 14_081_500 : 14_075_500
+        case "FT8": p.rfHz = 14_075_500
+        case "FT4": p.rfHz = 14_081_500
         case "WSPR": p.rfHz = 14_097_100
         case "Olivia": p.rfHz = 14_106_000
         case "MFSK16": p.rfHz = 14_108_000
@@ -80,7 +81,7 @@ import Testing
     /// a transmission); wider captures get `p.seconds`, and a slow pass synthesises its 16 s afresh.
     static func capture(_ p: Placement, snr: Double, seed: UInt64) -> (iq: [Float], longer: () -> (iq: [Float], seconds: Double)?) {
         var spec = p.spec
-        // FT8/FT4: the newest 3 s inside a transmission, at a slot phase that varies with the seed.
+        // FT8 and FT4: the newest 3 s inside a transmission, at a slot phase that varies with the seed.
         if case .bursts(let inner, var bursts) = spec, bursts.periodSeconds < 60 {
             let end = bursts.startSeconds + 3.5 + Double(seed % 7) / 7 * (bursts.onSeconds - 3.5)
             bursts.captureStartSeconds = (end - longSeconds).truncatingRemainder(dividingBy: bursts.periodSeconds)
@@ -525,9 +526,9 @@ import Testing
                                            captureCenterHz: 14_074_000, atHz: 14_074_000 + audioHz, bandwidthHz: nil,
                                            spectrumDb: nil, longer: { (iq, Double(iq.count / 2) / rate) })
         print("realFT8Track at \(audioHz) Hz: \(Self.describe(id)) needsLongerRead \(id.needsLongerRead)")
-        #expect(id.best == nil || id.best?.name == "FT8 / FT4", "FT8 at \(audioHz) Hz: \(Self.describe(id))")
-        let offered = id.best?.name == "FT8 / FT4"
-            || (id.needsLongerRead && id.alternatives.contains { $0.name == "FT8 / FT4" })
+        #expect(id.best == nil || id.best?.name == "FT8", "FT8 at \(audioHz) Hz: \(Self.describe(id))")
+        let offered = id.best?.name == "FT8"
+            || (id.needsLongerRead && id.alternatives.contains { $0.name == "FT8" })
         #expect(offered, "FT8 at \(audioHz) Hz: \(Self.describe(id)), needsLongerRead \(id.needsLongerRead)")
     }
 

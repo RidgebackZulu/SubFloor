@@ -313,7 +313,8 @@ struct SignalIDUITests {
         #expect(demod("WFM broadcast", .wfm, at: 98_000_000) == .wfm)
         #expect(demod("DMR", .fsk, at: 440_000_000) == .nfm)
         #expect(demod("AIS", .fsk, at: 162_000_000) == .nfm)
-        #expect(demod("FT8 / FT4", .fsk, at: 14_074_000) == .usb)
+        #expect(demod("FT8", .fsk, at: 14_074_000) == .usb)
+        #expect(demod("FT4", .fsk, at: 14_080_000) == .usb)
         #expect(demod("PSK31 / PSK63", .psk, at: 3_580_000) == .usb)
         // SSB voice by its measured sideband, else by the convention (LSB below 10 MHz).
         #expect(demod("SSB voice (USB/LSB)", .lsb, at: 14_200_000) == .lsb)

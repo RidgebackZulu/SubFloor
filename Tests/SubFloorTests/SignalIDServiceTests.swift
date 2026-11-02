@@ -215,14 +215,14 @@ struct SignalIDServiceTests {
         ], now: now)
         m.showDecodeLog(log)
         m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
-        let ft8 = ModeMatch(name: "FT8 / FT4", confidence: 0.5, evidence: [])
+        let ft8 = ModeMatch(name: "FT8", confidence: 0.5, evidence: [])
         m.signalID.analysis = Self.stub(alternatives: [ft8], widthHz: 50)
 
         let id = try #require(await m.signalID.identify(atHz: rf + 5))
         #expect(id.confirmedByDecode)
-        #expect(id.best?.name == "FT8 / FT4")
+        #expect(id.best?.name == "FT8")
         #expect(id.best?.confidence == 1)
-        #expect(!id.alternatives.contains { $0.name == "FT8 / FT4" })
+        #expect(!id.alternatives.contains { $0.name == "FT8" })
 
         // Named otherwise: no confirmation.
         m.showDecodeLog(log)
@@ -275,7 +275,7 @@ struct SignalIDServiceTests {
         #expect(!psk.confirmedByDecode && psk.best == nil)
         // An unnamed FSK (FT8's family) is.
         let fsk = try await identify(Self.stub(widthHz: 50, family: .fsk))
-        #expect(fsk.confirmedByDecode && fsk.best?.name == "FT8 / FT4" && fsk.best?.confidence == 1)
+        #expect(fsk.confirmedByDecode && fsk.best?.name == "FT8" && fsk.best?.confidence == 1)
     }
 
     /// A first read shorter than the 3 s asked for (but over the 1 s the identifier needs) says so in `note`, and

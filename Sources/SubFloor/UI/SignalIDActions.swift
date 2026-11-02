@@ -128,7 +128,7 @@ enum SignalIDTuning {
             }
         case "CW": .cw
         case "AM voice/broadcast", "Time signal (WWV/WWVH/CHU)", "AM airband", "ACARS": .am
-        case "RTTY", "NAVTEX / SITOR-B", "PSK31 / PSK63", "FT8 / FT4", "WSPR", "Olivia", "MFSK16",
+        case "RTTY", "NAVTEX / SITOR-B", "PSK31 / PSK63", "FT8", "FT4", "WSPR", "Olivia", "MFSK16",
              "ALE (MIL-STD-188-141)", "STANAG 4285", "HF fax", "DRM", "HFDL": .usb
         case "NFM voice", "APRS / AX.25", "POCSAG", "DMR", "P25 Phase 1", "NXDN", "D-STAR", "YSF (C4FM)", "AIS",
              "NOAA APT": .nfm

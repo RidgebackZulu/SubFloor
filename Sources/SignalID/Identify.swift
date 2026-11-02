@@ -165,8 +165,10 @@ public struct SignalIdentity: Codable, Sendable, Equatable {
 ///
 /// **Confidence.** Each row's parameter score (`ModeTable.score`: matching parameters and features add, mismatches
 /// subtract, the family counting twice) is scaled by the measurement's own family confidence (min(1, 0.5 + it)),
-/// then frequency hints add up to +0.15 inside a row's bands and, for modes that live only there, take up to 0.15
-/// outside. A hint can't lift a match whose parameters alone score under 0.55 to 0.7. A row is named at 0.7 or
+/// then frequency hints add up to +0.15 inside a row's bands (each reaching 2 kHz further, for a receiver tuned off) and,
+/// for modes that live only there, take up to 0.15 outside. A slot row gains 0.15 more when the signal's transmissions fit
+/// its UTC slots (`SignalMeasurement.slotFit`). Neither a hint nor slots can lift a match whose parameters alone score under
+/// 0.55 to 0.7. A row is named at 0.7 or
 /// more when no other is within 0.1 of it (neighbours that can't be told apart, DMR and P25 at an in-between
 /// deviation, are listed instead); a signal wider than the view is never named (family only, ruling R5).
 ///
@@ -175,15 +177,18 @@ public struct SignalIdentity: Codable, Sendable, Equatable {
 /// - a carrier on a read too short to resolve 1.46 Hz structure (under 8 s): it could be WSPR, so its family
 ///   confidence is held under 0.7 until the longer read (ruling R13);
 /// - weak keying (CW under 15 dB): its −20 dB width, and so its SNR, read narrow on 3 s (ruling R12);
-/// - a candidate that needs timing (WSPR, FT8/FT4 slots, fax lines, time-signal ticks) at 0.4 or more, or at 0.2
+/// - a candidate that needs timing (WSPR, FT8 and FT4 slots, fax lines, time-signal ticks) at 0.4 or more, or at 0.2
 ///   inside its own frequencies, or an unidentified signal there.
 public enum SignalIdentifier {
     public static let nameThreshold: Float = 0.7
     static let alternativeThreshold: Float = 0.3
     static let maxAlternatives = 3
     static let ambiguityMargin: Float = 0.1
-    /// Parameters scoring under this can't be lifted to a name by a hint.
+    /// Parameters scoring under this can't be lifted to a name by a hint, or by a slot fit.
     static let hintFloor = 0.55
+    /// A slot row's match gains `slotBonus` when the signal's transmissions fit its slots this well (`SlotEvidence`).
+    static let minSlotFit: Float = 0.75
+    static let slotBonus = 0.15
     static let firstSeconds = 3.0
     static let longSeconds = 16.0
     /// Under this much IQ is "Too soon after tuning — try again".
@@ -265,6 +270,13 @@ public enum SignalIdentifier {
                 confidence -= hint.outside
                 evidence.append(String(format: "outside the %@ (−%.2f)", hint.name, hint.outside))
             }
+            // Transmissions on the row's own UTC slots: more for a match whose tones already fit, never a name alone.
+            if row.slotted, let slot = m.slotFit, slot.periodSeconds == row.slotPeriodSeconds, slot.fit >= minSlotFit,
+               parameters >= hintFloor {
+                confidence += slotBonus
+                evidence.append(String(format: "transmissions start on %@ s UTC boundaries (+%.2f)",
+                                       SignalIdentity.number(slot.periodSeconds), slotBonus))
+            }
             if parameters < hintFloor { confidence = min(confidence, Double(nameThreshold) - 0.01) }
             if wider != nil { confidence = min(confidence, Double(nameThreshold) - 0.01) }
             if row.requiresHintOrDecode, !readableDecode, !row.hinted(rfHz), confidence >= Double(nameThreshold) {
@@ -326,7 +338,7 @@ public enum SignalIdentifier {
         }
         let alternatives = ranked.map(\.match).filter { $0.name != best?.name && $0.confidence >= alternativeThreshold }
             .prefix(maxAlternatives)
-        // A named FSK whose shift doesn't show how it is keyed (WSPR, MFSK16, FT8/FT4, Olivia): its width from its
+        // A named FSK whose shift doesn't show how it is keyed (WSPR, MFSK16, FT8, FT4, Olivia): its width from its
         // parameters and its standard's keying, where the edges sit under the noise (R16).
         if let best, let shaping = ModeTable.row(best.name)?.shaping { ParameterWidth.apply(to: &m, shaping: shaping) }
         return SignalIdentity(measurement: m, best: best, alternatives: Array(alternatives), needsLongerRead: longer,
@@ -340,6 +352,14 @@ public enum SignalIdentifier {
     /// - when those are tones that take turns, their own reading (`DirectFSK`) is the answer, if it shows a speed. If it
     ///   doesn't, the measurement goes first (what takes turns without keeping time may be fax), and only what that can't
     ///   name is called an FSK, with what the tones do show, when they changed too few times to show more;
+    /// - a narrow trace (`mayBeNarrowMFSK`: FT8, FT4) may be an MFSK whose tones the map can't part: read symbol by symbol
+    ///   (`symbolReading`, `SymbolTones`), that is the answer, unless the measurement found a carrier line. The quick first
+    ///   answer (no `longer`) reads it only when the measurement says PSK, which a hopping trace can pass for, and asks
+    ///   for the longer read when nothing names it; the longer read reads it over its longest transmission, and a reading
+    ///   the first pass made stands if that one doesn't read;
+    /// - `endTime` (when the last sample of `iq`, and of the longer read, which ends where `iq` does, was on the air; nil
+    ///   for a file or the demo source) puts the trace's on-times against the slot modes' UTC slots (`SlotEvidence`), into
+    ///   `slotFit`: a good fit raises a slot row whose tones already fit (`identify(_:rfHz:)`);
     /// - a very wide signal the neighbourhood can't see the edges of, only on positive evidence (`WideOccupancy`) in
     ///   `spectrumDb` (an averaged spectrum of the capture, FFT-shifted; worked out from the IQ when nil);
     /// - nothing there gives "Too weak to identify (SNR n dB)" or "No signal" (`tooWeak`);
@@ -347,15 +367,16 @@ public enum SignalIdentifier {
     ///   after tuning — try again";
     /// - when the slow-signal rules apply and `longer` is given, it is called (up to 16 s of IQ, ending where
     ///   `iq` ends) and the signal measured and named again from the same extent: a slot mode (FT8, FT4) over its
-    ///   longest transmission in the read. A shorter read than asked for is used, and said in `note`. The longer
-    ///   read's answer replaces the first's, a name the first gave included.
+    ///   longest transmission in the read (a narrow trace's from its own on-times, each moment against its own noise). A
+    ///   shorter read than asked for is used, and said in `note`. The longer read's answer replaces the first's, a name the
+    ///   first gave included.
     ///
     /// A cancelled task stops between stages (the neighbourhood, the measurement, each step of the longer read) and gets
     /// `cancelledNote` with what was measured so far: an answer nobody is waiting for.
     public static func identify(iq: [Float], sampleRate: Double, captureCenterHz: Double, atHz: Double,
                                 bandwidthHz: Double?, spectrumDb: [Float]?,
                                 longer: (() -> (iq: [Float], seconds: Double)?)?,
-                                pointRadiusHz: Double = 60) -> SignalIdentity {
+                                pointRadiusHz: Double = 60, endTime: Date? = nil) -> SignalIdentity {
         let available = sampleRate > 0 ? Double(iq.count / 2) / sampleRate : 0
         guard available >= minimumSeconds else {
             return SignalIdentity(measurement: SignalMeasurement(family: .noise, seconds: available),
@@ -374,6 +395,9 @@ public enum SignalIdentifier {
         var ceiling = SignalMeasurer.Ceiling.none
         // Tones that take turns, whose own reading didn't show a speed: what else measures them comes first.
         var tones: DirectFSK.Tones?, fskRead: DirectFSK.Tones.Read?
+        // The narrow trace the point is on, which may be an MFSK too close-spaced for the map (`SymbolTones`), and the
+        // map it was found on.
+        var narrow: (trace: SignalTrace, map: TimeFrequencyMap)?
         if let bandwidthHz {
             seed = (pointHz, bandwidthHz)
             ceiling = .given
@@ -426,6 +450,10 @@ public enum SignalIdentifier {
                 // A station is one beside tones: without them, it is only a hump in what the view shows.
                 here = nil
             }
+            if here == nil, !view.areas.contains(where: { $0.lowerHz...$0.upperHz ~= pointHz }),
+               let line = pointTrace(view, pointHz: pointHz, radiusHz: pointRadiusHz), mayBeNarrowMFSK(line) {
+                narrow = (line, map)
+            }
             if let found = located(view, signal: here, signals: signals, map: map, pointHz: pointHz, radiusHz: pointRadiusHz) {
                 seed = (found.offsetHz, found.widthHz)
                 coreHz = found.coreHz
@@ -439,12 +467,30 @@ public enum SignalIdentifier {
             if Task.isCancelled { return cancelled(SignalMeasurement(offsetHz: pointHz, seconds: seconds)) }
         }
 
-        let m = SignalMeasurer.measure(first, sampleRate: sampleRate, offsetHz: seed.offsetHz,
+        var m = SignalMeasurer.measure(first, sampleRate: sampleRate, offsetHz: seed.offsetHz,
                                        bandwidthHz: seed.widthHz, seconds: seconds, ceiling: ceiling)
         if Task.isCancelled { return cancelled(m) }
+        // A narrow trace whose symbols sit on tones spaced by their rate is that MFSK, whatever else its few seconds
+        // looked like (FT8's hops can pass for a PSK's). The quick first answer (no longer read to follow) reads its tones
+        // only then, to keep its speed: otherwise the longer read does.
+        var firstReading: SignalMeasurement?
+        if let narrow {
+            let slot = SlotEvidence.best(onTimes: narrow.trace.onTimes, readEnd: endTime, readSeconds: seconds)
+            if longer != nil || m.family == .psk,
+               let read = symbolReading(first, sampleRate: sampleRate, trace: narrow.trace, pointHz: pointHz,
+                                        map: narrow.map, on: SlotEvidence.transmissions(narrow.trace.onTimes), seconds: seconds,
+                                        measured: m) {
+                m = read
+                firstReading = read
+            }
+            m.slotFit = slot
+            if Task.isCancelled { return cancelled(m) }
+        }
         var identity = identify(m, rfHz: captureCenterHz + m.offsetHz)
         // A longer read may show the speed; until then, what the tones do show.
         if fskRead != nil, identity.best == nil, m.family == .unknown { identity.needsLongerRead = true }
+        // A narrow trace nothing names may be an MFSK whose tones the quick answer didn't read.
+        if narrow != nil, longer == nil, identity.best == nil, m.family == .unknown { identity.needsLongerRead = true }
         guard identity.needsLongerRead, !Task.isCancelled, let read = longer?(), read.iq.count >= 2 else {
             if Task.isCancelled { return cancelled(m) }
             if let fskRead, identity.best == nil, m.family == .unknown {
@@ -466,17 +512,57 @@ public enum SignalIdentifier {
         let slotted = ([identity.best].compactMap { $0 } + identity.alternatives).contains {
             ModeTable.row($0.name)?.slotted == true
         } || (m.family == .unknown && ModeTable.rows.contains { $0.slotted && $0.hinted(captureCenterHz + m.offsetHz) })
-        if slotted, let span = Transmissions.longest(long, sampleRate: sampleRate, offsetHz: m.offsetHz,
-                                                      bandwidthHz: coreHz ?? max(m.occupiedBandwidthHz, seed.widthHz)) {
+        // A narrow trace's own on-times over the longer read, each moment against its own noise (a receiver's gain
+        // steps don't cut its transmissions): its slots, and its longest transmission.
+        var timing: (map: TimeFrequencyMap, onTimes: [ClosedRange<Double>])?
+        var slot: SlotFit?
+        var during = 0...readSeconds
+        if let narrow {
+            timing = narrowTiming(long, sampleRate: sampleRate, trace: narrow.trace)
+            slot = timing.flatMap { SlotEvidence.best(onTimes: $0.onTimes, readEnd: endTime, readSeconds: readSeconds) }
+        }
+        if let run = timing.flatMap({ longestTransmission($0.onTimes, readSeconds: readSeconds) }) {
+            let lower = 2 * Int((run.lowerBound * sampleRate).rounded())
+            let upper = min(long.count, 2 * Int((run.upperBound * sampleRate).rounded()))
+            long = Array(long[lower..<upper])
+            during = run
+            readSeconds = Double(long.count / 2) / sampleRate
+            notes.append(String(format: "Measured over its longest transmission, %.1f s", readSeconds))
+        } else if slotted, timing == nil,
+                  let span = Transmissions.longest(long, sampleRate: sampleRate, offsetHz: m.offsetHz,
+                                                   bandwidthHz: coreHz ?? max(m.occupiedBandwidthHz, seed.widthHz)) {
             long = Array(long[(2 * span.lowerBound)..<(2 * span.upperBound)])
             readSeconds = Double(span.count) / sampleRate
             notes.append(String(format: "Measured over its longest transmission, %.1f s", readSeconds))
         }
         if Task.isCancelled { return cancelled(m) }
-        let slow = SignalMeasurer.measure(long, sampleRate: sampleRate, offsetHz: seed.offsetHz,
+        var slow = SignalMeasurer.measure(long, sampleRate: sampleRate, offsetHz: seed.offsetHz,
                                           bandwidthHz: seed.widthHz, seconds: readSeconds, ceiling: ceiling)
         if Task.isCancelled { return cancelled(slow) }
+        var longReading = false
+        if let narrow, let timing {
+            // The frames on the air within what was measured.
+            let on = SlotEvidence.transmissions(timing.onTimes).compactMap { run -> ClosedRange<Double>? in
+                let lower = max(run.lowerBound, during.lowerBound), upper = min(run.upperBound, during.upperBound)
+                return lower < upper ? (lower - during.lowerBound)...(upper - during.lowerBound) : nil
+            }
+            if let read = symbolReading(long, sampleRate: sampleRate, trace: narrow.trace, pointHz: pointHz,
+                                        map: timing.map, mapStart: during.lowerBound, on: on, seconds: readSeconds,
+                                        measured: slow) {
+                slow = read
+                longReading = true
+            }
+            slow.slotFit = slot
+            if Task.isCancelled { return cancelled(slow) }
+        }
         var refined = identify(slow, rfHz: captureCenterHz + slow.offsetHz)
+        // Tones the first pass read stand when the longer read shows nothing better (more symbols are more of a fade, a
+        // neighbour's turn, or the receiver's gain stepping down).
+        if !longReading, refined.best == nil, var firstReading {
+            firstReading.slotFit = slot ?? firstReading.slotFit
+            let kept = identify(firstReading, rfHz: captureCenterHz + firstReading.offsetHz)
+            if kept.best != nil { refined = kept }
+        }
         if refined.best == nil, slow.family == .unknown, let tones {
             let rereading = tones.reading(read.iq, rate: sampleRate, zeroHz: 0)
             let seen = rereading?.reading.baud != nil ? rereading : fskRead
@@ -603,6 +689,144 @@ public enum SignalIdentifier {
         return signals.first { $0.tones != nil && ($0.lowerHz - radiusHz)...($0.upperHz + radiusHz) ~= pointHz }
     }
 
+    /// The nearest trace within `radiusHz` of the point, the strongest of equals.
+    static func pointTrace(_ view: NeighbourhoodView, pointHz: Double, radiusHz: Double) -> SignalTrace? {
+        func distance(_ t: SignalTrace) -> Double { max(0, t.lowerHz - pointHz, pointHz - t.upperHz) }
+        return view.traces.filter { distance($0) <= radiusHz }.min { (distance($0), -$0.snrDb) < (distance($1), -$1.snrDb) }
+    }
+
+    // MARK: Narrow MFSK
+
+    /// A trace this narrow may be an MFSK whose tones the map can't part (FT4's four span 83 Hz; two FT8 stations side by
+    /// side read about 170 Hz). A steady line holds one frequency.
+    static let narrowMFSKMaxHz = 200.0
+    /// Each side of a trace, the channel its tones are read from reaches this far (a map bin, for skirts it cut).
+    static let narrowMarginHz = 8.0
+    /// The picture its on-times come from over the longer read: this far either side of it.
+    static let narrowViewHz = 500.0
+    /// How a trace's presence (`SymbolTones.Presence`) is smoothed either side: one moment's power over the noise is
+    /// itself noisy at a few dB.
+    static let presenceSmoothingSeconds = 0.25
+
+    static func mayBeNarrowMFSK(_ trace: SignalTrace) -> Bool {
+        !trace.steady && trace.upperHz - trace.lowerHz <= narrowMFSKMaxHz
+    }
+
+    /// `trace`, in `iq` (`seconds` of it), read as an orthogonal MFSK (`SymbolTones`), each moment counting by how far the
+    /// trace stands over the noise on `map` then (`mapStart` is `iq`'s start on it): its measurement, or nil when it doesn't
+    /// read as one, or `measured` already shows a carrier line (keyed, AM or a carrier: one frequency). A trace with a deep
+    /// valley in it is two stations side by side (two FT8s 50 Hz apart read as one 16-tone MFSK): the part on the point's
+    /// side of it (`narrowPiece`) is read first, and the whole trace only if that doesn't read. Its SNR comes from `map` over the moments within `on` (seconds in `iq`), in its own
+    /// width.
+    static func symbolReading(_ iq: [Float], sampleRate: Double, trace: SignalTrace, pointHz: Double,
+                              map: TimeFrequencyMap, mapStart: Double = 0, on: [ClosedRange<Double>], seconds: Double,
+                              measured: SignalMeasurement) -> SignalMeasurement? {
+        guard [.unknown, .psk, .fsk, .mfsk].contains(measured.family) else { return nil }
+        let during = on.map { ($0.lowerBound + mapStart)...($0.upperBound + mapStart) }
+        func presence(_ lower: Double, _ upper: Double) -> SymbolTones.Presence? {
+            let low = max(0, map.bin(lower)), high = min(map.bins - 1, map.bin(upper))
+            guard low <= high, map.rows > 0 else { return nil }
+            let reach = Int((presenceSmoothingSeconds / map.hopSeconds).rounded())
+            let excess = TraceFinder.smoothed(map.bandPower(low...high), reach: reach).map { Double($0) - 1 }
+            return SymbolTones.Presence(excess: excess, hopSeconds: map.hopSeconds,
+                                        firstSeconds: map.frameSeconds / 2 - mapStart)
+        }
+        var pieces = [(trace.lowerHz, trace.upperHz)]
+        if let piece = narrowPiece(trace, pointHz: pointHz, map: map, during: during) { pieces.insert(piece, at: 0) }
+        var found: (reading: SymbolTonesReading, centre: Double, lower: Double, upper: Double)?
+        for (lower, upper) in pieces where found == nil {
+            if Task.isCancelled { return nil }
+            let centre = (lower + upper) / 2
+            if let read = SymbolTones.read(iq, sampleRate: sampleRate, offsetHz: centre,
+                                           widthHz: upper - lower + 2 * narrowMarginHz, presence: presence(lower, upper)) {
+                found = (read, centre, lower, upper)
+            }
+        }
+        guard let (read, centre, lower, upper) = found else { return nil }
+        let snr = traceSNR(map, lowerHz: lower, upperHz: upper, during: during, widthHz: read.widthHz)
+        var notes = [String(format: "%d tones a symbol rate apart (%.2f Hz as their symbols read), one a symbol at %.2f Bd (%d seen)",
+                            read.toneCount, read.tonesSpacingHz, read.baud, read.tonesSeen)]
+        if measured.family == .psk { notes.append("Its symbols hop between tones: not PSK") }
+        // Its width is its parameters' (n − 1 spacings and a rate each side): the tones don't show where its edges lie, so
+        // a named row's own keying gives it (`ParameterWidth`, R16), as for any FSK whose edges sit under the noise.
+        return SignalMeasurement(offsetHz: centre + read.centreHz, occupiedBandwidthHz: read.widthHz,
+                                 bandwidth6dBHz: read.widthHz, snrDb: snr, envelope: .steady,
+                                 family: read.toneCount > 8 ? .mfsk : .fsk,
+                                 familyConfidence: SymbolTones.confidence(read), symbolRate: read.baud,
+                                 fskShiftHz: read.toneCount == 2 ? read.spacingHz : nil, toneCount: read.toneCount,
+                                 toneSpacingHz: read.spacingHz, seconds: seconds, notes: notes, edgesUnderNoise: true)
+    }
+
+    /// Where a trace wider than one narrow MFSK (`narrowPieceMinHz`) dips deepest between two humps, each `pieceValleyDb`
+    /// over the dip, on `map`'s average over `during`: the part on the point's side, or nil when there is no such dip.
+    /// An MFSK's own tones ripple less: FT4's by 3 dB at most on the corpus's tuning part and in synthesis, where two FT8
+    /// stations side by side dip 7 to 15.
+    static func narrowPiece(_ trace: SignalTrace, pointHz: Double, map: TimeFrequencyMap,
+                            during: [ClosedRange<Double>]) -> (Double, Double)? {
+        let low = max(0, map.bin(trace.lowerHz)), high = min(map.bins - 1, map.bin(trace.upperHz))
+        guard trace.upperHz - trace.lowerHz >= narrowPieceMinHz, high - low >= 4 else { return nil }
+        let rows = (0..<map.rows).filter { r in during.contains { $0 ~= Double(r) * map.hopSeconds + map.frameSeconds / 2 } }
+        guard !rows.isEmpty else { return nil }
+        var mean = [Double](repeating: 0, count: high - low + 1)
+        map.relativeDb.withUnsafeBufferPointer { db in
+            for r in rows {
+                for k in low...high { mean[k - low] += pow(10, Double(db[r * map.bins + k]) / 10) / Double(rows.count) }
+            }
+        }
+        let depth = pow(10, pieceValleyDb / 10)
+        var deepest: (bin: Int, ratio: Double)?
+        for k in 1..<(mean.count - 1) where mean[k] <= mean[k - 1] && mean[k] <= mean[k + 1] {
+            let left = mean[..<k].max()!, right = mean[(k + 1)...].max()!
+            let ratio = min(left, right) / max(mean[k], 1e-9)
+            if ratio >= depth, ratio > (deepest?.ratio ?? 0) { deepest = (k, ratio) }
+        }
+        guard let deepest else { return nil }
+        let valley = map.offsetHz(Double(low + deepest.bin))
+        return pointHz <= valley ? (trace.lowerHz, valley) : (valley, trace.upperHz)
+    }
+
+    /// A trace this wide may hold two narrow MFSKs side by side (FT8's 50 Hz each).
+    static let narrowPieceMinHz = 80.0
+    static let pieceValleyDb = 6.0
+
+    /// The power in `lowerHz…upperHz` of `map`, over the rows within `during`, less the noise, over the noise in `widthHz`.
+    static func traceSNR(_ map: TimeFrequencyMap, lowerHz: Double, upperHz: Double, during: [ClosedRange<Double>],
+                         widthHz: Double) -> Double {
+        let low = max(0, map.bin(lowerHz)), high = min(map.bins - 1, map.bin(upperHz))
+        guard low <= high, map.rows > 0 else { return 0 }
+        let levels = map.bandPower(low...high)
+        let rows = levels.indices.filter { r in during.contains { $0 ~= Double(r) * map.hopSeconds + map.frameSeconds / 2 } }
+        guard !rows.isEmpty else { return 0 }
+        let mean = rows.reduce(0.0) { $0 + Double(levels[$1]) } / Double(rows.count)
+        // Each bin's noise reads 1, and a bin sums its share of power over one frame's width.
+        let excess = (mean - 1) * Double(high - low + 1) * map.binHz
+        return 10 * log10(max(excess / max(widthHz, map.binHz), 1e-3))
+    }
+
+    /// A map of `trace`'s neighbourhood over `iq` and the trace's on-times there.
+    static func narrowTiming(_ iq: [Float], sampleRate: Double,
+                             trace: SignalTrace) -> (map: TimeFrequencyMap, onTimes: [ClosedRange<Double>])? {
+        let centre = (trace.lowerHz + trace.upperHz) / 2
+        let half = narrowViewHz + (trace.upperHz - trace.lowerHz) / 2
+        let cut = Channel.extract(iq, sampleRate: sampleRate, offsetHz: centre, bandwidthHz: 2 * half, sharp: false)
+        let map = TimeFrequencyMap.build(cut.samples, rate: cut.rate, centerOffsetHz: centre, binHz: mapBinHz,
+                                         hopSeconds: mapHopSeconds, halfSpanHz: half)
+        let low = max(0, map.bin(trace.lowerHz)), high = min(map.bins - 1, map.bin(trace.upperHz))
+        guard map.rows > 0, low <= high else { return nil }
+        return (map, TraceFinder.onTimes(low...high, map: map, quiet: 1))
+    }
+
+    /// The longest of `onTimes` as transmissions (`SlotEvidence.transmissions`: a blip of noise in the silence between two
+    /// would join them, a fade or a gain step would cut one), when there is silence in the read to set it apart and it
+    /// lasts `Transmissions.minSeconds`.
+    static func longestTransmission(_ onTimes: [ClosedRange<Double>], readSeconds: Double) -> ClosedRange<Double>? {
+        let runs = SlotEvidence.transmissions(onTimes).map { max(0, $0.lowerBound)...min(readSeconds, $0.upperBound) }
+        guard let run = runs.max(by: { $0.upperBound - $0.lowerBound < $1.upperBound - $1.lowerBound }),
+              run.upperBound - run.lowerBound >= Transmissions.minSeconds,
+              run.upperBound - run.lowerBound < readSeconds - 2 * SlotEvidence.readEdgeSeconds else { return nil }
+        return run
+    }
+
     /// Where to measure for the point: what `signalAtPoint` found (`signal`: an FSK whose tones didn't give their own
     /// answer, or a station in an FSK's span), the area the point lies in, or the nearest trace within `radiusHz` (the
     /// strongest of equals). Nil when there is none of those:
@@ -617,7 +841,6 @@ public enum SignalIdentifier {
                         map: TimeFrequencyMap, pointHz: Double,
                         radiusHz: Double) -> (offsetHz: Double, widthHz: Double, coreHz: Double,
                                               ceiling: SignalMeasurer.Ceiling)? {
-        func distance(_ t: SignalTrace) -> Double { max(0, t.lowerHz - pointHz, pointHz - t.upperHz) }
         var extent: (lower: Double, upper: Double)
         var mayBeLine = true, grows = false
         var line: SignalTrace?
@@ -628,8 +851,7 @@ public enum SignalIdentifier {
             extent = (area.lowerHz, area.upperHz)
             grows = true
         } else {
-            let candidates = view.traces.filter { distance($0) <= radiusHz }
-            guard let trace = candidates.min(by: { (distance($0), -$0.snrDb) < (distance($1), -$1.snrDb) }) else { return nil }
+            guard let trace = pointTrace(view, pointHz: pointHz, radiusHz: radiusHz) else { return nil }
             extent = (trace.lowerHz, trace.upperHz)
             mayBeLine = trace.upperHz - trace.lowerHz <= TraceFinder.steadyMaxHz
             if mayBeLine {

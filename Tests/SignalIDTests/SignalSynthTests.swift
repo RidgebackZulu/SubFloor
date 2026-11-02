@@ -224,7 +224,9 @@ private func runs(_ x: [Float], above threshold: Float) -> [(start: Int, length:
     }
 
     @Test func everyCatalogueEntrySynthesises() {
-        #expect(Set(SynthSpec.catalogue.map(\.name)).count == 30)
+        // One name for each row of the mode table (FT8 and FT4 are rows of their own).
+        #expect(Set(SynthSpec.catalogue.map(\.name)).count == 31)
+        #expect(Set(SynthSpec.catalogue.map(\.name)) == Set(ModeTable.rows.map(\.name)))
         let catalogue = SynthSpec.catalogue
         for (index, entry) in Sweep.cases(catalogue, default: Array(stride(from: 0, to: catalogue.count, by: 3))) {
             let fs = max(2 * entry.spec.minimumSampleRate, 8000)

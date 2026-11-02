@@ -156,7 +156,7 @@ confirmed_by_decode, needs_longer_read, note}`:
 - `needs_longer_read`: still true if a longer read was wanted and could not be made. `note`: caveats such as
   `Read 1.4 s of the 3 s asked for`.
 
-A signal under 50 Hz wide, keyed slower than 10 WPM, or a candidate that needs timing (WSPR, FT8/FT4 slots, fax
+A signal under 50 Hz wide, keyed slower than 10 WPM, or a candidate that needs timing (WSPR, FT8 and FT4 slots, fax
 lines, time ticks) is read again over up to 16 s of the ring; that is included in this answer. Less than 1 s of
 IQ since the last retune gives `Too soon after tuning — try again`: wait and call again. Results for a signal are
 kept 5 s. With the radio stopped it reads what the IQ ring heard last; an empty ring is an error.

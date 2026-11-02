@@ -71,7 +71,7 @@ For each it gives the frequency, the level there, the nearest bookmark, any deco
 what SubFloor's Signal ID makes of it. That is measured from the last seconds of IQ (bandwidth, SNR, symbol rate,
 shift, tones, keying) and matched against a table of known modes and the band plan:
 
-- **`name`** is set only at 70% confidence or more (`RTTY`, `FT8 / FT4`, `SSB voice (USB/LSB)`, `DMR`...), with
+- **`name`** is set only at 70% confidence or more (`RTTY`, `FT8`, `FT4`, `SSB voice (USB/LSB)`, `DMR`...), with
   the `confidence`. If a decoder the owner has running decoded the same signal in the last minute,
   `confirmed_by_decode` is true and the confidence is 1.
 - Below 70% there is **no name**: you get the `family` and its `parameters` (`2-FSK · 50 Bd · 850 Hz shift`) and

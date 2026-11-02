@@ -64,15 +64,15 @@ import Testing
         try Self.printScore("baseline", parts: CorpusPart.allCases) { RealCorpus.hover($0, $1) }
     }
 
-    /// The targets on the held-out part, which is only ever scored, through the hover's path on clips, and no wrong name
-    /// on any truth. By default every empty point and 2 of FT8, whose windows are the most likely to be misnamed;
-    /// `SUBFLOOR_SIGNALID_MATRIX=1` asserts over all of them. `fullRecordings` asserts the
-    /// same targets at the capture's own rate. The rows grow as the tasks that meet them land.
+    /// The targets on the held-out part, which is only ever scored, through the hover's path on clips (no decode), and no
+    /// wrong name on any truth: FT8 never named FT4, nor the reverse. By default every empty point and 2 transmitting
+    /// windows each of FT8, FT4 and the FSK; `SUBFLOOR_SIGNALID_MATRIX=1` asserts over all of them. `fullRecordings`
+    /// asserts the same targets at the capture's own rate. The rows grow as the tasks that meet them land.
     @Test func heldOutTargets() throws {
         let held = try RealCorpus.points(.heldOut)
         // A share of 95% means nothing over 2 points, and an empty point costs little: all of them, always.
         let points = Sweep.full ? held : held.filter { $0.truth == "none" }
-            + Self.subset(held.filter { $0.truth == "FT8" || $0.truth == "2-FSK" }, perTruth: 2)
+            + Self.subset(held.filter { ["FT8", "FT4", "2-FSK"].contains($0.truth) && RealCorpus.counts($0) }, perTruth: 2)
         var wrong: [String] = []
         let score = try RealCorpus.score(points: points) { clip, point in
             let id = RealCorpus.hover(clip, point)
@@ -89,7 +89,7 @@ import Testing
     }
 
     /// The share right each truth must reach.
-    static let targets = ["none": 0.95, "2-FSK": 0.8]
+    static let targets = ["none": 0.95, "2-FSK": 0.8, "FT8": 0.8, "FT4": 0.8]
     /// The FSK's neighbour, which stays its own signal.
     static let fskNeighbourHz = 11_685_864.0
     static let fskNeighbourReachHz = 500.0
@@ -105,6 +105,10 @@ import Testing
     }
 
     static func expectHeldOut(_ id: SignalIdentity, _ point: CorpusPoint, _ path: String, centerHz: Double) {
+        // The two slot modes are never taken for each other, at any confidence a name is given at.
+        if let other = ["FT8": "FT4", "FT4": "FT8"][point.truth] {
+            #expect(id.best?.name != other, "\(path): \(point.truth) at \(point.atHz) Hz, \(point.endSeconds) s: \(id.label)")
+        }
         if point.truth == "none" {
             #expect(id.measurement.occupiedBandwidthHz <= widestEmptyAnswerHz,
                     "\(path): empty point \(point.atHz) Hz: \(id.label)")
@@ -142,7 +146,8 @@ import Testing
             }
             let end = entry.startSeconds + point.endSeconds
             return RealCorpus.hover(rate: recording.captureRate, centerHz: recording.captureCenterHz, atHz: point.atHz,
-                                    spectrumDb: clip.captureSpectrumDb) { seconds in
+                                    spectrumDb: clip.captureSpectrumDb,
+                                    endTime: recording.startUTC?.addingTimeInterval(end)) { seconds in
                 (try? RealCorpus.readRecording(recording.file, seconds: max(0, end - seconds)..<end)) ?? []
             }
         }
