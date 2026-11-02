@@ -127,10 +127,12 @@ import Testing
     }
 
     /// A mode that isn't a slot mode is no group, and lends no name: five PSK31 stations 300 Hz apart, four within the
-    /// radius (three of them measured), the fifth past it within the group's reach.
+    /// radius (three of them measured), the fifth past it within the group's reach. They all start 0.35 s into the read, so
+    /// their timing agrees as a slot mode's would.
     @Test func onlyASlotModeIsAGroup() {
+        let started = SynthSpec.bursts(.psk31, .init(periodSeconds: 15, onSeconds: 10, startSeconds: 0.35, rampSeconds: 0.02))
         let psk = (0..<5).map { k in
-            SignalSynth.Placed(.psk31, offsetHz: [-450, -150, 150, 450, 800][k], snrDb: [15, 18, 16, 12, 15][k],
+            SignalSynth.Placed(started, offsetHz: [-450, -150, 150, 450, 800][k], snrDb: [15, 18, 16, 12, 15][k],
                                seed: UInt64(90 + k))
         }
         let iq = SignalSynth.several(psk, sampleRate: Self.rate, seconds: Self.seconds, noiseSeed: 95)
@@ -154,9 +156,51 @@ import Testing
         #expect(id.label == "FT8 · 2 signals · 473.9–474.4 kHz", "\(id.label)")
         id.signals.append(one(nil))
         #expect(id.label == "Several signals: FT8 ×2, unknown ×1", "\(id.label)")
+        // The named first, however many the unknown are.
+        id.signals += [one(nil), one(nil), one("CW")]
+        #expect(id.label == "Several signals: FT8 ×2, CW ×1, unknown ×3", "\(id.label)")
         // Its JSON keeps the group, and reads back.
         let back = try? JSONDecoder().decode(SignalIdentity.self, from: JSONEncoder().encode(id))
         #expect(back == id)
+    }
+
+    /// Narrow signals on for the whole read beside FT8 stations caught inside their transmissions share no timing with them:
+    /// a PSK31 and a PSK63 are never given FT8's (or FT4's) name, with or without a true time (the review's probe).
+    @Test func continuousSignalsBesideAGroupInheritNothing() {
+        guard case .bursts(let inner, var bursts) = SynthSpec.ft8() else { return }
+        bursts.captureStartSeconds = 3
+        let ft8 = SynthSpec.bursts(inner, bursts)
+        let iq = SignalSynth.several([
+            SignalSynth.Placed(ft8, offsetHz: -300, snrDb: 13, seed: 101), SignalSynth.Placed(ft8, offsetHz: 0, snrDb: 12, seed: 102),
+            SignalSynth.Placed(ft8, offsetHz: 300, snrDb: 14, seed: 103),
+            SignalSynth.Placed(.psk31, offsetHz: 600, snrDb: 8, seed: 104), SignalSynth.Placed(.psk63, offsetHz: -600, snrDb: 8, seed: 105),
+        ], sampleRate: Self.rate, seconds: Self.seconds, noiseSeed: 106)
+        // With a true time too, with the matrix (`onlyTheSameSlotAndWidthInherit` holds that rule by default).
+        for end in [nil] + (Sweep.full ? [SignalSynth.endTime(ft8, seconds: Self.seconds)] : []) {
+            let id = SignalIdentifier.identify(iq: iq, sampleRate: Self.rate, captureCenterHz: Self.centreHz,
+                                               atHz: Self.centreHz, bandwidthHz: nil, spectrumDb: nil,
+                                               longer: { (iq, Self.seconds) }, pointRadiusHz: 700, endTime: end)
+            #expect(id.signals.count >= 4, "\(Self.describe(id))")
+            let psks = id.signals.filter { abs(abs($0.measurement.offsetHz) - 600) < 60 }
+            #expect(psks.count == 2 && psks.allSatisfy { !["FT8", "FT4"].contains($0.best?.name ?? "") },
+                    "\(end == nil ? "no time" : "true time"): \(Self.describe(id))")
+        }
+    }
+
+    /// A cancelled task's answer from several signals is `cancelledNote`, as everywhere else.
+    @Test func cancelledWhileMeasuringOthers() async {
+        let iq = Self.nine
+        let id = await Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            let hood = SignalIdentifier.neighbourhood(iq, sampleRate: Self.rate, pointHz: 0)
+            let view = TraceFinder.find(hood.map)
+            let signals = SignalIdentifier.candidates(hood, view: view, pointHz: 0, radiusHz: 700)
+            let point = SignalIdentity(measurement: SignalMeasurement(offsetHz: 0, occupiedBandwidthHz: 50, family: .fsk))
+            return SignalIdentifier.underThePoint(point, first: iq, sampleRate: Self.rate, captureCenterHz: Self.centreHz,
+                                                  hood: hood, view: view, signals: signals, pointHz: 0, radiusHz: 700,
+                                                  seconds: Self.seconds, endTime: nil, readsTones: true, combLinesHz: [])
+        }.value
+        #expect(id.note == SignalIdentifier.cancelledNote, "\(Self.describe(id))")
     }
 
     /// The group's answer on a 3 s read (its longer read that same read) in a release build: ≤ 300 ms, the best of three
@@ -200,6 +244,11 @@ import Testing
         #expect(id.comb == nil && id.best?.name == "FT8" && abs(id.measurement.offsetHz - 600) < 15, "\(Self.describe(id))")
         let alone = Self.identify(lines, atOffset: lineHz, radiusHz: 2_800, rate: rate, captureSpectrumDb: spectrum)
         #expect(alone.signals.isEmpty && alone.comb != nil, "\(Self.describe(alone))")
+        // From the lower line (−3 kHz), only the station at +300 Hz is in reach as well: its answer, alone.
+        let one = Self.identify(iq, atOffset: InterferenceCombTests.lineHz(4), radiusHz: 3_400, rate: rate,
+                                captureSpectrumDb: spectrum)
+        #expect(one.signals.isEmpty && one.comb == nil && one.best?.name == "FT8" && abs(one.measurement.offsetHz - 300) < 15,
+                "\(Self.describe(one))")
     }
 }
 
@@ -225,6 +274,17 @@ extension GroupAnswerTests {
         #expect(!fits(Self.line(300, width: 56, on: [2.7...3.0])), "too late")
         #expect(!fits(Self.line(300, width: 56, on: [])), "never on")
         #expect(!fits(Self.line(300, width: 56, on: []), as: Self.line(0, width: 56, on: [])), "no timing either side")
+        // Both on for the whole read (inside their slot, or a PSK beside an FT8): no edge to agree on, no name.
+        #expect(!fits(Self.line(300, width: 56, on: [0...3]), as: Self.line(0, width: 56, on: [0...3])), "no edges")
+        // A carrier keyed on with an FT8's start: too narrow.
+        #expect(!fits(Self.line(300, width: 24, on: [0.6...3.0])), "a carrier's width")
+        // With a true time, one start on the grid fits; one 3.5 s off it, beyond any clock, doesn't, though it agrees with
+        // the model's own start within the clocks' 2 s.
+        #expect(fits(Self.line(300, width: 64, on: [0.9...3.0]), end: Date(timeIntervalSince1970: SignalSynth.slotEpoch + 3)))
+        let early = Self.line(0, width: 56, on: [2.0...15.0]), offGrid = Self.line(300, width: 56, on: [4.0...15.0])
+        let boundary = Date(timeIntervalSince1970: SignalSynth.slotEpoch + 15)
+        #expect(fits(offGrid, as: early, readSeconds: 15))
+        #expect(!fits(offGrid, as: early, readSeconds: 15, end: boundary), "3.5 s off the grid")
         var tones = Self.line(300, width: 56, on: [0.6...3.0])
         tones.kind = .fsk(tones: [300, 356])
         #expect(!fits(tones), "an FSK's tones")
