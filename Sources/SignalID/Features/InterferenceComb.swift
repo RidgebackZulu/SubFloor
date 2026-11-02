@@ -33,7 +33,10 @@ public struct CombInfo: Codable, Sendable, Equatable {
 /// 4. **Bare lines:** at least `minBareShare` of the lines that can be checked stand on noise: what lies from
 ///    `pedestalInnerHz` (or `pedestalInnerWidths` of the line's width) to `pedestalOuterHz` (or a third of the spacing)
 ///    either side is within `bareDb` of the quietest stretches (`floorShare`) within half a spacing. An AM station's
-///    carrier stands on its own sidebands: a channelled broadcast band is a grid of modulated lines, never a comb.
+///    carrier stands on its own sidebands: a channelled broadcast band is a grid of modulated lines, never a comb. And
+///    each line is judged so too, against the quietest floor of its own and its neighbours' on the grid: one that stands
+///    on a pedestal (a station whose carrier lies on a comb place) counts towards the grid but is none of the comb's
+///    lines, so nothing around it is taken for the comb.
 /// 5. **No broadcast raster:** a spacing within `rasterTolerance` of a whole number (up to `rasterMultiples`) of a
 ///    broadcast band's channels (`broadcastRastersHz`: 9 kHz, and 5 kHz, which 10 kHz is twice) is no comb. A weak
 ///    station's sidebands lie under the noise, and its carrier alone is a bare line: only its raster says what it is.
@@ -128,9 +131,21 @@ enum InterferenceComb {
         }
         // The grid that holds the most is the comb, or nothing is: one twice as wide holds half its lines, and those
         // stand where the others do.
-        guard let best, !onBroadcastRaster(best.spacing),
-              bare(best.lines, spacing: best.spacing, db: spectrumDb, binHz: binHz) else { return nil }
-        return (CombInfo(spacingHz: best.spacing, lineCount: best.places), best.lines.map(\.offsetHz))
+        guard let best, !onBroadcastRaster(best.spacing) else { return nil }
+        let levels = pedestals(best.lines, spacing: best.spacing, db: spectrumDb, binHz: binHz)
+        let checked = levels.compactMap { $0 }
+        guard checked.isEmpty
+            || Double(checked.filter { $0.pedestal - $0.floor <= bareDb }.count) >= minBareShare * Double(checked.count)
+        else { return nil }
+        // Each line on its own, against the quietest floor of its own and its neighbours': a station's sidebands can fill
+        // all of half a spacing about its carrier. One that can't be checked (too near the capture's edge, or a spacing
+        // too small to show what is beside it) is the comb's.
+        let combLines = best.lines.indices.filter { i in
+            guard let own = levels[i] else { return true }
+            let floors = [i - 1, i, i + 1].filter { levels.indices.contains($0) }.compactMap { levels[$0]?.floor }
+            return own.pedestal - (floors.min() ?? own.floor) <= bareDb
+        }.map { best.lines[$0].offsetHz }
+        return (CombInfo(spacingHz: best.spacing, lineCount: best.places), combLines)
     }
 
     /// The narrow lines in the spectrum's usable part, by local contrast.
@@ -264,25 +279,27 @@ enum InterferenceComb {
         }
     }
 
-    /// Whether enough of the comb's lines stand on noise, not on sidebands of their own (step 4). Lines too close together
-    /// to show what lies beside them aren't counted either way.
-    static func bare(_ lines: [Line], spacing: Double, db: [Float], binHz: Double) -> Bool {
+    /// Whether each line stands on noise, not on sidebands of its own (step 4), against its own floor: nil for a line too
+    /// close to the capture's edge, or to its neighbours, to show what lies beside it.
+    static func bare(_ lines: [Line], spacing: Double, db: [Float], binHz: Double) -> [Bool?] {
+        pedestals(lines, spacing: spacing, db: db, binHz: binHz).map { $0.map { $0.pedestal - $0.floor <= bareDb } }
+    }
+
+    /// Each line's pedestal (the median beside it, step 4) and floor (the quietest stretches within half a spacing), or
+    /// nil when it can't be checked.
+    static func pedestals(_ lines: [Line], spacing: Double, db: [Float], binHz: Double) -> [(pedestal: Float, floor: Float)?] {
         let n = db.count
-        var checked = 0, bare = 0
-        for line in lines {
+        return lines.map { line -> (pedestal: Float, floor: Float)? in
             let inner = Int((max(pedestalInnerHz, pedestalInnerWidths * line.widthHz) / binHz).rounded(.up))
             let outer = Int((min(pedestalOuterHz, pedestalOuterShare * spacing) / binHz).rounded(.down))
             let half = Int((spacing / 2 / binHz).rounded(.down))
-            guard outer - inner >= pedestalMinBins, line.bin - half >= 0, line.bin + half < n else { continue }
+            guard outer - inner >= pedestalMinBins, line.bin - half >= 0, line.bin + half < n else { return nil }
             var pedestal = Array(db[(line.bin - outer)...(line.bin - inner)]) + Array(db[(line.bin + inner)...(line.bin + outer)])
             vDSP_vsort(&pedestal, vDSP_Length(pedestal.count), 1)
             var around = Array(db[(line.bin - half)...(line.bin + half)])
             vDSP_vsort(&around, vDSP_Length(around.count), 1)
-            let floor = around[Int(floorShare * Double(around.count))]
-            checked += 1
-            if pedestal[pedestal.count / 2] - floor <= bareDb { bare += 1 }
+            return (pedestal[pedestal.count / 2], around[Int(floorShare * Double(around.count))])
         }
-        return checked == 0 || Double(bare) >= minBareShare * Double(checked)
     }
 }
 

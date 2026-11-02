@@ -386,14 +386,15 @@ public enum SignalIdentifier {
     ///   shorter read than asked for is used, and said in `note`. The longer read's answer replaces the first's, a name the
     ///   first gave included;
     /// - `captureSpectrumDb` (an averaged spectrum of the whole capture at `captureRate`, FFT-shifted, centred on
-    ///   `captureSpectrumCenterHz`: `captureCenterHz` when nil, as when `iq` is the capture itself) shows any interference
-    ///   comb (`InterferenceComb`). Its lines are neither noise nor areas around the point (`TraceFinder.find`), nor
-    ///   energy at an empty point (`tooWeak`), and the trace at the point, on one of them and steady as the comb is (`InterferenceComb.isCombLine`), is the comb's
-    ///   (`comb`) when nothing names it and what it measures is no modulation (`combFamilies`): a keyed or modulated
-    ///   signal on the grid, or one a mode's numbers name, keeps its own answer. A trace that may be a narrow MFSK
-    ///   (`mayBeNarrowMFSK`: a row of FT8s can sit on a grid, and their hops are too quick for the map) is labelled only
-    ///   once its tones have been tried (`symbolReading`): not on a quick answer that leaves them to the longer read, nor
-    ///   with an agent's width.
+    ///   `captureSpectrumCenterHz`: `captureCenterHz` when nil, as when `iq` is the capture itself; ignored without
+    ///   `captureRate`, which a channel's own rate can't stand in for) shows any interference comb (`InterferenceComb`).
+    ///   Its lines are neither areas around the point (`TraceFinder.find`), nor noise or energy at an empty point
+    ///   (`tooWeak`), and the trace at the point, on one of them and steady as the comb is (`InterferenceComb.isCombLine`),
+    ///   is the comb's (`comb`) when nothing names it and what it measures is no modulation (`combFamilies`): a keyed or
+    ///   modulated signal on the grid, or one a mode's numbers name, keeps its own answer. A trace that may be a narrow
+    ///   MFSK (`mayBeNarrowMFSK`: a row of FT8s can sit on a grid, and their hops are too quick for the map) is labelled
+    ///   only once its tones have been tried (`symbolReading`): not on a quick answer that leaves them to the longer read,
+    ///   nor with an agent's width.
     ///
     /// A cancelled task stops between stages (the neighbourhood, the measurement, each step of the longer read) and gets
     /// `cancelledNote` with what was measured so far: an answer nobody is waiting for.
@@ -413,7 +414,8 @@ public enum SignalIdentifier {
         let first = iq.count <= firstFloats ? iq : Array(iq.suffix(firstFloats))
         let pointHz = atHz - captureCenterHz
         // The capture's comb, its lines from `iq`'s own centre, and whether the point's trace is one of them.
-        let comb = captureSpectrumDb.flatMap { InterferenceComb.detect(spectrumDb: $0, sampleRate: captureRate ?? sampleRate) }
+        // Without its own rate a capture's spectrum shows no grid: it is ignored.
+        let comb = captureSpectrumDb.flatMap { db in captureRate.flatMap { InterferenceComb.detect(spectrumDb: db, sampleRate: $0) } }
         let combLines = comb.map { found in
             found.lineOffsetsHz.map { $0 + (captureSpectrumCenterHz ?? captureCenterHz) - captureCenterHz }
         } ?? []

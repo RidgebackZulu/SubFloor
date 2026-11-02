@@ -97,9 +97,9 @@ enum TraceFinder {
     static let onContrast = 4.0
     static let bridgeRows = 2
 
-    /// `combLinesHz`: an interference comb's lines in view (`InterferenceComb`), which are neither noise nor areas: their
-    /// bins (`combBins`) are left out of the quiet level and read as noise for areas (a real comb's doubled lines, with a
-    /// slot mode's tracks between them, otherwise make one). They are still traces.
+    /// `combLinesHz`: an interference comb's lines in view (`InterferenceComb`), which are no areas: their bins
+    /// (`combBins`) read as noise for areas (a real comb's doubled lines, with a slot mode's tracks between them, otherwise
+    /// make one). They are still traces. (The quiet level, a 5th percentile, is far below where a comb's few lines lie.)
     static func find(_ map: TimeFrequencyMap, combLinesHz: [Double] = []) -> NeighbourhoodView {
         let noise = median(map.noiseDbPerHz)
         guard map.rows > 0, map.bins >= 16 else { return NeighbourhoodView(traces: [], areas: [], noiseDb: Double(noise)) }
@@ -112,7 +112,7 @@ enum TraceFinder {
                 for k in run { comb[k] = true }
             }
         }
-        let quiet = quietLevel(smoothed(power, reach: areaReach), leavingOut: comb)
+        let quiet = quietLevel(smoothed(power, reach: areaReach))
         if quiet != 1 { power = power.map { $0 / quiet } }
         let fine = smoothed(power, reach: traceReach)
         let coarse = combLinesHz.isEmpty ? smoothed(power, reach: areaReach)
@@ -154,9 +154,8 @@ enum TraceFinder {
     /// What the map's quietest stretches read, when that is well under its noise level: a view so crowded that even a
     /// row's 20th percentile lies among signals (stations 10 kHz apart with 2 kHz gaps) has its true noise in those gaps.
     /// 1 otherwise: a real band's ripple is a dB or so.
-    static func quietLevel(_ coarse: [Float], leavingOut: [Bool] = []) -> Float {
-        var sorted = leavingOut.contains(true) ? coarse.indices.filter { !leavingOut[$0] }.map { coarse[$0] } : coarse
-        guard !sorted.isEmpty else { return 1 }
+    static func quietLevel(_ coarse: [Float]) -> Float {
+        var sorted = coarse
         vDSP_vsort(&sorted, vDSP_Length(sorted.count), 1)
         let quiet = sorted[Int(quietShare * Double(sorted.count))]
         return quiet < linear(-quietBelowDb) ? max(quiet, 1e-6) : 1

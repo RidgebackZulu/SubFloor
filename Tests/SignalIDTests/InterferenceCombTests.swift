@@ -85,19 +85,28 @@ import Testing
         }
     }
 
-    /// The 11.7 MHz recording, inside the 25 m broadcast band: whatever is found, none of its lines lands on the FSK's
-    /// tones. (The receiver's comb is there too, about 19.3 kHz apart, but half its lines stand on broadcasts' sidebands:
-    /// no comb is reported.)
+    /// The 11.7 MHz recording, inside the 25 m broadcast band. The receiver's comb is there too: its lines make a grid
+    /// about 19.3 kHz apart, as at 14 MHz, none of them on the FSK's tones. But half of them and more stand on broadcasts'
+    /// sidebands, so no comb is reported (step 4): a change to either shows here.
     @Test func realFSKCaptureComb() throws {
         let fsk = try #require(try RealCorpus.points(.tuning).first { $0.truth == "2-FSK" })
         let shift = try #require(fsk.parameters?["shiftHz"])
         for part in CorpusPart.allCases {
             let clip = try #require(try RealCorpus.clips().first { $0.part == part && $0.name.hasPrefix("11.7MHz") })
+            let binHz = clip.captureRate / Double(clip.captureSpectrumDb.count)
             let found = InterferenceComb.detect(spectrumDb: clip.captureSpectrumDb, sampleRate: clip.captureRate)
-            print("realFSKCaptureComb \(part): \(found.map { "\($0.info), \($0.lineOffsetsHz.count) lines" } ?? "no comb")")
-            for line in found?.lineOffsetsHz ?? [] {
+            #expect(found == nil, "\(part): \(String(describing: found?.info))")
+            let grid = try #require(InterferenceComb.fit(InterferenceComb.lines(clip.captureSpectrumDb, binHz: binHz),
+                                                         spacing: 19_270), "\(part): no grid")
+            let bare = InterferenceComb.bare(grid.lines, spacing: grid.spacing, db: clip.captureSpectrumDb, binHz: binHz)
+                .compactMap { $0 }
+            print("realFSKCaptureComb \(part): grid \(grid.spacing) Hz, \(grid.places) places, \(bare.filter { $0 }.count) of \(bare.count) bare")
+            #expect((19_000...19_500).contains(grid.spacing) && grid.places >= InterferenceComb.minimumLines, "\(part)")
+            #expect(Double(bare.filter { $0 }.count) < InterferenceComb.minBareShare * Double(bare.count), "\(part)")
+            for line in grid.lines {
                 for tone in [fsk.atHz - shift / 2, fsk.atHz + shift / 2] {
-                    #expect(abs(clip.captureCenterHz + line - tone) > 100, "\(part): a comb line at \(clip.captureCenterHz + line) Hz")
+                    #expect(abs(clip.captureCenterHz + line.offsetHz - tone) > 100,
+                            "\(part): a grid line at \(clip.captureCenterHz + line.offsetHz) Hz")
                 }
             }
         }
@@ -191,9 +200,9 @@ import Testing
     /// On the grid, a keyed or modulated signal keeps its own answer: CW is named, a carrier keyed on and off slowly (a
     /// beacon) and an AM station are no comb lines. A steady line beside them is.
     @Test func keyedSignalOnTheGridIsNamed() {
-        let slot = 5, amSlot = 2
+        let slot = 5, amSlot = 2, fskSlot = 8
         let seconds = 2.0
-        var iq = Self.capture(skipping: [slot, slot + 2, amSlot], seconds: seconds, seed: 521)
+        var iq = Self.capture(skipping: [slot, slot + 2, amSlot, fskSlot], seconds: seconds, seed: 521)
         let cw = SignalSynth.make(.cw(wpm: 20), sampleRate: Self.rate, seconds: seconds, snrDb: .infinity,
                                   offsetHz: Self.lineHz(slot), seed: 522)
         Self.add(cw, to: &iq, snrDb: 20, widthHz: 100)
@@ -205,6 +214,10 @@ import Testing
         let am = SignalSynth.make(.am(.tone(1000), depth: 0.5), sampleRate: Self.rate, seconds: seconds, snrDb: .infinity,
                                   offsetHz: Self.lineHz(amSlot), seed: 524)
         Self.add(am, to: &iq, snrDb: 20, widthHz: 2000)
+        // RTTY centred on a place: its tones key in turn.
+        let rtty = SignalSynth.make(.rtty(), sampleRate: Self.rate, seconds: seconds, snrDb: .infinity,
+                                    offsetHz: Self.lineHz(fskSlot), seed: 525)
+        Self.add(rtty, to: &iq, snrDb: 20, widthHz: 250)
         let spectrum = Self.spectrum(iq)
         let comb = InterferenceComb.detect(spectrumDb: spectrum, sampleRate: Self.rate)
         #expect(comb != nil, "the comb is found")
@@ -215,9 +228,37 @@ import Testing
         #expect(onKeyed.comb == nil && onKeyed.label == "Carrier", "keyed: \(IdentifyTests.describe(onKeyed))")
         let onAM = Self.identified(iq, at: Self.lineHz(amSlot), spectrum: spectrum)
         #expect(onAM.comb == nil && onAM.best == nil && onAM.measurement.family == .am, "AM: \(IdentifyTests.describe(onAM))")
+        let onFSK = Self.identified(iq, at: Self.lineHz(fskSlot) + 85, spectrum: spectrum)
+        #expect(onFSK.comb == nil && onFSK.measurement.family == .fsk
+                && abs((onFSK.measurement.fskShiftHz ?? 0) - 170) <= 5, "RTTY: \(IdentifyTests.describe(onFSK))")
         let onLine = Self.identified(iq, at: Self.lineHz(slot - 1), spectrum: spectrum)
         #expect(onLine.comb != nil && onLine.best == nil && onLine.label == "Interference comb · 6.0 kHz spacing",
                 "a steady line: \(IdentifyTests.describe(onLine))")
+        // A capture's spectrum without its rate shows no grid: no rate is guessed for it.
+        let rateless = SignalIdentifier.identify(iq: iq, sampleRate: Self.rate, captureCenterHz: Self.centreHz,
+                                                 atHz: Self.centreHz + Self.lineHz(slot - 1), bandwidthHz: nil, spectrumDb: nil,
+                                                 longer: nil, captureSpectrumDb: spectrum)
+        #expect(rateless.comb == nil, "without the capture's rate: \(IdentifyTests.describe(rateless))")
+    }
+
+    /// A strong AM voice station on a comb place (its carrier on it, and 600 Hz off another) keeps its name: a carrier on
+    /// its own sidebands is none of the comb's lines, so neither its area nor its window is taken for the comb.
+    @Test func aStationOnACombPlaceKeepsItsName() throws {
+        let seconds = 2.0, onPlace = 2, offPlace = 7
+        var iq = Self.capture(skipping: [onPlace, offPlace], seconds: seconds, seed: 591)
+        for (slot, offset, snr) in [(onPlace, 0.0, 35.0), (offPlace, 600, 45)] {
+            let am = SignalSynth.make(.am(.voice(lowHz: 100, highHz: 4500), depth: 0.8), sampleRate: Self.rate, seconds: seconds,
+                                      snrDb: .infinity, offsetHz: Self.lineHz(slot) + offset, seed: 592 + UInt64(slot))
+            Self.add(am, to: &iq, snrDb: snr, widthHz: 9000)
+        }
+        let spectrum = Self.spectrum(iq)
+        let comb = try #require(InterferenceComb.detect(spectrumDb: spectrum, sampleRate: Self.rate))
+        for (slot, offset, snr) in [(onPlace, 0.0, 35.0), (offPlace, 600, 45)] {
+            let carrier = Self.lineHz(slot) + offset
+            #expect(!comb.lineOffsetsHz.contains { abs($0 - carrier) < 100 }, "\(snr) dB carrier taken for a comb line")
+            let id = Self.identified(iq, at: carrier, spectrum: spectrum)
+            #expect(id.comb == nil && id.best?.name == "AM voice/broadcast", "\(snr) dB: \(IdentifyTests.describe(id))")
+        }
     }
 
     /// A comb's lines are neither noise nor energy at an empty point: lines wandering about 120 Hz wide, too faint there to
