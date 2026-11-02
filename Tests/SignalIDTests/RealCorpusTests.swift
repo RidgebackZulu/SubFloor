@@ -66,7 +66,9 @@ import Testing
 
     /// The targets on the held-out part, which is only ever scored, through the hover's path on clips (no decode), and no
     /// wrong name on any truth: FT8 never named FT4, nor the reverse. By default every empty point and 2 transmitting
-    /// windows each of FT8, FT4 and the FSK; `SUBFLOOR_SIGNALID_MATRIX=1` asserts over all of them. FT8's and FT4's shares
+    /// windows each of FT8, FT4 and the FSK, and one of the comb (its windows take the longer read);
+    /// `SUBFLOOR_SIGNALID_MATRIX=1` asserts over all of them, and prints
+    /// how many comb windows were labelled comb (not `No signal`). FT8's and FT4's shares
     /// (`gatedTargets`) are asserted only then, or with `SUBFLOOR_SIGNALID_REAL=1`: two windows say little of a share, and
     /// the default run holds what matters most there, no wrong name. `fullRecordings` asserts the same targets at the
     /// capture's own rate. The rows grow as the tasks that meet them land.
@@ -75,23 +77,28 @@ import Testing
         // A share of 95% means nothing over 2 points, and an empty point costs little: all of them, always.
         let points = Sweep.full ? held : held.filter { $0.truth == "none" }
             + Self.subset(held.filter { ["FT8", "FT4", "2-FSK"].contains($0.truth) && RealCorpus.counts($0) }, perTruth: 2)
+            + Self.subset(held.filter { $0.truth == "comb" && RealCorpus.counts($0) }, perTruth: 1)
         var wrong: [String] = []
+        var combLabels = 0
         let score = try RealCorpus.score(points: points) { clip, point in
             let id = RealCorpus.hover(clip, point)
             Self.expectHeldOut(id, point, "clip path", centerHz: clip.centerHz)
             if RealCorpus.isWrongName(id, point) { wrong.append("\(point.truth) at \(point.atHz) Hz: \(id.label)") }
+            if point.truth == "comb", id.comb != nil { combLabels += 1 }
             return id
         }
         if Sweep.full {
             for truth in score.keys.sorted() { print("heldOutTargets \(truth): \(score[truth]!.right)/\(score[truth]!.total) right") }
+            print("heldOutTargets comb windows labelled comb: \(combLabels)/\(score["comb"]?.total ?? 0)")
             for line in wrong { print("heldOutTargets wrong: \(line)") }
         }
         Self.expectTargets(score, "clip path", all: Sweep.full || Self.environment["SUBFLOOR_SIGNALID_REAL"] == "1")
         #expect(wrong.isEmpty, "clip path: wrong names at 0.7 or more: \(wrong)")
     }
 
-    /// The share right each truth must reach.
-    static let targets = ["none": 0.95, "2-FSK": 0.8, "FT8": 0.8, "FT4": 0.8]
+    /// The share right each truth must reach. A comb line is labelled comb or `No signal` in every window (the spec gives no
+    /// share: never named, and never another answer).
+    static let targets = ["none": 0.95, "2-FSK": 0.8, "FT8": 0.8, "FT4": 0.8, "comb": 1.0]
     /// The targets a default run doesn't assert (see `heldOutTargets`).
     static let gatedTargets: Set<String> = ["FT8", "FT4"]
     /// The FSK's neighbour, which stays its own signal.
@@ -154,7 +161,8 @@ import Testing
             let end = entry.startSeconds + point.endSeconds
             return RealCorpus.hover(rate: recording.captureRate, centerHz: recording.captureCenterHz, atHz: point.atHz,
                                     spectrumDb: clip.captureSpectrumDb,
-                                    endTime: recording.startUTC?.addingTimeInterval(end)) { seconds in
+                                    endTime: recording.startUTC?.addingTimeInterval(end),
+                                    capture: (clip.captureSpectrumDb, recording.captureRate, recording.captureCenterHz)) { seconds in
                 (try? RealCorpus.readRecording(recording.file, seconds: max(0, end - seconds)..<end)) ?? []
             }
         }
@@ -278,6 +286,7 @@ import Testing
 
     /// A label with its width rounded, so answers tally.
     static func shortLabel(_ id: SignalIdentity) -> String {
+        if id.comb != nil { return "Interference comb" }
         if let best = id.best { return best.name }
         let m = id.measurement
         if m.occupiedBandwidthHz == 0 { return id.note ?? "none" }

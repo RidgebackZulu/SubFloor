@@ -97,15 +97,26 @@ enum TraceFinder {
     static let onContrast = 4.0
     static let bridgeRows = 2
 
-    static func find(_ map: TimeFrequencyMap) -> NeighbourhoodView {
+    /// `combLinesHz`: an interference comb's lines in view (`InterferenceComb`), which are neither noise nor areas: their
+    /// bins (`combBins`) are left out of the quiet level and read as noise for areas (a real comb's doubled lines, with a
+    /// slot mode's tracks between them, otherwise make one). They are still traces.
+    static func find(_ map: TimeFrequencyMap, combLinesHz: [Double] = []) -> NeighbourhoodView {
         let noise = median(map.noiseDbPerHz)
         guard map.rows > 0, map.bins >= 16 else { return NeighbourhoodView(traces: [], areas: [], noiseDb: Double(noise)) }
         var power = map.meanPower()
         let areaReach = Int((areaReachHz / map.binHz).rounded())
-        let quiet = quietLevel(smoothed(power, reach: areaReach))
+        let traceReach = Int((traceReachHz / map.binHz).rounded())
+        var comb = [Bool](repeating: false, count: combLinesHz.isEmpty ? 0 : map.bins)
+        if !combLinesHz.isEmpty {
+            for run in combBins(smoothed(power, reach: traceReach), map: map, linesHz: combLinesHz) {
+                for k in run { comb[k] = true }
+            }
+        }
+        let quiet = quietLevel(smoothed(power, reach: areaReach), leavingOut: comb)
         if quiet != 1 { power = power.map { $0 / quiet } }
-        let fine = smoothed(power, reach: Int((traceReachHz / map.binHz).rounded()))
-        let coarse = smoothed(power, reach: areaReach)
+        let fine = smoothed(power, reach: traceReach)
+        let coarse = combLinesHz.isEmpty ? smoothed(power, reach: areaReach)
+            : smoothed(power.indices.map { comb[$0] ? 1 : power[$0] }, reach: areaReach)
         let edge = linear(edgeDb)
 
         var areas: [OccupiedArea] = []
@@ -143,12 +154,33 @@ enum TraceFinder {
     /// What the map's quietest stretches read, when that is well under its noise level: a view so crowded that even a
     /// row's 20th percentile lies among signals (stations 10 kHz apart with 2 kHz gaps) has its true noise in those gaps.
     /// 1 otherwise: a real band's ripple is a dB or so.
-    static func quietLevel(_ coarse: [Float]) -> Float {
-        var sorted = coarse
+    static func quietLevel(_ coarse: [Float], leavingOut: [Bool] = []) -> Float {
+        var sorted = leavingOut.contains(true) ? coarse.indices.filter { !leavingOut[$0] }.map { coarse[$0] } : coarse
+        guard !sorted.isEmpty else { return 1 }
         vDSP_vsort(&sorted, vDSP_Length(sorted.count), 1)
         let quiet = sorted[Int(quietShare * Double(sorted.count))]
         return quiet < linear(-quietBelowDb) ? max(quiet, 1e-6) : 1
     }
+
+    /// The bins of each comb line in `linesHz` on `map`: from its own bin out as far as `fine` (the read's average,
+    /// smoothed for traces) stays `edgeDb` up, but no further than `combReachHz` (a line's skirts, not what it lies in),
+    /// and at least `combMinReachHz` either side (a line too weak to stand out in the read is still no noise).
+    static func combBins(_ fine: [Float], map: TimeFrequencyMap, linesHz: [Double]) -> [ClosedRange<Int>] {
+        let reach = Int((combReachHz / map.binHz).rounded()), least = Int((combMinReachHz / map.binHz).rounded(.up))
+        let edge = linear(edgeDb)
+        return linesHz.compactMap { line in
+            let centre = map.bin(line)
+            guard centre + least >= 0, centre - least < map.bins else { return nil }
+            var lower = max(0, centre - least), upper = min(map.bins - 1, centre + least)
+            while lower > 0, centre - lower < reach, fine[lower - 1] >= edge { lower -= 1 }
+            while upper < map.bins - 1, upper - centre < reach, fine[upper + 1] >= edge { upper += 1 }
+            return lower...upper
+        }
+    }
+
+    /// How far a comb line's bins may reach either side of it, and reach at least.
+    static let combReachHz = 400.0
+    static let combMinReachHz = 32.0
 
     /// A trace that says plainly it is its own signal, in `tooWeak`'s window: as narrow as a line, or well up. What is
     /// left of a weak voice reads as pieces wider and fainter than that.

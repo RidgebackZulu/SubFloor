@@ -206,12 +206,16 @@ enum RealCorpus {
 
     /// As the hover does (`SignalIDService.run`): the newest 3 s, with the app's spectrum; when that asks for it, up to
     /// 16 s cut to a channel around what it measured, and the answer from that with no spectrum. `read` gives the
-    /// newest seconds ending at the point's time, as interleaved IQ at `rate`, and `endTime` is that time by UTC.
+    /// newest seconds ending at the point's time, as interleaved IQ at `rate`, and `endTime` is that time by UTC. Both
+    /// reads have the whole capture's spectrum (`capture`: its dB, rate and centre), for the comb.
     static func hover(rate: Double, centerHz: Double, atHz: Double, spectrumDb: [Float], endTime: Date?,
+                      capture: (db: [Float], rate: Double, centerHz: Double)? = nil,
                       read: (Double) -> [Float]) -> SignalIdentity {
         let first = SignalIdentifier.identify(iq: read(SignalIdentifier.firstSeconds), sampleRate: rate,
                                               captureCenterHz: centerHz, atHz: atHz, bandwidthHz: nil,
-                                              spectrumDb: spectrumDb, longer: nil, endTime: endTime)
+                                              spectrumDb: spectrumDb, longer: nil, endTime: endTime,
+                                              captureSpectrumDb: capture?.db, captureRate: capture?.rate,
+                                              captureSpectrumCenterHz: capture?.centerHz)
         guard first.needsLongerRead else { return first }
         let m = first.measurement
         let windowHz = max(48_000, 4 * m.occupiedBandwidthHz)
@@ -228,7 +232,8 @@ enum RealCorpus {
         let seconds = Double(iq.count / 2) / longRate
         var refined = SignalIdentifier.identify(iq: iq, sampleRate: longRate, captureCenterHz: centerHz + offsetHz,
                                                 atHz: atHz, bandwidthHz: nil, spectrumDb: nil, longer: { (iq, seconds) },
-                                                endTime: endTime)
+                                                endTime: endTime, captureSpectrumDb: capture?.db, captureRate: capture?.rate,
+                                                captureSpectrumCenterHz: capture?.centerHz)
         refined.measurement.offsetHz += offsetHz
         return refined
     }
@@ -236,7 +241,8 @@ enum RealCorpus {
     /// `hover` on a clip, at a point's time (the read ending then, by the recording's clock).
     static func hover(_ clip: CorpusClip, _ point: CorpusPoint) -> SignalIdentity {
         hover(rate: clip.rate, centerHz: clip.centerHz, atHz: point.atHz, spectrumDb: clip.spectrumDb,
-              endTime: clip.startUTC.addingTimeInterval(point.endSeconds)) { seconds in
+              endTime: clip.startUTC.addingTimeInterval(point.endSeconds),
+              capture: (clip.captureSpectrumDb, clip.captureRate, clip.captureCenterHz)) { seconds in
             let end = 2 * Int((point.endSeconds * clip.rate).rounded())
             let start = max(0, end - 2 * Int((seconds * clip.rate).rounded()))
             return Array(clip.iq[start..<min(end, clip.iq.count)])

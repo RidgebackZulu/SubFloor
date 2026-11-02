@@ -96,8 +96,10 @@ import Testing
 
     /// Keying whose sinc lobes stand as humps as tall as the tones, close to them and to each other. A lobe follows its
     /// tone, so it takes turns with the other tone too, but it is no tone, and no pair of lobes is another FSK.
-    @Test(arguments: [(100.0, 200.0, 20.0, UInt64(51)), (200, 850, 20, 51), (200, 850, 30, 51), (200, 850, 30, 52), (150, 850, 45, 51),
-                      (300, 850, 45, 51), (300, 1200, 30, 51), (45.45, 170, 40, 51)]) func lobesAreNotTones(baud: Double, shift: Double, snr: Double, seed: UInt64) {
+    /// (200 Bd, 850 Hz, 30 dB on seed 51 repeats seed 52's case: `SUBFLOOR_SIGNALID_MATRIX=1` only.)
+    @Test(arguments: [(100.0, 200.0, 20.0, UInt64(51)), (200, 850, 20, 51), (200, 850, 30, 52), (150, 850, 45, 51),
+                      (300, 850, 45, 51), (300, 1200, 30, 51), (45.45, 170, 40, 51)] + (Sweep.full ? [(200, 850, 30, 51)] : []))
+    func lobesAreNotTones(baud: Double, shift: Double, snr: Double, seed: UInt64) {
         let iq = SignalSynth.make(.rtty(baud: baud, shiftHz: shift), sampleRate: Self.rate, seconds: 3, snrDb: snr, seed: seed)
         let found = Self.signals(iq, pointHz: shift / 2)
         let fsks = found.filter { $0.tones != nil }

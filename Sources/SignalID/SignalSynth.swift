@@ -289,6 +289,47 @@ public enum SignalSynth {
         return out
     }
 
+    /// An interference comb to add to a capture: `count` steady lines `spacingHz` apart from `firstHz` (from the capture
+    /// centre), each of `amplitude` (a unit tone reads 0 dB) with its own phase, jittering in frequency about ±`wanderHz`
+    /// (the sum of `wanderTerms` sinusoids of its own, 8 to 40 Hz: each moment shows the whole even hump, its peak where
+    /// it was, as the owner's comb's lines do, about 130 Hz wide). The lines at `skipping` (indices from 0) are left out,
+    /// for something else to sit on the grid.
+    public static func comb(firstHz: Double, spacingHz: Double, count: Int, amplitude: Float, sampleRate: Double,
+                            seconds: Double, wanderHz: Double = 0, skipping: Set<Int> = [], seed: UInt64) -> [Float] {
+        let n = Int((seconds * sampleRate).rounded())
+        var out = [Float](repeating: 0, count: 2 * n)
+        var random = SynthRandom(seed: seed, stream: 4)
+        var phase = [Float](repeating: 0, count: n)
+        var sine = [Float](repeating: 0, count: n), cosine = [Float](repeating: 0, count: n)
+        // The wander, worked out every `wanderStep` samples (0.25 ms) and held between.
+        let wanderStep = max(1, Int(sampleRate / 4000))
+        for line in 0..<count {
+            let start = random.uniform() * 2 * Double.pi
+            let terms = (0..<wanderTerms).map { _ in (rate: random.uniform(8...40), phase: random.uniform() * 2 * Double.pi) }
+            guard !skipping.contains(line) else { continue }
+            let hz = firstHz + Double(line) * spacingHz
+            var p = start, wander = 0.0
+            for k in 0..<n {
+                if wanderHz != 0 && k % wanderStep == 0 {
+                    let t = Double(k) / sampleRate
+                    wander = wanderHz / 3 * terms.reduce(0) { $0 + sin(2 * Double.pi * $1.rate * t + $1.phase) }
+                }
+                p += 2 * Double.pi * (hz + wander) / sampleRate
+                if abs(p) > Double.pi { p -= 2 * Double.pi * (p / (2 * Double.pi)).rounded() }
+                phase[k] = Float(p)
+            }
+            var count32 = Int32(n)
+            vvsincosf(&sine, &cosine, phase, &count32)
+            for k in 0..<n {
+                out[2 * k] += amplitude * cosine[k]
+                out[2 * k + 1] += amplitude * sine[k]
+            }
+        }
+        return out
+    }
+
+    static let wanderTerms = 5
+
     /// The noise-free signal at unit mean power.
     static func render(_ spec: SynthSpec, sampleRate: Double, seconds: Double, offsetHz: Double = 0, seed: UInt64,
                        impairments: SynthImpairments = .none) -> [Float] {

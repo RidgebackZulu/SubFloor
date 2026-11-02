@@ -104,7 +104,8 @@ private func runs(_ x: [Float], above threshold: Float) -> [(start: Int, length:
         for (index, entry) in Sweep.cases(catalogue, default: Array(stride(from: 0, to: catalogue.count, by: 6))) {
             let plan = analysisPlan(entry.spec)
             let b = entry.spec.occupiedBandwidthHz
-            for snr in [10.0, 3.0] {
+            // The 3 dB repeat under `SUBFLOOR_SIGNALID_MATRIX=1`: the same estimate at another level.
+            for snr in Sweep.full ? [10.0, 3.0] : [10] {
                 let iq = SignalSynth.make(entry.spec, sampleRate: plan.rate, seconds: plan.seconds, snrDb: snr,
                                           seed: UInt64(300 + index))
                 let p = linear(PowerSpectrum.average(iq, size: plan.size, maxFrames: 4096))
@@ -122,7 +123,7 @@ private func runs(_ x: [Float], above threshold: Float) -> [(start: Int, length:
         // The declared width is the rendered one by construction; an independent render (another seed, rate
         // and resolution, this file's own fixed-point search) agrees within 6%.
         let catalogue = SynthSpec.catalogue
-        for (index, entry) in Sweep.cases(catalogue, default: Array(stride(from: 3, to: catalogue.count, by: 6))) {
+        for (index, entry) in Sweep.cases(catalogue, default: Array(stride(from: 3, to: catalogue.count, by: 12))) {
             let declared = entry.spec.occupiedBandwidthHz
             #expect(declared == SignalSynth.occupiedBandwidthHz(for: entry.spec))
             guard entry.spec != .carrier else { continue }
