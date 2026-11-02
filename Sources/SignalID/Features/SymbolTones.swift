@@ -50,20 +50,27 @@ struct SymbolTonesReading: Equatable {
 ///   spacing within `spacingTolerance` of the rate whose grid they sit on best (`grid`). The count is the next power of
 ///   two over the span of the grid positions used, a stray position at either end left out, and a lone symbol that takes
 ///   the span one past a power of two too.
-/// - **Orthogonal or nothing.** It is an MFSK only when all of these hold; otherwise nil, and the signal is measured as
-///   before:
-///   - its symbols sit on a grid spaced by the rate within `spacingTolerance`, `minOnGrid` of them within reach of it;
-///   - each symbol's two halves agree on its frequency (`minHalfAgreement`): it holds one tone throughout. A PSK's frames
-///     of several symbols don't (PSK31 ≤ 0.36, CW ≤ 0.21; FT8 and FT4 at 4 dB ≥ 0.41);
-///   - one tone at a time: in each symbol the strongest of its tones stands `minExclusivity` times over the rest. An
-///     interference comb's lines, all there at once with its pulses a symbol apart, read 5.1 on the tuning part (noise
+/// - **Orthogonal or nothing.** Its symbols must sit on a grid spaced by the rate within `spacingTolerance`, with two
+///   positions used at least. Then it is an MFSK only when every `Check` holds; otherwise nil, and the signal is measured
+///   as before. Each check alone stops a case the others let through (`SymbolTonesTests.eachCheckStopsWhatOnlyItCan`):
+///   - `contrast`: a CW key at 10 dB;
+///   - `halves`: each symbol's two halves agree on its frequency (`minHalfAgreement`), as one tone held throughout does.
+///     A CW key's frames don't (PSK31 ≤ 0.36, CW ≤ 0.21; FT8 and FT4 at 4 dB ≥ 0.41). On the corpus's tuning part it
+///     also turns away 5 readings of real FT8 that would have passed (a cost; the name came from the other read);
+///   - `exclusivity`: one tone at a time, the strongest of its tones `minExclusivity` times over the rest in each symbol.
+///     An interference comb's lines, all there at once with its pulses a symbol apart, read 5.1 on the tuning part (noise
 ///     alone about 3.3); FT4 at 4 dB 6.4–7.4, FT8 9 or more;
-///   - at least two tones, none holding more than `maxToneShare` of the symbols, filling `minSpanFill` of the span, and,
-///     with `symbolsPerTone` symbols a position or more, none between the outermost unused: a line, or a 2-FSK read on
-///     half-symbol frames, is no MFSK.
+///   - `toneShare`, `spanFill`, `emptyTone`: none holding more than `maxToneShare` of the symbols, the tones filling
+///     `minSpanFill` of their span, and with `symbolsPerTone` symbols a position, none between the outermost unused (a
+///     line pulsing at FT8's rate, two CW keys 40 Hz apart, a 2-FSK 85 Hz wide);
+///   - `pairs`: neighbouring symbols don't keep their tone in pairs. An 8-FSK at 3.125 Bd read at twice its rate on 3 s
+///     does (0.71; true MFSKs 0.14 at most).
+///   A test of how far the symbols sit from the grid (`onGrid`) stopped nothing the others didn't, over 27 kinds of
+///   signal and the tuning part, so it only scales the reading's confidence.
 ///
-/// The tones' own spacing reads a little narrow (Gaussian keying pulls them together: FT4's by 2–5%), so the spacing
-/// given is the rate, which they were seen to match; `SymbolTonesReading.tonesSpacingHz` keeps what they read.
+/// The tones' own spacing reads a little narrow (Gaussian keying pulls them together: FT4's by 2–5%), so within
+/// `rateSpacingTolerance` of the rate the spacing given is the rate; further off, what they read
+/// (`SymbolTonesReading.tonesSpacingHz` keeps it either way).
 enum SymbolTones {
     /// Samples per Hz of the channel's width after decimation.
     static let ratePerWidth = 8.0
@@ -88,6 +95,14 @@ enum SymbolTones {
     static let minConcentration = 0.3
     static let chanceConcentrations = 2.5
     static let spacingTolerance = 0.1
+    /// Tones read within this of the rate are given the rate as their spacing (Gaussian keying pulls them together by
+    /// up to 5%); further off, what they read.
+    static let rateSpacingTolerance = 0.05
+    /// How much more often neighbouring symbols keep their tone when the first of them is even than when it is odd (or
+    /// the reverse), at most; each parity needs `minPairs` pairs to count.
+    static let maxPairing = 0.5
+    static let minPairs = 4
+    /// The share of symbols on the grid a reading is half sure at (`confidence`).
     static let minOnGrid = 0.6
     static let solidOnGrid = 0.9
     /// Each symbol's two halves' frequencies correlate at least this well.
@@ -139,62 +154,71 @@ enum SymbolTones {
         }
     }
 
+    /// The checks a reading must pass (see the type's notes). All of them, but a test may leave one out to show what it
+    /// alone stops.
+    enum Check: CaseIterable, Hashable {
+        /// The swing stands `minContrast` over the median.
+        case contrast
+        /// Each symbol's two halves agree (`minHalfAgreement`).
+        case halves
+        /// No tone holds more than `maxToneShare` of the symbols.
+        case toneShare
+        /// The tones fill `minSpanFill` of their span.
+        case spanFill
+        /// With `symbolsPerTone` symbols a position, none between the outermost unused.
+        case emptyTone
+        /// One tone at a time (`minExclusivity`).
+        case exclusivity
+        /// Neighbouring symbols don't keep their tone in pairs (`maxPairing`): a slower MFSK read on half its symbols
+        /// holds each tone for two of them.
+        case pairs
+    }
+
     /// Reads the signal in `iq` (interleaved, at `sampleRate`) at `offsetHz`, `widthHz` wide, each frame counting by
     /// `presence` (nil: alike). Nil when it isn't an orthogonal MFSK this read can show (see the type's notes).
-    static func read(_ iq: [Float], sampleRate: Double, offsetHz: Double, widthHz: Double,
-                     presence: Presence? = nil) -> SymbolTonesReading? {
+    static func read(_ iq: [Float], sampleRate: Double, offsetHz: Double, widthHz: Double, presence: Presence? = nil,
+                     checks: Set<Check> = Set(Check.allCases)) -> SymbolTonesReading? {
         guard widthHz > 0, sampleRate > 0, iq.count >= 2 else { return nil }
         let (z, rate) = channel(iq, sampleRate: sampleRate, offsetHz: offsetHz, widthHz: widthHz)
+        let ffts = Transforms()
+        guard let symbol = symbolLength(z, rate: rate, widthHz: widthHz, presence: presence, ffts: ffts),
+              !checks.contains(.contrast) || symbol.contrast >= minContrast,
+              let tones = tones(z, rate: rate, symbol: symbol, presence: presence, ffts: ffts),
+              rejection(tones, checks: checks) == nil else { return nil }
+        var count = 2
+        while count < tones.last - tones.first + 1 { count *= 2 }
+        guard count <= maxTones else { return nil }
+        // The rate, when the tones are spaced by it as closely as Gaussian keying lets them read; otherwise what they read.
+        let spacing = abs(tones.grid.spacing * symbol.length - 1) <= rateSpacingTolerance ? 1 / symbol.length
+            : tones.grid.spacing
+        return SymbolTonesReading(baud: 1 / symbol.length, toneCount: count, spacingHz: spacing,
+                                  tonesSpacingHz: tones.grid.spacing, tonesSeen: tones.seen,
+                                  centreHz: tones.grid.offset + Double(tones.first + tones.last) / 2 * tones.grid.spacing,
+                                  contrast: symbol.contrast, onGrid: tones.onGrid, symbols: tones.values.count)
+    }
+
+    /// The symbol length found, the phase of its swing (where its boundaries fall), and its contrast.
+    struct SymbolLength {
+        var length: Double
+        var phase: Double
+        var contrast: Double
+    }
+
+    /// The length whose swing is strongest (see the type's notes), whatever its contrast. Nil when the read can't hold
+    /// enough lengths to judge.
+    static func symbolLength(_ z: [DSPComplex], rate: Double, widthHz: Double, presence: Presence?,
+                             ffts: Transforms) -> SymbolLength? {
         let seconds = Double(z.count) / rate
         let shortest = max(minLengthWidths / widthHz, 8 / rate)
         let longest = min(seconds / minSymbols, maxLengthSeconds)
         guard longest > shortest * lengthStep * lengthStep else { return nil }
-        let ffts = Transforms()
-        // The swing at `length`: over the whole read (its first harmonic across the starting points, and its phase), and
-        // the mean of each `segmentSymbols` symbols' own, which a length a little off doesn't cancel.
-        func swing(_ length: Double) -> (amplitude: Double, phase: Double, segments: Double) {
-            let segment = max(1, Int(segmentSymbols))
-            var whole = [Double](repeating: 0, count: offsets), weight = [Double](repeating: 0, count: offsets)
-            var parts: [Int: (sums: [Double], weights: [Double])] = [:]
-            for j in 0..<offsets {
-                let f = frames(z, rate: rate, length: length, start: Double(j) / Double(offsets), presence: presence,
-                               ffts: ffts)
-                for (i, k) in f.frames.enumerated() {
-                    let (c, w) = (f.concentrations[i], f.weights[i])
-                    whole[j] += c * w
-                    weight[j] += w
-                    var part = parts[k / segment] ?? ([Double](repeating: 0, count: offsets),
-                                                      [Double](repeating: 0, count: offsets))
-                    part.sums[j] += c * w
-                    part.weights[j] += w
-                    parts[k / segment] = part
-                }
-            }
-            func harmonic(_ sums: [Double], _ weights: [Double]) -> (Double, Double) {
-                var re = 0.0, im = 0.0
-                for j in 0..<offsets where weights[j] > 0 {
-                    let c = sums[j] / weights[j], angle = 2 * Double.pi * Double(j) / Double(offsets)
-                    re += c * cos(angle)
-                    im += c * sin(angle)
-                }
-                return (2 * (re * re + im * im).squareRoot() / Double(offsets), atan2(im, re))
-            }
-            let (amplitude, phase) = harmonic(whole, weight)
-            var inParts = 0.0, partWeight = 0.0
-            for part in parts.values {
-                let w = part.weights.reduce(0, +) / Double(offsets)
-                inParts += harmonic(part.sums, part.weights).0 * w
-                partWeight += w
-            }
-            return (amplitude, phase, partWeight > 0 ? inParts / partWeight : 0)
-        }
         var lengths: [Double] = []
-        var swings: [(amplitude: Double, phase: Double, segments: Double)] = []
+        var swings: [Swing] = []
         var length = shortest
         while length <= longest {
             if Task.isCancelled { return nil }
             lengths.append(length)
-            swings.append(swing(length))
+            swings.append(swing(z, rate: rate, length: length, presence: presence, ffts: ffts))
             length *= lengthStep
         }
         guard swings.count >= 8 else { return nil }
@@ -206,7 +230,7 @@ enum SymbolTones {
         let peaks = segmented.indices.filter { k in
             (k == 0 || segmented[k] >= segmented[k - 1]) && (k == segmented.count - 1 || segmented[k] >= segmented[k + 1])
         }.sorted { segmented[$0] > segmented[$1] }.prefix(closerLooks)
-        var best: (length: Double, amplitude: Double, phase: Double)?
+        var best: (length: Double, swing: Swing)?
         for k in peaks {
             // Steps a quarter of the whole swing's peak (its length over the read's) apart, across the scan's step.
             let fine = max(closeStepFloor, lengths[k] / (4 * seconds))
@@ -215,18 +239,97 @@ enum SymbolTones {
                 if Task.isCancelled { return nil }
                 let tried = lengths[k] * pow(1 + fine, Double(step))
                 guard tried >= shortest, tried <= longest else { continue }
-                let s = step == 0 ? swings[k] : swing(tried)
-                if s.amplitude > (best?.amplitude ?? 0) { best = (tried, s.amplitude, s.phase) }
+                let s = step == 0 ? swings[k] : swing(z, rate: rate, length: tried, presence: presence, ffts: ffts)
+                if s.amplitude > (best?.swing.amplitude ?? 0) { best = (tried, s) }
             }
         }
         guard let best else { return nil }
-        let contrast = best.amplitude / median
-        guard contrast >= minContrast else { return nil }
-        let symbol = best.length
-        let phase = best.phase
+        return SymbolLength(length: best.length, phase: best.swing.phase, contrast: best.swing.amplitude / median)
+    }
+
+    /// A length's swing: over the whole read (its first harmonic across the starting points, and its phase), and the
+    /// mean of each `segmentSymbols` symbols' own, which a length a little off doesn't cancel.
+    struct Swing {
+        var amplitude: Double
+        var phase: Double
+        var segments: Double
+    }
+
+    static func swing(_ z: [DSPComplex], rate: Double, length: Double, presence: Presence?, ffts: Transforms) -> Swing {
+        let segment = max(1, Int(segmentSymbols))
+        let parts = Int(Double(z.count) / rate / length) / segment + 2
+        // Each segment's weighted concentration and weight at each starting point, row by row.
+        var sums = [Double](repeating: 0, count: parts * offsets), weights = sums
+        for j in 0..<offsets {
+            let f = frames(z, rate: rate, length: length, start: Double(j) / Double(offsets), presence: presence,
+                           ffts: ffts)
+            for (i, k) in f.frames.enumerated() {
+                let cell = min(parts - 1, k / segment) * offsets + j
+                sums[cell] += f.concentrations[i] * f.weights[i]
+                weights[cell] += f.weights[i]
+            }
+        }
+        func harmonic(_ row: Range<Int>) -> (amplitude: Double, phase: Double, weight: Double) {
+            var re = 0.0, im = 0.0, weight = 0.0
+            for j in 0..<offsets where weights[row.lowerBound + j] > 0 {
+                let c = sums[row.lowerBound + j] / weights[row.lowerBound + j]
+                let angle = 2 * Double.pi * Double(j) / Double(offsets)
+                re += c * cos(angle)
+                im += c * sin(angle)
+                weight += weights[row.lowerBound + j]
+            }
+            return (2 * (re * re + im * im).squareRoot() / Double(offsets), atan2(im, re), weight / Double(offsets))
+        }
+        var wholeSums = [Double](repeating: 0, count: offsets), wholeWeights = wholeSums
+        var inParts = 0.0, partWeight = 0.0
+        for p in 0..<parts {
+            for j in 0..<offsets {
+                wholeSums[j] += sums[p * offsets + j]
+                wholeWeights[j] += weights[p * offsets + j]
+            }
+            let h = harmonic((p * offsets)..<((p + 1) * offsets))
+            inParts += h.amplitude * h.weight
+            partWeight += h.weight
+        }
+        var re = 0.0, im = 0.0
+        for j in 0..<offsets where wholeWeights[j] > 0 {
+            let c = wholeSums[j] / wholeWeights[j], angle = 2 * Double.pi * Double(j) / Double(offsets)
+            re += c * cos(angle)
+            im += c * sin(angle)
+        }
+        return Swing(amplitude: 2 * (re * re + im * im).squareRoot() / Double(offsets), phase: atan2(im, re),
+                     segments: partWeight > 0 ? inParts / partWeight : 0)
+    }
+
+    /// What the symbols, read on their boundaries, show of the tones: what `rejection` judges.
+    struct Tones {
+        /// Each symbol's frequency, in Hz from the channel's 0.
+        var values: [Double]
+        var grid: (spacing: Double, offset: Double, concentration: Double)
+        /// Symbols on each grid position, and how many sit on one.
+        var counts: [Int: Int]
+        var placed: Int
+        /// The outermost positions in use, strays left out, and how many positions between are used.
+        var first: Int
+        var last: Int
+        var seen: Int
+        var onGrid: Double
+        /// The correlation of each symbol's two halves' frequencies.
+        var halfAgreement: Double
+        /// The median over symbols of its tone's power over the mean of the others'.
+        var exclusivity: Double
+        /// How much more often neighbouring symbols keep their tone from an even symbol than from an odd one, or the
+        /// reverse (0 when either parity has too few pairs).
+        var pairing: Double
+    }
+
+    /// The symbols on the boundaries of `symbol` and what they show (see `Tones`). Nil when too few place a tone, or no
+    /// grid near the rate holds them.
+    static func tones(_ z: [DSPComplex], rate: Double, symbol: SymbolLength, presence: Presence?,
+                      ffts: Transforms) -> Tones? {
         // The frames on the boundaries: where the concentration's swing peaks.
-        let start = (phase / (2 * .pi)).truncatingRemainder(dividingBy: 1) + 1
-        let aligned = frames(z, rate: rate, length: symbol, start: start.truncatingRemainder(dividingBy: 1),
+        let start = (symbol.phase / (2 * .pi)).truncatingRemainder(dividingBy: 1) + 1
+        let aligned = frames(z, rate: rate, length: symbol.length, start: start.truncatingRemainder(dividingBy: 1),
                              presence: presence, ffts: ffts, padding: peakPadding)
         guard !aligned.concentrations.isEmpty else { return nil }
         // The frames that hold the signal: well concentrated, and from a moment it stands well up.
@@ -234,20 +337,28 @@ enum SymbolTones {
         let heard = aligned.weights.sorted()[aligned.weights.count * 9 / 10] * weakFrameShare
         let kept = aligned.peaksHz.indices.filter { aligned.concentrations[$0] >= strong && aligned.weights[$0] >= heard }
         let values = kept.map { aligned.peaksHz[$0] }
-        // Each symbol holds one tone throughout: its two halves agree. Frames of several symbols of something else (a PSK's
-        // reversals) don't.
-        let agreement = correlation(kept.map { aligned.halvesHz[$0] })
-        guard agreement >= minHalfAgreement else { return nil }
-        guard values.count >= minToneSymbols, let grid = grid(values, near: 1 / symbol) else { return nil }
+        guard values.count >= minToneSymbols, let grid = grid(values, near: 1 / symbol.length) else { return nil }
         var counts: [Int: Int] = [:]
         var placed = 0
-        for v in values {
-            let i = ((v - grid.offset) / grid.spacing).rounded()
-            guard abs(v - grid.offset - i * grid.spacing) <= FSKFeatures.maxResidual * grid.spacing else { continue }
-            counts[Int(i), default: 0] += 1
+        var positions: [Int: Int] = [:]   // by frame number
+        for (v, i) in zip(values, kept) {
+            let position = ((v - grid.offset) / grid.spacing).rounded()
+            guard abs(v - grid.offset - position * grid.spacing) <= FSKFeatures.maxResidual * grid.spacing else { continue }
+            counts[Int(position), default: 0] += 1
             placed += 1
+            positions[aligned.frames[i]] = Int(position)
         }
+        // Neighbours that keep their tone, by the parity of the first.
+        var kept2 = [0, 0], pairs = [0, 0]
+        for (frame, position) in positions {
+            guard let next = positions[frame + 1] else { continue }
+            pairs[frame % 2] += 1
+            if next == position { kept2[frame % 2] += 1 }
+        }
+        let pairing = pairs.allSatisfy { $0 >= minPairs }
+            ? abs(Double(kept2[0]) / Double(pairs[0]) - Double(kept2[1]) / Double(pairs[1])) : 0
         var seen = counts.keys.sorted()
+        guard seen.count >= 2 else { return nil }
         // An isolated stray position at either end (one symbol, two or more empty positions away).
         while seen.count > 2, counts[seen[0]] == 1, seen[1] - seen[0] > 2 { seen.removeFirst() }
         while seen.count > 2, counts[seen[seen.count - 1]] == 1, seen[seen.count - 1] - seen[seen.count - 2] > 2 {
@@ -264,12 +375,7 @@ enum SymbolTones {
                 seen.removeLast()
             }
         }
-        let onGrid = Double(placed) / Double(values.count)
-        guard let first = seen.first, let last = seen.last, last > first, onGrid >= minOnGrid,
-              Double(counts.values.max() ?? 0) <= maxToneShare * Double(placed),
-              Double(seen.count) >= minSpanFill * Double(last - first + 1) else { return nil }
-        // One tone at a time: in each symbol the strongest of the tones stands well over the rest. Lines that are all there
-        // at once (an interference comb's, its pulses a symbol apart) share each frame alike.
+        let first = seen[0], last = seen[seen.count - 1]
         let exclusivity = middleValue(kept.map { i -> Double in
             let spectrum = aligned.spectra[i]
             let powers = (first...last).map { position -> Double in
@@ -280,16 +386,29 @@ enum SymbolTones {
             let top = powers.max() ?? 0, rest = (powers.reduce(0, +) - top) / Double(max(1, powers.count - 1))
             return top / max(rest, 1e-30)
         })
-        guard exclusivity >= minExclusivity else { return nil }
-        // With symbols enough for every tone several times over, none between the outermost goes unused.
-        if placed >= symbolsPerTone * (last - first + 1), (first...last).contains(where: { counts[$0] == nil }) { return nil }
-        var count = 2
-        while count < last - first + 1 { count *= 2 }
-        guard count <= maxTones else { return nil }
-        return SymbolTonesReading(baud: 1 / symbol, toneCount: count, spacingHz: 1 / symbol, tonesSpacingHz: grid.spacing,
-                                  tonesSeen: seen.count,
-                                  centreHz: grid.offset + Double(first + last) / 2 * grid.spacing, contrast: contrast,
-                                  onGrid: onGrid, symbols: values.count)
+        return Tones(values: values, grid: grid, counts: counts, placed: placed, first: first, last: last,
+                     seen: seen.count, onGrid: Double(placed) / Double(values.count),
+                     halfAgreement: correlation(kept.map { aligned.halvesHz[$0] }), exclusivity: exclusivity,
+                     pairing: pairing)
+    }
+
+    /// The first of `checks` the tones fail, or nil when they pass them all (see `Check`).
+    static func rejection(_ t: Tones, checks: Set<Check> = Set(Check.allCases)) -> Check? {
+        let span = t.last - t.first + 1
+        let failed: [Check: Bool] = [
+            // Each symbol holds one tone throughout: its two halves agree. Frames of several symbols of something else (a
+            // PSK's reversals) don't.
+            .halves: t.halfAgreement < minHalfAgreement,
+            .toneShare: Double(t.counts.values.max() ?? 0) > maxToneShare * Double(t.placed),
+            .spanFill: Double(t.seen) < minSpanFill * Double(span),
+            // With symbols enough for every tone several times over, none between the outermost goes unused.
+            .emptyTone: t.placed >= symbolsPerTone * span && (t.first...t.last).contains { t.counts[$0] == nil },
+            // One tone at a time: in each symbol the strongest of the tones stands well over the rest. Lines that are all
+            // there at once (an interference comb's, its pulses a symbol apart) share each frame alike.
+            .exclusivity: t.exclusivity < minExclusivity,
+            .pairs: t.pairing > maxPairing,
+        ]
+        return Check.allCases.first { checks.contains($0) && failed[$0] == true }
     }
 
     /// The median.

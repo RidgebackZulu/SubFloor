@@ -165,10 +165,11 @@ public struct SignalIdentity: Codable, Sendable, Equatable {
 ///
 /// **Confidence.** Each row's parameter score (`ModeTable.score`: matching parameters and features add, mismatches
 /// subtract, the family counting twice) is scaled by the measurement's own family confidence (min(1, 0.5 + it)),
-/// then frequency hints add up to +0.15 inside a row's bands (each reaching 2 kHz further, for a receiver tuned off) and,
+/// then frequency hints add up to +0.15 inside a row's bands (a dial's reaching 2 kHz further, for a receiver tuned off) and,
 /// for modes that live only there, take up to 0.15 outside. A slot row gains 0.15 more when the signal's transmissions fit
-/// its UTC slots (`SignalMeasurement.slotFit`). Neither a hint nor slots can lift a match whose parameters alone score under
-/// 0.55 to 0.7. A row is named at 0.7 or
+/// its own UTC slots over two events or more (`SignalMeasurement.slotFits`). Neither a hint nor slots can lift a match
+/// whose parameters alone score under 0.55 to 0.7. A named row's caveat (what its numbers can't tell it from) joins its
+/// evidence. A row is named at 0.7 or
 /// more when no other is within 0.1 of it (neighbours that can't be told apart, DMR and P25 at an in-between
 /// deviation, are listed instead); a signal wider than the view is never named (family only, ruling R5).
 ///
@@ -186,8 +187,10 @@ public enum SignalIdentifier {
     static let ambiguityMargin: Float = 0.1
     /// Parameters scoring under this can't be lifted to a name by a hint, or by a slot fit.
     static let hintFloor = 0.55
-    /// A slot row's match gains `slotBonus` when the signal's transmissions fit its slots this well (`SlotEvidence`).
+    /// A slot row's match gains `slotBonus` when the signal's transmissions fit its slots this well, over this many
+    /// events at least (`SlotEvidence`; one edge fits FT4's grid by chance two times in three).
     static let minSlotFit: Float = 0.75
+    static let minSlotEvents = 2
     static let slotBonus = 0.15
     static let firstSeconds = 3.0
     static let longSeconds = 16.0
@@ -270,9 +273,10 @@ public enum SignalIdentifier {
                 confidence -= hint.outside
                 evidence.append(String(format: "outside the %@ (−%.2f)", hint.name, hint.outside))
             }
-            // Transmissions on the row's own UTC slots: more for a match whose tones already fit, never a name alone.
-            if row.slotted, let slot = m.slotFit, slot.periodSeconds == row.slotPeriodSeconds, slot.fit >= minSlotFit,
-               parameters >= hintFloor {
+            // Transmissions on the row's own UTC slots, two events of them at least: more for a match whose tones already
+            // fit, never a name alone (the `hintFloor` clamp below).
+            if row.slotted, let slot = m.slotFits.first(where: { $0.periodSeconds == row.slotPeriodSeconds }),
+               slot.fit >= minSlotFit, slot.events >= minSlotEvents {
                 confidence += slotBonus
                 evidence.append(String(format: "transmissions start on %@ s UTC boundaries (+%.2f)",
                                        SignalIdentity.number(slot.periodSeconds), slotBonus))
@@ -341,6 +345,11 @@ public enum SignalIdentifier {
         // A named FSK whose shift doesn't show how it is keyed (WSPR, MFSK16, FT8, FT4, Olivia): its width from its
         // parameters and its standard's keying, where the edges sit under the noise (R16).
         if let best, let shaping = ModeTable.row(best.name)?.shaping { ParameterWidth.apply(to: &m, shaping: shaping) }
+        // What its numbers can't tell it from.
+        if var named = best, let caveat = ModeTable.row(named.name)?.caveat {
+            named.evidence.append(caveat)
+            best = named
+        }
         return SignalIdentity(measurement: m, best: best, alternatives: Array(alternatives), needsLongerRead: longer,
                               note: wider)
     }
@@ -356,10 +365,11 @@ public enum SignalIdentifier {
     ///   (`symbolReading`, `SymbolTones`), that is the answer, unless the measurement found a carrier line. The quick first
     ///   answer (no `longer`) reads it only when the measurement says PSK, which a hopping trace can pass for, and asks
     ///   for the longer read when nothing names it; the longer read reads it over its longest transmission, and a reading
-    ///   the first pass made stands if that one doesn't read;
+    ///   the first pass made stands if that one doesn't read (or reads PSK). A narrow trace measured PSK whose tones didn't
+    ///   read, in a slot mode's frequencies, isn't named PSK (`heldForTones`): the quick answer asks for the longer read;
     /// - `endTime` (when the last sample of `iq`, and of the longer read, which ends where `iq` does, was on the air; nil
     ///   for a file or the demo source) puts the trace's on-times against the slot modes' UTC slots (`SlotEvidence`), into
-    ///   `slotFit`: a good fit raises a slot row whose tones already fit (`identify(_:rfHz:)`);
+    ///   `slotFits`: a good fit of two events or more raises a slot row whose tones already fit (`identify(_:rfHz:)`);
     /// - a very wide signal the neighbourhood can't see the edges of, only on positive evidence (`WideOccupancy`) in
     ///   `spectrumDb` (an averaged spectrum of the capture, FFT-shifted; worked out from the IQ when nil);
     /// - nothing there gives "Too weak to identify (SNR n dB)" or "No signal" (`tooWeak`);
@@ -475,7 +485,7 @@ public enum SignalIdentifier {
         // only then, to keep its speed: otherwise the longer read does.
         var firstReading: SignalMeasurement?
         if let narrow {
-            let slot = SlotEvidence.best(onTimes: narrow.trace.onTimes, readEnd: endTime, readSeconds: seconds)
+            let slots = SlotEvidence.all(onTimes: narrow.trace.onTimes, readEnd: endTime, readSeconds: seconds)
             if longer != nil || m.family == .psk,
                let read = symbolReading(first, sampleRate: sampleRate, trace: narrow.trace, pointHz: pointHz,
                                         map: narrow.map, on: SlotEvidence.transmissions(narrow.trace.onTimes), seconds: seconds,
@@ -483,10 +493,16 @@ public enum SignalIdentifier {
                 m = read
                 firstReading = read
             }
-            m.slotFit = slot
+            m.slotFits = slots
             if Task.isCancelled { return cancelled(m) }
         }
         var identity = identify(m, rfHz: captureCenterHz + m.offsetHz)
+        // A narrow trace measured PSK whose tones didn't read, in a slot mode's frequencies, may be that mode's tones on a
+        // read too short or too far off them to show: no PSK name yet, and a longer read.
+        if narrow != nil, m.family == .psk, firstReading == nil, inSlotFrequencies(captureCenterHz + m.offsetHz) {
+            identity = heldForTones(identity)
+            identity.needsLongerRead = true
+        }
         // A longer read may show the speed; until then, what the tones do show.
         if fskRead != nil, identity.best == nil, m.family == .unknown { identity.needsLongerRead = true }
         // A narrow trace nothing names may be an MFSK whose tones the quick answer didn't read.
@@ -515,11 +531,11 @@ public enum SignalIdentifier {
         // A narrow trace's own on-times over the longer read, each moment against its own noise (a receiver's gain
         // steps don't cut its transmissions): its slots, and its longest transmission.
         var timing: (map: TimeFrequencyMap, onTimes: [ClosedRange<Double>])?
-        var slot: SlotFit?
+        var slots: [SlotFit] = []
         var during = 0...readSeconds
         if let narrow {
             timing = narrowTiming(long, sampleRate: sampleRate, trace: narrow.trace)
-            slot = timing.flatMap { SlotEvidence.best(onTimes: $0.onTimes, readEnd: endTime, readSeconds: readSeconds) }
+            slots = timing.map { SlotEvidence.all(onTimes: $0.onTimes, readEnd: endTime, readSeconds: readSeconds) } ?? []
         }
         if let run = timing.flatMap({ longestTransmission($0.onTimes, readSeconds: readSeconds) }) {
             let lower = 2 * Int((run.lowerBound * sampleRate).rounded())
@@ -552,16 +568,20 @@ public enum SignalIdentifier {
                 slow = read
                 longReading = true
             }
-            slow.slotFit = slot
+            slow.slotFits = slots
             if Task.isCancelled { return cancelled(slow) }
         }
         var refined = identify(slow, rfHz: captureCenterHz + slow.offsetHz)
         // Tones the first pass read stand when the longer read shows nothing better (more symbols are more of a fade, a
         // neighbour's turn, or the receiver's gain stepping down).
-        if !longReading, refined.best == nil, var firstReading {
-            firstReading.slotFit = slot ?? firstReading.slotFit
+        if !longReading, refined.best == nil || slow.family == .psk, var firstReading {
+            if !slots.isEmpty { firstReading.slotFits = slots }
             let kept = identify(firstReading, rfHz: captureCenterHz + firstReading.offsetHz)
             if kept.best != nil { refined = kept }
+        }
+        if narrow != nil, slow.family == .psk, !longReading, refined.measurement.family == .psk,
+           inSlotFrequencies(captureCenterHz + slow.offsetHz) {
+            refined = heldForTones(refined)
         }
         if refined.best == nil, slow.family == .unknown, let tones {
             let rereading = tones.reading(read.iq, rate: sampleRate, zeroHz: 0)
@@ -687,6 +707,20 @@ public enum SignalIdentifier {
             return view.traces.contains(nearest.signal.traces[0]) ? nil : nearest.signal
         }
         return signals.first { $0.tones != nil && ($0.lowerHz - radiusHz)...($0.upperHz + radiusHz) ~= pointHz }
+    }
+
+    /// Whether `rfHz` lies in a slot mode's own frequencies (its hint).
+    static func inSlotFrequencies(_ rfHz: Double) -> Bool { ModeTable.rows.contains { $0.slotted && $0.hinted(rfHz) } }
+
+    /// `identity` with a PSK name held under the name threshold and listed among the alternatives, said why.
+    static func heldForTones(_ identity: SignalIdentity) -> SignalIdentity {
+        guard var best = identity.best, ModeTable.row(best.name)?.families.contains(.psk) == true else { return identity }
+        var held = identity
+        best.confidence = min(best.confidence, nameThreshold - 0.01)
+        best.evidence.append("a narrow trace in a slot mode's frequencies whose tones didn't read: may be its tones hopping")
+        held.best = nil
+        held.alternatives = Array(([best] + identity.alternatives).prefix(maxAlternatives))
+        return held
     }
 
     /// The nearest trace within `radiusHz` of the point, the strongest of equals.

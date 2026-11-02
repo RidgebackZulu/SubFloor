@@ -66,8 +66,10 @@ import Testing
 
     /// The targets on the held-out part, which is only ever scored, through the hover's path on clips (no decode), and no
     /// wrong name on any truth: FT8 never named FT4, nor the reverse. By default every empty point and 2 transmitting
-    /// windows each of FT8, FT4 and the FSK; `SUBFLOOR_SIGNALID_MATRIX=1` asserts over all of them. `fullRecordings`
-    /// asserts the same targets at the capture's own rate. The rows grow as the tasks that meet them land.
+    /// windows each of FT8, FT4 and the FSK; `SUBFLOOR_SIGNALID_MATRIX=1` asserts over all of them. FT8's and FT4's shares
+    /// (`gatedTargets`) are asserted only then, or with `SUBFLOOR_SIGNALID_REAL=1`: two windows say little of a share, and
+    /// the default run holds what matters most there, no wrong name. `fullRecordings` asserts the same targets at the
+    /// capture's own rate. The rows grow as the tasks that meet them land.
     @Test func heldOutTargets() throws {
         let held = try RealCorpus.points(.heldOut)
         // A share of 95% means nothing over 2 points, and an empty point costs little: all of them, always.
@@ -84,12 +86,14 @@ import Testing
             for truth in score.keys.sorted() { print("heldOutTargets \(truth): \(score[truth]!.right)/\(score[truth]!.total) right") }
             for line in wrong { print("heldOutTargets wrong: \(line)") }
         }
-        Self.expectTargets(score, "clip path")
+        Self.expectTargets(score, "clip path", all: Sweep.full || Self.environment["SUBFLOOR_SIGNALID_REAL"] == "1")
         #expect(wrong.isEmpty, "clip path: wrong names at 0.7 or more: \(wrong)")
     }
 
     /// The share right each truth must reach.
     static let targets = ["none": 0.95, "2-FSK": 0.8, "FT8": 0.8, "FT4": 0.8]
+    /// The targets a default run doesn't assert (see `heldOutTargets`).
+    static let gatedTargets: Set<String> = ["FT8", "FT4"]
     /// The FSK's neighbour, which stays its own signal.
     static let fskNeighbourHz = 11_685_864.0
     static let fskNeighbourReachHz = 500.0
@@ -121,8 +125,9 @@ import Testing
         }
     }
 
-    static func expectTargets(_ score: [String: (right: Int, total: Int)], _ path: String) {
-        for (truth, target) in targets {
+    static func expectTargets(_ score: [String: (right: Int, total: Int)], _ path: String, all: Bool = true,
+                              only: Set<String>? = nil) {
+        for (truth, target) in targets where (all || !gatedTargets.contains(truth)) && (only?.contains(truth) ?? true) {
             guard let s = score[truth] else {
                 Issue.record("\(path): nothing scored for \(truth)")
                 continue
@@ -134,10 +139,12 @@ import Testing
     /// The same points through the capture's own read, on the recordings themselves: the owner's 1 MS/s, which the
     /// clips' 62.5 kS/s must not hide. Prints every part's score and asserts the held-out targets. Every empty point;
     /// `SUBFLOOR_SIGNALID_REAL_POINTS=n` keeps the first n points of each other truth, per part (the whole run is about
-    /// 30 minutes in a debug build).
+    /// 30 minutes in a debug build), and `SUBFLOOR_SIGNALID_REAL_TRUTHS=FT8,FT4` only those truths (then only their
+    /// targets, and every wrong name among them).
     @Test(.enabled(if: environment["SUBFLOOR_SIGNALID_REAL"] == "1")) func fullRecordings() throws {
         let manifest = try RealCorpus.manifest()
         let allowed = Self.environment["SUBFLOOR_SIGNALID_REAL_POINTS"].flatMap(Int.init)
+        let truths = Self.environment["SUBFLOOR_SIGNALID_REAL_TRUTHS"].map { Set($0.split(separator: ",").map(String.init)) }
         var kept: [String: Int] = [:]
         let identify = { (clip: CorpusClip, point: CorpusPoint) -> SignalIdentity in
             guard let recording = manifest.recordings.first(where: { $0.clips.contains { $0.name == clip.name } }),
@@ -153,6 +160,7 @@ import Testing
         }
         func trimmed(_ part: CorpusPart) throws -> [CorpusPoint] {
             try RealCorpus.points(part).filter { point in
+                if let truths, !truths.contains(point.truth) { return false }
                 guard let allowed, point.truth != "none" else { return true }
                 let key = "\(part) \(point.truth)"
                 kept[key, default: 0] += 1
@@ -195,9 +203,12 @@ import Testing
                 print("fullRecordings \(part.rawValue) \(truth) answers: \(top.joined(separator: "; "))")
             }
             print("fullRecordings \(part.rawValue) wrong names at 0.7 or more: \(wrong.count)")
-            for line in wrong.prefix(20) { print("fullRecordings wrong: \(line)") }
+            for line in wrong { print("fullRecordings wrong: \(line)") }
             #expect(wrong.isEmpty, "1 MS/s \(part): wrong names at 0.7 or more: \(wrong)")
-            if part == .heldOut { Self.expectTargets(score, "1 MS/s") }
+            if part == .heldOut {
+                Self.expectTargets(score.filter { truths?.contains($0.key) ?? true }, "1 MS/s",
+                                   only: truths)
+            }
         }
     }
 

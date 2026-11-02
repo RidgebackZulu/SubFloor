@@ -8,11 +8,14 @@ public struct SlotFit: Codable, Sendable, Equatable {
     /// The share of what the read shows of its transmissions (where they start, end and how long they last) that fits the
     /// grid, under one clock error. 0 when the read shows no edge at all.
     public var fit: Float
+    /// How many of those fit: one edge alone fits FT4's grid by chance two times in three.
+    public var events: Int
 
-    public init(periodSeconds: Double, lengthSeconds: Double, fit: Float) {
+    public init(periodSeconds: Double, lengthSeconds: Double, fit: Float, events: Int) {
         self.periodSeconds = periodSeconds
         self.lengthSeconds = lengthSeconds
         self.fit = fit
+        self.events = events
     }
 }
 
@@ -32,8 +35,9 @@ public struct SlotFit: Codable, Sendable, Equatable {
 /// little more to each event (`eventToleranceSeconds`). Every event of a read shares the clock's error: the fit is the
 /// largest share of events that agree under one error within the clock's tolerance.
 ///
-/// Timing alone never names a mode: 2 s is a large share of a 7.5 s slot, so a random start fits FT4's grid one time in
-/// two. `SignalIdentifier` only lets a good fit add to a match whose tones already fit.
+/// Timing alone never names a mode: 2 s is a large share of a 7.5 s slot, so a random start fits FT4's grid two times in
+/// three. `SignalIdentifier` only lets a good fit of at least two events (`SlotFit.events`) add to a match whose tones
+/// already fit.
 enum SlotEvidence {
     static let clockToleranceSeconds = 2.0
     /// A slot mode's transmission starts this far into its slot.
@@ -78,14 +82,15 @@ enum SlotEvidence {
             if ends { timed.append(error(run.upperBound, target: startSeconds + length)) }
         }
         let total = timed.count + failed + fitting
-        guard total > 0 else { return SlotFit(periodSeconds: period, lengthSeconds: length, fit: 0) }
+        guard total > 0 else { return SlotFit(periodSeconds: period, lengthSeconds: length, fit: 0, events: 0) }
         var agreeing = 0
         var clock = -clockToleranceSeconds
         while clock <= clockToleranceSeconds + 1e-9 {
             agreeing = max(agreeing, timed.filter { abs($0 - clock) <= eventToleranceSeconds }.count)
             clock += clockStepSeconds
         }
-        return SlotFit(periodSeconds: period, lengthSeconds: length, fit: Float(agreeing + fitting) / Float(total))
+        return SlotFit(periodSeconds: period, lengthSeconds: length, fit: Float(agreeing + fitting) / Float(total),
+                       events: agreeing + fitting)
     }
 
     /// On-times as transmissions, in order: those under `blipSeconds` dropped, those closer than `gapSeconds` joined.
@@ -101,11 +106,10 @@ enum SlotEvidence {
         return out
     }
 
-    /// The best fit of `onTimes` over the slot rows' grids, nil without a true time or a slot row.
-    static func best(onTimes: [ClosedRange<Double>], readEnd: Date?, readSeconds: Double) -> SlotFit? {
+    /// The fit of `onTimes` to each slot row's grid; none without a true time.
+    static func all(onTimes: [ClosedRange<Double>], readEnd: Date?, readSeconds: Double) -> [SlotFit] {
         ModeTable.rows.filter { $0.slotted && $0.slotPeriodSeconds > 0 }
             .compactMap { fit(onTimes: onTimes, readEnd: readEnd, readSeconds: readSeconds, period: $0.slotPeriodSeconds,
                               length: $0.slotSeconds) }
-            .max { ($0.fit, $0.periodSeconds) < ($1.fit, $1.periodSeconds) }
     }
 }
