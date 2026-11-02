@@ -264,6 +264,33 @@ public enum SignalSynth {
         return out
     }
 
+    /// One of several signals in a capture (`several`): at `offsetHz`, `snrDb` over the noise in its own occupied bandwidth.
+    public struct Placed: Sendable {
+        public var spec: SynthSpec
+        public var offsetHz: Double
+        public var snrDb: Double
+        public var seed: UInt64
+
+        public init(_ spec: SynthSpec, offsetHz: Double, snrDb: Double, seed: UInt64) {
+            self.spec = spec
+            self.offsetHz = offsetHz
+            self.snrDb = snrDb
+            self.seed = seed
+        }
+    }
+
+    /// Several signals in one capture over the same noise (a band of FT8 stations): each as `make` would put it alone, the
+    /// noise from `noiseSeed`, of unit power over the whole sample rate.
+    public static func several(_ signals: [Placed], sampleRate: Double, seconds: Double, noiseSeed: UInt64) -> [Float] {
+        var out = make(.noise, sampleRate: sampleRate, seconds: seconds, snrDb: 0, seed: noiseSeed)
+        for signal in signals {
+            let x = render(signal.spec, sampleRate: sampleRate, seconds: seconds, offsetHz: signal.offsetHz, seed: signal.seed)
+            let gain = Float((pow(10, signal.snrDb / 10) * occupiedBandwidthHz(for: signal.spec) / sampleRate).squareRoot())
+            for k in 0..<min(out.count, x.count) { out[k] += gain * x[k] }
+        }
+        return out
+    }
+
     /// One tone of an FSK fading by up to `depthDb` while the others hold, as selective fading does.
     public static func fading(toneIndex: Int, depthDb: Double, rateHz: Double = 0.5) -> SynthImpairments {
         SynthImpairments(fadeDepthDb: depthDb, fadeRateHz: rateHz, fadingToneIndex: toneIndex)

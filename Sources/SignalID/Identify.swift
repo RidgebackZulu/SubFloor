@@ -33,10 +33,18 @@ public struct SignalIdentity: Codable, Sendable, Equatable {
     public var note: String?
     /// The signal is a line of an interference comb across the capture (`InterferenceComb`): never named.
     public var comb: CombInfo?
+    /// Filled when several signals lie under the point: each one's answer. Empty for one signal. The rest of this answer
+    /// (`measurement`, `best` …) is the signal nearest the point's, which is also one of these.
+    public var signals: [SignalIdentity]
+    /// A connected group of one slot mode: its whole span, relative to the capture centre.
+    public var groupSpanHz: ClosedRange<Double>?
+    /// The capture centre `groupSpanHz` is relative to, for the label's span in display Hz.
+    public var captureCenterHz: Double?
 
     public init(measurement: SignalMeasurement, best: ModeMatch? = nil, alternatives: [ModeMatch] = [],
                 needsLongerRead: Bool = false, confirmedByDecode: Bool = false, note: String? = nil,
-                comb: CombInfo? = nil) {
+                comb: CombInfo? = nil, signals: [SignalIdentity] = [], groupSpanHz: ClosedRange<Double>? = nil,
+                captureCenterHz: Double? = nil) {
         self.measurement = measurement
         self.best = best
         self.alternatives = alternatives
@@ -44,16 +52,73 @@ public struct SignalIdentity: Codable, Sendable, Equatable {
         self.confirmedByDecode = confirmedByDecode
         self.note = note
         self.comb = comb
+        self.signals = signals
+        self.groupSpanHz = groupSpanHz
+        self.captureCenterHz = captureCenterHz
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case measurement, best, alternatives, needsLongerRead, confirmedByDecode, note, comb, signals, groupSpanHz,
+             captureCenterHz
+    }
+
+    /// JSON from before `signals` decodes, and one signal's encodes as it did: the group's fields only when there is one.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        measurement = try c.decode(SignalMeasurement.self, forKey: .measurement)
+        best = try c.decodeIfPresent(ModeMatch.self, forKey: .best)
+        alternatives = try c.decode([ModeMatch].self, forKey: .alternatives)
+        needsLongerRead = try c.decode(Bool.self, forKey: .needsLongerRead)
+        confirmedByDecode = try c.decode(Bool.self, forKey: .confirmedByDecode)
+        note = try c.decodeIfPresent(String.self, forKey: .note)
+        comb = try c.decodeIfPresent(CombInfo.self, forKey: .comb)
+        signals = try c.decodeIfPresent([SignalIdentity].self, forKey: .signals) ?? []
+        groupSpanHz = try c.decodeIfPresent(ClosedRange<Double>.self, forKey: .groupSpanHz)
+        captureCenterHz = try c.decodeIfPresent(Double.self, forKey: .captureCenterHz)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(measurement, forKey: .measurement)
+        try c.encodeIfPresent(best, forKey: .best)
+        try c.encode(alternatives, forKey: .alternatives)
+        try c.encode(needsLongerRead, forKey: .needsLongerRead)
+        try c.encode(confirmedByDecode, forKey: .confirmedByDecode)
+        try c.encodeIfPresent(note, forKey: .note)
+        try c.encodeIfPresent(comb, forKey: .comb)
+        if !signals.isEmpty { try c.encode(signals, forKey: .signals) }
+        try c.encodeIfPresent(groupSpanHz, forKey: .groupSpanHz)
+        try c.encodeIfPresent(captureCenterHz, forKey: .captureCenterHz)
     }
 
     /// The one-line text: `RTTY · 45.45 Bd · 170 Hz shift · 91%` when named, `2-FSK · 50 Bd · 850 Hz shift` when
     /// not, `Interference comb · 19.3 kHz spacing` on a comb's line, or the note when there is nothing to measure.
+    /// Several signals under the point: `FT8 · 9 signals · 14.0731–14.0755 MHz` for a group of one slot mode that all
+    /// read as it, `Several signals: FT8 ×6, unknown ×2` otherwise (an unnamed one is `unknown`).
     public var label: String {
+        if !signals.isEmpty { return groupLabel }
         if let comb { return "Interference comb · \(Self.hz(comb.spacingHz)) spacing" }
         if best == nil, measurement.family == .noise || measurement.occupiedBandwidthHz == 0, let note { return note }
         var parts = [best?.name ?? Self.familyName(measurement)] + Self.parameters(measurement)
         if let best { parts.append("\(Int((100 * best.confidence).rounded()))%") }
         return parts.joined(separator: " · ")
+    }
+
+    /// `label` for several signals.
+    var groupLabel: String {
+        if let span = groupSpanHz, let name = signals.first?.best?.name, signals.allSatisfy({ $0.best?.name == name }) {
+            return "\(name) · \(signals.count) signals · \(Self.span(span, centreHz: captureCenterHz ?? 0))"
+        }
+        let counts = Dictionary(grouping: signals) { $0.best?.name ?? "unknown" }.mapValues(\.count)
+        let ordered = counts.sorted { ($0.value, $1.key) > ($1.value, $0.key) }
+        return "Several signals: " + ordered.map { "\($0.key) ×\($0.value)" }.joined(separator: ", ")
+    }
+
+    /// `14.0731–14.0755 MHz`, `474.2–475.0 kHz`: a span relative to `centreHz`, in display Hz.
+    static func span(_ span: ClosedRange<Double>, centreHz: Double) -> String {
+        let lower = centreHz + span.lowerBound, upper = centreHz + span.upperBound
+        if abs(lower) >= 1_000_000 { return String(format: "%.4f–%.4f MHz", lower / 1e6, upper / 1e6) }
+        return String(format: "%.1f–%.1f kHz", lower / 1e3, upper / 1e3)
     }
 
     /// The parameters for the ID card, by name.
@@ -394,7 +459,9 @@ public enum SignalIdentifier {
     ///   modulated signal on the grid, or one a mode's numbers name, keeps its own answer. A trace that may be a narrow
     ///   MFSK (`mayBeNarrowMFSK`: a row of FT8s can sit on a grid, and their hops are too quick for the map) is labelled
     ///   only once its tones have been tried (`symbolReading`): not on a quick answer that leaves them to the longer read,
-    ///   nor with an agent's width.
+    ///   nor with an agent's width;
+    /// - several signals within `pointRadiusHz` (no agent's width given): the answer for the point's own, with them all in
+    ///   `signals` (`underThePoint`), a slot mode's whole connected group when it is one.
     ///
     /// A cancelled task stops between stages (the neighbourhood, the measurement, each step of the longer read) and gets
     /// `cancelledNote` with what was measured so far: an answer nobody is waiting for.
@@ -421,14 +488,18 @@ public enum SignalIdentifier {
         } ?? []
         // Whether the point's trace is a comb line, and one that may be a narrow MFSK whose tones haven't been read.
         var onCombLine = false, tonesUnread = false
+        // What the point's neighbourhood showed, for the other signals under it (`underThePoint`); none with an agent's width.
+        var around: (hood: Neighbourhood, view: NeighbourhoodView, signals: [SignalCandidate])?
         func answer(_ identity: SignalIdentity) -> SignalIdentity {
-            guard onCombLine, !tonesUnread, let comb, identity.best == nil,
-                  combFamilies.contains(identity.measurement.family) else {
-                return identity
-            }
             var labelled = identity
-            labelled.comb = comb.info
-            return labelled
+            if onCombLine, !tonesUnread, let comb, identity.best == nil, combFamilies.contains(identity.measurement.family) {
+                labelled.comb = comb.info
+            }
+            guard let around, !Task.isCancelled else { return labelled }
+            return underThePoint(labelled, first: first, sampleRate: sampleRate, captureCenterHz: captureCenterHz,
+                                 hood: around.hood, view: around.view, signals: around.signals, pointHz: pointHz,
+                                 radiusHz: pointRadiusHz, seconds: seconds, endTime: endTime, readsTones: longer != nil,
+                                 combLinesHz: combLines)
         }
 
         // The seed: an agent's bandwidth, or what the neighbourhood shows at the point.
@@ -476,6 +547,7 @@ public enum SignalIdentifier {
             onCombLine = isOnCombLine(view, map: map, pointHz: pointHz, radiusHz: pointRadiusHz, combLinesHz: combLines)
             let signals = candidates(hood, view: view, pointHz: pointHz, radiusHz: pointRadiusHz)
             if Task.isCancelled { return cancelled(SignalMeasurement(offsetHz: pointHz, seconds: seconds)) }
+            around = (hood, view, signals)
             var here = signalAtPoint(signals, view: view, pointHz: pointHz, radiusHz: pointRadiusHz)
             // Tones that read as tones. Too few changes to show a speed, they are still what they are; plenty and none, they
             // may be a fast signal's lobes, or an FM's lines, and the numbers aren't to be trusted.
@@ -514,37 +586,13 @@ public enum SignalIdentifier {
             if Task.isCancelled { return cancelled(SignalMeasurement(offsetHz: pointHz, seconds: seconds)) }
         }
 
-        var m = SignalMeasurer.measure(first, sampleRate: sampleRate, offsetHz: seed.offsetHz,
-                                       bandwidthHz: seed.widthHz, seconds: seconds, ceiling: ceiling)
-        if Task.isCancelled { return cancelled(m) }
-        // A narrow trace whose symbols sit on tones spaced by their rate is that MFSK, whatever else its few seconds
-        // looked like (FT8's hops can pass for a PSK's). The quick first answer (no longer read to follow) reads its tones
-        // only then, to keep its speed: otherwise the longer read does.
-        var firstReading: SignalMeasurement?
-        if let narrow {
-            let slots = SlotEvidence.all(onTimes: narrow.trace.onTimes, readEnd: endTime, readSeconds: seconds)
-            if longer != nil || m.family == .psk,
-               let read = symbolReading(first, sampleRate: sampleRate, trace: narrow.trace, pointHz: pointHz,
-                                        map: narrow.map, on: SlotEvidence.transmissions(narrow.trace.onTimes), seconds: seconds,
-                                        measured: m) {
-                m = read
-                firstReading = read
-            }
-            m.slotFits = slots
-            if Task.isCancelled { return cancelled(m) }
-            tonesUnread = longer == nil && firstReading == nil && m.family != .psk
-        }
-        var identity = identify(m, rfHz: captureCenterHz + m.offsetHz)
-        // A narrow trace measured PSK whose tones didn't read, in a slot mode's frequencies, may be that mode's tones on a
-        // read too short or too far off them to show: no PSK name yet, and a longer read.
-        if narrow != nil, m.family == .psk, firstReading == nil, inSlotFrequencies(captureCenterHz + m.offsetHz) {
-            identity = heldForTones(identity)
-            identity.needsLongerRead = true
-        }
-        // A longer read may show the speed; until then, what the tones do show.
-        if fskRead != nil, identity.best == nil, m.family == .unknown { identity.needsLongerRead = true }
-        // A narrow trace nothing names may be an MFSK whose tones the quick answer didn't read.
-        if narrow != nil, longer == nil, identity.best == nil, m.family == .unknown { identity.needsLongerRead = true }
+        let pass = firstMeasurement(first, sampleRate: sampleRate, captureCenterHz: captureCenterHz, seed: seed,
+                                    ceiling: ceiling, narrow: narrow, pointHz: pointHz, seconds: seconds, endTime: endTime,
+                                    readsTones: longer != nil, tonesTakeTurns: fskRead != nil)
+        let m = pass.m, firstReading = pass.firstReading
+        if pass.cancelled { return cancelled(m) }
+        if narrow != nil { tonesUnread = pass.tonesUnread }
+        let identity = pass.identity
         guard identity.needsLongerRead, !Task.isCancelled, let read = longer?(), read.iq.count >= 2 else {
             if Task.isCancelled { return cancelled(m) }
             if let fskRead, identity.best == nil, m.family == .unknown {
@@ -634,6 +682,231 @@ public enum SignalIdentifier {
         if let note = refined.note { notes.insert(note, at: 0) }
         refined.note = notes.isEmpty ? nil : notes.joined(separator: "; ")
         return answer(refined)
+    }
+
+    /// What the first pass measured at a seed, and the name it gave.
+    struct FirstMeasurement {
+        var m: SignalMeasurement
+        var identity: SignalIdentity
+        /// What a narrow trace's tones read as (`symbolReading`), when they read.
+        var firstReading: SignalMeasurement?
+        /// A narrow trace whose tones weren't tried: left to the longer read.
+        var tonesUnread = false
+        var cancelled = false
+    }
+
+    /// The first pass's measurement of `seed` in `first` (`seconds` of it) and its name. A narrow trace whose symbols sit
+    /// on tones spaced by their rate is that MFSK, whatever else its few seconds looked like (FT8's hops can pass for a
+    /// PSK's): its tones are read (`readsTones`, when a longer read follows) or, on the quick first answer, only when it
+    /// measures PSK, to keep its speed. `tonesTakeTurns`: what is measured is tones whose own reading showed no speed.
+    static func firstMeasurement(_ first: [Float], sampleRate: Double, captureCenterHz: Double,
+                                 seed: (offsetHz: Double, widthHz: Double), ceiling: SignalMeasurer.Ceiling,
+                                 narrow: (trace: SignalTrace, map: TimeFrequencyMap)?, pointHz: Double, seconds: Double,
+                                 endTime: Date?, readsTones: Bool, tonesTakeTurns: Bool) -> FirstMeasurement {
+        var m = SignalMeasurer.measure(first, sampleRate: sampleRate, offsetHz: seed.offsetHz,
+                                       bandwidthHz: seed.widthHz, seconds: seconds, ceiling: ceiling)
+        var out = FirstMeasurement(m: m, identity: SignalIdentity(measurement: m))
+        if Task.isCancelled { out.cancelled = true; return out }
+        if let narrow {
+            let slots = SlotEvidence.all(onTimes: narrow.trace.onTimes, readEnd: endTime, readSeconds: seconds)
+            if readsTones || m.family == .psk,
+               let read = symbolReading(first, sampleRate: sampleRate, trace: narrow.trace, pointHz: pointHz,
+                                        map: narrow.map, on: SlotEvidence.transmissions(narrow.trace.onTimes), seconds: seconds,
+                                        measured: m) {
+                m = read
+                out.firstReading = read
+            }
+            m.slotFits = slots
+            out.m = m
+            if Task.isCancelled { out.cancelled = true; return out }
+            out.tonesUnread = !readsTones && out.firstReading == nil && m.family != .psk
+        }
+        out.m = m
+        var identity = identify(m, rfHz: captureCenterHz + m.offsetHz)
+        // A narrow trace measured PSK whose tones didn't read, in a slot mode's frequencies, may be that mode's tones on a
+        // read too short or too far off them to show: no PSK name yet, and a longer read.
+        if narrow != nil, m.family == .psk, out.firstReading == nil, inSlotFrequencies(captureCenterHz + m.offsetHz) {
+            identity = heldForTones(identity)
+            identity.needsLongerRead = true
+        }
+        // A longer read may show the speed; until then, what the tones do show.
+        if tonesTakeTurns, identity.best == nil, m.family == .unknown { identity.needsLongerRead = true }
+        // A narrow trace nothing names may be an MFSK whose tones the quick answer didn't read.
+        if narrow != nil, !readsTones, identity.best == nil, m.family == .unknown { identity.needsLongerRead = true }
+        out.identity = identity
+        return out
+    }
+
+    // MARK: Several signals
+
+    /// At most this many signals under the point are measured in the first pass: the point's own and the strongest others.
+    static let firstPassMeasured = 3
+    /// Signals of one slot mode this close together (edge to edge) are one connected group.
+    static let groupGapHz = 400.0
+    /// An unmeasured trace takes a measured one's slot mode only when its width on the map is within this share of that
+    /// one's: FT4's traces read about twice FT8's, and two FT8 stations side by side as one trace wider still.
+    static let inheritWidthShare = 0.3
+
+    /// `point` (the answer for the signal nearest the point) with every other signal under the point (`signals`): the
+    /// lines and FSKs `SignalGrouper` found within `radiusHz` of it, except an interference comb's lines (`isCombLine`),
+    /// which are no signals. Fewer than two of them leaves `point` as it is, and so does a point inside an area (voice,
+    /// AM): that signal is the point's.
+    /// - The point's own is the one its answer lies on (the strongest of equals), and whatever lies inside its answer (a
+    ///   carrier's sidebands, an FSK's tones): so is what lies inside another one's. When the point's own is a comb's line,
+    ///   the answer is the nearest of the others.
+    /// - Up to `firstPassMeasured` are measured, the point's own and then the strongest, as the point is
+    ///   (`memberAnswer`).
+    /// - When the names among them are one slot mode's (FT8, FT4) alone, the signals are its whole connected group
+    ///   (`groupGapHz` apart at most, as far as the view goes), and `groupSpanHz` its span.
+    /// - One not measured takes the slot-mode name of the nearest measured one it fits the same slot and width as
+    ///   (`fitsSameSlot`); otherwise it is unknown, until it is measured itself.
+    static func underThePoint(_ point: SignalIdentity, first: [Float], sampleRate: Double, captureCenterHz: Double,
+                              hood: Neighbourhood, view: NeighbourhoodView, signals: [SignalCandidate], pointHz: Double,
+                              radiusHz: Double, seconds: Double, endTime: Date?, readsTones: Bool,
+                              combLinesHz: [Double]) -> SignalIdentity {
+        func isComb(_ c: SignalCandidate) -> Bool {
+            c.tones == nil && c.traces.count == 1
+                && InterferenceComb.isCombLine(c.traces[0], view: view, map: hood.map, linesHz: combLinesHz)
+        }
+        func distance(_ c: SignalCandidate, from hz: Double) -> Double { max(0, c.lowerHz - hz, hz - c.upperHz) }
+        // A point inside an area (voice, AM) is that signal's alone.
+        guard !view.areas.contains(where: { $0.lowerHz...$0.upperHz ~= pointHz }) else { return point }
+        let near = signals.filter { $0.kind != .area && distance($0, from: pointHz) <= radiusHz }
+        let inRadius = near.filter { !isComb($0) }
+        // The point's own: where its answer lies.
+        let at = point.measurement.offsetHz
+        guard inRadius.count >= 2, let own = near.min(by: {
+            (distance($0, from: at), -level($0)) < (distance($1, from: at), -level($1))
+        }) else { return point }
+        // A comb's line at the point is no signal of them: the others are measured as many, and the nearest is the answer.
+        let onComb = isComb(own)
+        var measured: [(candidate: SignalCandidate, identity: SignalIdentity)] = onComb ? [] : [(own, point)]
+        func taken(_ c: SignalCandidate) -> Bool { measured.contains { $0.candidate == c || holds($0.identity, c) } }
+        for c in inRadius.sorted(by: { level($0) > level($1) }) where measured.count < firstPassMeasured && !taken(c) {
+            if Task.isCancelled { return point }
+            measured.append((c, memberAnswer(c, first: first, sampleRate: sampleRate, captureCenterHz: captureCenterHz,
+                                             hood: hood, view: view, signals: signals, seconds: seconds, endTime: endTime,
+                                             readsTones: readsTones)))
+        }
+        let names = Set(measured.compactMap { $0.identity.best?.name })
+        let mode = names.count == 1 ? names.first.flatMap(ModeTable.row).flatMap { $0.slotted ? $0 : nil } : nil
+
+        // The signals: those in the radius, or a slot mode's whole connected group.
+        var members = inRadius
+        if mode != nil {
+            var span = (lower: inRadius.map(\.lowerHz).min()!, upper: inRadius.map(\.upperHz).max()!)
+            var grew = true
+            while grew {
+                grew = false
+                for c in signals where c.kind != .area && !members.contains(c) && !isComb(c)
+                    && max(c.lowerHz - span.upper, span.lower - c.upperHz) <= groupGapHz {
+                    members.append(c)
+                    span = (min(span.lower, c.lowerHz), max(span.upper, c.upperHz))
+                    grew = true
+                }
+            }
+        }
+        var answers = measured.map(\.identity)
+        var spans = measured.map { ($0.candidate.lowerHz, $0.candidate.upperHz) }
+        for c in members where !taken(c) {
+            let centre = (c.lowerHz + c.upperHz) / 2
+            let from = measured.filter { entry in
+                guard let row = entry.identity.best.flatMap({ ModeTable.row($0.name) }), row.slotted else { return false }
+                return fitsSameSlot(c, as: entry.candidate, readSeconds: seconds, endTime: endTime, row: row)
+            }.min { abs($0.identity.measurement.offsetHz - centre) < abs($1.identity.measurement.offsetHz - centre) }
+            answers.append(unmeasured(c, seconds: seconds, captureCenterHz: captureCenterHz, from: from?.identity))
+            spans.append((c.lowerHz, c.upperHz))
+        }
+        guard answers.count >= 2 else { return point }
+        var out = point
+        if onComb, let nearest = measured.min(by: {
+            (distance($0.candidate, from: pointHz), -level($0.candidate)) < (distance($1.candidate, from: pointHz), -level($1.candidate))
+        }) {
+            out = nearest.identity
+        }
+        out.signals = answers.sorted { $0.measurement.offsetHz < $1.measurement.offsetHz }
+        if mode != nil { out.groupSpanHz = spans.map(\.0).min()!...spans.map(\.1).max()! }
+        out.captureCenterHz = captureCenterHz
+        return out
+    }
+
+    /// A candidate's strength: its strongest line over the noise.
+    static func level(_ c: SignalCandidate) -> Double { c.traces.map(\.snrDb).max() ?? -.infinity }
+
+    /// Whether `c`'s middle lies inside what `identity` answered for: part of that signal.
+    static func holds(_ identity: SignalIdentity, _ c: SignalCandidate) -> Bool {
+        let m = identity.measurement
+        return m.occupiedBandwidthHz > 0 && abs((c.lowerHz + c.upperHz) / 2 - m.offsetHz) <= m.occupiedBandwidthHz / 2
+    }
+
+    /// One of several signals under the point, measured and named as the point is on the first pass: an FSK by its tones
+    /// when they show a speed, otherwise its extent (`located`) measured, a narrow trace's tones read as the point's are.
+    static func memberAnswer(_ c: SignalCandidate, first: [Float], sampleRate: Double, captureCenterHz: Double,
+                             hood: Neighbourhood, view: NeighbourhoodView, signals: [SignalCandidate], seconds: Double,
+                             endTime: Date?, readsTones: Bool) -> SignalIdentity {
+        let centre = (c.lowerHz + c.upperHz) / 2
+        if c.tones != nil, let read = DirectFSK.Tones(c, signals: signals, noiseDb: view.noiseDb)?
+            .reading(SignalMeasurer.interleaved(hood.samples), rate: hood.rate, zeroHz: hood.centreHz),
+           read.reading.baud != nil {
+            return identify(read.measurement(seconds: seconds), rfHz: captureCenterHz + read.offsetHz)
+        }
+        // A line of the view's own is found at its middle; a station `SignalGrouper` found, or an FSK, is given.
+        let line = c.tones == nil && c.traces.count == 1 && view.traces.contains(c.traces[0]) ? c.traces[0] : nil
+        guard let found = located(view, signal: line == nil ? c : nil, signals: signals, map: hood.map, pointHz: centre,
+                                  radiusHz: (c.upperHz - c.lowerHz) / 2) else {
+            return unmeasured(c, seconds: seconds, captureCenterHz: captureCenterHz, from: nil)
+        }
+        let narrow = line.flatMap { mayBeNarrowMFSK($0) ? ($0, hood.map) : nil }
+        return firstMeasurement(first, sampleRate: sampleRate, captureCenterHz: captureCenterHz,
+                                seed: (found.offsetHz, found.widthHz), ceiling: found.ceiling, narrow: narrow,
+                                pointHz: centre, seconds: seconds, endTime: endTime, readsTones: readsTones,
+                                tonesTakeTurns: false).identity
+    }
+
+    /// A signal under the point that wasn't measured: `from`'s slot-mode name when it fits `from`'s slot and width, or
+    /// unknown.
+    static func unmeasured(_ c: SignalCandidate, seconds: Double, captureCenterHz: Double,
+                           from: SignalIdentity?) -> SignalIdentity {
+        let width = c.upperHz - c.lowerHz
+        var m = SignalMeasurement(offsetHz: (c.lowerHz + c.upperHz) / 2, occupiedBandwidthHz: width,
+                                  bandwidth6dBHz: width, snrDb: level(c), family: .unknown, seconds: seconds,
+                                  notes: ["Not measured: one of several signals under the point"])
+        guard let from, let name = from.best else { return SignalIdentity(measurement: m) }
+        let at = String(format: "%.0f Hz", captureCenterHz + from.measurement.offsetHz)
+        m.family = from.measurement.family
+        m.familyConfidence = from.measurement.familyConfidence
+        m.notes = ["Not measured: its transmissions and width are those of the \(name.name) at \(at)"]
+        return SignalIdentity(measurement: m, best: ModeMatch(name: name.name, confidence: name.confidence, evidence: [
+            "the same slot and width as the \(name.name) at \(at), which was measured",
+        ]))
+    }
+
+    /// Whether `c` fits the same slot as `measured` and is as wide: a line each, within `inheritWidthShare` of its width
+    /// on the map, starting and stopping where it does within the clock's tolerance (`SlotEvidence.clockToleranceSeconds`:
+    /// stations' clocks differ that much), with no starts or stops of its own (a key's). With a true time (`endTime`), its
+    /// own on-times fit `row`'s slots too, when they show any edge.
+    static func fitsSameSlot(_ c: SignalCandidate, as measured: SignalCandidate, readSeconds: Double, endTime: Date?,
+                             row: ModeRow) -> Bool {
+        guard c.tones == nil, measured.tones == nil, let line = c.traces.first, let model = measured.traces.first,
+              !line.onTimes.isEmpty, !model.onTimes.isEmpty else { return false }
+        let width = line.upperHz - line.lowerHz, modelWidth = model.upperHz - model.lowerHz
+        guard abs(width - modelWidth) <= inheritWidthShare * modelWidth else { return false }
+        func edges(_ onTimes: [ClosedRange<Double>]) -> (starts: [Double], ends: [Double]) {
+            let runs = onTimes.filter { $0.upperBound - $0.lowerBound >= SlotEvidence.blipSeconds }
+            return (runs.map(\.lowerBound).filter { $0 > SlotEvidence.readEdgeSeconds },
+                    runs.map(\.upperBound).filter { $0 < readSeconds - SlotEvidence.readEdgeSeconds })
+        }
+        func agree(_ a: [Double], _ b: [Double]) -> Bool {
+            a.count == b.count && zip(a.sorted(), b.sorted()).allSatisfy { abs($0 - $1) <= SlotEvidence.clockToleranceSeconds }
+        }
+        let mine = edges(line.onTimes), theirs = edges(model.onTimes)
+        guard agree(mine.starts, theirs.starts), agree(mine.ends, theirs.ends) else { return false }
+        if let fit = SlotEvidence.fit(onTimes: line.onTimes, readEnd: endTime, readSeconds: readSeconds,
+                                      period: row.slotPeriodSeconds, length: row.slotSeconds),
+           fit.events > 0, fit.fit < minSlotFit {
+            return false
+        }
+        return true
     }
 
     /// What a comb line measures as: a line (or a wandering one, which reads as nothing in particular), never modulation.

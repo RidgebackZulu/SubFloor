@@ -71,13 +71,18 @@ import Testing
     /// how many comb windows were labelled comb (not `No signal`). FT8's and FT4's shares
     /// (`gatedTargets`) are asserted only then, or with `SUBFLOOR_SIGNALID_REAL=1`: two windows say little of a share, and
     /// the default run holds what matters most there, no wrong name. `fullRecordings` asserts the same targets at the
-    /// capture's own rate. The rows grow as the tasks that meet them land.
+    /// capture's own rate. The rows grow as the tasks that meet them land. The FT8 points again at the owner's zoom
+    /// (`RealCorpus.groupTruth`), where the point takes in several stations: right when the label names FT8, and no
+    /// signal under the point named anything else (one of them by default, its share, like FT8's own, asserted only
+    /// with the matrix or the recordings).
     @Test func heldOutTargets() throws {
         let held = try RealCorpus.points(.heldOut)
+        let groups = held.filter { $0.truth == "FT8" }.map(RealCorpus.asGroup)
         // A share of 95% means nothing over 2 points, and an empty point costs little: all of them, always.
-        let points = Sweep.full ? held : held.filter { $0.truth == "none" }
+        let points = Sweep.full ? held + groups : held.filter { $0.truth == "none" }
             + Self.subset(held.filter { ["FT8", "FT4", "2-FSK"].contains($0.truth) && RealCorpus.counts($0) }, perTruth: 2)
             + Self.subset(held.filter { $0.truth == "comb" && RealCorpus.counts($0) }, perTruth: 1)
+            + Self.subset(groups.filter(RealCorpus.counts), perTruth: 1)
         var wrong: [String] = []
         var combLabels = 0
         let score = try RealCorpus.score(points: points) { clip, point in
@@ -98,9 +103,9 @@ import Testing
 
     /// The share right each truth must reach. A comb line is labelled comb or `No signal` in every window (the spec gives no
     /// share: never named, and never another answer).
-    static let targets = ["none": 0.95, "2-FSK": 0.8, "FT8": 0.8, "FT4": 0.8, "comb": 1.0]
+    static let targets = ["none": 0.95, "2-FSK": 0.8, "FT8": 0.8, "FT4": 0.8, "comb": 1.0, RealCorpus.groupTruth: 0.8]
     /// The targets a default run doesn't assert (see `heldOutTargets`).
-    static let gatedTargets: Set<String> = ["FT8", "FT4"]
+    static let gatedTargets: Set<String> = ["FT8", "FT4", RealCorpus.groupTruth]
     /// The FSK's neighbour, which stays its own signal.
     static let fskNeighbourHz = 11_685_864.0
     static let fskNeighbourReachHz = 500.0
@@ -116,9 +121,16 @@ import Testing
     }
 
     static func expectHeldOut(_ id: SignalIdentity, _ point: CorpusPoint, _ path: String, centerHz: Double) {
-        // The two slot modes are never taken for each other, at any confidence a name is given at.
-        if let other = ["FT8": "FT4", "FT4": "FT8"][point.truth] {
-            #expect(id.best?.name != other, "\(path): \(point.truth) at \(point.atHz) Hz, \(point.endSeconds) s: \(id.label)")
+        // The two slot modes are never taken for each other, at any confidence a name is given at, nor any signal under
+        // the point.
+        if let other = ["FT8": "FT4", "FT4": "FT8", RealCorpus.groupTruth: "FT4"][point.truth] {
+            #expect(([id] + id.signals).allSatisfy { $0.best?.name != other },
+                    "\(path): \(point.truth) at \(point.atHz) Hz, \(point.endSeconds) s: \(id.label)")
+        }
+        // No signal of several under the point is given a width it can't have.
+        for signal in id.signals {
+            #expect(signal.measurement.occupiedBandwidthHz <= widestEmptyAnswerHz,
+                    "\(path): \(point.truth) at \(point.atHz) Hz: \(signal.label) in \(id.label)")
         }
         if point.truth == "none" {
             #expect(id.measurement.occupiedBandwidthHz <= widestEmptyAnswerHz,
@@ -147,7 +159,8 @@ import Testing
     /// clips' 62.5 kS/s must not hide. Prints every part's score and asserts the held-out targets. Every empty point;
     /// `SUBFLOOR_SIGNALID_REAL_POINTS=n` keeps the first n points of each other truth, per part (the whole run is about
     /// 30 minutes in a debug build), and `SUBFLOOR_SIGNALID_REAL_TRUTHS=FT8,FT4` only those truths (then only their
-    /// targets, and every wrong name among them).
+    /// targets, and every wrong name among them). The FT8 points at the owner's zoom (`RealCorpus.groupTruth`) are scored
+    /// only when named there.
     @Test(.enabled(if: environment["SUBFLOOR_SIGNALID_REAL"] == "1")) func fullRecordings() throws {
         let manifest = try RealCorpus.manifest()
         let allowed = Self.environment["SUBFLOOR_SIGNALID_REAL_POINTS"].flatMap(Int.init)
@@ -162,12 +175,17 @@ import Testing
             return RealCorpus.hover(rate: recording.captureRate, centerHz: recording.captureCenterHz, atHz: point.atHz,
                                     spectrumDb: clip.captureSpectrumDb,
                                     endTime: recording.startUTC?.addingTimeInterval(end),
-                                    capture: (clip.captureSpectrumDb, recording.captureRate, recording.captureCenterHz)) { seconds in
+                                    capture: (clip.captureSpectrumDb, recording.captureRate, recording.captureCenterHz),
+                                    radiusHz: point.truth == RealCorpus.groupTruth ? RealCorpus.groupRadiusHz : 60) { seconds in
                 (try? RealCorpus.readRecording(recording.file, seconds: max(0, end - seconds)..<end)) ?? []
             }
         }
+        // The FT8 points at the owner's zoom only when asked for by name: they would double FT8's share of the half hour.
         func trimmed(_ part: CorpusPart) throws -> [CorpusPoint] {
-            try RealCorpus.points(part).filter { point in
+            let points = try RealCorpus.points(part)
+            let groups = truths?.contains(RealCorpus.groupTruth) == true
+                ? points.filter { $0.truth == "FT8" }.map(RealCorpus.asGroup) : []
+            return (points + groups).filter { point in
                 if let truths, !truths.contains(point.truth) { return false }
                 guard let allowed, point.truth != "none" else { return true }
                 let key = "\(part) \(point.truth)"
@@ -215,7 +233,7 @@ import Testing
             #expect(wrong.isEmpty, "1 MS/s \(part): wrong names at 0.7 or more: \(wrong)")
             if part == .heldOut {
                 Self.expectTargets(score.filter { truths?.contains($0.key) ?? true }, "1 MS/s",
-                                   only: truths)
+                                   only: truths ?? Set(Self.targets.keys).subtracting([RealCorpus.groupTruth]))
             }
         }
     }

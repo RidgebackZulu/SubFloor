@@ -148,6 +148,17 @@ enum RealCorpus {
         try score(points: points(part), identify: identify)
     }
 
+    /// The truth of an FT8 point looked at with the owner's zoom: one screen pixel is about this many Hz, so the point
+    /// takes in several stations.
+    static let groupTruth = "FT8 group"
+    static let groupRadiusHz = 345.0
+
+    /// `point` as a group point: the same place and time, its truth `groupTruth`.
+    static func asGroup(_ point: CorpusPoint) -> CorpusPoint {
+        CorpusPoint(clip: point.clip, atHz: point.atHz, endSeconds: point.endSeconds, truth: groupTruth,
+                    parameters: point.parameters, how: point.how + "; at the owner's zoom", transmitting: point.transmitting)
+    }
+
     /// The same, over the given points that count.
     static func score(points: [CorpusPoint], identify: (CorpusClip, CorpusPoint) -> SignalIdentity) throws
         -> [String: (right: Int, total: Int)] {
@@ -169,9 +180,12 @@ enum RealCorpus {
     /// - A mode: named it, by its own row's name (FT8 and FT4 are rows of their own).
     /// - "2-FSK": measured as 2-FSK with the point's shift and speed, and not given another mode's name.
     /// - "none": `No signal`. "comb": labelled a comb or `No signal`, never a mode. "not FSK": not called FSK.
+    /// - "FT8 group": an FT8 point at the owner's zoom (`groupRadiusHz`): its label names FT8, alone or among others.
     static func isRight(_ id: SignalIdentity, _ point: CorpusPoint) -> Bool {
         let m = id.measurement
         switch point.truth {
+        case groupTruth:
+            return id.label.hasPrefix("FT8 ") || id.label.contains(" FT8 ×")
         case "none":
             return id.best == nil && id.note == SignalIdentifier.noSignalNote
         case "comb":
@@ -193,10 +207,17 @@ enum RealCorpus {
 
     static func namesTruth(_ name: String?, _ truth: String) -> Bool { name == truth }
 
-    /// A name at 0.7 or more that the point's truth rules out: the worst outcome, whether or not the window counts.
+    /// A name at 0.7 or more that the point's truth rules out: the worst outcome, whether or not the window counts. Where
+    /// the truth holds for all around the point (a slot mode's frequencies, nothing there), so it does for every one of
+    /// several signals under it (`signals`).
     static func isWrongName(_ id: SignalIdentity, _ point: CorpusPoint) -> Bool {
+        if ["FT8", "FT4", groupTruth, "none", "comb"].contains(point.truth),
+           id.signals.contains(where: { isWrongName($0, point) }) {
+            return true
+        }
         guard let best = id.best, best.confidence >= SignalIdentifier.nameThreshold else { return false }
         switch point.truth {
+        case groupTruth: return best.name != "FT8"
         case "none", "comb": return !best.name.localizedCaseInsensitiveContains("comb")
         case "not FSK": return best.name == "2-FSK" || ModeTable.row(best.name)?.families.contains(.fsk) == true
         case "2-FSK": return best.name != "2-FSK"
@@ -209,11 +230,11 @@ enum RealCorpus {
     /// newest seconds ending at the point's time, as interleaved IQ at `rate`, and `endTime` is that time by UTC. Both
     /// reads have the whole capture's spectrum (`capture`: its dB, rate and centre), for the comb.
     static func hover(rate: Double, centerHz: Double, atHz: Double, spectrumDb: [Float], endTime: Date?,
-                      capture: (db: [Float], rate: Double, centerHz: Double)? = nil,
+                      capture: (db: [Float], rate: Double, centerHz: Double)? = nil, radiusHz: Double = 60,
                       read: (Double) -> [Float]) -> SignalIdentity {
         let first = SignalIdentifier.identify(iq: read(SignalIdentifier.firstSeconds), sampleRate: rate,
                                               captureCenterHz: centerHz, atHz: atHz, bandwidthHz: nil,
-                                              spectrumDb: spectrumDb, longer: nil, endTime: endTime,
+                                              spectrumDb: spectrumDb, longer: nil, pointRadiusHz: radiusHz, endTime: endTime,
                                               captureSpectrumDb: capture?.db, captureRate: capture?.rate,
                                               captureSpectrumCenterHz: capture?.centerHz)
         guard first.needsLongerRead else { return first }
@@ -232,17 +253,19 @@ enum RealCorpus {
         let seconds = Double(iq.count / 2) / longRate
         var refined = SignalIdentifier.identify(iq: iq, sampleRate: longRate, captureCenterHz: centerHz + offsetHz,
                                                 atHz: atHz, bandwidthHz: nil, spectrumDb: nil, longer: { (iq, seconds) },
-                                                endTime: endTime, captureSpectrumDb: capture?.db, captureRate: capture?.rate,
+                                                pointRadiusHz: radiusHz, endTime: endTime, captureSpectrumDb: capture?.db, captureRate: capture?.rate,
                                                 captureSpectrumCenterHz: capture?.centerHz)
         refined.measurement.offsetHz += offsetHz
         return refined
     }
 
-    /// `hover` on a clip, at a point's time (the read ending then, by the recording's clock).
+    /// `hover` on a clip, at a point's time (the read ending then, by the recording's clock), a group point
+    /// (`groupTruth`) at the owner's zoom.
     static func hover(_ clip: CorpusClip, _ point: CorpusPoint) -> SignalIdentity {
         hover(rate: clip.rate, centerHz: clip.centerHz, atHz: point.atHz, spectrumDb: clip.spectrumDb,
               endTime: clip.startUTC.addingTimeInterval(point.endSeconds),
-              capture: (clip.captureSpectrumDb, clip.captureRate, clip.captureCenterHz)) { seconds in
+              capture: (clip.captureSpectrumDb, clip.captureRate, clip.captureCenterHz),
+              radiusHz: point.truth == groupTruth ? groupRadiusHz : 60) { seconds in
             let end = 2 * Int((point.endSeconds * clip.rate).rounded())
             let start = max(0, end - 2 * Int((seconds * clip.rate).rounded()))
             return Array(clip.iq[start..<min(end, clip.iq.count)])
