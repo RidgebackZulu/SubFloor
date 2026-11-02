@@ -860,6 +860,38 @@ struct SignalIDServiceTests {
         #expect(started.withLock { $0 } == [background, owner, background], "\(started.withLock { $0 })")
     }
 
+    /// A queued identification whose caller is cancelled leaves the queue at once (nil while the running one still
+    /// holds) and never runs.
+    @Test func aCancelledQueuedOneLeavesAtOnce() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let started = Locked<[Double]>([]), release = Locked(false), returned = Locked(false)
+        let service = m.signalID, centre = m.centerHz
+        let running = centre + 1_000, queued = centre + 2_000
+        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
+        let inner = Self.stub()
+        m.signalID.analysis = { a in
+            started.withLock { $0.append(a.atHz) }
+            if a.atHz == running { Self.hold(release) }
+            return inner(a)
+        }
+        let busy = Task { await service.identify(atHz: running) }
+        #expect(await eventually { started.withLock { $0 } == [running] })
+        let waiting = Task { () -> SignalIdentity? in
+            let id = await service.identify(atHz: queued)   // background: the running one isn't stopped for it
+            returned.withLock { $0 = true }
+            return id
+        }
+        #expect(await eventually { service.queue.waiting == 1 })
+        waiting.cancel()
+        #expect(await eventually(10) { returned.withLock { $0 } }, "a cancelled queued caller waited for its turn")
+        #expect(service.queue.waiting == 0)
+        release.withLock { $0 = true }
+        let answers = [await waiting.value, await busy.value]
+        #expect(answers[0] == nil && answers[1] != nil)
+        #expect(started.withLock { $0 } == [running], "\(started.withLock { $0 })")
+    }
+
     /// The owner's, the background's and hovers asked together: never two at once, every caller but a replaced hover
     /// answered, all on the service's queue.
     @Test func oneAtATime() async {
@@ -1084,9 +1116,11 @@ struct SignalIDServiceTests {
             #expect(await eventually { radii.withLock { $0.count } == 2 * k + 2 })
         }
         _ = await m.signalID.identify(atHz: m.centerHz - 9_000)
+        // The same point at another radius isn't the answer kept for it: the signals under it differ.
+        _ = await m.signalID.identify(atHz: m.centerHz - 9_000, radiusHz: 1_380)
         let asked = radii.withLock { $0 }
-        #expect(asked.count == 5 && zip(asked.prefix(4), [1380.0, 1380, 40, 40]).allSatisfy { abs(($0 ?? 0) - $1) < 1e-6 }
-                && asked[4] == nil, "\(asked)")
+        #expect(asked.count == 6 && zip(asked.prefix(4), [1380.0, 1380, 40, 40]).allSatisfy { abs(($0 ?? 0) - $1) < 1e-6 }
+                && asked[4] == nil && asked[5] == 1_380, "\(asked)")
     }
 
     /// A tune that failed leaves the IQ at the old centre: a point it doesn't hold is "Too soon" for the first second,
