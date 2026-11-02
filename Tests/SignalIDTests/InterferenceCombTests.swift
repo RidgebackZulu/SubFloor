@@ -286,6 +286,63 @@ import Testing
         #expect(line.comb != nil, "the line itself: \(IdentifyTests.describe(line))")
     }
 
+    /// A beacon on a comb place, on for 3.5 s of every 6: steady over the newest 3 s, which it is on for, but keyed over the
+    /// longer read, so no comb line once that is made. A steady line beside it, on the same read, still is one.
+    @Test func aSlowBeaconIsJudgedOnTheLongerRead() throws {
+        let slot = 5, seconds = 9.4   // the newest 3 s (6.4–9.4 s) lie in its second transmission
+        var iq = Self.capture(skipping: [slot], seconds: seconds, seed: 601)
+        let beacon = SignalSynth.make(.bursts(.carrier, .init(periodSeconds: 6, onSeconds: 3.5)), sampleRate: Self.rate,
+                                      seconds: seconds, snrDb: .infinity, offsetHz: Self.lineHz(slot), seed: 602)
+        Self.add(beacon, to: &iq, snrDb: 20, widthHz: 100)
+        let spectrum = Self.spectrum(iq)
+        try #require(InterferenceComb.detect(spectrumDb: spectrum, sampleRate: Self.rate) != nil)
+        let first = Array(iq.suffix(2 * Int(3 * Self.rate)))
+        let quick = Self.identified(first, at: Self.lineHz(slot), spectrum: spectrum)
+        #expect(quick.comb != nil, "the newest 3 s alone: \(IdentifyTests.describe(quick))")
+        func long(_ offsetHz: Double) -> SignalIdentity {
+            SignalIdentifier.identify(iq: first, sampleRate: Self.rate, captureCenterHz: Self.centreHz,
+                                      atHz: Self.centreHz + offsetHz, bandwidthHz: nil, spectrumDb: nil,
+                                      longer: { (iq, seconds) }, captureSpectrumDb: spectrum, captureRate: Self.rate)
+        }
+        let keyed = long(Self.lineHz(slot))
+        #expect(keyed.comb == nil && keyed.best == nil, "over the longer read: \(IdentifyTests.describe(keyed))")
+        let steady = long(Self.lineHz(slot - 1))
+        #expect(steady.comb != nil, "a steady line: \(IdentifyTests.describe(steady))")
+    }
+
+    /// An agent's width on a wandering comb line: the quick answer asks for the longer read, which tries its tones (they
+    /// don't read) and labels it the comb's, as without a width; an FT8's do read, and it is none.
+    @Test func anAgentsWidthOnACombLineIsLabelled() throws {
+        let iq = Self.capture(db: 20, wanderHz: 60, seconds: 2, seed: 531)
+        let spectrum = Self.spectrum(iq)
+        let comb = try #require(CaptureComb.find(spectrumDb: spectrum, sampleRate: Self.rate, centerHz: Self.centreHz))
+        func at(_ widthHz: Double, longer: Bool) -> SignalIdentity {
+            SignalIdentifier.identify(iq: iq, sampleRate: Self.rate, captureCenterHz: Self.centreHz,
+                                      atHz: Self.centreHz + Self.lineHz(4), bandwidthHz: widthHz, spectrumDb: nil,
+                                      longer: longer ? { (iq, 2) } : nil, comb: comb)
+        }
+        for width in [200.0, 2000] {
+            let quick = at(width, longer: false)
+            #expect(quick.comb == nil && quick.needsLongerRead, "\(width) Hz, quick: \(IdentifyTests.describe(quick))")
+            let line = at(width, longer: true)
+            #expect(line.comb == comb.info, "\(width) Hz, the longer read: \(IdentifyTests.describe(line))")
+        }
+        // An FT8 on a comb place (its average a line of the grid, and on for all 3 s), under a width too narrow to name it:
+        // its tones read on the longer read, so it is no comb line.
+        let slot = 6, seconds = 6.0
+        var withFT8 = Self.capture(db: 20, wanderHz: 60, skipping: [slot], seconds: seconds, seed: 531)
+        let ft8 = SignalSynth.make(.ft8(captureStartInSlot: 1), sampleRate: Self.rate, seconds: seconds, snrDb: .infinity,
+                                   offsetHz: Self.lineHz(slot), seed: 611)
+        Self.add(ft8, to: &withFT8, snrDb: 15, widthHz: 50)
+        let ft8Comb = try #require(CaptureComb.find(spectrumDb: Self.spectrum(withFT8), sampleRate: Self.rate,
+                                                    centerHz: Self.centreHz))
+        let onFT8 = SignalIdentifier.identify(iq: Array(withFT8.suffix(2 * Int(3 * Self.rate))), sampleRate: Self.rate,
+                                              captureCenterHz: Self.centreHz, atHz: Self.centreHz + Self.lineHz(slot),
+                                              bandwidthHz: 20, spectrumDb: nil, longer: { (withFT8, seconds) },
+                                              comb: ft8Comb)
+        #expect(onFT8.comb == nil, "an FT8 under a 20 Hz width: \(IdentifyTests.describe(onFT8))")
+    }
+
     /// An FT8 beside a comb line (`lineFromFT8Hz` above its centre), 2.5 s into its transmission, keeps its name: the
     /// comb takes no name away. The line beside it is the comb's.
     static func ft8BesideALine(lineFromFT8Hz: Double, spectrum withComb: Bool = true) -> (ft8: SignalIdentity, line: SignalIdentity) {

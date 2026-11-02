@@ -442,14 +442,16 @@ public enum SignalIdentifier {
     ///   first gave included;
     /// - `captureSpectrumDb` (an averaged spectrum of the whole capture at `captureRate`, FFT-shifted, centred on
     ///   `captureSpectrumCenterHz`: `captureCenterHz` when nil, as when `iq` is the capture itself; ignored without
-    ///   `captureRate`, which a channel's own rate can't stand in for) shows any interference comb (`InterferenceComb`).
-    ///   Its lines are neither areas around the point (`TraceFinder.find`), nor noise or energy at an empty point
-    ///   (`tooWeak`), and the trace at the point, on one of them and steady as the comb is (`InterferenceComb.isCombLine`),
-    ///   is the comb's (`comb`) when nothing names it and what it measures is no modulation (`combFamilies`): a keyed or
-    ///   modulated signal on the grid, or one a mode's numbers name, keeps its own answer. A trace that may be a narrow
-    ///   MFSK (`mayBeNarrowMFSK`: a row of FT8s can sit on a grid, and their hops are too quick for the map) is labelled
-    ///   only once its tones have been tried (`symbolReading`): not on a quick answer that leaves them to the longer read,
-    ///   nor with an agent's width;
+    ///   `captureRate`, which a channel's own rate can't stand in for) shows any interference comb (`InterferenceComb`);
+    ///   `comb`, the comb already found on it (`CaptureComb.find`, once for every point in that capture), stands in for
+    ///   it. Its lines are neither areas around the point (`TraceFinder.find`), nor noise or energy at an empty point
+    ///   (`tooWeak`), and the trace at the point, on one of them and steady as the comb is (`InterferenceComb.isCombLine`:
+    ///   over the longer read when one is made, else the newest 3 s), is the comb's (`comb`) when nothing names it and
+    ///   what it measures is no modulation (`combFamilies`): a keyed or modulated signal on the grid, or one a mode's
+    ///   numbers name, keeps its own answer. A trace that may be a narrow MFSK (`mayBeNarrowMFSK`: a row of FT8s can sit
+    ///   on a grid, and their hops are too quick for the map) is labelled only once its tones have been tried
+    ///   (`symbolReading`): not on a quick answer, which asks for the longer read instead (with an agent's width too,
+    ///   whose tones are tried on the longer read only to see whether they read);
     /// - several signals within `pointRadiusHz` (no agent's width given): the answer for the point's own, with them all in
     ///   `signals` (`underThePoint`), a slot mode's whole connected group when it is one.
     ///
@@ -458,8 +460,9 @@ public enum SignalIdentifier {
     public static func identify(iq: [Float], sampleRate: Double, captureCenterHz: Double, atHz: Double,
                                 bandwidthHz: Double?, spectrumDb: [Float]?,
                                 longer: (() -> (iq: [Float], seconds: Double)?)?,
-                                pointRadiusHz: Double = 60, endTime: Date? = nil, captureSpectrumDb: [Float]? = nil,
-                                captureRate: Double? = nil, captureSpectrumCenterHz: Double? = nil) -> SignalIdentity {
+                                pointRadiusHz: Double = defaultRadiusHz, endTime: Date? = nil,
+                                captureSpectrumDb: [Float]? = nil, captureRate: Double? = nil,
+                                captureSpectrumCenterHz: Double? = nil, comb: CaptureComb? = nil) -> SignalIdentity {
         let available = sampleRate > 0 ? Double(iq.count / 2) / sampleRate : 0
         guard available >= minimumSeconds else {
             return SignalIdentity(measurement: SignalMeasurement(family: .noise, seconds: available),
@@ -470,20 +473,23 @@ public enum SignalIdentifier {
         let firstFloats = 2 * Int((seconds * sampleRate).rounded())
         let first = iq.count <= firstFloats ? iq : Array(iq.suffix(firstFloats))
         let pointHz = atHz - captureCenterHz
-        // The capture's comb, its lines from `iq`'s own centre, and whether the point's trace is one of them.
-        // Without its own rate a capture's spectrum shows no grid: it is ignored.
-        let comb = captureSpectrumDb.flatMap { db in captureRate.flatMap { InterferenceComb.detect(spectrumDb: db, sampleRate: $0) } }
-        let combLines = comb.map { found in
-            found.lineOffsetsHz.map { $0 + (captureSpectrumCenterHz ?? captureCenterHz) - captureCenterHz }
-        } ?? []
+        // The capture's comb (the one given, else found on its spectrum), its lines from `iq`'s own centre, and whether
+        // the point's trace is one of them. Without its own rate a capture's spectrum shows no grid: it is ignored.
+        let found = comb ?? captureSpectrumDb.flatMap { db in
+            captureRate.flatMap { CaptureComb.find(spectrumDb: db, sampleRate: $0, centerHz: captureSpectrumCenterHz ?? captureCenterHz) }
+        }
+        let combLines = found.map { $0.linesHz.map { $0 - captureCenterHz } } ?? []
         // Whether the point's trace is a comb line, and one that may be a narrow MFSK whose tones haven't been read.
         var onCombLine = false, tonesUnread = false
+        // The point's trace when one of the comb's lines lies in it, steady or not on the newest 3 s: its steadiness is
+        // judged again over the longer read (`steadyOverLongerRead`).
+        var combTrace: SignalTrace?
         // What the point's neighbourhood showed, for the other signals under it (`underThePoint`); none with an agent's width.
         var around: (hood: Neighbourhood, view: NeighbourhoodView, signals: [SignalCandidate])?
         func answer(_ identity: SignalIdentity) -> SignalIdentity {
             var labelled = identity
-            if onCombLine, !tonesUnread, let comb, identity.best == nil, combFamilies.contains(identity.measurement.family) {
-                labelled.comb = comb.info
+            if onCombLine, !tonesUnread, let found, identity.best == nil, combFamilies.contains(identity.measurement.family) {
+                labelled.comb = found.info
             }
             guard let around, !Task.isCancelled else { return labelled }
             return underThePoint(labelled, first: first, sampleRate: sampleRate, captureCenterHz: captureCenterHz,
@@ -510,7 +516,9 @@ public enum SignalIdentifier {
             let view = TraceFinder.find(hood.map, combLinesHz: combLines)
             if Task.isCancelled { return cancelled(SignalMeasurement(offsetHz: pointHz, seconds: seconds)) }
             onCombLine = isOnCombLine(view, map: hood.map, pointHz: pointHz, radiusHz: pointRadiusHz, combLinesHz: combLines)
-            // An agent's width reads no tones.
+            combTrace = combLineTrace(view, pointHz: pointHz, radiusHz: pointRadiusHz, combLinesHz: combLines)
+            // An agent's width reads no tones into its answer; on a comb line they are tried on the longer read, only to
+            // see whether they read.
             tonesUnread = pointTrace(view, pointHz: pointHz, radiusHz: pointRadiusHz).map(mayBeNarrowMFSK) ?? false
             let signals = candidates(hood, view: view, pointHz: pointHz, radiusHz: pointRadiusHz)
             let within = (pointHz - bandwidthHz / 2)...(pointHz + bandwidthHz / 2)
@@ -535,6 +543,7 @@ public enum SignalIdentifier {
             let view = TraceFinder.find(map, combLinesHz: combLines)
             if Task.isCancelled { return cancelled(SignalMeasurement(offsetHz: pointHz, seconds: seconds)) }
             onCombLine = isOnCombLine(view, map: map, pointHz: pointHz, radiusHz: pointRadiusHz, combLinesHz: combLines)
+            combTrace = combLineTrace(view, pointHz: pointHz, radiusHz: pointRadiusHz, combLinesHz: combLines)
             let signals = candidates(hood, view: view, pointHz: pointHz, radiusHz: pointRadiusHz)
             if Task.isCancelled { return cancelled(SignalMeasurement(offsetHz: pointHz, seconds: seconds)) }
             around = (hood, view, signals)
@@ -582,7 +591,12 @@ public enum SignalIdentifier {
         let m = pass.m, firstReading = pass.firstReading
         if pass.cancelled { return cancelled(m) }
         if narrow != nil { tonesUnread = pass.tonesUnread }
-        let identity = pass.identity
+        var identity = pass.identity
+        // An agent's width on a comb line that may be a narrow MFSK, nothing naming it: the longer read tries its tones.
+        let widthOnCombLine = bandwidthHz != nil && onCombLine && tonesUnread
+        if widthOnCombLine, identity.best == nil, combFamilies.contains(identity.measurement.family) {
+            identity.needsLongerRead = true
+        }
         guard identity.needsLongerRead, !Task.isCancelled, let read = longer?(), read.iq.count >= 2 else {
             if Task.isCancelled { return cancelled(m) }
             if let fskRead, identity.best == nil, m.family == .unknown {
@@ -671,6 +685,18 @@ public enum SignalIdentifier {
         refined.needsLongerRead = refined.needsLongerRead && snapshotSeconds < longSeconds - 0.1
         if let note = refined.note { notes.insert(note, at: 0) }
         refined.note = notes.isEmpty ? nil : notes.joined(separator: "; ")
+        if Task.isCancelled { return cancelled(slow) }
+        // An agent's width: a line whose tones read is an MFSK, never the comb's; one whose tones don't read may be.
+        if widthOnCombLine, let line = combTrace {
+            tonesUnread = tonesRead(read.iq, sampleRate: sampleRate, trace: line, pointHz: pointHz, seconds: snapshotSeconds,
+                                    measured: slow)
+        }
+        // Steady as the comb is over the longer read, not only over its newest 3 s (a slow beacon is on for longer).
+        if combTrace != nil {
+            onCombLine = steadyOverLongerRead(read.iq, sampleRate: sampleRate, pointHz: pointHz, radiusHz: pointRadiusHz,
+                                              combLinesHz: combLines)
+        }
+        if Task.isCancelled { return cancelled(slow) }
         return answer(refined)
     }
 
@@ -729,6 +755,38 @@ public enum SignalIdentifier {
 
     /// What a comb line measures as: a line (or a wandering one, which reads as nothing in particular), never modulation.
     static let combFamilies: Set<SignalFamily> = [.carrier, .unknown, .noise]
+
+    /// The radius `identify` looks within for a trace at the point when it isn't told one: a narrow signal's.
+    public static let defaultRadiusHz = 60.0
+
+    /// The trace at the point (`pointTrace`), outside any area, when one of the comb's lines lies in it
+    /// (`InterferenceComb.holdsLine`), steady or not.
+    static func combLineTrace(_ view: NeighbourhoodView, pointHz: Double, radiusHz: Double,
+                              combLinesHz: [Double]) -> SignalTrace? {
+        guard !combLinesHz.isEmpty, !view.areas.contains(where: { $0.lowerHz...$0.upperHz ~= pointHz }),
+              let line = pointTrace(view, pointHz: pointHz, radiusHz: radiusHz),
+              InterferenceComb.holdsLine(line, linesHz: combLinesHz) else { return nil }
+        return line
+    }
+
+    /// Whether the point's trace is a comb line over the whole of `iq` (the longer read), its steadiness judged over all of
+    /// it (`isOnCombLine` on its own neighbourhood).
+    static func steadyOverLongerRead(_ iq: [Float], sampleRate: Double, pointHz: Double, radiusHz: Double,
+                                     combLinesHz: [Double]) -> Bool {
+        let hood = neighbourhood(iq, sampleRate: sampleRate, pointHz: pointHz)
+        if Task.isCancelled { return false }
+        let view = TraceFinder.find(hood.map, combLinesHz: combLinesHz)
+        return isOnCombLine(view, map: hood.map, pointHz: pointHz, radiusHz: radiusHz, combLinesHz: combLinesHz)
+    }
+
+    /// Whether `trace`'s tones read as an MFSK's (`symbolReading`) over the whole of `iq` (`seconds` of it), its own on-times
+    /// there: a check only, the measurement left as it is.
+    static func tonesRead(_ iq: [Float], sampleRate: Double, trace: SignalTrace, pointHz: Double, seconds: Double,
+                          measured: SignalMeasurement) -> Bool {
+        guard let timing = narrowTiming(iq, sampleRate: sampleRate, trace: trace) else { return false }
+        return symbolReading(iq, sampleRate: sampleRate, trace: trace, pointHz: pointHz, map: timing.map,
+                             on: SlotEvidence.transmissions(timing.onTimes), seconds: seconds, measured: measured) != nil
+    }
 
     /// Whether the trace at the point (`pointTrace`), outside any area, is a comb line (`InterferenceComb.isCombLine`).
     static func isOnCombLine(_ view: NeighbourhoodView, map: TimeFrequencyMap, pointHz: Double, radiusHz: Double,

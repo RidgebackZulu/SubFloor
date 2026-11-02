@@ -15,6 +15,36 @@ public struct CombInfo: Codable, Sendable, Equatable {
     }
 }
 
+/// An interference comb found once on a whole capture's averaged spectrum (`InterferenceComb.detect`), to hand to every
+/// identification in that capture (`SignalIdentifier.identify(…comb:)`) instead of finding it again for each point.
+public struct CaptureComb: Sendable, Equatable {
+    public var info: CombInfo
+    /// Its lines, in the Hz the spectrum's centre was given in (display Hz in the app): a doubled line's both.
+    public var linesHz: [Double]
+
+    public init(info: CombInfo, linesHz: [Double]) {
+        self.info = info
+        self.linesHz = linesHz
+    }
+
+    /// The comb in `spectrumDb` (an averaged spectrum of a whole capture at `sampleRate`, FFT-shifted, centred on
+    /// `centerHz`), or nil when there is none.
+    public static func find(spectrumDb: [Float], sampleRate: Double, centerHz: Double) -> CaptureComb? {
+        InterferenceComb.detect(spectrumDb: spectrumDb, sampleRate: sampleRate).map {
+            CaptureComb(info: $0.info, linesHz: $0.lineOffsetsHz.map { centerHz + $0 })
+        }
+    }
+
+    /// The FFT size of `spectrum(iq:)`: the app's.
+    public static let spectrumSize = 8192
+
+    /// An averaged spectrum of interleaved IQ of a whole capture, as the app's is (`spectrumSize` bins, frames a quarter
+    /// apart, up to 256 of them), for `find` when there is no app spectrum.
+    public static func spectrum(iq: [Float]) -> [Float] {
+        PowerSpectrum.average(iq, size: spectrumSize, maxFrames: 256, hop: spectrumSize / 4)
+    }
+}
+
 /// Finds an interference comb in an averaged spectrum of the whole capture (FFT-shifted, dB).
 ///
 /// 1. **Lines:** local maxima standing `lineContrastDb` over the spectrum's local background (the median of blocks
@@ -312,13 +342,18 @@ extension InterferenceComb {
     /// Another of the comb's lines, to keep step with, is on for this much of the read at least.
     static let partnerShare = 0.3
 
+    /// Whether one of `linesHz` (from the map's centre) lies in `trace`, within `lineMatchHz` of its edges.
+    static func holdsLine(_ trace: SignalTrace, linesHz: [Double]) -> Bool {
+        linesHz.contains { (trace.lowerHz - lineMatchHz)...(trace.upperHz + lineMatchHz) ~= $0 }
+    }
+
     /// Whether `trace` is one of the comb's lines, where a read shows it: one of `linesHz` (from the map's centre) lies in
     /// it, and it is steady as the comb is: on for `steadyShare` of the read, or on and off with another of the comb's
     /// lines in view (`partnerShare`) at all but `1 − steadyShare` of its moments. The owner's comb comes and goes with the
     /// receiver's gain, all its lines together; a keyed signal on the grid keys alone. (A slot mode's tones hop faster
     /// than the map can show: `SignalIdentifier` waits for them to be read.)
     static func isCombLine(_ trace: SignalTrace, view: NeighbourhoodView, map: TimeFrequencyMap, linesHz: [Double]) -> Bool {
-        func onLine(_ t: SignalTrace) -> Bool { linesHz.contains { (t.lowerHz - lineMatchHz)...(t.upperHz + lineMatchHz) ~= $0 } }
+        func onLine(_ t: SignalTrace) -> Bool { holdsLine(t, linesHz: linesHz) }
         guard map.rows > 0, onLine(trace) else { return false }
         func on(_ t: SignalTrace) -> [Bool] {
             (0..<map.rows).map { r in
