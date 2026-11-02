@@ -17,6 +17,8 @@ struct FSKReading: Equatable {
     var snrDb: Double
     /// The middle of the tones, in Hz from the channel's 0.
     var centreHz: Double = 0
+    /// How many times the tone changed. Many, and still no speed: these may not be tones at all.
+    var changes: Int = 0
 }
 
 /// An FSK measured from its tones, when the signal's lines are known (`SignalGrouper`) and so no spectrum need say
@@ -69,6 +71,9 @@ enum DirectFSK {
     static let minUnitRuns = 0.12
     static let longestRunSymbols = 16.0
     static let settledConfidence: Float = 0.9
+    /// Agreement this faint is no speed: keying with no clock behind it reaches 0.55, the real FSK's tuning part falls to 0.63,
+    /// and a clean synthetic reading to 0.6.
+    static let minConfidence: Float = 0.58
     /// The tones' band reaches this far beyond them, in symbols (or `plainGuardHz` without a speed).
     static let guardSymbols = 2.0
     static let plainGuardHz = 100.0
@@ -91,7 +96,10 @@ enum DirectFSK {
         }
         guard let best else { return nil }
 
+        // The correction only puts a tone right: one that moved far, or past another, heard something else.
         let tones = best.tones
+        guard zip(tones, tones.dropFirst()).allSatisfy({ $1 - $0 >= closest / 2 }),
+              zip(tones, given).allSatisfy({ abs($0 - $1) <= closest / 2 }) else { return nil }
         let fullSpan = tones[tones.count - 1] - tones[0]
         let spacing = tones.count == 2 ? fullSpan : median(zip(tones, tones.dropFirst()).map { $1 - $0 })
         var count = tones.count
@@ -102,7 +110,7 @@ enum DirectFSK {
         }
         var reading = FSKReading(toneCount: count, shiftHz: count == 2 ? spacing : nil, spacingHz: spacing, baud: best.baud,
                                  baudConfidence: best.baud == nil ? 0 : best.confidence, snrDb: 0,
-                                 centreHz: (tones[0] + tones[tones.count - 1]) / 2)
+                                 centreHz: (tones[0] + tones[tones.count - 1]) / 2, changes: best.changes)
         let reach = best.baud.map { guardSymbols * $0 } ?? plainGuardHz
         let band = power(z, rate: rate, within: (tones[0] - reach)...(tones[tones.count - 1] + reach))
         let bandNoise = density * (fullSpan + 2 * reach)
@@ -236,6 +244,7 @@ enum DirectFSK {
         var confidence: Float = 0
         /// What the tones' filters heard, less their noise.
         var tonePower: Double
+        var changes = 0
 
         init?(_ z: [DSPComplex], rate: Double, tones: [Double], filterSeconds: Double, density: Double) {
             let length = max(4, Int((filterSeconds * rate).rounded()))
@@ -256,6 +265,7 @@ enum DirectFSK {
             self.tones = tones
 
             let runs = Self.runs(outputs.map(\.power), tops: tops, noise: noise, filterSteps: length / step)
+            changes = runs.filter(\.joined).count
             let onSteps = runs.reduce(0) { $0 + $1.steps.count }
             guard onSteps > 0 else { return nil }
             for t in tones.indices {
@@ -385,8 +395,11 @@ enum DirectFSK {
                 let contrast = b / Double(typical)
                 for baud in [hz, hz / 2] where baud >= DirectFSK.lowestBaud {
                     guard let fit = fit(durations, baud: baud) else { continue }
-                    return (baud, min(SignalMeasurer.score(contrast, DirectFSK.minLineContrast, DirectFSK.solidLineContrast),
-                                      SignalMeasurer.score(fit, DirectFSK.minRunFit, DirectFSK.solidRunFit)))
+                    let confidence = min(SignalMeasurer.score(contrast, DirectFSK.minLineContrast, DirectFSK.solidLineContrast),
+                                         SignalMeasurer.score(fit, DirectFSK.minRunFit, DirectFSK.solidRunFit))
+                    // (A start-stop signal's half-grid line stands lower, and its runs fit less, and it is told by the rest.)
+                    guard baud != hz || confidence >= DirectFSK.minConfidence else { continue }
+                    return (baud, confidence)
                 }
             }
             return nil

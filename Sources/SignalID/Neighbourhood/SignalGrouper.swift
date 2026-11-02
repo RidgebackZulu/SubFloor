@@ -37,12 +37,12 @@ struct SignalCandidate: Equatable {
 ///   against each other for a whole read.
 ///
 /// On the corpus's tuning part, in 3 s reads every 0.25 s, the real FSK's tones reach −0.55 and −0.50 at their weakest.
-/// Over 3 s, 240 pairs of independently keyed carriers (12 to 75 Bd, Morse from 8 to 25 WPM) reach −0.50 and −0.36, and
-/// none passes both.
+/// Over 3 s, 492 pairs of independently keyed carriers (8 and 12 Bd, Morse from 8 to 25 WPM) reach past the first in 9
+/// cases, and −0.36 on the second, and none passes both (`independentPairsNeverJoin`; three times as many reach −0.38).
 ///
-/// Two lines both steady (`SignalTrace.steady`) are never tones: a pair of carriers beat, and their beat can correlate
-/// at anything. Lines more than `turnsWithinDb` apart in level aren't an FSK's either (FM's carrier and sidebands take
-/// turns too), nor are lines under `minShiftHz` apart, which a frame short enough for the symbols can't part.
+/// Lines more than `turnsWithinDb` apart in level aren't an FSK's: a tone-keyed FM's carrier and sideband can take turns
+/// too. Steady carriers need no rule of their own: a pair's beat runs with them on this map (120 to 420 Hz apart, 3 s, the
+/// lowest either correlation reaches is +0.35), and lines in one or two bins don't turn against each other.
 enum SignalGrouper {
     /// Under what independent lines at a fast key reach (±0.14 in one segment, less in a median of them), over the real
     /// FSK's −0.55. A slow key gets past this: `overallCorrelation` is what stops it.
@@ -50,8 +50,16 @@ enum SignalGrouper {
     /// Between the −0.36 independent keys reach and the real FSK's −0.50.
     static let overallCorrelation: Float = -0.43
     static let maxShiftHz = 1_500.0
+    /// A span narrower than this has no room for two tones this map can part, so it needs no map.
     static let minShiftHz = 120.0
-    static let turnsWithinDb = 10.0
+    /// Far enough to let one tone fade this far under the other, and no further (`fmCarrierAndSidebandAreNotTones`).
+    static let turnsWithinDb = 20.0
+    /// How far under a span's strongest hump a line is still tried.
+    static let toneRangeDb = 20.0
+    /// A station's power where its nearest tone is off, over the noise a skirt shows there (`TurnStates`).
+    static let stationOverSkirt = 2.0
+    /// Moments off that it takes to tell.
+    static let minSettledRows = 20
     /// A 10 ms Hann frame: half its weight lies within 5 ms, under a 100 Bd symbol, and its nulls ±200 Hz away keep an
     /// FSK's other tone out at 170 Hz and more.
     static let turnsBinHz = 100.0
@@ -73,7 +81,7 @@ enum SignalGrouper {
     ///
     /// `lines` is the map the view was read from. Its traces and areas are spans of a read's average, and a strong FSK's
     /// sinc skirts fill them in whichever way the noise leaves them (one trace over both tones, an area either side, a
-    /// span's middle hundreds of Hz from its tone): so each span is tried at its peaks on `lines` (`tones`), not at its
+    /// span's middle hundreds of Hz from its tone): so each span is tried at its peaks on `lines` (`peaks`), not at its
     /// middle. Without it, at its middle.
     static func group(_ view: NeighbourhoodView, map: TimeFrequencyMap, lines: TimeFrequencyMap? = nil) -> [SignalCandidate] {
         let spans = (view.traces.map { (signal: SignalCandidate(kind: .single, lowerHz: $0.lowerHz, upperHz: $0.upperHz, traces: [$0]),
@@ -88,18 +96,20 @@ enum SignalGrouper {
         let inReach = signals.indices.filter { reach.overlaps(signals[$0].lowerHz...signals[$0].upperHz) }
         let average = inReach.isEmpty ? nil : lines.map(smoothedAverage)
         let tones = inReach.flatMap { index -> [Tone] in
-            let signal = signals[index], steady = signal.traces.first?.steady ?? false
+            let signal = signals[index]
             guard let lines, let average else {
-                return [Tone(hz: (signal.lowerHz + signal.upperHz) / 2, levelDb: spans[index].levelDb, steady: steady, signal: index)]
+                return [Tone(hz: (signal.lowerHz + signal.upperHz) / 2, levelDb: spans[index].levelDb, signal: index,
+                             lowerHz: signal.lowerHz, upperHz: signal.upperHz)]
             }
             return peaks(signal.lowerHz...signal.upperHz, average: average, lines: lines).map {
-                Tone(hz: $0.hz, levelDb: $0.levelDb, steady: steady, signal: index)
+                Tone(hz: $0.hz, levelDb: $0.levelDb, signal: index, lowerHz: $0.lowerHz, upperHz: $0.upperHz)
             }
         }
 
-        // Each line's group: the lowest it takes turns with, directly or through another.
-        var root = Array(tones.indices)
-        func find(_ k: Int) -> Int { root[k] == k ? k : find(root[k]) }
+        // Groups, strongest line first. A sinc lobe can stand as tall as a tone and takes turns with the other tone just as
+        // the tone does, only less firmly: so a line's partner is what it runs against hardest, and the pair is that partner's
+        // own hardest. Any more lines must take turns with every line already there, which a tone's lobe, following that tone,
+        // doesn't.
         var series: [Int: Series] = [:]
         func seriesAt(_ hz: Double) -> Series? {
             let bin = map.bin(hz)
@@ -109,31 +119,53 @@ enum SignalGrouper {
             series[bin] = made
             return made
         }
-        for a in tones.indices {
-            for b in tones.indices where b > a && find(a) != find(b) {
-                let apart = abs(tones[a].hz - tones[b].hz)
-                guard apart >= minShiftHz, apart <= maxShiftHz, !(tones[a].steady && tones[b].steady),
-                      abs(tones[a].levelDb - tones[b].levelDb) <= turnsWithinDb,
-                      let x = seriesAt(tones[a].hz), let y = seriesAt(tones[b].hz), let turns = x.turns(with: y),
-                      turns.correlation <= turnsCorrelation, turns.overall <= overallCorrelation else { continue }
-                root[find(b)] = find(a)
+        /// The correlation of two lines over the read, when they take turns.
+        func turns(_ a: Tone, _ b: Tone) -> Float? {
+            guard abs(a.hz - b.hz) <= maxShiftHz, abs(a.levelDb - b.levelDb) <= turnsWithinDb,
+                  let x = seriesAt(a.hz), let y = seriesAt(b.hz) else { return nil }
+            return x.turns(with: y)
+        }
+        var taken = Set<Int>()
+        func partner(of k: Int) -> Int? {
+            tones.indices.filter { $0 != k && !taken.contains($0) }
+                .compactMap { other in turns(tones[k], tones[other]).map { (other, $0) } }
+                .min { $0.1 < $1.1 }?.0
+        }
+        var groups: [[Int]] = []
+        let byLevel = tones.indices.sorted { tones[$0].levelDb > tones[$1].levelDb }
+        for first in byLevel where !taken.contains(first) {
+            guard let one = partner(of: first), let other = partner(of: one) else { continue }
+            var members = [other, one]
+            for more in byLevel where !taken.contains(more) && !members.contains(more)
+                && members.allSatisfy({ turns(tones[$0], tones[more]) != nil }) {
+                members.append(more)
+            }
+            taken.formUnion(members)
+            groups.append(members)
+            // What else was seen is a tone's skirt, tried no further, or a line that holds power of its own.
+            let states = TurnStates(members.compactMap { seriesAt(tones[$0].hz) }, hz: members.map { tones[$0].hz })
+            for k in tones.indices where !taken.contains(k) {
+                guard let at = seriesAt(tones[k].hz), states.holdsPower(at, hz: map.offsetHz(Double(map.bin(tones[k].hz)))) else {
+                    taken.insert(k)
+                    continue
+                }
             }
         }
 
-        // A group of lines is one signal, whatever spans it was seen in.
-        var joined = Set<Int>()
-        var out: [SignalCandidate] = []
-        for k in tones.indices where find(k) == k {
-            let members = tones.indices.filter { find($0) == k }
-            guard members.count > 1 else { continue }
+        // A group of lines is one signal, whatever spans it was seen in. A station in those spans stands on its own.
+        let consumed = Set(groups.flatMap { $0.map { tones[$0].signal } })
+        var out = groups.map { members -> SignalCandidate in
             let own = Set(members.map { tones[$0].signal }).sorted()
-            joined.formUnion(own)
-            out.append(SignalCandidate(kind: .fsk(tones: members.map { tones[$0].hz }.sorted()),
-                                       lowerHz: own.map { signals[$0].lowerHz }.min() ?? 0,
-                                       upperHz: own.map { signals[$0].upperHz }.max() ?? 0,
-                                       traces: own.flatMap { signals[$0].traces }))
+            return SignalCandidate(kind: .fsk(tones: members.map { tones[$0].hz }.sorted()),
+                                   lowerHz: own.map { signals[$0].lowerHz }.min() ?? 0,
+                                   upperHz: own.map { signals[$0].upperHz }.max() ?? 0,
+                                   traces: own.flatMap { signals[$0].traces })
         }
-        out += signals.indices.filter { !joined.contains($0) }.map { signals[$0] }
+        out += tones.indices.filter { !taken.contains($0) && consumed.contains(tones[$0].signal) }.map { k in
+            let line = SignalTrace(lowerHz: tones[k].lowerHz, upperHz: tones[k].upperHz, snrDb: tones[k].levelDb, onTimes: [], steady: false)
+            return SignalCandidate(kind: .single, lowerHz: line.lowerHz, upperHz: line.upperHz, traces: [line])
+        }
+        out += signals.indices.filter { !consumed.contains($0) }.map { signals[$0] }
         return out.sorted { $0.lowerHz < $1.lowerHz }
     }
 
@@ -158,35 +190,80 @@ enum SignalGrouper {
     private struct Tone {
         var hz: Double
         var levelDb: Double
-        var steady: Bool
         var signal: Int
+        /// Where its hump stands.
+        var lowerHz, upperHz: Double
     }
 
     /// The humps in a stretch of the read's average, each `TraceFinder.valleyDb` over the valleys beside it, within
-    /// `TraceFinder.toneRangeDb` of the strongest: at least its strongest point.
-    static func peaks(_ band: ClosedRange<Double>, average: [Float], lines: TimeFrequencyMap) -> [(hz: Double, levelDb: Double)] {
+    /// `toneRangeDb` of the strongest: at least its strongest point. Each stands where it stays within `TraceFinder.valleyDb`
+    /// of its own top.
+    static func peaks(_ band: ClosedRange<Double>, average: [Float], lines: TimeFrequencyMap)
+        -> [(hz: Double, levelDb: Double, lowerHz: Double, upperHz: Double)] {
         let low = max(0, lines.bin(band.lowerBound)), high = min(average.count - 1, lines.bin(band.upperBound))
         guard low <= high else { return [] }
-        let tops = TraceFinder.split(low...high, fine: average, top: .infinity).compactMap { piece in
-            piece.max { average[$0] < average[$1] }
+        let pieces = TraceFinder.split(low...high, fine: average, top: .infinity).compactMap { piece in
+            piece.max { average[$0] < average[$1] }.map { (piece: piece, top: $0) }
         }
-        let strongest = tops.map { average[$0] }.max() ?? 0
-        return tops.filter { average[$0] >= strongest / TraceFinder.linear(TraceFinder.toneRangeDb) }.map {
-            (lines.offsetHz(Double($0)), 10 * log10(max(Double(average[$0]), 1e-6)))
+        let strongest = pieces.map { average[$0.top] }.max() ?? 0
+        var out: [(hz: Double, levelDb: Double, lowerHz: Double, upperHz: Double)] = []
+        for (piece, top) in pieces where average[top] >= strongest / TraceFinder.linear(toneRangeDb) {
+            let edge: Float = average[top] / TraceFinder.linear(TraceFinder.valleyDb)
+            var lower = top, upper = top
+            while lower > piece.lowerBound, average[lower - 1] >= edge { lower -= 1 }
+            while upper < piece.upperBound, average[upper + 1] >= edge { upper += 1 }
+            let level = 10 * log10(max(Double(average[top]), 1e-6))
+            out.append((lines.offsetHz(Double(top)), level, lines.offsetHz(Double(lower)), lines.offsetHz(Double(upper))))
         }
+        return out
     }
 
-    /// The two frequencies' turns on `map`, in the segments where both show. Nil when too few do, or the map can't tell.
-    static func turns(_ aHz: Double, _ bHz: Double, map: TimeFrequencyMap) -> (correlation: Float, overall: Float)? {
-        let binA = map.bin(aHz), binB = map.bin(bHz)
-        guard map.frameSeconds <= longestFrameSeconds, map.rows > 0, (0..<map.bins).contains(binA), (0..<map.bins).contains(binB)
-        else { return nil }
-        return Series(bin: binA, map: map).turns(with: Series(bin: binB, map: map))
+    /// Which of a group's tones is on, moment by moment, and whether another line in its span holds power of its own.
+    ///
+    /// A tone's skirt lives on that tone's changes: it follows the tone and is gone once the tone is off. So a line is
+    /// looked at where its nearest tone has been off for a whole frame, another tone on: a skirt reads the noise, and a
+    /// station reads itself (`stationOverSkirt` times that).
+    struct TurnStates {
+        /// Row by row, the tone that is settled on, or nil around a change.
+        let settled: [Int?]
+        let series: [Series]
+        let hz: [Double]
+
+        init(_ series: [Series], hz: [Double]) {
+            self.series = series
+            self.hz = hz
+            let rows = series.first?.levelled.count ?? 0
+            var winner = [Int](repeating: 0, count: rows)
+            for r in 0..<rows {
+                var strongest: Float = -1
+                for t in series.indices where series[t].levelled[r] > strongest {
+                    strongest = series[t].levelled[r]
+                    winner[r] = t
+                }
+            }
+            var states = [Int?](repeating: nil, count: rows)
+            for r in 0..<rows where r > 0 && r + 1 < rows && winner[r - 1] == winner[r] && winner[r + 1] == winner[r] {
+                states[r] = winner[r]
+            }
+            settled = states
+        }
+
+        func holdsPower(_ line: Series, hz lineHz: Double) -> Bool {
+            let nearest = hz.indices.min { abs(hz[$0] - lineHz) < abs(hz[$1] - lineHz) } ?? 0
+            var level = 0.0, moments = 0
+            for (r, tone) in settled.enumerated() where r < line.relative.count {
+                guard let tone, tone != nearest else { continue }
+                level += Double(line.relative[r])
+                moments += 1
+            }
+            guard moments >= minSettledRows else { return false }
+            return level >= stationOverSkirt * Double(moments)
+        }
     }
 
     /// One frequency's power over time on a turns map, and what is worked out once per frequency however many lines it is
     /// tried against.
-    private struct Series {
+    struct Series {
         /// As a share of each row's noise.
         let relative: [Float]
         /// As a share of the line's own level in its segment, its top clipped so a moment's noise doesn't lead. Where the
@@ -218,19 +295,32 @@ enum SignalGrouper {
             length = segment
         }
 
-        func turns(with other: Series) -> (correlation: Float, overall: Float)? {
+        /// The median over the segments where both show.
+        func medianCorrelation(with other: Series) -> Float? {
             var correlations: [Float] = []
+            for s in shows.indices where shows[s] && other.shows[s] {
+                let range = (s * length)..<((s + 1) * length)
+                correlations.append(SignalGrouper.correlation(levelled[range], other.levelled[range]))
+            }
+            return correlations.count >= minSegments ? TraceFinder.median(correlations) : nil
+        }
+
+        /// The correlation over every moment of the segments where either shows.
+        func overallCorrelation(with other: Series) -> Float {
             var a: [Float] = [], b: [Float] = []
             for s in shows.indices where shows[s] || other.shows[s] {
                 let range = (s * length)..<((s + 1) * length)
                 a += levelled[range]
                 b += other.levelled[range]
-                if shows[s], other.shows[s] {
-                    correlations.append(SignalGrouper.correlation(levelled[range], other.levelled[range]))
-                }
             }
-            guard correlations.count >= minSegments else { return nil }
-            return (TraceFinder.median(correlations), SignalGrouper.correlation(a[...], b[...]))
+            return a.isEmpty ? 0 : SignalGrouper.correlation(a[...], b[...])
+        }
+
+        /// The correlation over the read, when the line takes turns with `other`.
+        func turns(with other: Series) -> Float? {
+            guard let median = medianCorrelation(with: other), median <= turnsCorrelation else { return nil }
+            let overall = overallCorrelation(with: other)
+            return overall <= SignalGrouper.overallCorrelation ? overall : nil
         }
     }
 
@@ -261,7 +351,7 @@ extension TimeFrequencyMap {
         var out = [Float](repeating: 0, count: rows)
         guard rows > 0 else { return out }
         relativeDb.withUnsafeBufferPointer { db in
-            cblas_scopy(Int32(rows), db.baseAddress! + bin, Int32(bins), &out, 1)
+            for r in 0..<rows { out[r] = db[r * bins + bin] }
         }
         var tenth: Float = 0.1
         vDSP_vsmul(out, 1, &tenth, &out, 1, vDSP_Length(rows))

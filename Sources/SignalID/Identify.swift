@@ -134,9 +134,12 @@ public struct SignalIdentity: Codable, Sendable, Equatable {
         return out
     }
 
-    /// A measured speed within its error of a whole number shows as that number: 74.98 as 75, and 45.45 stays.
+    /// A measured reading's speed lies within about 0.03% of what is sent.
+    static let wholeTolerance = 0.0008
+
+    /// A measured speed within its error of a whole number shows as that number: 74.98 as 75, and 45.45 and 56.25 stay.
     static func wholeWhenClose(_ baud: Double) -> Double {
-        abs(baud - baud.rounded()) <= 0.005 * baud ? baud.rounded() : baud
+        abs(baud - baud.rounded()) <= wholeTolerance * baud ? baud.rounded() : baud
     }
 
     /// Up to two decimals, trailing zeros dropped: 45.45, 50, 1.46, 4800.
@@ -336,7 +339,7 @@ public enum SignalIdentifier {
     ///   it, whose extent the measurement stays inside (`SignalMeasurer.Ceiling`). Nothing further out is looked for;
     /// - when those are tones that take turns, their own reading (`DirectFSK`) is the answer, if it shows a speed. If it
     ///   doesn't, the measurement goes first (what takes turns without keeping time may be fax), and only what that can't
-    ///   name is called an FSK, with what the tones do show;
+    ///   name is called an FSK, with what the tones do show, when they changed too few times to show more;
     /// - a very wide signal the neighbourhood can't see the edges of, only on positive evidence (`WideOccupancy`) in
     ///   `spectrumDb` (an averaged spectrum of the capture, FFT-shifted; worked out from the IQ when nil);
     /// - nothing there gives "Too weak to identify (SNR n dB)" or "No signal" (`tooWeak`);
@@ -370,10 +373,30 @@ public enum SignalIdentifier {
         var coreHz: Double?
         var ceiling = SignalMeasurer.Ceiling.none
         // Tones that take turns, whose own reading didn't show a speed: what else measures them comes first.
-        var fsk: SignalCandidate?, tones: DirectFSK.Tones?, fskRead: DirectFSK.Tones.Read?
+        var tones: DirectFSK.Tones?, fskRead: DirectFSK.Tones.Read?
         if let bandwidthHz {
             seed = (pointHz, bandwidthHz)
             ceiling = .given
+            // A whole FSK inside the width, whose tones show their speed, answers for it, no wider than the width.
+            let hood = neighbourhood(first, sampleRate: sampleRate, pointHz: pointHz)
+            let view = TraceFinder.find(hood.map)
+            if Task.isCancelled { return cancelled(SignalMeasurement(offsetHz: pointHz, seconds: seconds)) }
+            let signals = candidates(hood, view: view, pointHz: pointHz, radiusHz: pointRadiusHz)
+            let within = (pointHz - bandwidthHz / 2)...(pointHz + bandwidthHz / 2)
+            if let whole = signalAtPoint(signals, view: view, pointHz: pointHz, radiusHz: pointRadiusHz),
+               let tones = whole.tones, tones.allSatisfy(within.contains),
+               let read = DirectFSK.Tones(whole, signals: signals, noiseDb: view.noiseDb)?
+                .reading(SignalMeasurer.interleaved(hood.samples), rate: hood.rate, zeroHz: hood.centreHz),
+               read.reading.baud != nil {
+                var m = read.measurement(seconds: seconds)
+                if m.occupiedBandwidthHz > bandwidthHz {
+                    m.snrDb += 10 * log10(m.occupiedBandwidthHz / bandwidthHz)
+                    m.occupiedBandwidthHz = bandwidthHz
+                    m.bandwidth6dBHz = min(m.bandwidth6dBHz, bandwidthHz)
+                }
+                return identify(m, rfHz: captureCenterHz + m.offsetHz)
+            }
+            if Task.isCancelled { return cancelled(SignalMeasurement(offsetHz: pointHz, seconds: seconds)) }
         } else {
             let hood = neighbourhood(first, sampleRate: sampleRate, pointHz: pointHz)
             let map = hood.map
@@ -382,15 +405,28 @@ public enum SignalIdentifier {
             if Task.isCancelled { return cancelled(SignalMeasurement(offsetHz: pointHz, seconds: seconds)) }
             let signals = candidates(hood, view: view, pointHz: pointHz, radiusHz: pointRadiusHz)
             if Task.isCancelled { return cancelled(SignalMeasurement(offsetHz: pointHz, seconds: seconds)) }
-            fsk = fskCandidate(signals, pointHz: pointHz, radiusHz: pointRadiusHz)
-            if let fsk {
-                tones = DirectFSK.Tones(fsk, signals: signals, noiseDb: view.noiseDb)
-                fskRead = tones?.reading(SignalMeasurer.interleaved(hood.samples), rate: hood.rate, zeroHz: hood.centreHz)
-                if let fskRead, fskRead.reading.baud != nil {
-                    return identify(fskRead.measurement(seconds: seconds), rfHz: captureCenterHz + fskRead.offsetHz)
-                }
+            var here = signalAtPoint(signals, view: view, pointHz: pointHz, radiusHz: pointRadiusHz)
+            // Tones that read as tones. Too few changes to show a speed, they are still what they are; plenty and none, they
+            // may be a fast signal's lobes, or an FM's lines, and the numbers aren't to be trusted.
+            func read(_ fsk: SignalCandidate) -> DirectFSK.Tones.Read? {
+                let read = DirectFSK.Tones(fsk, signals: signals, noiseDb: view.noiseDb)?
+                    .reading(SignalMeasurer.interleaved(hood.samples), rate: hood.rate, zeroHz: hood.centreHz)
+                return read.flatMap { $0.reading.baud != nil || $0.reading.changes < DirectFSK.minChanges ? $0 : nil }
             }
-            if let found = located(view, fsk: fsk, map: map, pointHz: pointHz, radiusHz: pointRadiusHz) {
+            if let fsk = here, fsk.tones != nil {
+                tones = DirectFSK.Tones(fsk, signals: signals, noiseDb: view.noiseDb)
+                fskRead = read(fsk)
+                if let answer = fskRead, answer.reading.baud != nil {
+                    return identify(answer.measurement(seconds: seconds), rfHz: captureCenterHz + answer.offsetHz)
+                }
+                // What doesn't read as tones is measured as what the view shows at the point, not as a span of them.
+                if fskRead == nil { here = nil }
+            } else if let station = here, read(signals.first { $0.tones != nil && $0.lowerHz...$0.upperHz ~= station.lowerHz }
+                                               ?? station) == nil {
+                // A station is one beside tones: without them, it is only a hump in what the view shows.
+                here = nil
+            }
+            if let found = located(view, signal: here, signals: signals, map: map, pointHz: pointHz, radiusHz: pointRadiusHz) {
                 seed = (found.offsetHz, found.widthHz)
                 coreHz = found.coreHz
                 ceiling = found.ceiling
@@ -544,21 +580,32 @@ public enum SignalIdentifier {
     /// Room in the turns picture beyond the farthest tone it can be asked about.
     static let turnsRoomHz = 200.0
 
-    /// The FSK the point lies on: within `radiusHz` of a tone, when that is the nearest line, or between its tones.
-    static func fskCandidate(_ signals: [SignalCandidate], pointHz: Double, radiusHz: Double) -> SignalCandidate? {
-        func distance(_ lower: Double, _ upper: Double) -> Double { max(0, lower - pointHz, pointHz - upper) }
+    /// What `SignalGrouper` found at the point that the view alone doesn't show, or nil when it is for the view to say:
+    /// - the nearest line within `radiusHz`, a tone or a line of its own, the stronger of equals. A tone gives its FSK; a
+    ///   station `SignalGrouper` found inside an FSK's span gives that station;
+    /// - no line there, the FSK whose span the point lies in, or within `radiusHz` of.
+    static func signalAtPoint(_ signals: [SignalCandidate], view: NeighbourhoodView, pointHz: Double,
+                              radiusHz: Double) -> SignalCandidate? {
         guard !signals.contains(where: { $0.kind == .area && $0.lowerHz...$0.upperHz ~= pointHz }) else { return nil }
-        let lines = signals.flatMap { signal in signal.traces.map { (trace: $0, signal: signal) } }
-        if let nearest = lines.filter({ distance($0.trace.lowerHz, $0.trace.upperHz) <= radiusHz })
-            .min(by: { (distance($0.trace.lowerHz, $0.trace.upperHz), -$0.trace.snrDb)
-                < (distance($1.trace.lowerHz, $1.trace.upperHz), -$1.trace.snrDb) }) {
-            return nearest.signal.tones == nil ? nil : nearest.signal
+        func distance(_ lower: Double, _ upper: Double) -> Double { max(0, lower - pointHz, pointHz - upper) }
+        var lines: [(distance: Double, levelDb: Double, signal: SignalCandidate)] = []
+        for signal in signals {
+            if let tones = signal.tones {
+                lines += tones.map { (abs($0 - pointHz), .infinity, signal) }
+            } else if signal.kind == .single, let line = signal.traces.first {
+                lines.append((distance(line.lowerHz, line.upperHz), line.snrDb, signal))
+            }
         }
-        return signals.first { $0.tones != nil && $0.lowerHz...$0.upperHz ~= pointHz }
+        if let nearest = lines.filter({ $0.distance <= radiusHz }).min(by: { ($0.distance, -$0.levelDb) < ($1.distance, -$1.levelDb) }) {
+            if nearest.signal.tones != nil { return nearest.signal }
+            return view.traces.contains(nearest.signal.traces[0]) ? nil : nearest.signal
+        }
+        return signals.first { $0.tones != nil && ($0.lowerHz - radiusHz)...($0.upperHz + radiusHz) ~= pointHz }
     }
 
-    /// Where to measure for the point: an FSK's tones (`fsk`, when its tones didn't give their own answer), the area the
-    /// point lies in, or the nearest trace within `radiusHz` (the strongest of equals). Nil when there is none of those:
+    /// Where to measure for the point: what `signalAtPoint` found (`signal`: an FSK whose tones didn't give their own
+    /// answer, or a station in an FSK's span), the area the point lies in, or the nearest trace within `radiusHz` (the
+    /// strongest of equals). Nil when there is none of those:
     /// nothing further out is looked for. A strong line with sidebands in view (`TraceFinder.hasSidebands`) is more than
     /// the line: its extent is theirs, on the read's average, out to where they stay over the noise on both sides, and
     /// grows as far as whatever next has no mirror image about the line.
@@ -566,16 +613,17 @@ public enum SignalIdentifier {
     /// The extent keeps some room each side (`seedRoomHz` or `seedRoomShare` of its width), for skirts the read's
     /// average can't show and the measurement's width settles on, but no more than halfway to whatever is next to it.
     /// `coreHz` is the width without that room.
-    static func located(_ view: NeighbourhoodView, fsk: SignalCandidate? = nil, map: TimeFrequencyMap, pointHz: Double,
+    static func located(_ view: NeighbourhoodView, signal: SignalCandidate? = nil, signals: [SignalCandidate] = [],
+                        map: TimeFrequencyMap, pointHz: Double,
                         radiusHz: Double) -> (offsetHz: Double, widthHz: Double, coreHz: Double,
                                               ceiling: SignalMeasurer.Ceiling)? {
         func distance(_ t: SignalTrace) -> Double { max(0, t.lowerHz - pointHz, pointHz - t.upperHz) }
         var extent: (lower: Double, upper: Double)
         var mayBeLine = true, grows = false
         var line: SignalTrace?
-        if let fsk {
-            extent = (fsk.lowerHz, fsk.upperHz)
-            mayBeLine = false
+        if let signal {
+            extent = (signal.lowerHz, signal.upperHz)
+            mayBeLine = signal.tones == nil && signal.upperHz - signal.lowerHz <= TraceFinder.steadyMaxHz
         } else if let area = view.areas.first(where: { $0.lowerHz...$0.upperHz ~= pointHz }) {
             extent = (area.lowerHz, area.upperHz)
             grows = true
@@ -597,8 +645,17 @@ public enum SignalIdentifier {
             }
         }
         // Next to it, what isn't a line's sidebands.
-        let others = TraceFinder.beside(view, line: mayBeLine ? line : nil)
-            .filter { neighbour in fsk.map { !($0.lowerHz...$0.upperHz).overlaps(neighbour.lower...neighbour.upper) } ?? true }
+        var others = TraceFinder.beside(view, line: mayBeLine ? line : nil)
+        if let signal {
+            // What held it is no neighbour; the tones and stations beside it, whichever span they came in, are.
+            others = others.filter { !($0.lower...$0.upper).overlaps(signal.lowerHz...signal.upperHz) }
+            for other in signals where other != signal {
+                others += (other.tones ?? []).map { TraceFinder.Neighbour(lower: $0, upper: $0, snrDb: 0) }
+                if other.kind == .single {
+                    others.append(TraceFinder.Neighbour(lower: other.lowerHz, upper: other.upperHz, snrDb: 0))
+                }
+            }
+        }
         let nextBelow = others.filter { $0.upper < extent.lower }.map(\.upper).max()
         let nextAbove = others.filter { $0.lower > extent.upper }.map(\.lower).min()
         let room = max(seedRoomHz, seedRoomShare * (extent.upper - extent.lower))
