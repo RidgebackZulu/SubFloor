@@ -5,18 +5,22 @@ import Foundation
 
 extension SignalIdentity {
     /// `label` for several signals: the group's form when every one reads as its slot mode, otherwise the named modes by
-    /// count and the unknown last (`Several signals: FT8 ×4, unknown ×7`).
+    /// count and the unknown last (`Several signals: FT8 ×4, unknown ×7`). One whose name is inherited counts as its mode.
     var groupLabel: String {
-        if let span = groupSpanHz, let name = signals.first?.best?.name, signals.allSatisfy({ $0.best?.name == name }) {
+        let names = signals.map(\.countedName)
+        if let span = groupSpanHz, let name = names.first ?? nil, names.allSatisfy({ $0 == name }) {
             return "\(name) · \(signals.count) signals · \(Self.span(span, centreHz: captureCenterHz ?? 0))"
         }
         // Named modes first, the most first (ties by name), and the unknown last.
-        let counts = Dictionary(grouping: signals.compactMap { $0.best?.name }) { $0 }.mapValues(\.count)
+        let counts = Dictionary(grouping: names.compactMap { $0 }) { $0 }.mapValues(\.count)
         var parts = counts.sorted { ($0.value, $1.key) > ($1.value, $0.key) }.map { "\($0.key) ×\($0.value)" }
-        let unknown = signals.filter { $0.best == nil }.count
+        let unknown = names.filter { $0 == nil }.count
         if unknown > 0 { parts.append("unknown ×\(unknown)") }
         return "Several signals: " + parts.joined(separator: ", ")
     }
+
+    /// The mode a group's label counts this signal under: its name, or the one it inherited (`nameInherited`).
+    var countedName: String? { best?.name ?? (nameInherited ? alternatives.first?.name : nil) }
 
     /// `14.0731–14.0755 MHz`, `474.2–475.0 kHz`: a span relative to `centreHz`, in display Hz.
     static func span(_ span: ClosedRange<Double>, centreHz: Double) -> String {
@@ -35,9 +39,12 @@ extension SignalIdentifier {
     /// An unmeasured trace takes a measured one's slot mode only when its width on the map is within this share of that
     /// one's: FT4's traces read about twice FT8's, and two FT8 stations side by side as one trace wider still.
     static let inheritWidthShare = 0.3
-    /// With a true time, an unmeasured trace's own transmissions must fit the slot mode's slots this well (the hint floor:
-    /// timing that tells nothing names nothing).
-    static let inheritSlotFit = Float(hintFloor)
+    /// With a true time, an unmeasured trace's own transmissions must fit the slot mode's slots this well (a share of its
+    /// events, so one at least): timing that tells nothing lends nothing.
+    static let inheritSlotFit: Float = 0.55
+    /// A name taken from a measured neighbour, on its timing and width alone, is never a name: it stays this sure, under
+    /// `nameThreshold` (a station keying up within the clocks' 2 s of an FT8 shares both).
+    static let inheritedConfidence: Float = 0.65
 
     /// `point` (the answer for the signal nearest the point) with every other signal under the point (`signals`): the
     /// lines and FSKs `SignalGrouper` found within `radiusHz` of it, except an interference comb's lines (`isCombLine`),
@@ -72,7 +79,8 @@ extension SignalIdentifier {
             (distance($0, from: at), -level($0)) < (distance($1, from: at), -level($1))
         }) else { return point }
         // A comb's line at the point is no signal of them: the others are measured as many, and the nearest is the answer.
-        let onComb = isComb(own)
+        // Only when the answer at the point is the comb's: a station on a comb place keeps its own.
+        let onComb = isComb(own) && point.comb != nil
         func answer(_ c: SignalCandidate) -> SignalIdentity {
             memberAnswer(c, first: first, sampleRate: sampleRate, captureCenterHz: captureCenterHz, hood: hood, view: view,
                          signals: signals, seconds: seconds, endTime: endTime, readsTones: readsTones)
@@ -164,8 +172,8 @@ extension SignalIdentifier {
         return pass.cancelled ? cancelled(pass.m) : pass.identity
     }
 
-    /// A signal under the point that wasn't measured: `from`'s slot-mode name when it fits `from`'s slot and width, or
-    /// unknown.
+    /// A signal under the point that wasn't measured: unknown, with `from`'s slot-mode name as its likely one (its only
+    /// alternative, at `inheritedConfidence`, and `nameInherited`) when it fits `from`'s slot and width.
     static func unmeasured(_ c: SignalCandidate, seconds: Double, captureCenterHz: Double,
                            from: SignalIdentity?) -> SignalIdentity {
         let width = c.upperHz - c.lowerHz
@@ -174,12 +182,11 @@ extension SignalIdentifier {
                                   notes: ["Not measured: one of several signals under the point"])
         guard let from, let name = from.best else { return SignalIdentity(measurement: m) }
         let at = String(format: "%.0f Hz", captureCenterHz + from.measurement.offsetHz)
-        m.family = from.measurement.family
-        m.familyConfidence = from.measurement.familyConfidence
         m.notes = ["Not measured: its transmissions and width are those of the \(name.name) at \(at)"]
-        return SignalIdentity(measurement: m, best: ModeMatch(name: name.name, confidence: name.confidence, evidence: [
-            "the same slot and width as the \(name.name) at \(at), which was measured",
-        ]))
+        let likely = ModeMatch(name: name.name, confidence: min(name.confidence, inheritedConfidence), evidence: [
+            "the same slot and width as the \(name.name) at \(at), which was measured: likely \(name.name), not measured",
+        ])
+        return SignalIdentity(measurement: m, alternatives: [likely], nameInherited: true)
     }
 
     /// Whether `c` fits the same slot as `measured` and is as wide, on positive evidence: a line each, within
@@ -187,7 +194,7 @@ extension SignalIdentifier {
     /// (`SlotEvidence.clockToleranceSeconds`: stations' clocks differ that much), with no starts or stops of its own (a
     /// key's), and at least one start or stop for them to agree on: two lines on for the whole read (inside a slot, or a
     /// PSK beside an FT8) share no timing at all. With a true time (`endTime`), its own on-times fit `row`'s slots too
-    /// (`inheritSlotFit`, one event at least).
+    /// (`inheritSlotFit`).
     static func fitsSameSlot(_ c: SignalCandidate, as measured: SignalCandidate, readSeconds: Double, endTime: Date?,
                              row: ModeRow) -> Bool {
         guard c.tones == nil, measured.tones == nil, let line = c.traces.first, let model = measured.traces.first else {
@@ -209,7 +216,7 @@ extension SignalIdentifier {
         if endTime != nil {
             guard let fit = SlotEvidence.fit(onTimes: line.onTimes, readEnd: endTime, readSeconds: readSeconds,
                                              period: row.slotPeriodSeconds, length: row.slotSeconds),
-                  fit.events >= 1, fit.fit >= inheritSlotFit else { return false }
+                  fit.fit >= inheritSlotFit else { return false }
         }
         return true
     }

@@ -61,8 +61,11 @@ import Testing
         #expect(measured.count == SignalIdentifier.firstPassMeasured, "\(measured)")
         // The point's own (0 Hz) and the strongest two within the radius (14 dB at −300 Hz, 13 dB at +600 Hz).
         for (got, want) in zip(measured, [-300.0, 0, 600]) { #expect(abs(got - want) < 15, "\(measured)") }
-        #expect(id.signals.filter { !Self.wasMeasured($0) }.allSatisfy {
-            $0.best?.evidence.contains { $0.hasPrefix("the same slot and width as the FT8") } == true
+        // The rest are likely FT8, not measured: never named, under the threshold, counted as FT8 by the label.
+        #expect(id.signals.filter { !Self.wasMeasured($0) }.allSatisfy { member in
+            member.nameInherited && member.best == nil && member.alternatives.count == 1
+                && member.alternatives[0].name == "FT8" && member.alternatives[0].confidence < SignalIdentifier.nameThreshold
+                && member.alternatives[0].evidence.contains { $0.hasPrefix("the same slot and width as the FT8") }
         })
     }
 
@@ -102,7 +105,8 @@ import Testing
         #expect(wide.label == narrow.label && narrow.best?.name == "RTTY", "\(wide.label) vs \(narrow.label)")
         // One signal's JSON is as it was: no group fields.
         let json = String(decoding: (try? JSONEncoder().encode(wide)) ?? Data(), as: UTF8.self)
-        #expect(!json.contains("signals") && !json.contains("groupSpanHz") && !json.contains("captureCenterHz"), "\(json)")
+        #expect(!json.contains("signals") && !json.contains("groupSpanHz") && !json.contains("captureCenterHz")
+                && !json.contains("nameInherited"), "\(json)")
     }
 
     /// A carrier's sidebands lie inside its answer: an AM carrier with its two tone lines is one signal at any radius.
@@ -159,9 +163,39 @@ import Testing
         // The named first, however many the unknown are.
         id.signals += [one(nil), one(nil), one("CW")]
         #expect(id.label == "Several signals: FT8 ×2, CW ×1, unknown ×3", "\(id.label)")
+        // A likely FT8, not measured, counts as FT8.
+        var likely = one(nil)
+        likely.alternatives = [ModeMatch(name: "FT8", confidence: 0.65, evidence: [])]
+        likely.nameInherited = true
+        id.signals.append(likely)
+        #expect(id.label == "Several signals: FT8 ×3, CW ×1, unknown ×3", "\(id.label)")
         // Its JSON keeps the group, and reads back.
         let back = try? JSONDecoder().decode(SignalIdentity.self, from: JSONEncoder().encode(id))
         #expect(back == id)
+    }
+
+    /// Stations keying up 0.4 s after three FT8s start, and staying on (a PSK63 and a PSK31, weaker, so not measured):
+    /// their one start agrees with the FT8s' within the clocks' 2 s, and their width is near enough, but a name taken
+    /// on timing and width is never a name. Each is at most likely FT8, under the threshold (the re-review's probe).
+    @Test func stationsKeyingUpBesideAGroupAreNeverNamed() {
+        let ft8s = [Self.ft8(-300, snrDb: 13, seed: 301), Self.ft8(0, snrDb: 12, seed: 302), Self.ft8(300, snrDb: 14, seed: 303)]
+        func keyed(_ inner: SynthSpec) -> SynthSpec {
+            .bursts(inner, .init(periodSeconds: 15, onSeconds: 12, startSeconds: 0.9, captureStartSeconds: 0, rampSeconds: 0.02))
+        }
+        let iq = SignalSynth.several(ft8s + [.init(keyed(.psk63), offsetHz: 600, snrDb: 8, seed: 304),
+                                             .init(keyed(.psk31), offsetHz: -600, snrDb: 8, seed: 306)],
+                                     sampleRate: Self.rate, seconds: Self.seconds, noiseSeed: 305)
+        // With a true time too, with the matrix.
+        for end in [nil] + (Sweep.full ? [SignalSynth.endTime(ft8s[0].spec, seconds: Self.seconds)] : []) {
+            let id = SignalIdentifier.identify(iq: iq, sampleRate: Self.rate, captureCenterHz: Self.centreHz,
+                                               atHz: Self.centreHz, bandwidthHz: nil, spectrumDb: nil,
+                                               longer: { (iq, Self.seconds) }, pointRadiusHz: 700, endTime: end)
+            let keyedUp = id.signals.filter { abs(abs($0.measurement.offsetHz) - 600) < 80 }
+            #expect(keyedUp.count == 2, "\(Self.describe(id))")
+            #expect(keyedUp.allSatisfy { member in
+                member.best.map { !["FT8", "FT4"].contains($0.name) || $0.confidence < SignalIdentifier.nameThreshold } ?? true
+            }, "\(end == nil ? "no time" : "true time"): \(Self.describe(id))")
+        }
     }
 
     /// Narrow signals on for the whole read beside FT8 stations caught inside their transmissions share no timing with them:
@@ -249,6 +283,31 @@ import Testing
                                 captureSpectrumDb: spectrum)
         #expect(one.signals.isEmpty && one.comb == nil && one.best?.name == "FT8" && abs(one.measurement.offsetHz - 300) < 15,
                 "\(Self.describe(one))")
+    }
+}
+
+/// A station on a comb place, named, keeps its answer beside one other station within the radius: the comb's line at the
+/// point is set aside only when the point's answer is the comb's (the owner's comb has lines at 14.0769 and 14.0780 MHz,
+/// inside the FT8 sub-band). A 25 dB FT8 caught inside its transmission on a line, a 12 dB one 100 Hz above it, the point
+/// 20 Hz up, the default radius (the re-review's probe).
+extension GroupAnswerTests {
+    @Test func aNamedStationOnACombLineKeepsItsAnswer() {
+        typealias C = InterferenceCombTests
+        guard case .bursts(let inner, var bursts) = SynthSpec.ft8() else { return }
+        bursts.captureStartSeconds = 3
+        let midTx = SynthSpec.bursts(inner, bursts)
+        let lineHz = C.lineHz(4), centre = 14_075_000 - lineHz
+        var iq = C.capture(seconds: Self.seconds, seed: 611)
+        let stations = SignalSynth.several([.init(midTx, offsetHz: lineHz, snrDb: 25, seed: 703),
+                                            .init(midTx, offsetHz: lineHz + 100, snrDb: 12, seed: 705)],
+                                           sampleRate: C.rate, seconds: Self.seconds, noiseSeed: 615)
+        for k in iq.indices { iq[k] += stations[k] }
+        let spectrum = C.spectrum(iq)
+        let id = SignalIdentifier.identify(iq: iq, sampleRate: C.rate, captureCenterHz: centre, atHz: centre + lineHz + 20,
+                                           bandwidthHz: nil, spectrumDb: nil, longer: { (iq, Self.seconds) },
+                                           pointRadiusHz: 60, captureSpectrumDb: spectrum, captureRate: C.rate)
+        #expect(id.best?.name == "FT8" && abs(id.measurement.offsetHz - lineHz) < 15 && id.comb == nil,
+                "\(Self.describe(id)) at \(id.measurement.offsetHz - lineHz) Hz from the line")
     }
 }
 

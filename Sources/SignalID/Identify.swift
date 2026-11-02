@@ -41,11 +41,14 @@ public struct SignalIdentity: Codable, Sendable, Equatable {
     /// The capture centre that `signals`' offsets and `groupSpanHz` are relative to (for the label's span in display Hz):
     /// not necessarily the top-level `measurement.offsetHz`'s, which a caller that recentres a read shifts alone.
     public var captureCenterHz: Double?
+    /// One of `signals` that wasn't measured, and takes its likely name (its only alternative, under the name threshold)
+    /// from a measured one beside it whose slot and width it shares: "likely FT8, not measured".
+    public var nameInherited: Bool
 
     public init(measurement: SignalMeasurement, best: ModeMatch? = nil, alternatives: [ModeMatch] = [],
                 needsLongerRead: Bool = false, confirmedByDecode: Bool = false, note: String? = nil,
                 comb: CombInfo? = nil, signals: [SignalIdentity] = [], groupSpanHz: ClosedRange<Double>? = nil,
-                captureCenterHz: Double? = nil) {
+                captureCenterHz: Double? = nil, nameInherited: Bool = false) {
         self.measurement = measurement
         self.best = best
         self.alternatives = alternatives
@@ -56,11 +59,12 @@ public struct SignalIdentity: Codable, Sendable, Equatable {
         self.signals = signals
         self.groupSpanHz = groupSpanHz
         self.captureCenterHz = captureCenterHz
+        self.nameInherited = nameInherited
     }
 
     private enum CodingKeys: String, CodingKey {
         case measurement, best, alternatives, needsLongerRead, confirmedByDecode, note, comb, signals, groupSpanHz,
-             captureCenterHz
+             captureCenterHz, nameInherited
     }
 
     /// JSON from before `signals` decodes, and one signal's encodes as it did: the group's fields only when there is one.
@@ -76,6 +80,7 @@ public struct SignalIdentity: Codable, Sendable, Equatable {
         signals = try c.decodeIfPresent([SignalIdentity].self, forKey: .signals) ?? []
         groupSpanHz = try c.decodeIfPresent(ClosedRange<Double>.self, forKey: .groupSpanHz)
         captureCenterHz = try c.decodeIfPresent(Double.self, forKey: .captureCenterHz)
+        nameInherited = try c.decodeIfPresent(Bool.self, forKey: .nameInherited) ?? false
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -90,6 +95,7 @@ public struct SignalIdentity: Codable, Sendable, Equatable {
         if !signals.isEmpty { try c.encode(signals, forKey: .signals) }
         try c.encodeIfPresent(groupSpanHz, forKey: .groupSpanHz)
         try c.encodeIfPresent(captureCenterHz, forKey: .captureCenterHz)
+        if nameInherited { try c.encode(nameInherited, forKey: .nameInherited) }
     }
 
     /// The one-line text: `RTTY · 45.45 Bd · 170 Hz shift · 91%` when named, `2-FSK · 50 Bd · 850 Hz shift` when
