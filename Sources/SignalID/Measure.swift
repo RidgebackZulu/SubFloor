@@ -482,6 +482,25 @@ public enum SignalMeasurer {
         var occupiedHz: Double
     }
 
+    /// An FSK's own tones' reading (`DirectFSK`) as a measurement. `offsetHz`: the middle of its tones.
+    static func measurement(_ read: FSKReading, offsetHz: Double, seconds: Double) -> SignalMeasurement {
+        var notes = [String(format: "%d tones %.0f Hz apart take turns", read.toneCount, read.spacingHz ?? 0)]
+        if let baud = read.baud {
+            notes.append(String(format: "The keying line and the tone runs agree on %.2f Bd", baud))
+        } else {
+            notes.append("The tone runs and the keying line don't agree on a speed")
+        }
+        let width = DirectFSK.widthHz(read)
+        return SignalMeasurement(offsetHz: offsetHz, occupiedBandwidthHz: width, bandwidth6dBHz: width, snrDb: read.snrDb,
+                                 envelope: .steady, family: read.toneCount > 8 ? .mfsk : .fsk,
+                                 familyConfidence: max(read.baudConfidence, fskWithoutSpeedConfidence),
+                                 symbolRate: read.baud, fskShiftHz: read.shiftHz, toneCount: read.toneCount,
+                                 toneSpacingHz: read.spacingHz, seconds: seconds, notes: notes)
+    }
+
+    /// Tones that take turns are an FSK at this, whatever is known of their speed.
+    static let fskWithoutSpeedConfidence: Float = 0.5
+
     // MARK: Decision
 
     static func classify(_ m: inout SignalMeasurement, line: Line, envelope: EnvelopeFeatures,

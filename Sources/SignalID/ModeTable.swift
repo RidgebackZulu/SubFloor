@@ -25,10 +25,14 @@ public struct ModeRow: Sendable {
     /// How its FSK is keyed by its standard (WSPR and MFSK16 rectangular, FT8/FT4 and Olivia Gaussian): when
     /// named, its width comes from its parameters where the edges sit under the noise (`ParameterWidth`, R16).
     let shaping: ParameterWidth.Shaping?
+    /// Its numbers are shared by what isn't it, so they can't name it alone: it takes its hint's frequencies, or a
+    /// readable decode. Otherwise it is offered, below the name threshold (RTTY: the same keying is used well outside the
+    /// amateur bands, by stations that aren't sending RTTY).
+    let requiresHintOrDecode: Bool
 
     init(_ name: String, _ families: Set<SignalFamily>, partial: [SignalFamily: Double] = [:],
          _ variants: [[ModeFeature]], hints: [ModeHint] = [], needsTiming: Bool = false, slotted: Bool = false,
-         slotSeconds: Double = 0, shaping: ParameterWidth.Shaping? = nil) {
+         slotSeconds: Double = 0, shaping: ParameterWidth.Shaping? = nil, requiresHintOrDecode: Bool = false) {
         self.name = name
         self.families = families
         self.partialFamilies = partial
@@ -38,6 +42,7 @@ public struct ModeRow: Sendable {
         self.slotted = slotted
         self.slotSeconds = slotSeconds
         self.shaping = shaping
+        self.requiresHintOrDecode = requiresHintOrDecode
     }
 
     /// Each variant's width from its parameters, (n − 1) × spacing + 2 × rate (a slotted row's: its transmissions').
@@ -224,7 +229,7 @@ public enum ModeTable {
                 hints: [ModeHint("CW sub-band", cwSubBands, inside: 0.1)]),
         ModeRow("RTTY", [.fsk], [[tones([2]), rate([45.45, 50, 75]), ModeFeature(.shift([170, 425, 850], tolerance: 0.04),
                                                                                   weight: 2)]],
-                hints: [ModeHint("amateur RTTY segment", rttySegments, inside: 0.1)]),
+                hints: [ModeHint("amateur RTTY segment", rttySegments, inside: 0.1)], requiresHintOrDecode: true),
         ModeRow("NAVTEX / SITOR-B", [.fsk], [[tones([2]), rate([100]), ModeFeature(.shift([170], tolerance: 0.04),
                                                                                     weight: 2)]],
                 hints: [ModeHint("NAVTEX frequency", navtex)]),

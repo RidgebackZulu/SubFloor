@@ -63,12 +63,6 @@ enum TraceFinder {
     /// Two peaks with a valley this deep under the weaker of them are two signals.
     static let valleyDb = 6.0
     static let valleyTopDb = 6.0
-    /// Two neighbouring traces' power correlated at this or under takes turns, as far apart as this. A clean FSK's
-    /// measure −0.9; separate stations on the corpus's tuning part stayed over −0.46.
-    static let turnsCorrelation = -0.5
-    static let turnsReachHz = 1500.0
-    /// An FSK's tones stand about alike. (FM's carrier and sidebands take turns too, far apart in level.)
-    static let turnsWithinDb = 10.0
     /// How alike the two sides of a signal's sidebands are, in where they lie and how wide.
     static let sidebandMatch = 0.1
     /// An area's sidebands stand this far under it; a line's, when they are lines too, as AM's by a tone do.
@@ -154,32 +148,6 @@ enum TraceFinder {
         vDSP_vsort(&sorted, vDSP_Length(sorted.count), 1)
         let quiet = sorted[Int(quietShare * Double(sorted.count))]
         return quiet < linear(-quietBelowDb) ? max(quiet, 1e-6) : 1
-    }
-
-    /// Whether two traces' power runs against each other from moment to moment: one signal's tones.
-    static func takeTurns(_ a: SignalTrace, _ b: SignalTrace, map: TimeFrequencyMap) -> Bool {
-        correlation(a.lowerHz...a.upperHz, b.lowerHz...b.upperHz, map: map) <= turnsCorrelation
-    }
-
-    /// The correlation of two bands' power over the rows.
-    static func correlation(_ a: ClosedRange<Double>, _ b: ClosedRange<Double>, map: TimeFrequencyMap) -> Double {
-        func band(_ hz: ClosedRange<Double>) -> ClosedRange<Int>? {
-            let low = max(0, map.bin(hz.lowerBound)), high = min(map.bins - 1, map.bin(hz.upperBound))
-            return low <= high ? low...high : nil
-        }
-        guard let bandA = band(a), let bandB = band(b), map.rows >= 8 else { return 0 }
-        let x = map.bandPower(bandA), y = map.bandPower(bandB)
-        var meanX: Float = 0, meanY: Float = 0
-        vDSP_meanv(x, 1, &meanX, vDSP_Length(x.count))
-        vDSP_meanv(y, 1, &meanY, vDSP_Length(y.count))
-        var xy = 0.0, xx = 0.0, yy = 0.0
-        for k in x.indices {
-            let dx = Double(x[k] - meanX), dy = Double(y[k] - meanY)
-            xy += dx * dy
-            xx += dx * dx
-            yy += dy * dy
-        }
-        return xx > 0 && yy > 0 ? xy / (xx * yy).squareRoot() : 0
     }
 
     /// A trace that says plainly it is its own signal, in `tooWeak`'s window: as narrow as a line, or well up. What is
@@ -294,10 +262,10 @@ enum TraceFinder {
     }
 
     /// `run` cut at each valley `valleyDb` under the peaks either side that comes down near the noise (at most
-    /// `valleyTopDb` over it). A valley still well up (an FSK's tones 170 Hz apart, each spilling towards the other) may
-    /// be one signal's: that is for its measurement to say.
-    static func split(_ run: ClosedRange<Int>, fine: [Float]) -> [ClosedRange<Int>] {
-        let depth = linear(valleyDb), top = linear(valleyTopDb)
+    /// `valleyTopDb` over it, or `top` as a power). A valley still well up (an FSK's tones 170 Hz apart, each spilling
+    /// towards the other) may be one signal's: that is for `SignalGrouper` to say.
+    static func split(_ run: ClosedRange<Int>, fine: [Float], top: Float = linear(valleyTopDb)) -> [ClosedRange<Int>] {
+        let depth = linear(valleyDb)
         var pieces: [ClosedRange<Int>] = []
         var start = run.lowerBound, peak = fine[start], valley = start
         for k in run.dropFirst() {

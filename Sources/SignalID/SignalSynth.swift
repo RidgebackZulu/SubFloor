@@ -200,6 +200,12 @@ public enum SynthSpec: Sendable, Hashable {
     /// `SignalSynth.occupiedBandwidthHz(for:)`).
     public var occupiedBandwidthHz: Double { SignalSynth.occupiedBandwidthHz(for: self) }
 
+    /// The FSK it is, when it is one.
+    var keyedFSK: FSK? {
+        if case .fsk(let f) = self { return f }
+        return nil
+    }
+
     /// The lowest capture rate that holds the signal comfortably (1.25 × its occupied bandwidth).
     public var minimumSampleRate: Double { max(1.25 * occupiedBandwidthHz, 100) }
 }
@@ -212,11 +218,15 @@ public struct SynthImpairments: Sendable, Equatable {
     public var fadeDepthDb: Double
     /// Typical rate of the fade.
     public var fadeRateHz: Double
+    /// An FSK's one tone that fades, alone (selective fading); `fadeDepthDb` and `fadeRateHz` then say how. Nil: all of it.
+    public var fadingToneIndex: Int?
 
-    public init(driftHzPerSecond: Double = 0, fadeDepthDb: Double = 0, fadeRateHz: Double = 0.2) {
+    public init(driftHzPerSecond: Double = 0, fadeDepthDb: Double = 0, fadeRateHz: Double = 0.2,
+                fadingToneIndex: Int? = nil) {
         self.driftHzPerSecond = driftHzPerSecond
         self.fadeDepthDb = fadeDepthDb
         self.fadeRateHz = fadeRateHz
+        self.fadingToneIndex = fadingToneIndex
     }
 
     public static let none = SynthImpairments()
@@ -254,6 +264,11 @@ public enum SignalSynth {
         return out
     }
 
+    /// One tone of an FSK fading by up to `depthDb` while the others hold, as selective fading does.
+    public static func fading(toneIndex: Int, depthDb: Double, rateHz: Double = 0.5) -> SynthImpairments {
+        SynthImpairments(fadeDepthDb: depthDb, fadeRateHz: rateHz, fadingToneIndex: toneIndex)
+    }
+
     /// `iq` with its level changed by `db` from `atSeconds` on, signal and noise alike: a receiver's gain changing.
     public static func levelStep(_ iq: [Float], sampleRate: Double, atSeconds: Double, db: Double) -> [Float] {
         var out = iq
@@ -279,7 +294,7 @@ public enum SignalSynth {
         var random = SynthRandom(seed: seed, stream: 0)
         var x = SynthModulators.baseband(spec, rate: rate, count: used + SynthDSP.interpolatorHalfSpan + 1,
                                          random: &random)
-        SynthDSP.impair(&x, impairments, rate: rate, seconds: Double(used) / rate, random: &random)
+        SynthDSP.impair(&x, impairments, fsk: spec.keyedFSK, rate: rate, seconds: Double(used) / rate, random: &random)
         x.normalisePower(over: used)
         SynthDSP.interpolate(x, factor: factor, into: &out, count: n)
         if offsetHz != 0 { SynthDSP.mix(&out, frequency: offsetHz, sampleRate: sampleRate) }

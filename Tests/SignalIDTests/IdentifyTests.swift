@@ -345,8 +345,9 @@ import Testing
         let sitor = SignalMeasurement(occupiedBandwidthHz: 1300, snrDb: 20, envelope: .steady, family: .fsk,
                                       familyConfidence: 1, symbolRate: 50, fskShiftHz: 850, toneCount: 2,
                                       toneSpacingHz: 850, seconds: 3)
-        // 850 Hz RTTY outside the amateur segments (weather, military) is still RTTY by its parameters.
-        #expect(SignalIdentifier.identify(sitor, rfHz: 8_000_000).best?.name == "RTTY")
+        // RTTY's numbers outside the amateur segments (weather, military) aren't shown to be RTTY: the spec's "2-FSK".
+        #expect(SignalIdentifier.identify(sitor, rfHz: 8_000_000).best == nil)
+        #expect(SignalIdentifier.identify(sitor, rfHz: 8_000_000).label == "2-FSK · 50 Bd · 850 Hz shift")
         var unnamed = sitor
         unnamed.symbolRate = 57
         #expect(SignalIdentifier.identify(unnamed, rfHz: 8_000_000).label == "2-FSK · 57 Bd · 850 Hz shift")

@@ -72,20 +72,27 @@ import Testing
         let held = try RealCorpus.points(.heldOut)
         // A share of 95% means nothing over 2 points, and an empty point costs little: all of them, always.
         let points = Sweep.full ? held : held.filter { $0.truth == "none" }
-            + Self.subset(held.filter { $0.truth == "FT8" }, perTruth: 2)
+            + Self.subset(held.filter { $0.truth == "FT8" || $0.truth == "2-FSK" }, perTruth: 2)
         var wrong: [String] = []
         let score = try RealCorpus.score(points: points) { clip, point in
             let id = RealCorpus.hover(clip, point)
-            Self.expectHeldOut(id, point, "clip path")
+            Self.expectHeldOut(id, point, "clip path", centerHz: clip.centerHz)
             if RealCorpus.isWrongName(id, point) { wrong.append("\(point.truth) at \(point.atHz) Hz: \(id.label)") }
             return id
+        }
+        if Sweep.full {
+            for truth in score.keys.sorted() { print("heldOutTargets \(truth): \(score[truth]!.right)/\(score[truth]!.total) right") }
+            for line in wrong { print("heldOutTargets wrong: \(line)") }
         }
         Self.expectTargets(score, "clip path")
         #expect(wrong.isEmpty, "clip path: wrong names at 0.7 or more: \(wrong)")
     }
 
     /// The share right each truth must reach.
-    static let targets = ["none": 0.95]
+    static let targets = ["none": 0.95, "2-FSK": 0.8]
+    /// The FSK's neighbour, which stays its own signal.
+    static let fskNeighbourHz = 11_685_864.0
+    static let fskNeighbourReachHz = 500.0
     /// No answer on an empty point may be wider than this.
     static let widestEmptyAnswerHz = 100_000.0
 
@@ -97,10 +104,16 @@ import Testing
         }
     }
 
-    static func expectHeldOut(_ id: SignalIdentity, _ point: CorpusPoint, _ path: String) {
+    static func expectHeldOut(_ id: SignalIdentity, _ point: CorpusPoint, _ path: String, centerHz: Double) {
         if point.truth == "none" {
             #expect(id.measurement.occupiedBandwidthHz <= widestEmptyAnswerHz,
                     "\(path): empty point \(point.atHz) Hz: \(id.label)")
+        }
+        if point.truth == "2-FSK" {
+            // The answer's extent stops short of the neighbour.
+            let m = id.measurement
+            let lower = centerHz + m.offsetHz - m.occupiedBandwidthHz / 2
+            #expect(lower > fskNeighbourHz + fskNeighbourReachHz, "\(path): FSK at \(point.atHz) Hz, \(point.endSeconds) s: \(id.label)")
         }
     }
 
@@ -155,7 +168,10 @@ import Testing
                 let id = identify(clip, point)
                 answers[point.truth, default: [:]][Self.shortLabel(id), default: 0] += 1
                 note(id, point)
-                if part == .heldOut { Self.expectHeldOut(id, point, "1 MS/s") }
+                if part == .heldOut {
+                    let center = manifest.recordings.first { $0.clips.contains { $0.name == clip.name } }?.captureCenterHz ?? 0
+                    Self.expectHeldOut(id, point, "1 MS/s", centerHz: center)
+                }
                 return id
             }
             // The windows that don't count towards a score can still hold a wrong name.

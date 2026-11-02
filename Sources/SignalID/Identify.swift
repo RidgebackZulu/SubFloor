@@ -106,7 +106,7 @@ public struct SignalIdentity: Codable, Sendable, Equatable {
         let rate = m.symbolRate.map { "\(number($0)) Bd" }
         switch m.family {
         case .fsk:
-            if let rate { out.append(rate) }
+            if let baud = m.symbolRate { out.append("\(number(wholeWhenClose(baud))) Bd") }
             if m.toneCount ?? 2 == 2, let shift = m.fskShiftHz ?? m.toneSpacingHz {
                 out.append("\(hz(shift)) shift")
             } else if let spacing = m.toneSpacingHz {
@@ -132,6 +132,11 @@ public struct SignalIdentity: Codable, Sendable, Equatable {
             break
         }
         return out
+    }
+
+    /// A measured speed within its error of a whole number shows as that number: 74.98 as 75, and 45.45 stays.
+    static func wholeWhenClose(_ baud: Double) -> Double {
+        abs(baud - baud.rounded()) <= 0.005 * baud ? baud.rounded() : baud
     }
 
     /// Up to two decimals, trailing zeros dropped: 45.45, 50, 1.46, 4800.
@@ -218,8 +223,9 @@ public enum SignalIdentifier {
         return PowerSpectrum.average(iq, size: size, hop: size / 4)
     }
 
-    /// Names `m`, measured at `rfHz` (display Hz), from the mode table.
-    public static func identify(_ m: SignalMeasurement, rfHz: Double) -> SignalIdentity {
+    /// Names `m`, measured at `rfHz` (display Hz), from the mode table. `readableDecode`: a trial decode gave readable
+    /// text, which a row that requires it takes in place of its frequencies.
+    public static func identify(_ m: SignalMeasurement, rfHz: Double, readableDecode: Bool = false) -> SignalIdentity {
         var m = m
         var longer = false
         let longEnough = m.seconds >= longRead
@@ -258,6 +264,10 @@ public enum SignalIdentifier {
             }
             if parameters < hintFloor { confidence = min(confidence, Double(nameThreshold) - 0.01) }
             if wider != nil { confidence = min(confidence, Double(nameThreshold) - 0.01) }
+            if row.requiresHintOrDecode, !readableDecode, !row.hinted(rfHz), confidence >= Double(nameThreshold) {
+                confidence = Double(nameThreshold) - 0.01
+                evidence.append("its numbers alone don't name it: outside its frequencies, and no readable decode")
+            }
             confidence = max(0, confidence)
             if row.needsTiming && !longEnough
                 && (confidence >= timingCandidate || (parameters >= hintedTimingCandidate && row.hinted(rfHz))) {
@@ -322,8 +332,11 @@ public enum SignalIdentifier {
 
     /// The whole identification at `atHz` (display Hz) in a capture centred on `captureCenterHz`:
     /// - where to measure: `bandwidthHz` (an agent's), honoured as it is; otherwise what the read shows around the point
-    ///   (`neighbourhoodMap`, `TraceFinder`): the area the point lies in, or a trace within `pointRadiusHz` of it, whose
-    ///   extent the measurement stays inside (`SignalMeasurer.Ceiling`). Nothing further out is looked for;
+    ///   (`neighbourhood`, `TraceFinder`, `SignalGrouper`): the area the point lies in, or a trace within `pointRadiusHz` of
+    ///   it, whose extent the measurement stays inside (`SignalMeasurer.Ceiling`). Nothing further out is looked for;
+    /// - when those are tones that take turns, their own reading (`DirectFSK`) is the answer, if it shows a speed. If it
+    ///   doesn't, the measurement goes first (what takes turns without keeping time may be fax), and only what that can't
+    ///   name is called an FSK, with what the tones do show;
     /// - a very wide signal the neighbourhood can't see the edges of, only on positive evidence (`WideOccupancy`) in
     ///   `spectrumDb` (an averaged spectrum of the capture, FFT-shifted; worked out from the IQ when nil);
     /// - nothing there gives "Too weak to identify (SNR n dB)" or "No signal" (`tooWeak`);
@@ -356,15 +369,28 @@ public enum SignalIdentifier {
         // How wide the signal itself shows, where the seed's width holds more than that.
         var coreHz: Double?
         var ceiling = SignalMeasurer.Ceiling.none
+        // Tones that take turns, whose own reading didn't show a speed: what else measures them comes first.
+        var fsk: SignalCandidate?, tones: DirectFSK.Tones?, fskRead: DirectFSK.Tones.Read?
         if let bandwidthHz {
             seed = (pointHz, bandwidthHz)
             ceiling = .given
         } else {
-            let map = neighbourhoodMap(first, sampleRate: sampleRate, pointHz: pointHz)
+            let hood = neighbourhood(first, sampleRate: sampleRate, pointHz: pointHz)
+            let map = hood.map
             if Task.isCancelled { return cancelled(SignalMeasurement(offsetHz: pointHz, seconds: seconds)) }
             let view = TraceFinder.find(map)
             if Task.isCancelled { return cancelled(SignalMeasurement(offsetHz: pointHz, seconds: seconds)) }
-            if let found = located(view, map: map, pointHz: pointHz, radiusHz: pointRadiusHz) {
+            let signals = candidates(hood, view: view, pointHz: pointHz, radiusHz: pointRadiusHz)
+            if Task.isCancelled { return cancelled(SignalMeasurement(offsetHz: pointHz, seconds: seconds)) }
+            fsk = fskCandidate(signals, pointHz: pointHz, radiusHz: pointRadiusHz)
+            if let fsk {
+                tones = DirectFSK.Tones(fsk, signals: signals, noiseDb: view.noiseDb)
+                fskRead = tones?.reading(SignalMeasurer.interleaved(hood.samples), rate: hood.rate, zeroHz: hood.centreHz)
+                if let fskRead, fskRead.reading.baud != nil {
+                    return identify(fskRead.measurement(seconds: seconds), rfHz: captureCenterHz + fskRead.offsetHz)
+                }
+            }
+            if let found = located(view, fsk: fsk, map: map, pointHz: pointHz, radiusHz: pointRadiusHz) {
                 seed = (found.offsetHz, found.widthHz)
                 coreHz = found.coreHz
                 ceiling = found.ceiling
@@ -380,9 +406,17 @@ public enum SignalIdentifier {
         let m = SignalMeasurer.measure(first, sampleRate: sampleRate, offsetHz: seed.offsetHz,
                                        bandwidthHz: seed.widthHz, seconds: seconds, ceiling: ceiling)
         if Task.isCancelled { return cancelled(m) }
-        let identity = identify(m, rfHz: captureCenterHz + m.offsetHz)
+        var identity = identify(m, rfHz: captureCenterHz + m.offsetHz)
+        // A longer read may show the speed; until then, what the tones do show.
+        if fskRead != nil, identity.best == nil, m.family == .unknown { identity.needsLongerRead = true }
         guard identity.needsLongerRead, !Task.isCancelled, let read = longer?(), read.iq.count >= 2 else {
-            return Task.isCancelled ? cancelled(m) : identity
+            if Task.isCancelled { return cancelled(m) }
+            if let fskRead, identity.best == nil, m.family == .unknown {
+                var answer = identify(fskRead.measurement(seconds: seconds), rfHz: captureCenterHz + fskRead.offsetHz)
+                answer.needsLongerRead = identity.needsLongerRead
+                return answer
+            }
+            return identity
         }
 
         // The longer read, from the same seed.
@@ -407,6 +441,14 @@ public enum SignalIdentifier {
                                           bandwidthHz: seed.widthHz, seconds: readSeconds, ceiling: ceiling)
         if Task.isCancelled { return cancelled(slow) }
         var refined = identify(slow, rfHz: captureCenterHz + slow.offsetHz)
+        if refined.best == nil, slow.family == .unknown, let tones {
+            let rereading = tones.reading(read.iq, rate: sampleRate, zeroHz: 0)
+            let seen = rereading?.reading.baud != nil ? rereading : fskRead
+            if let seen {
+                let at = seen == rereading ? snapshotSeconds : seconds
+                refined = identify(seen.measurement(seconds: at), rfHz: captureCenterHz + seen.offsetHz)
+            }
+        }
         // The longer read has been made; only a shorter one than asked for leaves a need that more IQ could meet.
         refined.needsLongerRead = refined.needsLongerRead && snapshotSeconds < longSeconds - 0.1
         if let note = refined.note { notes.insert(note, at: 0) }
@@ -440,12 +482,21 @@ public enum SignalIdentifier {
                 Double(e.upperBin - e.lowerBin + 1) * binHz)
     }
 
+    /// What was read around a point: `map`, and the samples it was built from (`rate`, their 0 Hz `centreHz` from the
+    /// capture centre), which hold everything on it.
+    struct Neighbourhood {
+        var map: TimeFrequencyMap
+        var samples: [DSPComplex]
+        var rate: Double
+        var centreHz: Double
+    }
+
     /// What `TraceFinder` reads around `pointHz`: the map of ±`localWindowHz` / 2 of it, as far as the capture goes, cut
     /// to a channel first so a capture's rate makes no difference. The channel's rate only has to hold that span: its
     /// filter passes twice what it is asked for before anything aliasing onto it matters (half of `localWindowHz` asked
     /// for, 125 kS/s from 1 MS/s). A capture's outer edges are filter skirts, so the map leaves them out of its noise
     /// unless the point itself lies there: then it reaches the point and a little past, up to the capture's edge.
-    static func neighbourhoodMap(_ iq: [Float], sampleRate: Double, pointHz: Double) -> TimeFrequencyMap {
+    static func neighbourhood(_ iq: [Float], sampleRate: Double, pointHz: Double) -> Neighbourhood {
         let nyquist = sampleRate / 2
         let edge = min(nyquist, max(usableCaptureShare * nyquist, abs(pointHz) + pointMarginHz))
         let lower = max(pointHz - localWindowHz / 2, -edge), upper = min(pointHz + localWindowHz / 2, edge)
@@ -462,31 +513,70 @@ public enum SignalIdentifier {
                     start += count
                 }
             }
-            return TimeFrequencyMap.build(z, rate: sampleRate, centerOffsetHz: centre, binHz: mapBinHz,
-                                          hopSeconds: mapHopSeconds, halfSpanHz: width / 2)
+            let map = TimeFrequencyMap.build(z, rate: sampleRate, centerOffsetHz: centre, binHz: mapBinHz,
+                                             hopSeconds: mapHopSeconds, halfSpanHz: width / 2)
+            return Neighbourhood(map: map, samples: z, rate: sampleRate, centreHz: centre)
         }
         let channel = Channel.extract(iq, sampleRate: sampleRate, offsetHz: centre, bandwidthHz: width / 2, sharp: false)
-        return TimeFrequencyMap.build(channel.samples, rate: channel.rate, centerOffsetHz: centre, binHz: mapBinHz,
-                                      hopSeconds: mapHopSeconds, halfSpanHz: width / 2)
+        let map = TimeFrequencyMap.build(channel.samples, rate: channel.rate, centerOffsetHz: centre, binHz: mapBinHz,
+                                         hopSeconds: mapHopSeconds, halfSpanHz: width / 2)
+        return Neighbourhood(map: map, samples: channel.samples, rate: channel.rate, centreHz: centre)
     }
 
-    /// Where to measure for the point: the area it lies in, or the nearest trace within `radiusHz` (the strongest of
-    /// equals), with a neighbour whose power takes turns with it (RTTY's other tone). Nil when there is neither: nothing
-    /// further out is looked for. A strong line with sidebands in view (`TraceFinder.hasSidebands`) is more than the line:
-    /// its extent is theirs, on the read's average, out to where they stay over the noise on both sides, and grows as far
-    /// as whatever next has no mirror image about the line.
+    /// `neighbourhood`'s map alone.
+    static func neighbourhoodMap(_ iq: [Float], sampleRate: Double, pointHz: Double) -> TimeFrequencyMap {
+        neighbourhood(iq, sampleRate: sampleRate, pointHz: pointHz).map
+    }
+
+    /// The view around the point as signals (`SignalGrouper`), from a picture of the frequencies the point's lines could
+    /// have tones on, cut narrow so it costs little. When there aren't two lines there to try, it isn't made.
+    static func candidates(_ hood: Neighbourhood, view: NeighbourhoodView, pointHz: Double, radiusHz: Double) -> [SignalCandidate] {
+        let reach = radiusHz + SignalGrouper.maxShiftHz + turnsRoomHz
+        guard SignalGrouper.mayHoldTones(view, band: (pointHz - reach)...(pointHz + reach), lines: hood.map) else {
+            return SignalGrouper.group(view, map: .empty)
+        }
+        let cut = Channel.extract(SignalMeasurer.interleaved(hood.samples), sampleRate: hood.rate,
+                                  offsetHz: pointHz - hood.centreHz, bandwidthHz: 2 * reach, sharp: false)
+        let map = SignalGrouper.turnsMap(cut.samples, rate: cut.rate, centerOffsetHz: pointHz, halfSpanHz: reach)
+        return SignalGrouper.group(view, map: map, lines: hood.map)
+    }
+
+    /// Room in the turns picture beyond the farthest tone it can be asked about.
+    static let turnsRoomHz = 200.0
+
+    /// The FSK the point lies on: within `radiusHz` of a tone, when that is the nearest line, or between its tones.
+    static func fskCandidate(_ signals: [SignalCandidate], pointHz: Double, radiusHz: Double) -> SignalCandidate? {
+        func distance(_ lower: Double, _ upper: Double) -> Double { max(0, lower - pointHz, pointHz - upper) }
+        guard !signals.contains(where: { $0.kind == .area && $0.lowerHz...$0.upperHz ~= pointHz }) else { return nil }
+        let lines = signals.flatMap { signal in signal.traces.map { (trace: $0, signal: signal) } }
+        if let nearest = lines.filter({ distance($0.trace.lowerHz, $0.trace.upperHz) <= radiusHz })
+            .min(by: { (distance($0.trace.lowerHz, $0.trace.upperHz), -$0.trace.snrDb)
+                < (distance($1.trace.lowerHz, $1.trace.upperHz), -$1.trace.snrDb) }) {
+            return nearest.signal.tones == nil ? nil : nearest.signal
+        }
+        return signals.first { $0.tones != nil && $0.lowerHz...$0.upperHz ~= pointHz }
+    }
+
+    /// Where to measure for the point: an FSK's tones (`fsk`, when its tones didn't give their own answer), the area the
+    /// point lies in, or the nearest trace within `radiusHz` (the strongest of equals). Nil when there is none of those:
+    /// nothing further out is looked for. A strong line with sidebands in view (`TraceFinder.hasSidebands`) is more than
+    /// the line: its extent is theirs, on the read's average, out to where they stay over the noise on both sides, and
+    /// grows as far as whatever next has no mirror image about the line.
     ///
     /// The extent keeps some room each side (`seedRoomHz` or `seedRoomShare` of its width), for skirts the read's
     /// average can't show and the measurement's width settles on, but no more than halfway to whatever is next to it.
     /// `coreHz` is the width without that room.
-    static func located(_ view: NeighbourhoodView, map: TimeFrequencyMap, pointHz: Double,
+    static func located(_ view: NeighbourhoodView, fsk: SignalCandidate? = nil, map: TimeFrequencyMap, pointHz: Double,
                         radiusHz: Double) -> (offsetHz: Double, widthHz: Double, coreHz: Double,
                                               ceiling: SignalMeasurer.Ceiling)? {
         func distance(_ t: SignalTrace) -> Double { max(0, t.lowerHz - pointHz, pointHz - t.upperHz) }
         var extent: (lower: Double, upper: Double)
         var mayBeLine = true, grows = false
         var line: SignalTrace?
-        if let area = view.areas.first(where: { $0.lowerHz...$0.upperHz ~= pointHz }) {
+        if let fsk {
+            extent = (fsk.lowerHz, fsk.upperHz)
+            mayBeLine = false
+        } else if let area = view.areas.first(where: { $0.lowerHz...$0.upperHz ~= pointHz }) {
             extent = (area.lowerHz, area.upperHz)
             grows = true
         } else {
@@ -505,20 +595,10 @@ public enum SignalIdentifier {
                     }
                 }
             }
-            // Its neighbours either side, when their power runs against its own: its other tones.
-            let below = view.traces.filter { $0.upperHz <= trace.lowerHz }.max { $0.upperHz < $1.upperHz }
-            let above = view.traces.filter { $0.lowerHz >= trace.upperHz }.min { $0.lowerHz < $1.lowerHz }
-            for other in [below, above].compactMap({ $0 })
-            where max(other.lowerHz - trace.upperHz, trace.lowerHz - other.upperHz) <= TraceFinder.turnsReachHz
-                && abs(other.snrDb - trace.snrDb) <= TraceFinder.turnsWithinDb
-                && TraceFinder.takeTurns(trace, other, map: map) {
-                extent = (min(extent.lower, other.lowerHz), max(extent.upper, other.upperHz))
-                mayBeLine = false
-                grows = false
-            }
         }
         // Next to it, what isn't a line's sidebands.
         let others = TraceFinder.beside(view, line: mayBeLine ? line : nil)
+            .filter { neighbour in fsk.map { !($0.lowerHz...$0.upperHz).overlaps(neighbour.lower...neighbour.upper) } ?? true }
         let nextBelow = others.filter { $0.upper < extent.lower }.map(\.upper).max()
         let nextAbove = others.filter { $0.lower > extent.upper }.map(\.lower).min()
         let room = max(seedRoomHz, seedRoomShare * (extent.upper - extent.lower))

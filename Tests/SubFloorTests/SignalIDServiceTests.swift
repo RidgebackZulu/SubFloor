@@ -139,7 +139,8 @@ struct SignalIDServiceTests {
         m.signalID.snapshotProvider = Self.provider(snap)
         m.signalID.chunkProvider = Self.chunks(snap)
         let id = try #require(await m.signalID.identify(atHz: m.centerHz + 5_000))
-        #expect(id.best?.name == "RTTY", "\(id.label)")
+        // RTTY's numbers, away from the amateur segments: not shown to be RTTY.
+        #expect(id.label.hasPrefix("2-FSK · 45.45 Bd · 170 Hz shift"), "\(id.label)")
         #expect(abs(id.measurement.offsetHz - 5_000) < 50, "\(id.measurement.offsetHz)")
         #expect(!id.confirmedByDecode)
     }
@@ -157,7 +158,7 @@ struct SignalIDServiceTests {
         m.signalID.snapshotProvider = Self.provider(snap)
         m.signalID.chunkProvider = Self.chunks(snap)
         let id = try #require(await m.signalID.identify(atHz: m.centerHz + 5_000))
-        #expect(id.best?.name == "RTTY", "\(id.label)")
+        #expect(id.label.hasPrefix("2-FSK · 45.45 Bd"), "\(id.label)")
     }
 
     /// A point on the same signal within 5 s reuses the result, and an empty point its own; a point elsewhere, or a
@@ -716,7 +717,7 @@ struct SignalIDServiceTests {
         #expect(outside.note == SignalIdentifier.tooSoonNote && outside.best == nil, "\(outside.label)")
         #expect(calls.withLock { $0 } == 0)   // nothing read for it
         let inside = try #require(await m.signalID.identify(atHz: old + 5_000))
-        #expect(inside.best?.name == "RTTY", "\(inside.label)")
+        #expect(inside.label.hasPrefix("2-FSK · 45.45 Bd"), "\(inside.label)")
         #expect(calls.withLock { $0 } == 1)
     }
 
