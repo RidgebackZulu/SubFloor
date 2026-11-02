@@ -1545,4 +1545,198 @@ struct SignalIDServiceTests {
         #expect(given.withLock { $0 } == [nil] && outcome != nil && outcome?.comb == nil,
                 "\(given.withLock { $0 }), kept \(String(describing: outcome?.comb))")
     }
+
+    // MARK: Fix round 2: a ring that moves on
+
+    /// A ring at `rate` that moves on with `clock` (its end, in seconds), as the radio's does: it holds `holds` seconds,
+    /// says where its reads end (`endFrame`) and when (`endTime`, the clock), and a read of the chunked kind takes
+    /// `readCost` of clock a second it visits. Its IQ is zeros, with a tone `toneHz` from the centre while the ring's
+    /// position lies in `tone` (seconds on the clock). Made a piece at a time, never held. `lag`: the ring moves on that
+    /// much just after each probe of its rate says where it ends (a read then finds it further on). `stopped`: the radio
+    /// is stopped, so the ring ends where it did at the start while its reads are stamped with the clock, as the
+    /// recorder stamps them.
+    nonisolated private static func movingRing(rate: Double, clock: Locked<Double>, holds: Double = 30,
+                                               readCost: Double = 0.03, toneHz: Double = 5_000,
+                                               tone: ClosedRange<Double>? = nil, lag: Double = 0,
+                                               stopped: Bool = false)
+        -> (snapshot: SignalIDService.SnapshotProvider, chunks: SignalIDService.ChunkProvider) {
+        @Sendable func fill(_ out: inout [Float], from first: Int, count: Int) {
+            out.withUnsafeMutableBufferPointer { $0.update(repeating: 0) }
+            guard let tone, Double(first + count) / rate >= tone.lowerBound,
+                  Double(first) / rate <= tone.upperBound else { return }
+            for k in 0..<count {
+                let n = first + k
+                guard tone ~= Double(n) / rate else { continue }
+                let phase = 2 * Double.pi * toneHz * Double(n) / rate
+                out[2 * k] = Float(cos(phase))
+                out[2 * k + 1] = Float(sin(phase))
+            }
+        }
+        let stoppedAt = clock.withLock { $0 }
+        @Sendable func ringEnd(_ now: Double) -> Int { Int(((stopped ? stoppedAt : now) * rate).rounded()) }
+        let snapshot: SignalIDService.SnapshotProvider = { last in
+            let now = clock.withLock { $0 }
+            if last <= SignalIDService.probeSeconds { clock.withLock { $0 += lag } }
+            let end = ringEnd(now), frames = min(Int((last * rate).rounded()), Int(holds * rate))
+            var samples = [Float](repeating: 0, count: 2 * frames)
+            fill(&samples, from: end - frames, count: frames)
+            return IQSnapshot(samples: samples, sampleRate: rate, endTime: Date(timeIntervalSinceReferenceDate: now),
+                              endFrame: end)
+        }
+        let chunks: SignalIDService.ChunkProvider = { last, chunkFrames, visit in
+            let now = clock.withLock { $0 }
+            let end = ringEnd(now), frames = min(Int((last * rate).rounded()), Int(holds * rate))
+            var piece = [Float](repeating: 0, count: 2 * min(chunkFrames, frames))
+            var done = 0
+            while done < frames {
+                let n = min(chunkFrames, frames - done)
+                fill(&piece, from: end - frames + done, count: n)
+                guard piece[0..<(2 * n)].withUnsafeBufferPointer(visit) else { return nil }
+                done += n
+            }
+            clock.withLock { $0 += readCost * Double(frames) / rate }
+            return IQRead(frames: frames, sampleRate: rate, endTime: Date(timeIntervalSinceReferenceDate: now),
+                          endFrame: end)
+        }
+        return (snapshot, chunks)
+    }
+
+    /// The look-back on a ring that moves on while it works (N1): each analysis takes 0.35 s or 0.6 s of the test's
+    /// clock and each read 3 % of what it visits, at the channel rates of 10 MS/s and 6 MS/s. Its span is fixed in sample
+    /// time when it starts, so every window holds its own 3 s (the last its 1 s), in one read and two; "No signal" is
+    /// right, says nothing more, and is kept. With a signal heard 9 to 12 s before the first read ended, that is the
+    /// answer, 9 s back.
+    @Test func aLookBackOnAMovingRing() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        for (rate, reads, cost) in [(625_000.0, 1, 0.35), (750_000.0, 2, 0.6)] {
+            do {
+                let clock = Locked(1_000.0)
+                let ring = Self.movingRing(rate: rate, clock: clock)
+                m.signalID.snapshotProvider = ring.snapshot
+                m.signalID.chunkProvider = ring.chunks
+                m.signalID.invalidateCache()
+                let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
+                let silence = Self.silence(seen)
+                m.signalID.analysis = { a in
+                    clock.withLock { $0 += cost }
+                    return silence(a)
+                }
+                let before = SignalIDService.lookBackStats.withLock { $0.reads }
+                let at = m.centerHz + 5_000
+                let id = try #require(await m.signalID.identify(atHz: at))
+                let label = "\(rate) S/s, \(cost) s an analysis"
+                #expect(id.note == SignalIdentifier.noSignalNote, "\(label): \(id.note ?? "no note")")
+                #expect(SignalIDService.lookBackStats.withLock { $0.reads } - before == reads, "\(label)")
+                let windows = seen.withLock { $0 }.filter(\.longer).map(\.seconds)
+                #expect(windows.count == 5 && zip(windows, [3.0, 3, 3, 3, 1]).allSatisfy { $0 >= $1 - 0.06 },
+                        "\(label): \(windows)")
+                let runs = seen.withLock { $0.count }
+                _ = await m.signalID.identify(atHz: at)
+                #expect(seen.withLock { $0.count } == runs, "\(label): not kept")
+            }
+        }
+        // A signal 8.6 to 12 s before the first read's end, at the 6 MS/s channel rate (two reads): the windows ending 3
+        // and 6 s back are mostly silent.
+        do {
+            let rate = 750_000.0
+            let clock = Locked(1_000.0)
+            let ring = Self.movingRing(rate: rate, clock: clock, tone: (1_000 - 12)...(1_000 - 8.6))
+            m.signalID.snapshotProvider = ring.snapshot
+            m.signalID.chunkProvider = ring.chunks
+            m.signalID.invalidateCache()
+            m.signalID.analysis = { a in
+                clock.withLock { $0 += 0.6 }
+                // Something there when the window's newest 3 s (or all it holds) are mostly tone.
+                let frames = min(a.iq.count / 2, Int(3 * a.sampleRate))
+                var power = 0.0
+                for k in (a.iq.count / 2 - frames)..<(a.iq.count / 2) {
+                    power += Double(a.iq[2 * k] * a.iq[2 * k] + a.iq[2 * k + 1] * a.iq[2 * k + 1])
+                }
+                let on = power / Double(max(frames, 1)) > 0.5
+                return SignalIdentity(measurement: SignalMeasurement(offsetHz: a.atHz - a.captureCenterHz,
+                                                                     occupiedBandwidthHz: on ? 100 : 0,
+                                                                     family: on ? .carrier : .noise, seconds: 3),
+                                      note: on ? nil : SignalIdentifier.noSignalNote)
+            }
+            let found = try #require(await m.signalID.identify(atHz: m.centerHz + 5_000))
+            #expect(found.measurement.family == .carrier && found.note == SignalIDService.silentFor(9),
+                    "\(rate): \(found.note ?? "no note")")
+        }
+    }
+
+    /// A look-back that reaches its most reads before covering its span says so (not that a read failed), and isn't
+    /// kept (N2).
+    @Test func aLookBackStopsAtItsMostReads() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let clock = Locked(1_000.0)
+        let ring = Self.movingRing(rate: 750_000, clock: clock)   // a 375 kS/s channel: two reads
+        m.signalID.snapshotProvider = ring.snapshot
+        m.signalID.chunkProvider = ring.chunks
+        m.signalID.lookBackReads = 1
+        let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
+        m.signalID.analysis = Self.silence(seen)
+        let at = m.centerHz + 5_000
+        let id = try #require(await m.signalID.identify(atHz: at))
+        #expect(id.note == "\(SignalIdentifier.noSignalNote); \(SignalIDService.lookBackStopped(after: 1))",
+                "\(id.note ?? "no note")")
+        let runs = seen.withLock { $0.count }
+        _ = await m.signalID.identify(atHz: at)
+        #expect(seen.withLock { $0.count } > runs, "kept")
+    }
+
+    /// A ring that outruns where its probe said it ended, past the 0.25 s margin, never makes the look-back read again.
+    /// Outrun by 0.5 s, the oldest window loses what the ring moved past and too little of it is left (under 1 s): it is
+    /// passed over, the look-back covers 15 s, and says the ring moved on (not kept). Outrun by 1.5 s, the window 12 to
+    /// 15 s back is analysed with what it holds (2.75 s), and the look-back covers 14.75 s. One read each.
+    @Test func aRingThatOutrunsItsProbe() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        for (lag, note, kept) in [(0.5, SignalIdentifier.noSignalNote + "; Looked back 15.0 s of the 16 s asked for: the ring moved on",
+                                   false),
+                                  (1.5, SignalIdentifier.noSignalNote + "; Looked back 14.8 s of the 16 s asked for: the ring moved on",
+                                   false)] {
+            let clock = Locked(1_000.0)
+            let ring = Self.movingRing(rate: 625_000, clock: clock, lag: lag)
+            m.signalID.snapshotProvider = ring.snapshot
+            m.signalID.chunkProvider = ring.chunks
+            m.signalID.invalidateCache()
+            let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
+            m.signalID.analysis = Self.silence(seen)
+            let before = SignalIDService.lookBackStats.withLock { $0.reads }
+            let at = m.centerHz + 5_000
+            let id = try #require(await m.signalID.identify(atHz: at))
+            #expect(id.note == note, "\(lag) s: \(id.note ?? "no note")")
+            #expect(SignalIDService.lookBackStats.withLock { $0.reads } - before == 1, "\(lag) s")
+            let runs = seen.withLock { $0.count }
+            _ = await m.signalID.identify(atHz: at)
+            #expect((seen.withLock { $0.count } == runs) == kept, "\(lag) s: kept \(kept)")
+        }
+    }
+
+    /// The radio stopped: the ring ends where it did, though each read is stamped with the clock as it is made. Placed
+    /// in sample time, every window still holds its own 3 s (by the reads' end times it would be placed 0.6 s an analysis
+    /// off).
+    @Test func aStoppedRingIsPlacedBySampleTime() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let clock = Locked(1_000.0)
+        let ring = Self.movingRing(rate: 625_000, clock: clock, stopped: true)
+        m.signalID.snapshotProvider = ring.snapshot
+        m.signalID.chunkProvider = ring.chunks
+        let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
+        let silence = Self.silence(seen)
+        m.signalID.analysis = { a in
+            clock.withLock { $0 += 0.6 }
+            return silence(a)
+        }
+        let id = try #require(await m.signalID.identify(atHz: m.centerHz + 5_000))
+        #expect(id.note == SignalIdentifier.noSignalNote, "\(id.note ?? "no note")")
+        let windows = seen.withLock { $0 }.filter(\.longer).map(\.seconds)
+        // Each window and what came before it, and the read's margin at its old end (the ring didn't move into it).
+        let margin = SignalIDService.lookBackMarginSeconds
+        #expect(windows.count == 5 && zip(windows, [13.0, 10, 7, 4, 1]).allSatisfy { abs($0 - ($1 + margin)) < 0.06 },
+                "\(windows)")
+    }
 }

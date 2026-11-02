@@ -47,11 +47,16 @@ public struct IQSnapshot: Sendable {
     public var frames: Int { samples.count / 2 }
     /// When the last frame was heard.
     public var endTime: Date
+    /// Where it ends in the ring: the count of frames the ring had taken when it was read (its newest frame is the
+    /// one before). It only grows, so reads made at different times can be placed against each other in sample
+    /// time, with the radio running or stopped. Nil when not known.
+    public var endFrame: Int?
 
-    public init(samples: [Float], sampleRate: Double, endTime: Date) {
+    public init(samples: [Float], sampleRate: Double, endTime: Date, endFrame: Int? = nil) {
         self.samples = samples
         self.sampleRate = sampleRate
         self.endTime = endTime
+        self.endFrame = endFrame
     }
 }
 
@@ -61,11 +66,14 @@ public struct IQRead: Sendable, Equatable {
     public var sampleRate: Double
     /// When the last frame was heard.
     public var endTime: Date
+    /// Where it ends in the ring (`IQSnapshot.endFrame`). Nil when not known.
+    public var endFrame: Int?
 
-    public init(frames: Int, sampleRate: Double, endTime: Date) {
+    public init(frames: Int, sampleRate: Double, endTime: Date, endFrame: Int? = nil) {
         self.frames = frames
         self.sampleRate = sampleRate
         self.endTime = endTime
+        self.endFrame = endFrame
     }
 }
 
@@ -449,15 +457,17 @@ public final class StreamRecorder: @unchecked Sendable {
         let frames = Int(min(lastSeconds * setup.sampleRate, Double(ring.available / bpf)).rounded())
         guard frames > 0 else { return nil }
         var end = Date()
+        var endFrame: Int?
         /// Copies the newest frames into `out`, under the producer lock so a reconfigure cannot change
         /// what the bytes mean first. `out` must be faulted in already: a fresh allocation's page faults
         /// would otherwise run with `push` blocked (tens of ms for 16 s of 2 MS/s).
         func copy(into out: UnsafeMutableRawBufferPointer) -> Int {
-            let (n, now) = producer.withLock { p -> (Int, @Sendable () -> Date) in
-                guard p.setup?.layout == layout, p.plan == plan else { return (0, p.now) }
-                return (ring.copyNewest(into: out), p.now)
+            let (n, now, head) = producer.withLock { p -> (Int, @Sendable () -> Date, Int?) in
+                guard p.setup?.layout == layout, p.plan == plan else { return (0, p.now, nil) }
+                return (ring.copyNewest(into: out), p.now, ring.headFrames)
             }
             end = now()
+            endFrame = head
             return n
         }
         let samples: [Float]
@@ -478,7 +488,7 @@ public final class StreamRecorder: @unchecked Sendable {
             }
         }
         guard !samples.isEmpty else { return nil }
-        return IQSnapshot(samples: samples, sampleRate: setup.sampleRate, endTime: end)
+        return IQSnapshot(samples: samples, sampleRate: setup.sampleRate, endTime: end, endFrame: endFrame)
     }
 
     /// `snapshot(lastSeconds:)`'s frames (the same span, fixed when it is called: never from before the last
@@ -522,7 +532,8 @@ public final class StreamRecorder: @unchecked Sendable {
             format.decode(bytes.baseAddress!, count: count, into: floats.baseAddress!)
             guard visit(UnsafeBufferPointer(rebasing: floats[0..<count])) else { return nil }
         }
-        return IQRead(frames: (span.end - span.start) / bpf, sampleRate: setup.sampleRate, endTime: span.time)
+        return IQRead(frames: (span.end - span.start) / bpf, sampleRate: setup.sampleRate, endTime: span.time,
+                      endFrame: span.end / bpf)
     }
 
     private func enqueue(_ c: Command) {

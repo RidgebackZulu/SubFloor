@@ -57,6 +57,22 @@ import Testing
         #expect(abs(s.endTime.timeIntervalSinceNow) < 5)
     }
 
+    /// Both kinds of read say where they end in the ring (`endFrame`): the count of frames pushed, growing as more come
+    /// and on past a retune's clear, so reads made at different times can be placed against each other.
+    @Test func readsSayWhereTheyEnd() throws {
+        let r = makeIQ()
+        defer { r.shutdown() }
+        push(r, frames: 0..<2_000_000, i: { _ in 0.1 }, q: { _ in 0 })
+        #expect(try #require(r.snapshot(lastSeconds: 1)).endFrame == 2_000_000)
+        push(r, frames: 0..<500_000, i: { _ in 0.1 }, q: { _ in 0 })
+        let read = try #require(r.snapshot(lastSeconds: 1, chunkFrames: 100_000) { _ in true })
+        #expect(read.endFrame == 2_500_000 && read.frames == 1_000_000)
+        r.clearHistory()
+        push(r, frames: 0..<100_000, i: { _ in 0.1 }, q: { _ in 0 })
+        let after = try #require(r.snapshot(lastSeconds: 1))
+        #expect(after.endFrame == 2_600_000 && after.frames == 100_000)
+    }
+
     @Test func snapshotStopsAtTheRetune() throws {
         let r = makeIQ()
         defer { r.shutdown() }
