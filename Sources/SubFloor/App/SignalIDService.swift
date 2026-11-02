@@ -154,14 +154,18 @@ final class SignalIDQueue {
 /// `IQRead.endTime`: the read's own, the longer read's its own, the look-back's each window's) only from the RSP
 /// (`sourceKind`): the demo source and IQ files have no true time, so no slot evidence. Hover and card ask within
 /// `radiusPixels` of the pointer at the current zoom (`radiusHz`); agents get the identifier's default. The capture's
-/// interference comb is found once (`CaptureComb.find`) on the app's spectrum of this capture, or with none on
-/// `combReadSeconds` of the ring's newest IQ, kept `combSeconds` and forgotten on a retune, and given to every analysis.
+/// interference comb is found once (`CaptureComb.find`, `findComb`, before the first read) on the app's spectrum of this
+/// capture, or with none on `combReadSeconds` of the ring's newest IQ (never on a read that reaches the retune barrier);
+/// it is kept `combSeconds`, only when the first read had its 3 s, and forgotten on a retune, and given only to analyses
+/// of IQ heard in the tuning it was found in.
 ///
 /// **A silent moment isn't an empty frequency** (`lookBack`). When the first read finds nothing at the point ("No
-/// signal"), and a longer read may be made, up to `longSeconds` of the ring (to the retune barrier) are read as the
-/// longer read is, and `firstSeconds` at a time going back from the newest are analysed until one isn't "No signal":
-/// that answer, saying how long it has been silent; "No signal" once none is. The first answer is out meanwhile, as
-/// measuring. A ring holding less says so ("Looked back 5.0 s of the 16 s asked for").
+/// signal"), and a longer read may be made, the `longSeconds` before it (as far as the ring and the retune barrier go)
+/// are analysed `firstSeconds` at a time going back, read off the ring in turn as a channel around the point, each read
+/// within `longReadBudgetBytes` (one at 10 MS/s, two at 6) and trimmed in place, until a window measures a signal:
+/// that answer, saying how long nothing was there to identify; "No signal" once none does. The first answer is out
+/// meanwhile, as measuring. "No signal" is kept for the point once the look-back covered the 16 s or all the ring held
+/// since the retune; a ring holding less says so ("Looked back 5.0 s of the 16 s asked for").
 ///
 /// **Frames.** Every answer comes back in the capture's frame: its `measurement.offsetHz`, its `signals`' and its
 /// `groupSpanHz` are all relative to the capture centre the ring's IQ was heard at (display Hz), which a group answer's
@@ -442,7 +446,7 @@ final class SignalIDService {
                 continue
             }
             guard !Task.isCancelled, let result, result.state == tuning.current else { return nil }
-            if let found = result.comb { combCache = (result.state, now(), found) }
+            if let found = result.comb { combCache = (result.state, now(), found.reading) }
             return keep(result, atHz: atHz, bandwidthHz: bandwidthHz, radiusHz: radiusHz)
         }
     }
@@ -458,11 +462,11 @@ final class SignalIDService {
         return confirmed(hit.identity, centerHz: hit.centerHz, bandwidthHz: bandwidthHz, now: now)
     }
 
-    /// The comb found for this tuning within `combSeconds`, if any was looked for.
-    private func knownComb() -> CombReading? {
+    /// The comb found for this tuning within `combSeconds`, if any was looked for, with the tuning it was found in.
+    private func knownComb() -> KnownComb? {
         guard let known = combCache, known.state == tuning.current,
               now().timeIntervalSince(known.at) <= Self.combSeconds else { return nil }
-        return known.comb
+        return KnownComb(state: known.state, reading: known.comb)
     }
 
     /// `result`'s answer, confirmed, and cached when it should be.
@@ -495,17 +499,24 @@ final class SignalIDService {
     @MainActor private final class Finished { var value = false }
 
     /// What `run` made of it: the answer, the tuning its IQ was heard in, whether it had every read it asked for (the
-    /// first pass's 3 s, and the longer read or look-back when wanted), and the comb when it had to find it.
+    /// first pass's 3 s, and the longer read or look-back when wanted), and the comb when it had to find it and it may
+    /// be kept (found in that tuning, with 3 s and more of it in the ring).
     struct Outcome: Sendable {
         var identity: SignalIdentity
         var state: TuneBarrier.State
         var complete: Bool
-        var comb: CombReading? = nil
+        var comb: KnownComb? = nil
     }
 
     /// Whether the capture has a comb, once looked for (`comb` nil: none).
     struct CombReading: Sendable, Equatable {
         var comb: CaptureComb?
+    }
+
+    /// The comb as found in the tuning `state`: given to an analysis of IQ heard in that tuning only.
+    struct KnownComb: Sendable, Equatable {
+        var state: TuneBarrier.State
+        var reading: CombReading
     }
 
     /// What `run` is asked, from the main actor.
@@ -521,8 +532,8 @@ final class SignalIDService {
         var trueTime = false
         /// A tune failed over `notAtFrequencyGraceSeconds` ago: a point the IQ doesn't hold is `notAtFrequencyNote`.
         var notAtFrequency = false
-        /// The capture's comb as already found for this tuning; nil: find it.
-        var comb: CombReading? = nil
+        /// The capture's comb as already found, and the tuning it was found in; nil: find it.
+        var comb: KnownComb? = nil
     }
 
     /// `run` (the tests' form).
@@ -547,7 +558,18 @@ final class SignalIDService {
         var whole = wholeFirst
         var identity: SignalIdentity
         var read: FirstRead
-        var combFound: CombReading?
+        // The capture's comb: as found for this tuning, else found now (before the first read, so that read isn't held
+        // meanwhile), on the app's spectrum of it or on the ring.
+        var combFound: KnownComb?
+        if request.comb == nil {
+            combFound = findComb(spectrum: request.spectrum, provider: provider, chunks: chunks, barrier: barrier,
+                                 finder: combFinder)
+            guard !Task.isCancelled else { return nil }
+        }
+        // Only for IQ heard in the tuning it was found in.
+        func combFor(_ state: TuneBarrier.State) -> CaptureComb? {
+            [request.comb, combFound].compactMap { $0 }.first { $0.state == state }?.reading.comb
+        }
         while true {
             // Held only here: a channel read again whole is let go first.
             guard !Task.isCancelled,
@@ -562,12 +584,7 @@ final class SignalIDService {
                                              note: note)
                 return Outcome(identity: outside, state: first.state, complete: false)
             }
-            // The capture's comb: as found for this tuning, else on the app's spectrum of it, else on the ring.
-            if request.comb == nil, combFound == nil {
-                combFound = comb(first, chunks: chunks, barrier: barrier, finder: combFinder)
-                guard !Task.isCancelled else { return nil }
-            }
-            let comb = (request.comb ?? combFound)?.comb
+            let comb = combFor(first.state)
             identity = analysis(AnalysisInput(iq: first.iq, sampleRate: first.sampleRate,
                                               captureCenterHz: first.state.centerHz + first.offsetHz, atHz: atHz,
                                               bandwidthHz: bandwidthHz, spectrumDb: first.spectrumDb, longer: nil,
@@ -584,9 +601,11 @@ final class SignalIDService {
             break
         }
         let state = read.state, rate = read.sampleRate
-        let comb = (request.comb ?? combFound)?.comb
+        let comb = combFor(state)
+        // Kept only when found in this tuning with 3 s of it in the ring (never from a read "Too soon" after a retune).
+        let keptComb = combFound.flatMap { $0.state == state && !read.short ? $0 : nil }
         func outcome(_ identity: SignalIdentity, complete: Bool) -> Outcome {
-            Outcome(identity: identity, state: state, complete: complete, comb: combFound)
+            Outcome(identity: identity, state: state, complete: complete, comb: keptComb)
         }
         // Less than the 3 s asked for (but enough to measure): said in the note.
         let readSeconds = Double(read.frames) / rate
@@ -602,21 +621,27 @@ final class SignalIDService {
         // first answer is out meanwhile.
         onFirst?(identity, state)
         read.iq = []   // not held through the longer read
+        if silent {
+            switch lookBack(request: request, state: state, firstEnd: read.endTime, sampleRate: read.captureRate,
+                            comb: comb, chunks: chunks, analysis: analysis, barrier: barrier) {
+            case .dropped:
+                return nil
+            case .unavailable(let why):
+                add(why, to: &identity)
+                return outcome(identity, complete: false)
+            case .answer(let found, let complete):
+                return outcome(found, complete: complete)
+            }
+        }
         let m = identity.measurement
-        let around = silent ? atHz - state.centerHz : m.offsetHz
-        switch longerRead(offsetHz: around, widthHz: max(silent ? 0 : m.occupiedBandwidthHz, bandwidthHz ?? 0),
+        switch longerRead(offsetHz: m.offsetHz, widthHz: max(m.occupiedBandwidthHz, bandwidthHz ?? 0),
                           tuning: state, sampleRate: read.captureRate, chunks: chunks, barrier: barrier) {
         case .dropped:
             return nil
         case .unavailable(let why):
-            add(silent ? lookBackFailedNote : why, to: &identity)
+            add(why, to: &identity)
             return outcome(identity, complete: false)
         case .read(let long):
-            if silent {
-                guard let found = lookBack(long, request: request, state: state, comb: comb, analysis: analysis,
-                                           barrier: barrier) else { return nil }
-                return outcome(found.identity, complete: found.complete)
-            }
             let refined = analysis(AnalysisInput(iq: long.iq, sampleRate: long.sampleRate,
                                                  captureCenterHz: state.centerHz + long.offsetHz, atHz: atHz,
                                                  bandwidthHz: bandwidthHz, spectrumDb: nil, longer: { (long.iq, long.seconds) },
@@ -644,51 +669,137 @@ final class SignalIDService {
     /// The note when the look-back's read failed: the newest 3 s are all there is.
     nonisolated static let lookBackFailedNote = "The look-back read failed; this is the newest 3 s alone"
 
-    /// The note on what a look-back found, `seconds` back from the newest IQ it read.
+    /// The note on what a look-back found, its window ending `seconds` before the first read did.
     nonisolated static func silentFor(_ seconds: Double) -> String {
-        String(format: "Silent for the last %.0f s; this is what was on before then", seconds)
+        String(format: "Nothing to identify in the last %.0f s; this is what was on before then", seconds)
     }
 
-    /// The look-back (see the type's notes) over `long` (the ring's newest up to `longSeconds`, a channel around the
-    /// point): `firstSeconds` at a time going back from its newest (which the first read was), each analysed with what
-    /// came before it as its longer read and its own end time, until one isn't "No signal" (that answer, recentred and
-    /// saying how long it has been silent), or none is ("No signal"). A read shorter than asked for says so; the answer
-    /// is complete when the read was whole and the answer wants no more. Nil when the radio retuned or it was cancelled.
-    nonisolated static func lookBack(_ long: LongRead, request: Request, state: TuneBarrier.State, comb: CaptureComb?,
-                                     analysis: Analysis, barrier: TuneBarrier) -> (identity: SignalIdentity, complete: Bool)? {
-        let rate = long.sampleRate
-        let whole = long.seconds >= longSeconds - 0.1
-        var notes: [String] = []
-        if !whole { notes.append(String(format: "Looked back %.1f s of the %.0f s asked for", long.seconds, longSeconds)) }
-        var iq = long.iq
-        var answer = SignalIdentity(measurement: SignalMeasurement(offsetHz: request.atHz - state.centerHz,
-                                                                   family: .noise, seconds: long.seconds),
-                                    note: SignalIdentifier.noSignalNote)
-        var complete = whole
-        var back = firstSeconds
-        while long.seconds - back >= SignalIdentifier.minimumSeconds {
-            // What came before `back` seconds ago, trimmed in place.
-            let keep = Int(((long.seconds - back) * rate).rounded())
-            iq.removeLast(max(0, iq.count - 2 * keep))
-            guard !Task.isCancelled, barrier.current == state else { return nil }
-            let before = iq, seconds = Double(keep) / rate
-            let found = analysis(AnalysisInput(iq: before, sampleRate: rate, captureCenterHz: state.centerHz + long.offsetHz,
-                                               atHz: request.atHz, bandwidthHz: request.bandwidthHz, spectrumDb: nil,
-                                               longer: { (before, seconds) }, pointRadiusHz: request.radiusHz,
-                                               endTime: request.trueTime ? long.endTime.addingTimeInterval(-back) : nil,
-                                               comb: comb))
-            guard !Task.isCancelled, barrier.current == state else { return nil }
-            if !isSilent(found) {
-                answer = recentred(found, by: long.offsetHz, captureCenterHz: state.centerHz)
-                notes.insert(silentFor(back), at: 0)
-                complete = complete && !found.needsLongerRead
-                break
-            }
-            back += firstSeconds
+    /// A look-back read is placed by the time the ring's newest IQ was heard at its last read: the ring has moved on by
+    /// the next, by up to this much, and each read reaches this far either side of what it is for.
+    nonisolated static let lookBackMarginSeconds = 0.25
+    /// A look-back reaching back this much short of `longSeconds` covered them (a ring of exactly 16 s, its settle and
+    /// the margin taken off).
+    nonisolated static let lookBackToleranceSeconds = 0.5
+    /// The most reads one look-back makes (two at most at the rig's rates: a guard against a ring that keeps moving).
+    nonisolated static let lookBackMaxReads = 6
+    /// The channel extractor reserves its output with a frame per stage and one more over the input's share.
+    nonisolated static let lookBackSlackFrames = 16
+
+    #if DEBUG
+    /// Test hook: how many times a look-back's read was copied to be trimmed (never, when it is handed over), and the
+    /// most floats one of its reads reserved.
+    nonisolated static let lookBackStats = Mutex((copies: 0, reads: 0, mostFloats: 0))
+    #endif
+
+    /// How a look-back went.
+    enum LookBackOutcome: Sendable {
+        case answer(SignalIdentity, complete: Bool)
+        /// None to be had: why, for the answer's note.
+        case unavailable(String)
+        /// Cancelled, or the radio retuned: the answer is dropped.
+        case dropped
+    }
+
+    /// The look-back (see the type's notes): what was at the point before the first read, which ended at `firstEnd`.
+    /// Its windows end `firstSeconds`, 2 × … before `firstEnd`, each analysed with what came before it (back to
+    /// `longSeconds` before `firstEnd`) as its longer read, and its own end time. They are read in turn off the ring as a
+    /// channel around the point (`channelRead`), each read as much as `longReadBudgetBytes` holds of it (less
+    /// `lookBackMarginSeconds` and `settleSeconds`), placed by time and handed over to be trimmed in place, window by window: never copied.
+    ///
+    /// The first window whose answer has an extent is the answer, recentred, saying how long nothing was there to
+    /// identify; with none, "No signal". A ring holding less than `longSeconds` (its start or the retune barrier reached)
+    /// says how much it held, and that is all there is: the answer is complete either way. Nil (`dropped`) when the radio
+    /// retuned or it was cancelled.
+    nonisolated static func lookBack(request: Request, state: TuneBarrier.State, firstEnd: Date, sampleRate: Double,
+                                     comb: CaptureComb?, chunks: ChunkProvider, analysis: Analysis,
+                                     barrier: TuneBarrier) -> LookBackOutcome {
+        let pointHz = request.atHz - state.centerHz
+        let windowHz = max(minimumChannelHz, channelWidths * (request.bandwidthHz ?? 0))
+        let rate = Channel.outputRate(sampleRate: sampleRate, bandwidthHz: windowHz)
+        // What one read holds: the budget (less the extractor's few frames of slack: `lookBackSlackFrames`), less the
+        // margin and the settle it reads on top.
+        let room = Double(longReadBudgetBytes / 8 - lookBackSlackFrames) / rate - lookBackMarginSeconds - settleSeconds
+        guard room >= firstSeconds + SignalIdentifier.minimumSeconds else {
+            return .unavailable(String(format: "No look-back: a %.0f kHz channel is too wide for one", windowHz / 1000))
         }
-        let said = [answer.note].compactMap { $0 } + notes
-        answer.note = said.joined(separator: "; ")
-        return (answer, complete)
+        let oldest = firstEnd.addingTimeInterval(-longSeconds)
+        var backs = Array(stride(from: firstSeconds, through: longSeconds - SignalIdentifier.minimumSeconds,
+                                 by: firstSeconds))
+        // The ring's newest as last read, and its start once a read reached it.
+        var known = firstEnd
+        var start: Date?
+        var reads = 0
+        pastReads: while let first = backs.first, reads < lookBackMaxReads {
+            // From the first window not yet analysed back as far as one read holds.
+            let newer = firstEnd.addingTimeInterval(-first)
+            let span = min(newer.timeIntervalSince(oldest), room)
+            let older = newer.addingTimeInterval(-span)
+            reads += 1
+            switch channelRead(seconds: known.timeIntervalSince(older) + lookBackMarginSeconds, offsetHz: pointHz,
+                               windowHz: windowHz, tuning: state, sampleRate: sampleRate, chunks: chunks,
+                               barrier: barrier, feedSeconds: span + lookBackMarginSeconds) {
+            case .dropped:
+                return .dropped
+            case .failed:
+                return .unavailable(lookBackFailedNote)
+            case .read(var segment):
+                // Handed over: `segment` lets go of it, so trimming it doesn't copy it.
+                var iq = segment.iq
+                segment.iq = []
+                known = max(known, segment.readEndTime)
+                let readStart = segment.endTime.addingTimeInterval(-segment.seconds)
+                if segment.reachedStart { start = readStart }
+                #if DEBUG
+                lookBackStats.withLock { $0.reads += 1; $0.mostFloats = max($0.mostFloats, segment.reservedFloats) }
+                let base = iq.withUnsafeBufferPointer { $0.baseAddress }
+                #endif
+                while let back = backs.first {
+                    let end = firstEnd.addingTimeInterval(-back)
+                    let held = end.timeIntervalSince(readStart)   // this window and what came before it, in this read
+                    let window = min(firstSeconds, end.timeIntervalSince(oldest))
+                    if segment.reachedStart {
+                        guard held >= SignalIdentifier.minimumSeconds else { break pastReads }   // nothing older
+                    } else if held < window - settleSeconds {
+                        continue pastReads   // the next read has it whole
+                    }
+                    let keep = min(iq.count / 2, Int((held * rate).rounded()))
+                    iq.removeLast(iq.count - 2 * keep)
+                    #if DEBUG
+                    if iq.withUnsafeBufferPointer({ $0.baseAddress }) != base { lookBackStats.withLock { $0.copies += 1 } }
+                    #endif
+                    guard !Task.isCancelled, barrier.current == state else { return .dropped }
+                    let before = iq, seconds = Double(keep) / rate
+                    let found = analysis(AnalysisInput(iq: before, sampleRate: rate,
+                                                       captureCenterHz: state.centerHz + segment.offsetHz,
+                                                       atHz: request.atHz, bandwidthHz: request.bandwidthHz,
+                                                       spectrumDb: nil, longer: { (before, seconds) },
+                                                       pointRadiusHz: request.radiusHz,
+                                                       endTime: request.trueTime ? end : nil, comb: comb))
+                    guard !Task.isCancelled, barrier.current == state else { return .dropped }
+                    // Only something measured stops it ("Too weak" is no past signal to show).
+                    if found.measurement.occupiedBandwidthHz > 0 || !found.signals.isEmpty {
+                        var answer = recentred(found, by: segment.offsetHz, captureCenterHz: state.centerHz)
+                        // One note: what it found and when, not also what the window's own longer read held.
+                        let said = (found.note ?? "").components(separatedBy: "; ").filter {
+                            !$0.isEmpty && !($0.hasPrefix("Read ") && $0.hasSuffix(" s asked for"))
+                        }
+                        answer.note = (said + [silentFor(back)]).joined(separator: "; ")
+                        return .answer(answer, complete: !found.needsLongerRead)
+                    }
+                    backs.removeFirst()
+                }
+                if segment.reachedStart { break pastReads }
+            }
+        }
+        guard backs.isEmpty || start != nil else { return .unavailable(lookBackFailedNote) }
+        var none = SignalIdentity(measurement: SignalMeasurement(offsetHz: pointHz, family: .noise),
+                                  note: SignalIdentifier.noSignalNote)
+        // The ring held less than asked for: how much it held (the newest 3 s, the first read's, included).
+        if let start, firstEnd.timeIntervalSince(start) < longSeconds - lookBackToleranceSeconds {
+            none.note = SignalIdentifier.noSignalNote
+                + String(format: "; Looked back %.1f s of the %.0f s asked for", firstEnd.timeIntervalSince(start), longSeconds)
+        }
+        return .answer(none, complete: true)
     }
 
     /// `identity`, from a read centred `offsetHz` from the capture's centre `captureCenterHz`, in the capture's frame:
@@ -705,25 +816,40 @@ final class SignalIDService {
         return out
     }
 
-    /// The capture's comb: on the app's spectrum of it when `first` has one, else on up to `combReadSeconds`
-    /// (`combFrames` at most) of the ring's newest IQ, read a piece at a time. Nil when that read failed or was cut
-    /// by a retune (looked for again next time).
-    nonisolated static func comb(_ first: FirstRead, chunks: ChunkProvider, barrier: TuneBarrier,
-                                 finder: CombFinder) -> CombReading? {
-        let rate = first.captureRate, centre = first.state.centerHz
-        if let db = first.captureDb { return CombReading(comb: finder(db, rate, centre)) }
+    /// The capture's comb, found in the tuning it returns: on the app's spectrum of the capture (`appSpectrum`) when it
+    /// has one, else on `combReadSeconds` (`combFrames` at most) of the ring's newest IQ, read a piece at a time. A read
+    /// that reaches back to the retune barrier (shorter than asked for, with its `settleSeconds`) finds none and is
+    /// looked for again next time (nil), as is one cut by a retune or failed.
+    nonisolated static func findComb(spectrum: SpectrumSnapshot?, provider: SnapshotProvider, chunks: ChunkProvider,
+                                     barrier: TuneBarrier, finder: CombFinder) -> KnownComb? {
+        let state = barrier.current
+        guard state.sequence % 2 == 0, let probe = provider(probeSeconds), probe.sampleRate > 0,
+              barrier.current == state else { return nil }
+        let rate = probe.sampleRate, centre = state.centerHz
+        if let db = appSpectrum(spectrum, state: state, rate: rate) {
+            return KnownComb(state: state, reading: CombReading(comb: finder(db, rate, centre)))
+        }
         let frames = min(combFrames, Int((combReadSeconds * rate).rounded()))
-        guard frames >= CaptureComb.spectrumSize else { return CombReading(comb: nil) }
+        guard frames >= CaptureComb.spectrumSize else { return KnownComb(state: state, reading: CombReading(comb: nil)) }
+        let asked = frames + Int((settleSeconds * rate).rounded())
         var iq: [Float] = []
-        iq.reserveCapacity(2 * frames)
-        let read = chunks(Double(frames) / rate, min(Int(chunkSeconds * rate), maxChunkFrames)) { piece in
+        iq.reserveCapacity(2 * asked)
+        let read = chunks(Double(asked) / rate, min(Int(chunkSeconds * rate), maxChunkFrames)) { piece in
             guard !Task.isCancelled else { return false }
-            iq.append(contentsOf: piece.prefix(2 * frames - iq.count))
+            iq.append(contentsOf: piece.prefix(2 * asked - iq.count))
             return true
         }
-        guard !Task.isCancelled, barrier.current == first.state, let read, read.sampleRate == rate,
-              iq.count / 2 >= CaptureComb.spectrumSize else { return nil }
-        return CombReading(comb: finder(CaptureComb.spectrum(iq: iq), rate, centre))
+        guard !Task.isCancelled, barrier.current == state, let read, read.sampleRate == rate, read.frames >= asked,
+              iq.count == 2 * asked else { return nil }
+        iq.removeFirst(iq.count - 2 * frames)   // the newest `frames`
+        return KnownComb(state: state, reading: CombReading(comb: finder(CaptureComb.spectrum(iq: iq), rate, centre)))
+    }
+
+    /// The app's averaged spectrum when it is of the capture the ring holds in `state` at `rate`.
+    nonisolated static func appSpectrum(_ spectrum: SpectrumSnapshot?, state: TuneBarrier.State, rate: Double) -> [Float]? {
+        spectrum.flatMap { s in
+            abs(s.centerHz - state.centerHz) < 0.5 && abs(s.spanHz - rate) < 0.5 && s.average.count >= 8 ? s.average : nil
+        }
     }
 
     /// The answer measured a signal the first read's channel (`windowHz` wide) wasn't cut wide enough for: the
@@ -746,8 +872,6 @@ final class SignalIDService {
         var captureRate: Double
         /// The app's spectrum over what was read, when it is of this capture.
         var spectrumDb: [Float]?
-        /// The app's spectrum of the whole capture, when it is of this capture.
-        var captureDb: [Float]?
         /// Shorter than the 3 s asked for: it reached back to a retune.
         var short: Bool
         var state: TuneBarrier.State
@@ -777,10 +901,7 @@ final class SignalIDService {
             let rate = probe.sampleRate
             guard barrier.current == state, rate > 0 else { continue }
             // The app's spectrum, when it is of this capture (the identifier works out its own otherwise).
-            let appDb = spectrum.flatMap { s in
-                abs(s.centerHz - state.centerHz) < 0.5 && abs(s.spanHz - rate) < 0.5 && s.average.count >= 8
-                    ? s.average : nil
-            }
+            let appDb = appSpectrum(spectrum, state: state, rate: rate)
             let pointHz = atHz - state.centerHz
             // A point the IQ doesn't hold, while the IQ is another capture's than the model shows (a tune that
             // failed): nothing read (`run` answers it).
@@ -798,7 +919,7 @@ final class SignalIDService {
                                      channelHz: plan.windowHz, captureRate: rate,
                                      spectrumDb: appDb.flatMap { crop($0, rate: rate, offsetHz: channel.offsetHz,
                                                                       channelRate: channel.sampleRate) },
-                                     captureDb: appDb, short: channel.iq.count / 2 < asked, state: state,
+                                     short: channel.iq.count / 2 < asked, state: state,
                                      endTime: channel.endTime)
                 case .dropped:
                     continue
@@ -814,7 +935,7 @@ final class SignalIDService {
             let keep = max(0, min(snapshot.frames - settle, Int((firstSeconds * rate).rounded())))
             snapshot.samples.removeFirst(2 * (snapshot.frames - keep))
             return FirstRead(iq: snapshot.samples, sampleRate: rate, offsetHz: 0, channelHz: nil, captureRate: rate,
-                             spectrumDb: appDb, captureDb: appDb, short: keep < Int((firstSeconds * rate).rounded()),
+                             spectrumDb: appDb, short: keep < Int((firstSeconds * rate).rounded()),
                              state: state, endTime: snapshot.endTime)
         }
         return nil
@@ -875,8 +996,13 @@ final class SignalIDService {
         var sampleRate: Double
         var offsetHz: Double
         var seconds: Double
-        /// When its last sample was heard (`IQRead.endTime`).
+        /// When its last sample was heard (the read's `IQRead.endTime`, less what it skipped: `channelRead`'s
+        /// `feedSeconds`).
         var endTime: Date
+        /// When the ring's newest sample was heard as it was read (`IQRead.endTime`).
+        var readEndTime: Date
+        /// It reached back to the ring's start or the retune barrier: the ring held less than asked for.
+        var reachedStart = false
         /// The output's size as reserved before the read, in floats, and whether it outgrew that (it never
         /// should: the read's peak is this plus one piece).
         var reservedFloats: Int
@@ -922,7 +1048,7 @@ final class SignalIDService {
     /// is sized once, for what was asked: never grown by doubling; the peak is it and one piece.
     nonisolated static func channelRead(seconds: Double, offsetHz: Double, windowHz: Double,
                                         tuning: TuneBarrier.State, sampleRate: Double, chunks: ChunkProvider,
-                                        barrier: TuneBarrier) -> ChannelReadOutcome {
+                                        barrier: TuneBarrier, feedSeconds: Double? = nil) -> ChannelReadOutcome {
         guard barrier.current == tuning, sampleRate > 0 else { return .dropped }
         let decimates = !DecimationPlan.stages(inputRate: sampleRate,
                                                minimumRate: max(4 * windowHz, Channel.minimumRate)).isEmpty
@@ -932,24 +1058,35 @@ final class SignalIDService {
         let rate = extractor?.rate ?? sampleRate
         let asked = seconds + settleSeconds
         let askedFrames = Int((asked * sampleRate).rounded())
+        // Only the oldest `feedSeconds` of what is read are kept (the rest is visited, not held).
+        let feedFrames = feedSeconds.map { min(askedFrames, Int((($0 + settleSeconds) * sampleRate).rounded())) }
+            ?? askedFrames
         var copied: [Float] = []
-        if let extractor { extractor.reserve(inputFrames: askedFrames) } else { copied.reserveCapacity(2 * askedFrames) }
+        if let extractor { extractor.reserve(inputFrames: feedFrames) } else { copied.reserveCapacity(2 * feedFrames) }
+        var fed = 0
         let read = chunks(asked, min(Int(chunkSeconds * sampleRate), maxChunkFrames)) { piece in
             guard !Task.isCancelled else { return false }
-            if let extractor { extractor.feed(piece) } else { copied.append(contentsOf: piece) }
+            let room = 2 * (feedFrames - fed)
+            guard room > 0 else { return true }
+            let part = piece.count <= room ? piece : UnsafeBufferPointer(rebasing: piece[0..<room])
+            if let extractor { extractor.feed(part) } else { copied.append(contentsOf: part) }
+            fed += part.count / 2
             return true
         }
         guard !Task.isCancelled, barrier.current == tuning else { return .dropped }
         guard let read, read.sampleRate == sampleRate else { return .failed }
-        let reserved = extractor?.reservedFloats ?? 2 * askedFrames
+        let reserved = extractor?.reservedFloats ?? 2 * feedFrames
         let grew = extractor?.outgrewReservation ?? (copied.count > reserved)
         var iq = extractor?.finish().samples ?? copied
-        // The oldest `settleSeconds` of a read reaching back to the barrier, and anything over `seconds`.
-        let settle = read.frames < askedFrames ? Int((settleSeconds * rate).rounded()) : 0
-        let keep = max(0, min(iq.count / 2 - settle, Int((seconds * rate).rounded())))
+        // The oldest `settleSeconds` of a read reaching back to the barrier, and anything over what was asked.
+        let reachedStart = read.frames < askedFrames
+        let settle = reachedStart ? Int((settleSeconds * rate).rounded()) : 0
+        let keep = max(0, min(iq.count / 2 - settle, Int(((feedSeconds ?? seconds) * rate).rounded())))
         iq.removeFirst(iq.count - 2 * keep)
+        let skipped = Double(read.frames - fed) / sampleRate
         return .read(LongRead(iq: iq, sampleRate: rate, offsetHz: whole ? 0 : offsetHz, seconds: Double(keep) / rate,
-                              endTime: read.endTime, reservedFloats: reserved, grew: grew))
+                              endTime: read.endTime.addingTimeInterval(-skipped), readEndTime: read.endTime,
+                              reachedStart: reachedStart, reservedFloats: reserved, grew: grew))
     }
 
     // MARK: Decode confirmation
@@ -1133,7 +1270,8 @@ final class SignalIDService {
     func retuned(displayCenterHz: Double?) {
         tuning.end(centerHz: displayCenterHz)
         tuneFailedAt = displayCenterHz == nil ? now() : nil
-        cache.removeAll()   // the comb's too: it is kept for the tuning it was found in (`knownComb`)
+        cache.removeAll()
+        combCache = nil
         endHover()
     }
 }

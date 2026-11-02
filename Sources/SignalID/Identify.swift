@@ -481,6 +481,8 @@ public enum SignalIdentifier {
         let combLines = found.map { $0.linesHz.map { $0 - captureCenterHz } } ?? []
         // Whether the point's trace is a comb line, and one that may be a narrow MFSK whose tones haven't been read.
         var onCombLine = false, tonesUnread = false
+        // An agent's width: the trace's tones, tried on the longer read only to see, read as an MFSK's.
+        var tonesReadAsMFSK = false
         // The point's trace when one of the comb's lines lies in it, steady or not on the newest 3 s: its steadiness is
         // judged again over the longer read (`steadyOverLongerRead`).
         var combTrace: SignalTrace?
@@ -488,7 +490,7 @@ public enum SignalIdentifier {
         var around: (hood: Neighbourhood, view: NeighbourhoodView, signals: [SignalCandidate])?
         func answer(_ identity: SignalIdentity) -> SignalIdentity {
             var labelled = identity
-            if onCombLine, !tonesUnread, let found, identity.best == nil, combFamilies.contains(identity.measurement.family) {
+            if onCombLine, !tonesUnread, !tonesReadAsMFSK, let found, identity.best == nil, combFamilies.contains(identity.measurement.family) {
                 labelled.comb = found.info
             }
             guard let around, !Task.isCancelled else { return labelled }
@@ -688,8 +690,9 @@ public enum SignalIdentifier {
         if Task.isCancelled { return cancelled(slow) }
         // An agent's width: a line whose tones read is an MFSK, never the comb's; one whose tones don't read may be.
         if widthOnCombLine, let line = combTrace {
-            tonesUnread = tonesRead(read.iq, sampleRate: sampleRate, trace: line, pointHz: pointHz, seconds: snapshotSeconds,
-                                    measured: slow)
+            tonesReadAsMFSK = tonesRead(read.iq, sampleRate: sampleRate, trace: line, pointHz: pointHz,
+                                        seconds: snapshotSeconds, measured: slow)
+            tonesUnread = false   // tried
         }
         // Steady as the comb is over the longer read, not only over its newest 3 s (a slow beacon is on for longer).
         if combTrace != nil {

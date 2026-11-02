@@ -975,18 +975,17 @@ struct SignalIDServiceTests {
             firsts.withLock { $0.append(first.label) }
         })
         #expect(id.measurement.family == .fsk && abs(id.measurement.offsetHz - 5_000) < 50, "\(id.label)")
-        #expect(id.note?.contains("Silent for the last") == true, "\(id.note ?? "no note")")
+        #expect(id.note == SignalIDService.silentFor(6), "\(id.note ?? "no note")")   // one note, the window 6–9 s back
         #expect(firsts.withLock { $0 } == [SignalIdentifier.noSignalNote], "\(firsts.withLock { $0 })")
     }
 
-    /// Nothing in 16 s: "No signal", having looked back `firstSeconds` at a time, each window ending where it ends; kept
-    /// for the point.
+    /// Nothing in 16 s: "No signal", having looked back `firstSeconds` at a time, each window ending where it ends (by
+    /// the first read's end: the ring moved on 0.2 s by the look-back's read); kept for the point.
     @Test func noSignalAfterLookingBack() async throws {
         guard let m = runningModel() else { return }
         defer { m.shutdown() }
         let end = Date().addingTimeInterval(-30)
-        let snap = IQSnapshot(samples: [Float](repeating: 0, count: 2 * Int(16.1 * 48_000)), sampleRate: 48_000,
-                              endTime: end)
+        let snap = IQSnapshot(samples: [Float](repeating: 0, count: 2 * 17 * 48_000), sampleRate: 48_000, endTime: end)
         let calls = Locked(0)
         m.signalID.snapshotProvider = Self.provider(snap, calls: calls)
         m.signalID.chunkProvider = Self.chunks(snap, endTime: end.addingTimeInterval(0.2))
@@ -994,15 +993,24 @@ struct SignalIDServiceTests {
         let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
         m.signalID.analysis = Self.silence(seen)
         let at = m.centerHz + 5_000
+        let reads = SignalIDService.lookBackStats.withLock { $0.reads }
         let id = try #require(await m.signalID.identify(atHz: at))
         #expect(id.label == SignalIdentifier.noSignalNote && id.note == SignalIdentifier.noSignalNote, "\(id.label)")
+        // One read: its margin takes in how far the ring moved on since the first read.
+        #expect(SignalIDService.lookBackStats.withLock { $0.reads } == reads + 1)
         let windows = seen.withLock { $0 }.dropFirst()
         #expect(windows.map { Int($0.seconds.rounded()) } == [13, 10, 7, 4, 1], "\(windows.map(\.seconds))")
         let ends = windows.compactMap { $0.endTime?.timeIntervalSince(end) }
-        #expect(ends.count == 5 && zip(ends, [-2.8, -5.8, -8.8, -11.8, -14.8]).allSatisfy { abs($0 - $1) < 1e-6 }, "\(ends)")
+        #expect(ends.count == 5 && zip(ends, [-3.0, -6, -9, -12, -15]).allSatisfy { abs($0 - $1) < 1e-6 }, "\(ends)")
         #expect(windows.allSatisfy { $0.longer })
         _ = await m.signalID.identify(atHz: at)
         #expect(calls.withLock { $0 } == 1)   // kept
+        // A ring of exactly 16 s, its settle and the read's margin short of them: covered, nothing said of the ring.
+        let sixteen = Self.zeroRing(rate: 48_000, seconds: 16, endTime: end)
+        m.signalID.snapshotProvider = sixteen.snapshot
+        m.signalID.chunkProvider = sixteen.chunks
+        let full = try #require(await m.signalID.identify(atHz: at + 1_000))
+        #expect(full.note == SignalIdentifier.noSignalNote, "\(full.note ?? "no note")")
     }
 
     /// The radio stopped: the ring's IQ is read, and the analysis gets when it was heard, not now; the longer read
@@ -1028,7 +1036,8 @@ struct SignalIDServiceTests {
         #expect(ends.withLock { $0 } == [heard, longEnd], "\(ends.withLock { $0 })")
     }
 
-    /// A 5 s ring: the look-back reads what it holds (less the 50 ms after the barrier), says so, and isn't kept.
+    /// A 5 s ring: the look-back reads what it holds (less the 50 ms after the barrier) and says so; that is the whole
+    /// ring, so its "No signal" is kept (ruling, fix round 1).
     @Test func shortRingSaysSo() async throws {
         guard let m = runningModel() else { return }
         defer { m.shutdown() }
@@ -1043,7 +1052,7 @@ struct SignalIDServiceTests {
         #expect(id.note == "\(SignalIdentifier.noSignalNote); \(said)", "\(id.note ?? "no note")")
         #expect(seen.withLock { $0.map { ($0.seconds * 100).rounded() / 100 } } == [3, 1.95], "\(seen.withLock { $0 })")
         _ = await m.signalID.identify(atHz: m.centerHz + 5_000)
-        #expect(calls.withLock { $0 } == 2)   // not kept: the ring is filling
+        #expect(calls.withLock { $0 } == 1)   // kept: the look-back read all the ring held
     }
 
     /// A retune during the look-back drops the answer (nil), and nothing is kept for the old centre.
@@ -1151,7 +1160,7 @@ struct SignalIDServiceTests {
         let before = probes.withLock { $0 }
         let again = try #require(await m.signalID.identify(atHz: outside))
         #expect(again.note == SignalIDService.notAtFrequencyNote)
-        #expect(probes.withLock { $0 } == before + 1)   // read again: not kept
+        #expect(probes.withLock { $0 } > before)   // read again: not kept
         // A tune that works forgets it (here the IQ stays the old centre's: "Too soon" again), and a point the IQ holds
         // is identified there throughout.
         m.signalID.retuneBegins()
@@ -1353,5 +1362,187 @@ struct SignalIDServiceTests {
         let seen = centres.withLock { $0 }
         #expect(seen.count == 4 && seen[0] == m.centerHz && seen[2] == m.centerHz
                 && abs(seen[1] - refined) < 1 && abs(seen[3] - silent) < 1, "\(seen)")
+    }
+
+    // MARK: Fix round 1
+
+    /// A ring of `seconds` of zeros at `rate`, heard up to `endTime`, made a piece at a time as it is read (never held):
+    /// the first read's snapshot, and the chunked reads, counting those over a second asked and what they asked.
+    nonisolated private static func zeroRing(rate: Double, seconds: Double, endTime: Date, asked: Locked<[Double]>? = nil)
+        -> (snapshot: SignalIDService.SnapshotProvider, chunks: SignalIDService.ChunkProvider) {
+        let ringFrames = Int(seconds * rate)
+        let snapshot: SignalIDService.SnapshotProvider = { last in
+            let frames = min(ringFrames, Int((last * rate).rounded()))
+            return IQSnapshot(samples: [Float](repeating: 0, count: 2 * frames), sampleRate: rate, endTime: endTime)
+        }
+        let chunks: SignalIDService.ChunkProvider = { last, chunkFrames, visit in
+            asked?.withLock { $0.append(last) }
+            let frames = min(ringFrames, Int((last * rate).rounded()))
+            let piece = [Float](repeating: 0, count: 2 * min(chunkFrames, frames))
+            var done = 0
+            while done < frames {
+                let n = min(chunkFrames, frames - done)
+                guard piece[0..<(2 * n)].withUnsafeBufferPointer(visit) else { return nil }
+                done += n
+            }
+            return IQRead(frames: frames, sampleRate: rate, endTime: endTime)
+        }
+        return (snapshot, chunks)
+    }
+
+    /// The look-back at the rig's channel rates: a 48 kHz channel runs at 312.5 kS/s from 10 MS/s and at 375 kS/s from
+    /// 6 MS/s, where the 32 MB budget holds 13.4 s and 11.2 s. Rings at 625 and 750 kS/s give those channel rates for a
+    /// fraction of the IQ. An empty point still looks back over the whole 16 s (one read at 312.5 kS/s, two at 375),
+    /// every window whole and ending where it should, no read over the budget and none copied to be trimmed; and its
+    /// "No signal" says nothing of the ring and is kept for the point.
+    @Test func aLookBackAtTheRigsRatesCovers16s() async throws {
+        #expect(Channel.outputRate(sampleRate: 10_000_000, bandwidthHz: SignalIDService.minimumChannelHz) == 312_500)
+        #expect(Channel.outputRate(sampleRate: 6_000_000, bandwidthHz: SignalIDService.minimumChannelHz) == 375_000)
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        m.signalID.sourceKind = { .sdrplay }
+        for (rate, reads) in [(625_000.0, 1), (750_000.0, 2)] {
+            #expect(Channel.outputRate(sampleRate: rate, bandwidthHz: SignalIDService.minimumChannelHz) == rate / 2)
+            let end = Date().addingTimeInterval(-5)
+            let ring = Self.zeroRing(rate: rate, seconds: 30, endTime: end)
+            m.signalID.snapshotProvider = ring.snapshot
+            m.signalID.chunkProvider = ring.chunks
+            m.signalID.invalidateCache()
+            let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
+            m.signalID.analysis = Self.silence(seen)
+            let before = SignalIDService.lookBackStats.withLock { $0 }
+            let at = m.centerHz + 5_000
+            let id = try #require(await m.signalID.identify(atHz: at))
+            let after = SignalIDService.lookBackStats.withLock { $0 }
+            #expect(id.note == SignalIdentifier.noSignalNote, "\(rate): \(id.note ?? "no note")")
+            let windows = seen.withLock { $0 }.filter(\.longer)
+            let ends = windows.compactMap { $0.endTime?.timeIntervalSince(end) }
+            #expect(ends.count == 5 && zip(ends, [-3.0, -6, -9, -12, -15]).allSatisfy { abs($0 - $1) < 1e-6 },
+                    "\(rate): \(ends)")
+            // Each window holds its own 3 s (the last its 1 s) and what came before it in its read.
+            #expect(zip(windows.map(\.seconds), [3.0, 3, 3, 3, 1]).allSatisfy { $0 >= $1 - 0.06 }, "\(rate): \(windows.map(\.seconds))")
+            #expect(after.reads - before.reads == reads, "\(rate): \(after.reads - before.reads) reads")
+            #expect(after.copies == before.copies, "\(rate): the look-back's read was copied to be trimmed")
+            #expect(after.mostFloats * MemoryLayout<Float>.size <= SignalIDService.longReadBudgetBytes,
+                    "\(rate): \(after.mostFloats * 4) bytes reserved")
+            let runs = seen.withLock { $0.count }
+            _ = await m.signalID.identify(atHz: at)
+            #expect(seen.withLock { $0.count } == runs, "\(rate): not kept for the point")
+        }
+    }
+
+    /// Windows that are "Too weak" don't stop the look-back as if something had been on: the first that measured a
+    /// signal does, with one note, not also what its own longer read held. Only "Too weak" in 16 s is "No signal".
+    @Test func aTooWeakWindowDoesNotStopTheLookBack() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let ring = Self.zeroRing(rate: 48_000, seconds: 20, endTime: Date())
+        m.signalID.snapshotProvider = ring.snapshot
+        m.signalID.chunkProvider = ring.chunks
+        let windows = Locked(0), signalAt = Locked(2)
+        m.signalID.analysis = { a in
+            let offset = a.atHz - a.captureCenterHz
+            guard a.longer != nil else {
+                return SignalIdentity(measurement: SignalMeasurement(offsetHz: offset, family: .noise),
+                                      note: SignalIdentifier.noSignalNote)
+            }
+            let n = windows.withLock { $0 += 1; return $0 }
+            if n == signalAt.withLock({ $0 }) {
+                return SignalIdentity(measurement: SignalMeasurement(offsetHz: offset, occupiedBandwidthHz: 100,
+                                                                     family: .fsk, seconds: 3),
+                                      note: "Read 10.0 s of the 16 s asked for")
+            }
+            return SignalIdentity(measurement: SignalMeasurement(offsetHz: offset, family: .unknown, seconds: 3),
+                                  note: "Too weak to identify (SNR 2 dB)")
+        }
+        let id = try #require(await m.signalID.identify(atHz: m.centerHz + 5_000))
+        #expect(id.measurement.family == .fsk && id.note == SignalIDService.silentFor(6), "\(id.note ?? "no note")")
+        windows.withLock { $0 = 0 }
+        signalAt.withLock { $0 = 0 }   // never
+        let weak = try #require(await m.signalID.identify(atHz: m.centerHz + 9_000))
+        #expect(weak.note == SignalIdentifier.noSignalNote && windows.withLock { $0 } == 5, "\(weak.note ?? "no note")")
+    }
+
+    /// The comb's ring read keeps the retune's settle: a ring holding less than it asks for (0.3 s since the retune)
+    /// finds no comb (none of the old centre's IQ is read for it); one found while the first read is short (1.5 s) is
+    /// used but not kept; one found with 3 s of the tuning is kept. It is read before the first read, so that isn't held
+    /// meanwhile.
+    @Test func theCombIsNeverFoundOnTheRetunesSettle() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let found = Locked(0), order = Locked<[String]>([])
+        m.signalID.combFinder = { _, _, _ in
+            found.withLock { $0 += 1 }
+            return nil
+        }
+        m.signalID.analysis = Self.stub()
+        var point = m.centerHz
+        for (seconds, finds) in [(0.3, 0), (1.5, 2), (3.1, 1)] {
+            let ring = Self.zeroRing(rate: 48_000, seconds: seconds, endTime: Date())
+            m.signalID.snapshotProvider = { last in
+                if last >= SignalIDService.firstSeconds { order.withLock { $0.append("first") } }
+                return ring.snapshot(last)
+            }
+            m.signalID.chunkProvider = { last, frames, visit in
+                order.withLock { $0.append("comb") }
+                return ring.chunks(last, frames, visit)
+            }
+            m.signalID.retuneBegins()
+            m.signalID.retuned(displayCenterHz: m.centerHz)
+            found.withLock { $0 = 0 }
+            order.withLock { $0 = [] }
+            for _ in 0..<2 {
+                point += 1_000
+                _ = await m.signalID.identify(atHz: point)
+            }
+            #expect(found.withLock { $0 } == finds, "\(seconds) s since the retune: found \(found.withLock { $0 }) times")
+            #expect(order.withLock { $0 }.first == "comb", "\(seconds) s: \(order.withLock { $0 })")
+        }
+    }
+
+    /// A comb given for one tuning is never given to IQ heard in another (M1).
+    @Test nonisolated func aCombIsOnlyForItsTuning() {
+        let snap = Self.snapshot(.noise, seconds: 3.1, offsetHz: 0)
+        let barrier = TuneBarrier()
+        barrier.end(centerHz: 7_000_000)
+        let comb = CaptureComb(info: CombInfo(spacingHz: 6000, lineCount: 9), linesHz: [7_006_000])
+        let given = Locked<[CaptureComb?]>([])
+        let inner = Self.stub()
+        let analysis: SignalIDService.Analysis = { a in
+            given.withLock { $0.append(a.comb) }
+            return inner(a)
+        }
+        var other = barrier.current
+        other.sequence += 2
+        for state in [barrier.current, other] {
+            let request = SignalIDService.Request(atHz: 7_005_000, bandwidthHz: nil, spectrum: nil, longer: false,
+                                                  comb: SignalIDService.KnownComb(state: state,
+                                                                                  reading: .init(comb: comb)))
+            let finder: SignalIDService.CombFinder = { _, _, _ in nil }
+            let outcome = SignalIDService.run(request, provider: Self.provider(snap), chunks: Self.chunks(snap),
+                                              analysis: analysis, combFinder: finder, barrier: barrier)
+            #expect(outcome != nil)
+        }
+        #expect(given.withLock { $0 } == [comb, nil], "\(given.withLock { $0 })")
+        // Found now, then a retune before the first read (at its probe of the ring's rate): the comb is neither given to
+        // the new tuning's IQ nor kept for it.
+        let probes = Locked(0)
+        let inner2 = Self.provider(snap)
+        let retuning: SignalIDService.SnapshotProvider = { seconds in
+            if seconds <= SignalIDService.probeSeconds, probes.withLock({ $0 += 1; return $0 }) == 2 {
+                barrier.begin()
+                barrier.end(centerHz: 7_000_000)
+            }
+            return inner2(seconds)
+        }
+        given.withLock { $0 = [] }
+        let finder: SignalIDService.CombFinder = { _, _, _ in comb }
+        let outcome = SignalIDService.run(SignalIDService.Request(atHz: 7_005_000, bandwidthHz: nil, spectrum: nil,
+                                                                  longer: false),
+                                          provider: retuning, chunks: Self.chunks(snap), analysis: analysis,
+                                          combFinder: finder, barrier: barrier)
+        #expect(probes.withLock { $0 } >= 2)
+        #expect(given.withLock { $0 } == [nil] && outcome != nil && outcome?.comb == nil,
+                "\(given.withLock { $0 }), kept \(String(describing: outcome?.comb))")
     }
 }
