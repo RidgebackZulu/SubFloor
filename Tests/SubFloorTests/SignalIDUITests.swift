@@ -101,7 +101,8 @@ struct SignalIDUITests {
     /// one at a time: a cancelled one must not hold the next), or after 120 s.
     private static func rtty(runs: Locked<Int>? = nil, needsLongerRead: Bool = false, holdFirst: Locked<Bool>? = nil,
                              holdLongerRead: Locked<Bool>? = nil) -> SignalIDService.Analysis {
-        { _, _, centre, at, _, _, longer in
+        { a in
+            let (centre, at, longer) = (a.captureCenterHz, a.atHz, a.longer)
             runs?.withLock { $0 += 1 }
             if let hold = longer == nil ? holdFirst : holdLongerRead {
                 let deadline = Date().addingTimeInterval(120)
@@ -155,7 +156,8 @@ struct SignalIDUITests {
         let dwells = Locked(0), open = Locked(false)
         m.signalID.snapshotProvider = Self.provider(Self.snapshot(seconds: 3.1))
         // Every identification that starts is a run (the points differ: none reuses another's answer).
-        m.signalID.analysis = { _, _, centre, at, _, _, _ in
+        m.signalID.analysis = { a in
+            let (centre, at) = (a.captureCenterHz, a.atHz)
             runs.withLock { $0 += 1 }
             return SignalIdentity(measurement: SignalMeasurement(offsetHz: at - centre, family: .noise, seconds: 3),
                                   note: "No signal")

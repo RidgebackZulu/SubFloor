@@ -49,17 +49,123 @@ final class SignalIDExecutor: TaskExecutor {
     }
 }
 
+/// Whose an identification is (`SignalIDService.identify`): the owner's hover and card go ahead of agents' and
+/// background work (`get_cursor`, its longer read, scans).
+enum SignalIDPriority: Sendable { case owner, background }
+
+/// Who runs next on the service's executor (`SignalIDService.identify`), on the main actor: one identification at a
+/// time, the owner's queued ones before any background one, in the order asked within each. A newer hover replaces any
+/// older one still queued (it gets nil). The owner asking stops a running background one (`preempted`, its task
+/// cancelled: it stops at its next cancellation check); its caller, still waiting, asks again.
+@MainActor
+final class SignalIDQueue {
+    @MainActor final class Ticket {
+        let priority: SignalIDPriority
+        /// A hover's: a newer hover replaces it while it is queued.
+        let hover: Bool
+        /// Asked again after the owner stopped it: first among the background ones.
+        let again: Bool
+        fileprivate var continuation: CheckedContinuation<Bool, Never>?
+        /// Cancels its identification while it runs.
+        var cancel: (() -> Void)?
+        /// The owner stopped it while it ran.
+        fileprivate(set) var preempted = false
+
+        init(priority: SignalIDPriority, hover: Bool, again: Bool = false) {
+            self.priority = priority
+            self.hover = hover
+            self.again = again
+        }
+    }
+
+    private var queued: [Ticket] = []
+    private var running: Ticket?
+
+    /// How many are waiting (tests).
+    var waiting: Int { queued.count }
+
+    /// Waits for `ticket`'s turn: true when it has it (it runs until `finished`), false when a newer hover replaced it
+    /// or its task was cancelled while it waited.
+    func turn(_ ticket: Ticket) async -> Bool {
+        if ticket.hover {
+            for old in queued where old.hover { resume(old, false) }
+        }
+        if ticket.priority == .owner, let now = running, now.priority == .background, !now.preempted {
+            now.preempted = true
+            now.cancel?()
+        }
+        if running == nil && queued.isEmpty {
+            running = ticket
+            return true
+        }
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                ticket.continuation = continuation
+                let index: Int
+                switch (ticket.priority, ticket.again) {
+                case (.owner, _): index = queued.firstIndex { $0.priority == .background } ?? queued.endIndex
+                case (.background, true):
+                    index = queued.firstIndex { $0.priority == .background && !$0.again } ?? queued.endIndex
+                case (.background, false): index = queued.endIndex
+                }
+                queued.insert(ticket, at: index)
+            }
+        } onCancel: {
+            Task { @MainActor in self.resume(ticket, false) }
+        }
+    }
+
+    /// `ticket` has run: the next queued one gets its turn.
+    func finished(_ ticket: Ticket) {
+        guard running === ticket else { return }
+        running = nil
+        guard !queued.isEmpty else { return }
+        let next = queued.removeFirst()
+        running = next
+        next.continuation?.resume(returning: true)
+        next.continuation = nil
+    }
+
+    /// A queued `ticket` taken out, told `turn`.
+    private func resume(_ ticket: Ticket, _ turn: Bool) {
+        guard let index = queued.firstIndex(where: { $0 === ticket }) else { return }
+        queued.remove(at: index)
+        ticket.continuation?.resume(returning: turn)
+        ticket.continuation = nil
+    }
+}
+
 /// Signal ID in the app: names the signal at a display frequency from the newest IQ in the recorder's pre-roll ring
 /// (`StreamRecorder.snapshot`), with `SignalIdentifier.identify`.
 ///
-/// **Off the main actor, one at a time.** The reads and the analysis run in a task given only Sendable values, on
-/// the service's own serial executor (`SignalIDExecutor`), never the cooperative pool: identifications queue behind
-/// each other in the order asked for (the hover's, the card's, `get_cursor`'s, a scan's), so at most one holds IQ
-/// and works at a time, and none starves the app's other async work. Awaiting `identify` from a task that is then
-/// cancelled cancels it, queued or running: one still queued returns at once when its turn comes, a running one
-/// stops between the identifier's stages or the read's pieces, and the answer is dropped. The main actor reads the
-/// model (the spectrum, the decode log) and the cache only. With the radio stopped the ring still holds what it
-/// heard last: that is read, and nil comes only when it holds nothing.
+/// **Off the main actor, one at a time, the owner's first.** The reads and the analysis run in a task given only
+/// Sendable values, on the service's own serial executor (`SignalIDExecutor`), never the cooperative pool, and the
+/// queue (`SignalIDQueue`) gives that executor one identification at a time: at most one holds IQ and works, and none
+/// starves the app's other async work. The owner's (`SignalIDPriority.owner`: the hover's and the card's) go ahead of
+/// queued background ones (`get_cursor`'s and its longer read, `identify_signal`'s, a scan's); a newer hover replaces an
+/// older one still queued (nil); and the owner asking stops a running background one at its next cancellation check,
+/// which is then asked again while its caller waits (a scan's point is so read again). Awaiting `identify` from a task
+/// that is then cancelled cancels it, queued or running: one queued returns nil at once, a running one stops between the
+/// identifier's stages or the read's pieces, and the answer is dropped. The main actor reads the model (the spectrum,
+/// the decode log) and the caches only. With the radio stopped the ring still holds what it heard last: that is read,
+/// and nil comes only when it holds nothing.
+///
+/// **Time, radius and the comb.** The analysis gets when its IQ's last sample was on the air (`IQSnapshot.endTime`,
+/// `IQRead.endTime`: the read's own, the longer read's its own, the look-back's each window's) only from the RSP
+/// (`sourceKind`): the demo source and IQ files have no true time, so no slot evidence. Hover and card ask within
+/// `radiusPixels` of the pointer at the current zoom (`radiusHz`); agents get the identifier's default. The capture's
+/// interference comb is found once (`CaptureComb.find`) on the app's spectrum of this capture, or with none on
+/// `combReadSeconds` of the ring's newest IQ, kept `combSeconds` and forgotten on a retune, and given to every analysis.
+///
+/// **A silent moment isn't an empty frequency** (`lookBack`). When the first read finds nothing at the point ("No
+/// signal"), and a longer read may be made, up to `longSeconds` of the ring (to the retune barrier) are read as the
+/// longer read is, and `firstSeconds` at a time going back from the newest are analysed until one isn't "No signal":
+/// that answer, saying how long it has been silent; "No signal" once none is. The first answer is out meanwhile, as
+/// measuring. A ring holding less says so ("Looked back 5.0 s of the 16 s asked for").
+///
+/// **Frames.** Every answer comes back in the capture's frame: its `measurement.offsetHz`, its `signals`' and its
+/// `groupSpanHz` are all relative to the capture centre the ring's IQ was heard at (display Hz), which a group answer's
+/// `captureCenterHz` says, whatever channel it was measured on (`recentred`).
 ///
 /// **The IQ and its centre.** Everything is in display Hz: the mode table's band hints are, and with HamItUp on the
 /// radio is tuned `Upconverter.loHz` above. `AppModel` brackets every clear of the IQ history (a hardware retune, an
@@ -104,7 +210,8 @@ final class SignalIDExecutor: TaskExecutor {
 ///
 /// **Hover.** `AppModel.hover(at:viewSize:)` feeds the pointer: resting `dwellSeconds` starts `identify` there
 /// (`hoverPending` while it runs, then `hoverIdentity`; the first pass's answer is up with `hoverMeasuring` while a
-/// longer read runs); moving more than `moveTolerance` points from where it
+/// longer read or a look-back runs), as the owner's, within `radiusPixels` at the zoom; moving more than
+/// `moveTolerance` points from where it
 /// came to rest, leaving, the spectrum moving under it (zoom, pan) or a retune cancels it and clears the answer.
 ///
 /// **Card.** A right click (`openCard`) identifies the signal there the same way and fills `card` in as it comes;
@@ -118,10 +225,36 @@ final class SignalIDService {
     /// (`StreamRecorder.snapshot(lastSeconds:chunkFrames:_:)`), any thread.
     typealias ChunkProvider = @Sendable (_ lastSeconds: Double, _ chunkFrames: Int,
                                          _ visit: (UnsafeBufferPointer<Float>) -> Bool) -> IQRead?
-    /// `SignalIdentifier.identify(iq:sampleRate:captureCenterHz:atHz:bandwidthHz:spectrumDb:longer:)`.
-    typealias Analysis = @Sendable (_ iq: [Float], _ sampleRate: Double, _ captureCenterHz: Double, _ atHz: Double,
-                                    _ bandwidthHz: Double?, _ spectrumDb: [Float]?,
-                                    _ longer: (() -> (iq: [Float], seconds: Double)?)?) -> SignalIdentity
+    /// `SignalIdentifier.identify(iq:…)` on what one analysis is given (`identifier`).
+    typealias Analysis = @Sendable (AnalysisInput) -> SignalIdentity
+    /// `CaptureComb.find(spectrumDb:sampleRate:centerHz:)`, any thread.
+    typealias CombFinder = @Sendable (_ spectrumDb: [Float], _ sampleRate: Double, _ centerHz: Double) -> CaptureComb?
+
+    /// What one analysis is given: `SignalIdentifier.identify(iq:…)`'s parameters.
+    struct AnalysisInput {
+        var iq: [Float]
+        var sampleRate: Double
+        /// `iq`'s centre (display Hz): a channel's, or the capture's.
+        var captureCenterHz: Double
+        var atHz: Double
+        var bandwidthHz: Double?
+        var spectrumDb: [Float]?
+        var longer: (() -> (iq: [Float], seconds: Double)?)?
+        /// Nil: the identifier's own (`SignalIdentifier.defaultRadiusHz`).
+        var pointRadiusHz: Double?
+        /// When `iq`'s last sample was on the air; nil without a true time (the demo source, an IQ file).
+        var endTime: Date?
+        /// The capture's interference comb, found once for its spectrum.
+        var comb: CaptureComb?
+    }
+
+    /// The identifier itself.
+    nonisolated static let identifier: Analysis = { a in
+        SignalIdentifier.identify(iq: a.iq, sampleRate: a.sampleRate, captureCenterHz: a.captureCenterHz, atHz: a.atHz,
+                                  bandwidthHz: a.bandwidthHz, spectrumDb: a.spectrumDb, longer: a.longer,
+                                  pointRadiusHz: a.pointRadiusHz ?? SignalIdentifier.defaultRadiusHz,
+                                  endTime: a.endTime, comb: a.comb)
+    }
 
     nonisolated static let firstSeconds = 3.0
     nonisolated static let longSeconds = 16.0
@@ -151,6 +284,17 @@ final class SignalIDService {
     static let dwellSeconds = 0.5
     /// Pointer movement, in view points, that leaves the point it rested on.
     static let moveTolerance = 3.0
+    /// Hover and card: the radius is this many view points' worth of Hz at the current zoom.
+    static let radiusPixels = 4.0
+    /// The comb found on a capture's spectrum is kept this long; with no app spectrum, it is found on this much of the
+    /// ring's newest IQ (`combFrames` at most).
+    nonisolated static let combSeconds = 5.0
+    nonisolated static let combReadSeconds = 0.5
+    nonisolated static let combFrames = 1 << 20
+    /// A failed tune leaves the IQ at the old centre: for this long a point it doesn't hold is "Too soon", then
+    /// `notAtFrequencyNote`.
+    static let notAtFrequencyGraceSeconds = 1.0
+    nonisolated static let notAtFrequencyNote = "The radio isn't at this frequency: the last tune failed"
 
     /// The answer for where the pointer rests (nil while none, or while it is pending).
     private(set) var hoverIdentity: SignalIdentity?
@@ -184,10 +328,11 @@ final class SignalIDService {
     /// Test hook: where the longer read comes from.
     @ObservationIgnored var chunkProvider: ChunkProvider = { _, _, _ in nil }
     /// Test hook: the analysis (the identifier).
-    @ObservationIgnored var analysis: Analysis = { iq, rate, centre, at, width, spectrum, longer in
-        SignalIdentifier.identify(iq: iq, sampleRate: rate, captureCenterHz: centre, atHz: at, bandwidthHz: width,
-                                  spectrumDb: spectrum, longer: longer)
-    }
+    @ObservationIgnored var analysis: Analysis = SignalIDService.identifier
+    /// Test hook: what finds the capture's comb.
+    @ObservationIgnored var combFinder: CombFinder = { CaptureComb.find(spectrumDb: $0, sampleRate: $1, centerHz: $2) }
+    /// Test hook: where the IQ comes from (`AppModel.sourceKind`): only the RSP's samples carry a true time.
+    @ObservationIgnored var sourceKind: @MainActor () -> SourceKind? = { nil }
     /// Test hook: the clock decodes are confirmed and answers cached by.
     @ObservationIgnored var now: @Sendable () -> Date = { Date() }
     /// Test hook: the hover's dwell (returns early when cancelled).
@@ -197,11 +342,14 @@ final class SignalIDService {
     @ObservationIgnored let tuning = TuneBarrier()
     /// Where every identification runs, one at a time.
     @ObservationIgnored let executor = SignalIDExecutor()
+    /// Who runs on it next.
+    @ObservationIgnored let queue = SignalIDQueue()
     @ObservationIgnored private weak var model: AppModel?
 
     private struct CacheEntry {
         var range: ClosedRange<Double>
         var bandwidthHz: Double?
+        var radiusHz: Double?
         var sequence: Int
         var centerHz: Double
         var at: Date
@@ -209,6 +357,10 @@ final class SignalIDService {
     }
 
     @ObservationIgnored private var cache: [CacheEntry] = []
+    /// The capture's comb as last found, for the tuning it was found in, and when.
+    @ObservationIgnored private var combCache: (state: TuneBarrier.State, at: Date, comb: CombReading)?
+    /// When the last tune failed (nil: it didn't), by `now`.
+    @ObservationIgnored private var tuneFailedAt: Date?
     @ObservationIgnored private var hoverAnchor: CGPoint?
     @ObservationIgnored private var hoverTask: Task<Void, Never>?
     /// Counts the hovers ended, so a first answer arriving late is known for stale.
@@ -219,31 +371,34 @@ final class SignalIDService {
     /// Reads `model`'s radio, spectrum and decodes, and its IQ recorder's ring.
     func attach(to model: AppModel, recorder: StreamRecorder) {
         self.model = model
+        sourceKind = { [weak model] in model?.sourceKind }
         snapshotProvider = { [recorder] in recorder.snapshot(lastSeconds: $0) }
         chunkProvider = { [recorder] in recorder.snapshot(lastSeconds: $0, chunkFrames: $1, $2) }
     }
 
     // MARK: Identify
 
-    /// The signal at `atHz` (display Hz), or over `bandwidthHz` around it when given (an agent's); nil when there is
-    /// no data (an empty ring), when the radio retuned before it finished, or when cancelled.
+    /// The signal at `atHz` (display Hz), or over `bandwidthHz` around it when given (an agent's), with traces within
+    /// `radiusHz` of it under the point (nil: the identifier's default); nil when there is no data (an empty ring), when
+    /// the radio retuned before it finished, when cancelled, or when a newer hover replaced it in the queue. `priority`:
+    /// whose it is (see the type's notes).
     ///
-    /// When the first pass asks for a longer read, `firstAnswer` is called with that pass's answer as soon as it is
-    /// made (on the main actor, not after this call returned): the one to show while the longer read runs. With
-    /// `longerRead` false none is made (a stepped scan's ring holds only the first read): the first answer is
-    /// returned, still wanting it.
-    func identify(atHz: Double, bandwidthHz: Double? = nil, longerRead: Bool = true,
+    /// When the first pass asks for a longer read (or a look-back), `firstAnswer` is called with that pass's answer as
+    /// soon as it is made (on the main actor, not after this call returned): the one to show, as measuring, while the
+    /// rest runs. With `longerRead` false none is made (a stepped scan's ring holds only the first read): the first
+    /// answer is returned, still wanting it.
+    func identify(atHz: Double, bandwidthHz: Double? = nil, radiusHz: Double? = nil, longerRead: Bool = true,
+                  priority: SignalIDPriority = .background,
                   firstAnswer: (@MainActor (SignalIdentity) -> Void)? = nil) async -> SignalIdentity? {
-        guard let model else { return nil }
-        let now = self.now()
-        let sequence = tuning.current.sequence
-        cache.removeAll { $0.sequence != sequence || now.timeIntervalSince($0.at) > Self.cacheSeconds }
-        if let hit = cache.first(where: { $0.range.contains(atHz) && $0.bandwidthHz == bandwidthHz }) {
-            return confirmed(hit.identity, centerHz: hit.centerHz, bandwidthHz: bandwidthHz, now: now)
-        }
+        await identify(atHz: atHz, bandwidthHz: bandwidthHz, radiusHz: radiusHz, longerRead: longerRead,
+                       priority: priority, hover: false, firstAnswer: firstAnswer)
+    }
 
-        let spectrum = model.spectrumSnapshot(), modelCentre = model.centerHz
-        let provider = snapshotProvider, chunks = chunkProvider, analysis = self.analysis, barrier = tuning
+    /// `identify`, as a hover's when `hover` (a newer hover replaces it while it is queued).
+    func identify(atHz: Double, bandwidthHz: Double? = nil, radiusHz: Double? = nil, longerRead: Bool = true,
+                  priority: SignalIDPriority, hover: Bool,
+                  firstAnswer: (@MainActor (SignalIdentity) -> Void)? = nil) async -> SignalIdentity? {
+        guard model != nil else { return nil }
         // The first answer reaches the main actor in a task of its own: dropped once this call has returned.
         let finished = Finished()
         defer { finished.value = true }
@@ -257,29 +412,78 @@ final class SignalIDService {
             }
         }
         let onFirstAnswer = onFirst
-        let task = Task.detached(executorPreference: executor, priority: .userInitiated) {
-            Self.run(atHz: atHz, bandwidthHz: bandwidthHz, spectrum: spectrum, longer: longerRead,
-                     modelCenterHz: modelCentre, provider: provider, chunks: chunks, analysis: analysis,
-                     barrier: barrier, onFirst: onFirstAnswer)
+        var again = false
+        while true {
+            if let hit = cached(atHz: atHz, bandwidthHz: bandwidthHz, radiusHz: radiusHz) { return hit }
+            let ticket = SignalIDQueue.Ticket(priority: priority, hover: hover, again: again)
+            guard await queue.turn(ticket) else { return nil }
+            guard !Task.isCancelled, let model else {
+                queue.finished(ticket)
+                return nil
+            }
+            let request = Request(
+                atHz: atHz, bandwidthHz: bandwidthHz, radiusHz: radiusHz, spectrum: model.spectrumSnapshot(),
+                longer: longerRead, modelCenterHz: model.centerHz, trueTime: sourceKind() == .sdrplay,
+                notAtFrequency: tuneFailedAt.map { now().timeIntervalSince($0) >= Self.notAtFrequencyGraceSeconds } ?? false,
+                comb: knownComb())
+            let provider = snapshotProvider, chunks = chunkProvider, analysis = self.analysis, barrier = tuning
+            let finder = combFinder
+            let task = Task.detached(executorPreference: executor, priority: .userInitiated) {
+                Self.run(request, provider: provider, chunks: chunks, analysis: analysis, combFinder: finder,
+                         barrier: barrier, onFirst: onFirstAnswer)
+            }
+            ticket.cancel = { task.cancel() }
+            if ticket.preempted { task.cancel() }   // the owner asked between its turn and its start
+            let result = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+            queue.finished(ticket)
+            // Stopped for the owner (it gave nothing): asked again while its caller waits.
+            if ticket.preempted, result == nil, !Task.isCancelled {
+                again = true
+                continue
+            }
+            guard !Task.isCancelled, let result, result.state == tuning.current else { return nil }
+            if let found = result.comb { combCache = (result.state, now(), found) }
+            return keep(result, atHz: atHz, bandwidthHz: bandwidthHz, radiusHz: radiusHz)
         }
-        let result = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
-        guard !Task.isCancelled, let result, result.state == tuning.current else { return nil }
+    }
 
+    /// A cached answer for the point, confirmed by any decode now (see the type's notes).
+    private func cached(atHz: Double, bandwidthHz: Double?, radiusHz: Double?) -> SignalIdentity? {
+        let now = self.now()
+        let sequence = tuning.current.sequence
+        cache.removeAll { $0.sequence != sequence || now.timeIntervalSince($0.at) > Self.cacheSeconds }
+        guard let hit = cache.first(where: {
+            $0.range.contains(atHz) && $0.bandwidthHz == bandwidthHz && $0.radiusHz == radiusHz
+        }) else { return nil }
+        return confirmed(hit.identity, centerHz: hit.centerHz, bandwidthHz: bandwidthHz, now: now)
+    }
+
+    /// The comb found for this tuning within `combSeconds`, if any was looked for.
+    private func knownComb() -> CombReading? {
+        guard let known = combCache, known.state == tuning.current,
+              now().timeIntervalSince(known.at) <= Self.combSeconds else { return nil }
+        return known.comb
+    }
+
+    /// `result`'s answer, confirmed, and cached when it should be.
+    private func keep(_ result: Outcome, atHz: Double, bandwidthHz: Double?, radiusHz: Double?) -> SignalIdentity {
         let identity = result.identity, state = result.state
         let answer = confirmed(identity, centerHz: state.centerHz, bandwidthHz: bandwidthHz, now: self.now())
         // Kept when it found an extent and had every read it asked for (a short ring's answer improves as it
-        // fills), or when a decode settled it; over the extent. "No signal" and "Too weak" with every read, for the
-        // point alone (a poll of empty spectrum doesn't read it again); never "Too soon", which the ring outgrows.
+        // fills), or when a decode settled it; over the extent. "No signal" and "Too weak" with every read (the
+        // look-back's too), for the point alone (a poll of empty spectrum doesn't read it again); never "Too soon",
+        // which the ring outgrows (nor the failed tune's note: neither had every read).
         let m = identity.measurement
         if m.occupiedBandwidthHz > 0 && (result.complete || answer.confirmedByDecode) {
             let centre = state.centerHz + m.offsetHz, half = max(m.occupiedBandwidthHz, m.bandwidth6dBHz) / 2
             cache.append(CacheEntry(range: min(centre - half, atHz)...max(centre + half, atHz),
-                                    bandwidthHz: bandwidthHz, sequence: state.sequence, centerHz: state.centerHz,
-                                    at: self.now(), identity: identity))
+                                    bandwidthHz: bandwidthHz, radiusHz: radiusHz, sequence: state.sequence,
+                                    centerHz: state.centerHz, at: self.now(), identity: identity))
         } else if m.occupiedBandwidthHz == 0 && result.complete && identity.note != SignalIdentifier.tooSoonNote
                     && identity.note != SignalIdentifier.cancelledNote {
-            cache.append(CacheEntry(range: atHz...atHz, bandwidthHz: bandwidthHz, sequence: state.sequence,
-                                    centerHz: state.centerHz, at: self.now(), identity: identity))
+            cache.append(CacheEntry(range: atHz...atHz, bandwidthHz: bandwidthHz, radiusHz: radiusHz,
+                                    sequence: state.sequence, centerHz: state.centerHz, at: self.now(),
+                                    identity: identity))
         }
         return answer
     }
@@ -290,42 +494,87 @@ final class SignalIDService {
     /// Whether an `identify` call has returned (read on the main actor).
     @MainActor private final class Finished { var value = false }
 
-    /// What `run` made of it: the answer, the tuning its IQ was heard in, and whether it had every read it asked
-    /// for (the first pass's 3 s, and the longer read when wanted).
+    /// What `run` made of it: the answer, the tuning its IQ was heard in, whether it had every read it asked for (the
+    /// first pass's 3 s, and the longer read or look-back when wanted), and the comb when it had to find it.
     struct Outcome: Sendable {
         var identity: SignalIdentity
         var state: TuneBarrier.State
         var complete: Bool
+        var comb: CombReading? = nil
     }
 
-    /// The first read, the analysis and (on request, when `longer`) the longer read: on the service's executor. Nil
-    /// when there is no IQ, the radio retuned meanwhile, or the task was cancelled. `modelCenterHz`: the display
-    /// centre the model shows (see `firstRead`). `whole`: the first read is the whole capture whatever its rate
-    /// (tests compare the two).
+    /// Whether the capture has a comb, once looked for (`comb` nil: none).
+    struct CombReading: Sendable, Equatable {
+        var comb: CaptureComb?
+    }
+
+    /// What `run` is asked, from the main actor.
+    struct Request: Sendable {
+        var atHz: Double
+        var bandwidthHz: Double?
+        var radiusHz: Double? = nil
+        var spectrum: SpectrumSnapshot?
+        var longer: Bool
+        /// The display centre the model shows (see `firstRead`).
+        var modelCenterHz: Double? = nil
+        /// The ring's samples carry the time they were heard (the RSP's): the analysis gets it.
+        var trueTime = false
+        /// A tune failed over `notAtFrequencyGraceSeconds` ago: a point the IQ doesn't hold is `notAtFrequencyNote`.
+        var notAtFrequency = false
+        /// The capture's comb as already found for this tuning; nil: find it.
+        var comb: CombReading? = nil
+    }
+
+    /// `run` (the tests' form).
     nonisolated static func run(atHz: Double, bandwidthHz: Double?, spectrum: SpectrumSnapshot?, longer: Bool,
                                 modelCenterHz: Double? = nil, provider: SnapshotProvider, chunks: ChunkProvider,
-                                analysis: Analysis, barrier: TuneBarrier, whole wholeFirst: Bool = false,
+                                analysis: Analysis, barrier: TuneBarrier, whole: Bool = false,
                                 onFirst: (@Sendable (SignalIdentity, TuneBarrier.State) -> Void)? = nil) -> Outcome? {
+        run(Request(atHz: atHz, bandwidthHz: bandwidthHz, spectrum: spectrum, longer: longer, modelCenterHz: modelCenterHz),
+            provider: provider, chunks: chunks, analysis: analysis,
+            combFinder: { CaptureComb.find(spectrumDb: $0, sampleRate: $1, centerHz: $2) }, barrier: barrier,
+            whole: whole, onFirst: onFirst)
+    }
+
+    /// The first read, the analysis and (on request, when `longer`) the longer read or the look-back: on the service's
+    /// executor. Nil when there is no IQ, the radio retuned meanwhile, or the task was cancelled. `whole`: the first read
+    /// is the whole capture whatever its rate (tests compare the two).
+    nonisolated static func run(_ request: Request, provider: SnapshotProvider, chunks: ChunkProvider,
+                                analysis: Analysis, combFinder: CombFinder, barrier: TuneBarrier,
+                                whole wholeFirst: Bool = false,
+                                onFirst: (@Sendable (SignalIdentity, TuneBarrier.State) -> Void)? = nil) -> Outcome? {
+        let atHz = request.atHz, bandwidthHz = request.bandwidthHz
         var whole = wholeFirst
         var identity: SignalIdentity
         var read: FirstRead
+        var combFound: CombReading?
         while true {
             // Held only here: a channel read again whole is let go first.
             guard !Task.isCancelled,
-                  let first = firstRead(atHz: atHz, bandwidthHz: bandwidthHz, spectrum: spectrum, whole: whole,
-                                        modelCenterHz: modelCenterHz, provider: provider, chunks: chunks,
+                  let first = firstRead(atHz: atHz, bandwidthHz: bandwidthHz, spectrum: request.spectrum, whole: whole,
+                                        modelCenterHz: request.modelCenterHz, provider: provider, chunks: chunks,
                                         barrier: barrier) else { return nil }
             // A point outside the capture the IQ holds (a failed tune left it at the old centre): nothing to read.
             guard !first.iq.isEmpty || abs(atHz - first.state.centerHz) <= first.captureRate / 2 else {
-                let tooSoon = SignalIdentity(measurement: SignalMeasurement(offsetHz: atHz - first.state.centerHz,
+                let note = request.notAtFrequency ? notAtFrequencyNote : SignalIdentifier.tooSoonNote
+                let outside = SignalIdentity(measurement: SignalMeasurement(offsetHz: atHz - first.state.centerHz,
                                                                             family: .noise),
-                                             note: SignalIdentifier.tooSoonNote)
-                return Outcome(identity: tooSoon, state: first.state, complete: false)
+                                             note: note)
+                return Outcome(identity: outside, state: first.state, complete: false)
             }
-            identity = analysis(first.iq, first.sampleRate, first.state.centerHz + first.offsetHz, atHz, bandwidthHz,
-                                first.spectrumDb, nil)
+            // The capture's comb: as found for this tuning, else on the app's spectrum of it, else on the ring.
+            if request.comb == nil, combFound == nil {
+                combFound = comb(first, chunks: chunks, barrier: barrier, finder: combFinder)
+                guard !Task.isCancelled else { return nil }
+            }
+            let comb = (request.comb ?? combFound)?.comb
+            identity = analysis(AnalysisInput(iq: first.iq, sampleRate: first.sampleRate,
+                                              captureCenterHz: first.state.centerHz + first.offsetHz, atHz: atHz,
+                                              bandwidthHz: bandwidthHz, spectrumDb: first.spectrumDb, longer: nil,
+                                              pointRadiusHz: request.radiusHz,
+                                              endTime: request.trueTime ? first.endTime : nil, comb: comb))
             guard !Task.isCancelled else { return nil }
-            identity.measurement.offsetHz += first.offsetHz   // back in the capture's frame
+            identity = recentred(identity, by: first.offsetHz, captureCenterHz: first.state.centerHz)
             // A signal wider than the channel was cut for is read again whole.
             if let window = first.channelHz, wider(identity, than: window) {
                 whole = true
@@ -335,33 +584,146 @@ final class SignalIDService {
             break
         }
         let state = read.state, rate = read.sampleRate
+        let comb = (request.comb ?? combFound)?.comb
+        func outcome(_ identity: SignalIdentity, complete: Bool) -> Outcome {
+            Outcome(identity: identity, state: state, complete: complete, comb: combFound)
+        }
         // Less than the 3 s asked for (but enough to measure): said in the note.
         let readSeconds = Double(read.frames) / rate
         if read.short && readSeconds >= SignalIdentifier.minimumSeconds {
             add(String(format: "Read %.1f s of the %.0f s asked for", readSeconds, firstSeconds), to: &identity)
         }
-        guard identity.needsLongerRead, longer else {
-            return Outcome(identity: identity, state: state, complete: !read.short && !identity.needsLongerRead)
+        let silent = isSilent(identity)
+        guard request.longer, wantsLongerRead(identity) || (silent && !read.short) else {
+            return outcome(identity, complete: !read.short && !wantsLongerRead(identity))
         }
 
-        // The longer read, on the channel around what the first pass measured; the first answer is out meanwhile.
+        // The longer read (or the look-back), on the channel around what the first pass measured (or the point); the
+        // first answer is out meanwhile.
         onFirst?(identity, state)
         read.iq = []   // not held through the longer read
         let m = identity.measurement
-        switch longerRead(offsetHz: m.offsetHz, widthHz: max(m.occupiedBandwidthHz, bandwidthHz ?? 0),
+        let around = silent ? atHz - state.centerHz : m.offsetHz
+        switch longerRead(offsetHz: around, widthHz: max(silent ? 0 : m.occupiedBandwidthHz, bandwidthHz ?? 0),
                           tuning: state, sampleRate: read.captureRate, chunks: chunks, barrier: barrier) {
         case .dropped:
             return nil
         case .unavailable(let why):
-            add(why, to: &identity)
-            return Outcome(identity: identity, state: state, complete: false)
+            add(silent ? lookBackFailedNote : why, to: &identity)
+            return outcome(identity, complete: false)
         case .read(let long):
-            var refined = analysis(long.iq, long.sampleRate, state.centerHz + long.offsetHz, atHz, bandwidthHz, nil,
-                                   { (long.iq, long.seconds) })
+            if silent {
+                guard let found = lookBack(long, request: request, state: state, comb: comb, analysis: analysis,
+                                           barrier: barrier) else { return nil }
+                return outcome(found.identity, complete: found.complete)
+            }
+            let refined = analysis(AnalysisInput(iq: long.iq, sampleRate: long.sampleRate,
+                                                 captureCenterHz: state.centerHz + long.offsetHz, atHz: atHz,
+                                                 bandwidthHz: bandwidthHz, spectrumDb: nil, longer: { (long.iq, long.seconds) },
+                                                 pointRadiusHz: request.radiusHz,
+                                                 endTime: request.trueTime ? long.endTime : nil, comb: comb))
             guard !Task.isCancelled else { return nil }
-            refined.measurement.offsetHz += long.offsetHz   // back in the capture's frame
-            return Outcome(identity: refined, state: state, complete: !refined.needsLongerRead)
+            return outcome(recentred(refined, by: long.offsetHz, captureCenterHz: state.centerHz),
+                           complete: !refined.needsLongerRead)
         }
+    }
+
+    /// The first pass wants the longer read: for its own signal, or for one under the point it measured but couldn't name
+    /// on 3 s (an FT8 group's members read `unknown` until their tones are read).
+    nonisolated static func wantsLongerRead(_ identity: SignalIdentity) -> Bool {
+        identity.needsLongerRead || identity.signals.contains {
+            $0.needsLongerRead && $0.best == nil && !$0.nameInherited && $0.measurement.family == .unknown
+        }
+    }
+
+    /// Nothing at the point: "No signal" (and nothing more said: a short read's adds its note).
+    nonisolated static func isSilent(_ identity: SignalIdentity) -> Bool {
+        identity.note == SignalIdentifier.noSignalNote
+    }
+
+    /// The note when the look-back's read failed: the newest 3 s are all there is.
+    nonisolated static let lookBackFailedNote = "The look-back read failed; this is the newest 3 s alone"
+
+    /// The note on what a look-back found, `seconds` back from the newest IQ it read.
+    nonisolated static func silentFor(_ seconds: Double) -> String {
+        String(format: "Silent for the last %.0f s; this is what was on before then", seconds)
+    }
+
+    /// The look-back (see the type's notes) over `long` (the ring's newest up to `longSeconds`, a channel around the
+    /// point): `firstSeconds` at a time going back from its newest (which the first read was), each analysed with what
+    /// came before it as its longer read and its own end time, until one isn't "No signal" (that answer, recentred and
+    /// saying how long it has been silent), or none is ("No signal"). A read shorter than asked for says so; the answer
+    /// is complete when the read was whole and the answer wants no more. Nil when the radio retuned or it was cancelled.
+    nonisolated static func lookBack(_ long: LongRead, request: Request, state: TuneBarrier.State, comb: CaptureComb?,
+                                     analysis: Analysis, barrier: TuneBarrier) -> (identity: SignalIdentity, complete: Bool)? {
+        let rate = long.sampleRate
+        let whole = long.seconds >= longSeconds - 0.1
+        var notes: [String] = []
+        if !whole { notes.append(String(format: "Looked back %.1f s of the %.0f s asked for", long.seconds, longSeconds)) }
+        var iq = long.iq
+        var answer = SignalIdentity(measurement: SignalMeasurement(offsetHz: request.atHz - state.centerHz,
+                                                                   family: .noise, seconds: long.seconds),
+                                    note: SignalIdentifier.noSignalNote)
+        var complete = whole
+        var back = firstSeconds
+        while long.seconds - back >= SignalIdentifier.minimumSeconds {
+            // What came before `back` seconds ago, trimmed in place.
+            let keep = Int(((long.seconds - back) * rate).rounded())
+            iq.removeLast(max(0, iq.count - 2 * keep))
+            guard !Task.isCancelled, barrier.current == state else { return nil }
+            let before = iq, seconds = Double(keep) / rate
+            let found = analysis(AnalysisInput(iq: before, sampleRate: rate, captureCenterHz: state.centerHz + long.offsetHz,
+                                               atHz: request.atHz, bandwidthHz: request.bandwidthHz, spectrumDb: nil,
+                                               longer: { (before, seconds) }, pointRadiusHz: request.radiusHz,
+                                               endTime: request.trueTime ? long.endTime.addingTimeInterval(-back) : nil,
+                                               comb: comb))
+            guard !Task.isCancelled, barrier.current == state else { return nil }
+            if !isSilent(found) {
+                answer = recentred(found, by: long.offsetHz, captureCenterHz: state.centerHz)
+                notes.insert(silentFor(back), at: 0)
+                complete = complete && !found.needsLongerRead
+                break
+            }
+            back += firstSeconds
+        }
+        let said = [answer.note].compactMap { $0 } + notes
+        answer.note = said.joined(separator: "; ")
+        return (answer, complete)
+    }
+
+    /// `identity`, from a read centred `offsetHz` from the capture's centre `captureCenterHz`, in the capture's frame:
+    /// its measurement, and each of its signals' and its group's span, moved by `offsetHz`, so that all of them are
+    /// relative to `captureCenterHz`, which a group answer then says (`captureCenterHz`).
+    nonisolated static func recentred(_ identity: SignalIdentity, by offsetHz: Double,
+                                      captureCenterHz: Double) -> SignalIdentity {
+        var out = identity
+        out.measurement.offsetHz += offsetHz
+        guard !out.signals.isEmpty || out.groupSpanHz != nil || out.captureCenterHz != nil else { return out }
+        for k in out.signals.indices { out.signals[k].measurement.offsetHz += offsetHz }
+        out.groupSpanHz = out.groupSpanHz.map { ($0.lowerBound + offsetHz)...($0.upperBound + offsetHz) }
+        out.captureCenterHz = captureCenterHz
+        return out
+    }
+
+    /// The capture's comb: on the app's spectrum of it when `first` has one, else on up to `combReadSeconds`
+    /// (`combFrames` at most) of the ring's newest IQ, read a piece at a time. Nil when that read failed or was cut
+    /// by a retune (looked for again next time).
+    nonisolated static func comb(_ first: FirstRead, chunks: ChunkProvider, barrier: TuneBarrier,
+                                 finder: CombFinder) -> CombReading? {
+        let rate = first.captureRate, centre = first.state.centerHz
+        if let db = first.captureDb { return CombReading(comb: finder(db, rate, centre)) }
+        let frames = min(combFrames, Int((combReadSeconds * rate).rounded()))
+        guard frames >= CaptureComb.spectrumSize else { return CombReading(comb: nil) }
+        var iq: [Float] = []
+        iq.reserveCapacity(2 * frames)
+        let read = chunks(Double(frames) / rate, min(Int(chunkSeconds * rate), maxChunkFrames)) { piece in
+            guard !Task.isCancelled else { return false }
+            iq.append(contentsOf: piece.prefix(2 * frames - iq.count))
+            return true
+        }
+        guard !Task.isCancelled, barrier.current == first.state, let read, read.sampleRate == rate,
+              iq.count / 2 >= CaptureComb.spectrumSize else { return nil }
+        return CombReading(comb: finder(CaptureComb.spectrum(iq: iq), rate, centre))
     }
 
     /// The answer measured a signal the first read's channel (`windowHz` wide) wasn't cut wide enough for: the
@@ -384,9 +746,13 @@ final class SignalIDService {
         var captureRate: Double
         /// The app's spectrum over what was read, when it is of this capture.
         var spectrumDb: [Float]?
+        /// The app's spectrum of the whole capture, when it is of this capture.
+        var captureDb: [Float]?
         /// Shorter than the 3 s asked for: it reached back to a retune.
         var short: Bool
         var state: TuneBarrier.State
+        /// When its last sample was heard.
+        var endTime: Date
         var frames: Int { iq.count / 2 }
     }
 
@@ -420,7 +786,7 @@ final class SignalIDService {
             // failed): nothing read (`run` answers it).
             guard abs(pointHz) <= rate / 2 || modelCenterHz.map({ abs($0 - state.centerHz) < 1 }) ?? true else {
                 return FirstRead(iq: [], sampleRate: rate, offsetHz: 0, channelHz: nil, captureRate: rate,
-                                 spectrumDb: nil, short: true, state: state)
+                                 spectrumDb: nil, short: true, state: state, endTime: probe.endTime)
             }
             if !whole, failures < 2,
                let plan = firstChannel(pointHz: pointHz, bandwidthHz: bandwidthHz, spectrumDb: appDb, rate: rate) {
@@ -432,7 +798,8 @@ final class SignalIDService {
                                      channelHz: plan.windowHz, captureRate: rate,
                                      spectrumDb: appDb.flatMap { crop($0, rate: rate, offsetHz: channel.offsetHz,
                                                                       channelRate: channel.sampleRate) },
-                                     short: channel.iq.count / 2 < asked, state: state)
+                                     captureDb: appDb, short: channel.iq.count / 2 < asked, state: state,
+                                     endTime: channel.endTime)
                 case .dropped:
                     continue
                 case .failed:
@@ -447,7 +814,8 @@ final class SignalIDService {
             let keep = max(0, min(snapshot.frames - settle, Int((firstSeconds * rate).rounded())))
             snapshot.samples.removeFirst(2 * (snapshot.frames - keep))
             return FirstRead(iq: snapshot.samples, sampleRate: rate, offsetHz: 0, channelHz: nil, captureRate: rate,
-                             spectrumDb: appDb, short: keep < Int((firstSeconds * rate).rounded()), state: state)
+                             spectrumDb: appDb, captureDb: appDb, short: keep < Int((firstSeconds * rate).rounded()),
+                             state: state, endTime: snapshot.endTime)
         }
         return nil
     }
@@ -507,6 +875,8 @@ final class SignalIDService {
         var sampleRate: Double
         var offsetHz: Double
         var seconds: Double
+        /// When its last sample was heard (`IQRead.endTime`).
+        var endTime: Date
         /// The output's size as reserved before the read, in floats, and whether it outgrew that (it never
         /// should: the read's peak is this plus one piece).
         var reservedFloats: Int
@@ -579,7 +949,7 @@ final class SignalIDService {
         let keep = max(0, min(iq.count / 2 - settle, Int((seconds * rate).rounded())))
         iq.removeFirst(iq.count - 2 * keep)
         return .read(LongRead(iq: iq, sampleRate: rate, offsetHz: whole ? 0 : offsetHz, seconds: Double(keep) / rate,
-                              reservedFloats: reserved, grew: grew))
+                              endTime: read.endTime, reservedFloats: reserved, grew: grew))
     }
 
     // MARK: Decode confirmation
@@ -655,8 +1025,14 @@ final class SignalIDService {
 
     // MARK: Hover
 
-    /// The pointer rests at `point` (view points) over `hz` (display Hz).
-    func hover(at point: CGPoint, hz: Double) {
+    /// The radius hover and card ask within at a zoom of `hzPerPoint` (nil: the identifier's default).
+    static func radiusHz(hzPerPoint: Double?) -> Double? {
+        hzPerPoint.flatMap { $0 > 0 && $0.isFinite ? radiusPixels * $0 : nil }
+    }
+
+    /// The pointer rests at `point` (view points) over `hz` (display Hz), the view showing `hzPerPoint` (nil: not
+    /// known) a point: the owner's, within `radiusPixels` of it.
+    func hover(at point: CGPoint, hz: Double, hzPerPoint: Double? = nil) {
         if let anchor = hoverAnchor, hypot(point.x - anchor.x, point.y - anchor.y) <= Self.moveTolerance { return }
         endHover()
         hoverAnchor = point
@@ -666,7 +1042,8 @@ final class SignalIDService {
             await dwell()
             guard !Task.isCancelled, let self else { return }
             hoverPending = true
-            let identity = await identify(atHz: hz) { [weak self] first in
+            let identity = await identify(atHz: hz, radiusHz: Self.radiusHz(hzPerPoint: hzPerPoint), priority: .owner,
+                                          hover: true) { [weak self] first in
                 // The first pass is up while the longer read runs.
                 guard let self, hoverGeneration == generation else { return }
                 hoverPending = false
@@ -696,15 +1073,17 @@ final class SignalIDService {
 
     /// Opens the card for the signal at `hz` (display Hz), clicked at `point` (view points): identifies it (the cache
     /// answers at once for a signal the hover just read) and fills the card in, the first pass's answer first when
-    /// a longer read follows. Replaces any open card; the hover's answer is cleared (the card is the answer now).
-    func openCard(at point: CGPoint, hz: Double) {
+    /// a longer read follows: the owner's, within `radiusPixels` of it at `hzPerPoint` (nil: not known). Replaces any
+    /// open card; the hover's answer is cleared (the card is the answer now).
+    func openCard(at point: CGPoint, hz: Double, hzPerPoint: Double? = nil) {
         closeCard()
         endHover()
         let generation = cardGeneration
         card = Card(id: generation, point: point, hz: hz, signalHz: hz)
         cardTask = Task { [weak self] in
             guard let self else { return }
-            let identity = await identify(atHz: hz) { [weak self] first in
+            let identity = await identify(atHz: hz, radiusHz: Self.radiusHz(hzPerPoint: hzPerPoint),
+                                          priority: .owner) { [weak self] first in
                 guard let self, cardGeneration == generation else { return }
                 fill(first, measuring: true)
             }
@@ -750,10 +1129,11 @@ final class SignalIDService {
     func retuneBegins() { tuning.begin() }
 
     /// The retune is done: the ring's IQ is now at `displayCenterHz` (nil: the retune failed, still the old
-    /// centre). Forgets the answers and the pointer's.
+    /// centre, which `notAtFrequencyNote` says after its grace). Forgets the answers and the pointer's.
     func retuned(displayCenterHz: Double?) {
         tuning.end(centerHz: displayCenterHz)
-        cache.removeAll()
+        tuneFailedAt = displayCenterHz == nil ? now() : nil
+        cache.removeAll()   // the comb's too: it is kept for the tuning it was found in (`knownComb`)
         endHover()
     }
 }

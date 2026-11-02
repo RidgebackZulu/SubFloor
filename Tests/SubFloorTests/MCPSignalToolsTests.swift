@@ -60,7 +60,8 @@ struct MCPSignalToolsTests {
 
     /// A stub analysis: a 100 Hz wide RTTY, centred where it was asked.
     private nonisolated static func rtty(widthHz: Double = 100, seconds: Double = 0) -> SignalIDService.Analysis {
-        { _, _, centre, at, _, _, _ in
+        { a in
+            let (centre, at) = (a.captureCenterHz, a.atHz)
             if seconds > 0 { Thread.sleep(forTimeInterval: seconds) }
             return SignalIdentity(measurement: SignalMeasurement(offsetHz: at - centre, occupiedBandwidthHz: widthHz,
                                                                  bandwidth6dBHz: widthHz / 2, snrDb: 24, family: .fsk,
@@ -261,7 +262,8 @@ struct MCPSignalToolsTests {
         let lines = [from + 0.4 * span, from + 1.3 * span, from + 2.2 * span]
         tools.scanSpectrum = { Self.spectrum(of: m, lines: lines) }
         let passes = Shared<[(hz: Double, longer: Bool)]>([])
-        m.signalID.analysis = { _, _, centre, at, _, _, longer in
+        m.signalID.analysis = { a in
+            let (centre, at, longer) = (a.captureCenterHz, a.atHz, a.longer)
             let seen = passes.withLock { p in
                 p.append((at, longer != nil))
                 return p.filter { abs($0.hz - at) < 2_000 }.count
@@ -431,7 +433,7 @@ struct MCPSignalToolsTests {
         let lines = [from + 0.4 * span, from + 1.3 * span, from + 2.2 * span]
         tools.scanSpectrum = { Self.spectrum(of: m, lines: lines) }
         let calls = Shared(0)
-        m.signalID.analysis = { _, _, centre, at, _, _, _ in
+        m.signalID.analysis = { a in
             if calls.withLock({ n -> Int in n += 1; return n }) == 1 {
                 Task { @MainActor in
                     parked.withLock { $0 = m.centerHz }
@@ -439,7 +441,7 @@ struct MCPSignalToolsTests {
                 }
                 Thread.sleep(forTimeInterval: 0.2)   // the owner acts while this identify runs
             }
-            return Self.rtty()(Array<Float>(), 48_000, centre, at, nil, nil, nil)
+            return Self.rtty()(a)
         }
         return await call(tools, "identify_signals", ["from_hz": .number(from), "to_hz": .number(from + 2.5 * span)])
     }
@@ -522,14 +524,14 @@ struct MCPSignalToolsTests {
         let span = m.sampleRate, from = 6_000_000.0
         tools.scanSpectrum = { Self.spectrum(of: m, lines: [from + 2.2 * span]) }   // in the last piece only
         let target = Shared(0.0), parked = Shared(0.0)
-        m.signalID.analysis = { _, _, centre, at, _, _, _ in
+        m.signalID.analysis = { a in
             Task { @MainActor in
                 parked.withLock { $0 = m.centerHz }
                 target.withLock { $0 = m.centerHz + 250_000 }
                 m.setVFO(m.centerHz + 250_000)
             }
             Thread.sleep(forTimeInterval: 0.2)
-            return Self.rtty()([], 48_000, centre, at, nil, nil, nil)
+            return Self.rtty()(a)
         }
         let r = await call(tools, "identify_signals", ["from_hz": .number(from), "to_hz": .number(from + 2.5 * span)])
         #expect(r.structured?["signals"]?.array?.count == 1)
@@ -661,7 +663,8 @@ struct MCPSignalToolsTests {
     @Test func cursorDoesNotWaitForTheLongerRead() async {
         let runs = Shared(0)
         let longReadDone = Shared(false)
-        let analysis: SignalIDService.Analysis = { iq, rate, centre, at, width, spectrum, longer in
+        let analysis: SignalIDService.Analysis = { a in
+            let (centre, at, longer) = (a.captureCenterHz, a.atHz, a.longer)
             let n = runs.withLock { n -> Int in n += 1; return n }
             var id = SignalIdentity(measurement: SignalMeasurement(offsetHz: at - centre, occupiedBandwidthHz: 30, snrDb: 20,
                                                                    family: .carrier, familyConfidence: 0.8, seconds: 3))
