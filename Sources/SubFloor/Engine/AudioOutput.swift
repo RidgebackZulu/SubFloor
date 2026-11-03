@@ -6,6 +6,8 @@ import Synchronization
 final class AudioOutput: @unchecked Sendable {
     static let sampleRate = 48_000.0
     static let targetLatency = 2_400
+    /// Under `swift test` nothing reaches the speakers: the engines still run, at no volume.
+    static let speakersSilenced = ["swiftpm-testing-helper", "xctest"].contains(ProcessInfo.processInfo.processName)
 
     let underruns = Atomic<Int>(0)
     private let ring = SPSCRing<Float>(capacity: 48_000, fill: 0)
@@ -28,6 +30,7 @@ final class AudioOutput: @unchecked Sendable {
         }
         engine.attach(node)
         engine.connect(node, to: engine.mainMixerNode, format: format)
+        if Self.speakersSilenced { engine.mainMixerNode.outputVolume = 0 }
         source = node
         configObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
