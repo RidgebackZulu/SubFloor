@@ -218,6 +218,13 @@ struct SignalIDDecodingTests {
                                   chunks: Self.chunks(Self.ft8Ring([], seconds: 31, endTime: late), endTime: late),
                                   decoders: decoders)
         #expect(far.note == SignalIDDecoding.noSlotNote && calls.withLock { $0 } == 0)
+        // A message that is nothing once cleaned is no message.
+        var blank = SignalIDDecoding.Decoders.standard
+        blank.ft8 = { _, slotStart in
+            [SlotDecode(mode: .ft8, slotStart: slotStart, frequencyHz: 1000, snrDb: 0, timeOffset: 0, message: "\u{7}\u{0}")]
+        }
+        let (empty, _) = Self.trial(own, centerHz: Self.ft8Centre, chunks: Self.chunks(Self.ft8Ring([])), decoders: blank)
+        #expect(empty?.decodes.isEmpty == true && empty?.slot != nil)
     }
 
     // MARK: RTTY and PSK31

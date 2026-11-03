@@ -124,6 +124,14 @@ private func makeDecoder(_ hz: Double = 1_500) -> any SignalDecoder {
     /// 10 dB, the channel laid out for it, and the default's layout is the 45.45 Bd, 170 Hz one exactly.
     @Test func otherKeyingsDecode() {
         #expect(RTTYSignalDecoder.layout(baud: 45.45, shiftHz: 170) == (450, 1_000))
+        // Another keying keeps the default's margins: its tones and two bit rates inside the passband (the cutoff less
+        // half the 500 Hz transition), and what aliases from past the transition as far from them (124 Hz).
+        for (baud, shift) in [(50.0, 425.0), (75, 850), (45.45, 850)] {
+            let layout = RTTYSignalDecoder.layout(baud: baud, shiftHz: shift)
+            let reach = shift / 2 + 2 * baud
+            #expect(layout.cutoffHz - 250 >= reach - 1e-9, "\(baud) Bd \(shift) Hz")
+            #expect(layout.basebandTarget - (layout.cutoffHz + 250) - reach >= 124 - 1e-6, "\(baud) Bd \(shift) Hz")
+        }
         for (baud, shift) in [(50.0, 425.0), (75, 850), (45.45, 850), (75, 170)] {
             let clear = RTTYEncoder.audio(text: text, centerHz: 1_500, baud: baud, shiftHz: shift)
             let audio = ModemTestSignals.awgn(clear, snrDb: 10, seed: 4001, signalPower: rttyPower)
