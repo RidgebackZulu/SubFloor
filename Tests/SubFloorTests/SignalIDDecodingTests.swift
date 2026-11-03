@@ -141,20 +141,22 @@ struct SignalIDDecodingTests {
     // MARK: FT8
 
     /// A checked message names the FT8 it lies on at 1.0, its text kept, when that trace was on the air in the message's
-    /// slot as the trial's own 28 s read times it; a message beside no trace names nothing, and a trace with no message
-    /// of its own keeps what it had. The ring ends 12 s into the slot after the one decoded: the identification's 16 s
-    /// read would hold only 2 s of the decoded slot's transmissions, the trial's 28 s all of them.
+    /// slot as the trial's own 45 s read times it; a message beside no trace names nothing, and a trace with no message
+    /// of its own keeps what it had. The point is clicked while it sends (8 s into its slot): it is decoded in its
+    /// previous own slot, 30 s before, which only a read of a parity period and a slot holds.
     @Test func ft8DecodeConfirms() throws {
-        let next = Self.slotStart.addingTimeInterval(15), end = Self.slotStart.addingTimeInterval(27)
+        let next = Self.slotStart.addingTimeInterval(15), now = Self.slotStart.addingTimeInterval(30)
+        let end = Self.slotStart.addingTimeInterval(38)
         let ring = Self.ft8Ring([
-            ("CQ K1ABC FN42", 1000, []), ("G4XYZ K1ABC -12", 1200, []),
+            // The point: sending now, and in its own slot before.
+            ("CQ K1ABC FN42", 1000, [Self.slotStart, now]), ("G4XYZ K1ABC -12", 1200, []),
             // Near the box's edge, 1.3 kHz from its middle.
             ("CQ VK2ABC QF56", 2400, []),
-            // On the air only in the slot now on (another parity).
-            ("CQ W1AW FN31", 1600, [next]),
+            // On the air only in the slot now on (never in a complete slot of the read).
+            ("CQ W1AW FN31", 1600, [now]),
             // A line two stations share, one of each parity.
             ("CQ DL1ABC JO62", 1400, [Self.slotStart]), ("CQ JA1XYZ PM95", 1400, [next]),
-        ], seconds: 30, endTime: end)
+        ], seconds: 48, endTime: end)
         let chunks = Self.chunks(ring, endTime: end)
         let own = Self.ft8Identity(toneZeroHz: 1000)
         // A group under the point: the two stations, and a trace between them that is neither (likely FT8, inherited).
@@ -243,7 +245,7 @@ struct SignalIDDecodingTests {
     }
 
     /// With no complete slot within reach, no decode: the name from its tones and slots stands, and the note says what
-    /// limited it (a 10 s ring; a full 28 s read whose last slot of its own began just before it).
+    /// limited it (a 10 s ring; a full 45 s read whose last slot of its own began just before it).
     @Test func ft8NoSlotInReachGoesWithout() {
         let calls = Shared(0)
         var decoders = SignalIDDecoding.Decoders.standard
@@ -259,10 +261,10 @@ struct SignalIDDecodingTests {
         let (_, untimed) = Self.trial(own, centerHz: Self.ft8Centre, chunks: Self.chunks(Self.serviceRing),
                                       trueTime: false, decoders: decoders)
         #expect(untimed.note == SignalIDDecoding.noTrueTimeNote && calls.withLock { $0 } == 0)
-        // A full ring whose newest complete slot of its own started more than `ft8RingSeconds` ago (28.9 s): out of reach.
-        let late = Self.slotStart.addingTimeInterval(28.9)
+        // A full ring whose newest complete slot of its own started more than `ft8RingSeconds` ago (45.9 s): out of reach.
+        let late = Self.slotStart.addingTimeInterval(45.9)
         let (_, far) = Self.trial(own, centerHz: Self.ft8Centre,
-                                  chunks: Self.chunks(Self.ft8Ring([("CQ K1ABC FN42", 1000, [])], seconds: 31, endTime: late),
+                                  chunks: Self.chunks(Self.ft8Ring([("CQ K1ABC FN42", 1000, [])], seconds: 48, endTime: late),
                                                       endTime: late),
                                   decoders: decoders)
         #expect(far.note == SignalIDDecoding.noOwnSlotNote && calls.withLock { $0 } == 0, "\(far.note ?? "")")

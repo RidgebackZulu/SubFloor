@@ -42,8 +42,11 @@ struct TrialDecode: Sendable, Equatable {
 /// Everything a decoder prints is cleaned (`clean`): control characters out, `maxTextCharacters` at most. It is data,
 /// shown as heard, never interpreted.
 enum SignalIDDecoding {
-    /// The most of the ring an FT8 trial reads back from its newest sample.
-    static let ft8RingSeconds = 28.0
+    /// The most of the ring an FT8 trial reads back from its newest sample: one own-parity period (30 s: a station sends
+    /// every other slot) and a slot, so a station clicked while it sends is decoded in its previous own slot. The read is a
+    /// 4 kHz channel at under 32 kS/s whatever the capture's rate (`Channel.outputRate`): 11.5 MB of IQ at most, read a
+    /// piece at a time (`SignalIDService.channelRead`).
+    static let ft8RingSeconds = 45.0
     /// A stream's trial reads this much of the newest IQ, at least `minimumStreamSeconds` (a shorter ring is read whole).
     static let streamSeconds = 10.0
     static let minimumStreamSeconds = 3.0
@@ -88,7 +91,8 @@ enum SignalIDDecoding {
     static let ft8Name = "FT8", rttyName = "RTTY", pskName = "PSK31 / PSK63"
 
     static let noTrueTimeNote = "No FT8 decode: the IQ has no true time to find its slots by"
-    static let noOwnSlotNote = "No FT8 decode: it was on the air in no complete slot of the last 28 s; named from its tones and slots"
+    static let noOwnSlotNote = String(format: "No FT8 decode: it was on the air in no complete slot of the last %.0f s; named from its tones and slots",
+                                      ft8RingSeconds)
     /// The note when the ring held only `seconds`, and no complete slot the signal was on the air in.
     static func ringShortNote(_ seconds: Double) -> String {
         String(format: "No FT8 decode: the ring holds %.0f s, and no complete slot it was on the air in; named from its tones and slots",
