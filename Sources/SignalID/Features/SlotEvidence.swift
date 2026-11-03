@@ -19,6 +19,47 @@ public struct SlotFit: Codable, Sendable, Equatable {
     }
 }
 
+/// When a trace was on the air, by UTC (seconds since 1970): the read it was seen in, and its transmissions in it
+/// (`SlotEvidence.transmissions`). Set only with a true time.
+public struct OnAir: Codable, Sendable, Equatable {
+    public var readStartUTC: Double
+    public var readEndUTC: Double
+    public var runs: [ClosedRange<Double>]
+
+    public init(readStartUTC: Double, readEndUTC: Double, runs: [ClosedRange<Double>]) {
+        self.readStartUTC = readStartUTC
+        self.readEndUTC = readEndUTC
+        self.runs = runs
+    }
+
+    /// The least of a transmission the read must have seen to tell whether the trace was on for it.
+    public static let minimumSeenSeconds = 3.0
+
+    /// Whether the trace was on the air for the transmission `span` (UTC): the read saw `minimumSeenSeconds` of it at
+    /// least, and the trace's runs cover what it saw, short by the clock's tolerance at most
+    /// (`SlotEvidence.clockToleranceSeconds`: a station's clock and the Mac's may differ that much).
+    public func covers(_ span: ClosedRange<Double>) -> Bool {
+        let lower = max(span.lowerBound, readStartUTC), upper = min(span.upperBound, readEndUTC)
+        guard upper - lower >= Self.minimumSeenSeconds else { return false }
+        let covered = runs.reduce(0.0) { $0 + max(0, min(upper, $1.upperBound) - max(lower, $1.lowerBound)) }
+        return covered >= upper - lower - SlotEvidence.clockToleranceSeconds
+    }
+
+    /// The trace on the air this long within a transmission's middle is on for it.
+    public static let heardSeconds = 1.0
+
+    /// Whether the trace was on for any of the transmission `span` (UTC): `heardSeconds` or more of its runs within its
+    /// middle as the read saw it (`span` less the clock's tolerance at each end, so a neighbouring slot's transmission
+    /// on a clock that far off isn't taken for one in it).
+    public func heard(during span: ClosedRange<Double>) -> Bool {
+        let tolerance = SlotEvidence.clockToleranceSeconds
+        let lower = max(span.lowerBound + tolerance, readStartUTC), upper = min(span.upperBound - tolerance, readEndUTC)
+        guard upper > lower else { return false }
+        let on = runs.reduce(0.0) { $0 + max(0, min(upper, $1.upperBound) - max(lower, $1.lowerBound)) }
+        return on >= Self.heardSeconds
+    }
+}
+
 /// Timing evidence for the slot modes (FT8: 15 s slots, FT4: 7.5 s): their transmissions start `startSeconds` into a
 /// slot on UTC boundaries and last a fixed time.
 ///
@@ -104,6 +145,15 @@ enum SlotEvidence {
             }
         }
         return out
+    }
+
+    /// `onTimes` (seconds within a read `readSeconds` long whose last sample was on the air at `readEnd`) as `OnAir`; nil
+    /// without a true time.
+    static func onAir(onTimes: [ClosedRange<Double>], readEnd: Date?, readSeconds: Double) -> OnAir? {
+        guard let readEnd else { return nil }
+        let end = readEnd.timeIntervalSince1970, start = end - readSeconds
+        return OnAir(readStartUTC: start, readEndUTC: end,
+                     runs: transmissions(onTimes).map { (start + $0.lowerBound)...(start + $0.upperBound) })
     }
 
     /// The fit of `onTimes` to each slot row's grid; none without a true time.

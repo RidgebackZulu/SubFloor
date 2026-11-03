@@ -25,6 +25,30 @@ import Testing
         #expect(fits.count == 2 && fits.first { $0.periodSeconds == 15 }.map { $0.events >= 2 } == true)
     }
 
+    /// When a trace was on the air, by UTC (`OnAir`, what a trial decode's slot is checked against): a transmission it
+    /// covers allowing for the clocks (2 s), one it was off for, or one the read saw too little of.
+    @Test func onAirCoversItsTransmission() {
+        // Its transmissions: a blip under 0.25 s dropped.
+        let air = SlotEvidence.onAir(onTimes: [1.5...14.1, 14.3...14.5], readEnd: Self.end(16), readSeconds: 16)!
+        #expect(air.readStartUTC == SignalSynth.slotEpoch && air.runs == [(SignalSynth.slotEpoch + 1.5)...(SignalSynth.slotEpoch + 14.1)])
+        let slot = SignalSynth.slotEpoch
+        #expect(air.covers((slot + 0.5)...(slot + 13.14)))          // a clock 1 s off
+        #expect(!air.covers((slot + 15.5)...(slot + 28.14)))        // the next slot: not seen
+        let late = SlotEvidence.onAir(onTimes: [3.0...14.1], readEnd: Self.end(16), readSeconds: 16)!
+        #expect(!late.covers((slot + 0.5)...(slot + 13.14)))        // 2.5 s short: past any clock
+        // The read saw 2 s of it: too little to tell, though it was on throughout.
+        let short = SlotEvidence.onAir(onTimes: [0...2], readEnd: Self.end(13.14), readSeconds: 2)!
+        #expect(!short.covers((slot + 0.5)...(slot + 13.14)))
+        #expect(SlotEvidence.onAir(onTimes: [0...2], readEnd: nil, readSeconds: 2) == nil)
+        // Heard in the next slot: 2.5 s past the clocks' 2 s into it. 1.5 s in (within the clocks) is not.
+        let next = (slot + 15.5)...(slot + 28.14)
+        #expect(SlotEvidence.onAir(onTimes: [0.5...13.1, 15.5...20], readEnd: Self.end(20), readSeconds: 20)!
+            .heard(during: next))
+        #expect(!SlotEvidence.onAir(onTimes: [0.5...13.1, 15.5...17], readEnd: Self.end(17), readSeconds: 17)!
+            .heard(during: next))
+        #expect(!air.heard(during: next))
+    }
+
     /// FT4's: one starting every 7.5 s and lasting 4.5 s fit its 7.5 s slots, and not FT8's.
     @Test func ft4OnItsSlotsFits() {
         let on = [0.5...5.0, 8.0...12.5, 15.5...20.0]
@@ -166,7 +190,16 @@ import Testing
             let capture = Self.capture(spec, readSeconds: seconds, endInTransmission: seconds - 0.2, rfHz: rfHz, seed: seed)
             let id = Self.identified(capture, rfHz: rfHz, endTime: capture.end)
             #expect(id.best?.name == name, "\(name) seed \(seed): \(IdentifyTests.describe(id))")
-            if name == "FT8" { #expect(id.best?.evidence.contains { $0.contains("JS8") } == true) }
+            if name == "FT8" {
+                #expect(id.best?.evidence.contains { $0.contains("JS8") } == true)
+                // When it was on the air, by UTC, for a trial decode.
+                #expect(id.measurement.onAir.map { !$0.runs.isEmpty && $0.readEndUTC == capture.end?.timeIntervalSince1970 } == true)
+                // The quick first pass's too.
+                let quick = SignalIdentifier.identify(iq: capture.first, sampleRate: Self.rate,
+                                                      captureCenterHz: rfHz - Self.offsetHz, atHz: rfHz, bandwidthHz: nil,
+                                                      spectrumDb: nil, longer: nil, endTime: capture.end)
+                #expect(quick.measurement.onAir.map { !$0.runs.isEmpty } == true, "\(IdentifyTests.describe(quick))")
+            }
             let other = name == "FT8" ? "FT4" : "FT8"
             #expect(!([id.best].compactMap { $0 } + id.alternatives).contains { $0.name == other && $0.confidence >= 0.7 })
         }

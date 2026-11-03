@@ -226,8 +226,8 @@ final class SignalIDQueue {
 /// a slot once.
 ///
 /// **Card.** A right click (`openCard`) identifies the signal there the same way, with a trial decode, and fills `card`
-/// in as it comes; the UI shows it as a popover at the click. A retune that drops its longer read leaves the first answer, saying so
-/// (`longerReadCutNote`).
+/// in as it comes; the UI shows it as a popover at the click. A retune that drops its longer read or its trial decode
+/// leaves the answer it had, saying so (`longerReadCutNote`, `trialDecodeCutNote`).
 @MainActor @Observable
 final class SignalIDService {
     /// Up to `lastSeconds` of the ring's newest IQ (`StreamRecorder.snapshot`), any thread.
@@ -329,6 +329,8 @@ final class SignalIDService {
         var pending = true
         /// `identity` is the first pass's answer and the longer read it asked for is running.
         var measuring = false
+        /// Its trial decode is running (`identity` the answer before it).
+        var decoding = false
     }
 
     /// The open card (nil: none). Shown as a popover at its point.
@@ -409,18 +411,21 @@ final class SignalIDService {
     /// applies (`SignalIDDecoding.plan`), the answer is given to `firstAnswer` and then decoded, a queued job of its own
     /// in the same lane, and the answer returned is the decoded one (`SignalIDDecoding.applied`); nil when the radio
     /// retuned or it was cancelled meanwhile. FT8 slots decoded are kept (`slotDecodes`): another point in the same slot
-    /// and box uses them.
+    /// and box uses them. `decoding` is called (on the main actor) as the decode starts, after that first answer.
     func identify(atHz: Double, bandwidthHz: Double? = nil, radiusHz: Double? = nil, longerRead: Bool = true,
                   priority: SignalIDPriority = .background, tryDecode: Bool = false,
-                  firstAnswer: (@MainActor (SignalIdentity) -> Void)? = nil) async -> SignalIdentity? {
+                  firstAnswer: (@MainActor (SignalIdentity) -> Void)? = nil,
+                  decoding: (@MainActor () -> Void)? = nil) async -> SignalIdentity? {
         await identify(atHz: atHz, bandwidthHz: bandwidthHz, radiusHz: radiusHz, longerRead: longerRead,
-                       priority: priority, hover: false, tryDecode: tryDecode, firstAnswer: firstAnswer)
+                       priority: priority, hover: false, tryDecode: tryDecode, firstAnswer: firstAnswer,
+                       decoding: decoding)
     }
 
     /// `identify`, as a hover's when `hover` (a newer hover replaces it while it is queued).
     func identify(atHz: Double, bandwidthHz: Double? = nil, radiusHz: Double? = nil, longerRead: Bool = true,
                   priority: SignalIDPriority, hover: Bool, tryDecode: Bool = false,
-                  firstAnswer: (@MainActor (SignalIdentity) -> Void)? = nil) async -> SignalIdentity? {
+                  firstAnswer: (@MainActor (SignalIdentity) -> Void)? = nil,
+                  decoding: (@MainActor () -> Void)? = nil) async -> SignalIdentity? {
         guard let answer = await analysed(atHz: atHz, bandwidthHz: bandwidthHz, radiusHz: radiusHz,
                                           longerRead: longerRead, priority: priority, hover: hover,
                                           firstAnswer: firstAnswer) else { return nil }
@@ -429,6 +434,7 @@ final class SignalIDService {
               let plan = SignalIDDecoding.plan(for: answer, centerHz: state.centerHz) else { return answer }
         // Out while the decode runs: nothing waits on it.
         firstAnswer?(answer)
+        decoding?()
         return await decoded(answer, plan: plan, state: state, priority: priority)
     }
 
@@ -461,7 +467,8 @@ final class SignalIDService {
                 again = true
                 continue
             }
-            guard !Task.isCancelled, let made, state == tuning.current else { return nil }
+            guard let made, state == tuning.current else { return nil }
+            // A slot decoded is kept though the caller has gone (another point in it uses it).
             if let slot = made.slot {
                 let now = self.now()
                 slotDecodes.removeAll {
@@ -471,6 +478,7 @@ final class SignalIDService {
                 }
                 slotDecodes.append(slot)
             }
+            guard !Task.isCancelled else { return nil }
             return SignalIDDecoding.applied(made, to: answer, centerHz: state.centerHz)
         }
     }
@@ -1346,10 +1354,13 @@ final class SignalIDService {
         cardTask = Task { [weak self] in
             guard let self else { return }
             let identity = await identify(atHz: hz, radiusHz: Self.radiusHz(hzPerPoint: hzPerPoint),
-                                          priority: .owner, tryDecode: true) { [weak self] first in
+                                          priority: .owner, tryDecode: true, firstAnswer: { [weak self] first in
                 guard let self, cardGeneration == generation else { return }
                 fill(first, measuring: true)
-            }
+            }, decoding: { [weak self] in
+                guard let self, cardGeneration == generation, card != nil else { return }
+                card?.decoding = true
+            })
             guard !Task.isCancelled, cardGeneration == generation else { return }
             fill(identity, measuring: false)
         }
@@ -1367,13 +1378,16 @@ final class SignalIDService {
 
     /// The card's note when a retune cut its longer read short and the first answer stays.
     static let longerReadCutNote = "The longer read was cut short by a retune"
+    /// The card's note when a retune cut its trial decode short and the answer before it stays.
+    static let trialDecodeCutNote = "The trial decode was cut short by a retune"
 
     /// `identity` into the card; nil (no data, or a retune during the longer read) keeps any first answer, said
     /// in its note when a longer read was running.
     private func fill(_ identity: SignalIdentity?, measuring: Bool) {
         guard var shown = card else { return }
         if identity == nil, shown.measuring, var first = shown.identity {
-            first.note = [first.note, Self.longerReadCutNote].compactMap { $0 }.joined(separator: "; ")
+            let cut = shown.decoding ? Self.trialDecodeCutNote : Self.longerReadCutNote
+            first.note = [first.note, cut].compactMap { $0 }.joined(separator: "; ")
             shown.identity = first
         }
         shown.pending = false

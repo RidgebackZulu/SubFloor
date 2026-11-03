@@ -82,6 +82,8 @@ public final class RTTYSignalDecoder: SignalDecoder {
     /// The tracked centre, midway between mark and space.
     public var frequencyHz: Double { tunedHz }
     public var submode: String { "RTTY \(Int(bitRate))" }
+    /// The baseband rate it works at (tests).
+    var basebandRateHz: Double { basebandRate }
     /// The reverse-polarity path (mark the lower tone) is in use.
     var isReversed: Bool { active == 1 }
 
@@ -293,7 +295,8 @@ public final class RTTYSignalDecoder: SignalDecoder {
         originHz = frequencyHz
         tunedHz = frequencyHz
         nco = NCO(frequency: -frequencyHz, sampleRate: sampleRate)
-        factor = max(1, Int((sampleRate / layout.basebandTarget).rounded()))
+        // Rounded down, so the rate is at or over the target (the default's 12 exactly: 12 kHz / 1 kHz).
+        factor = max(1, Int(sampleRate / layout.basebandTarget))
         basebandRate = sampleRate / Double(factor)
         decimator = Self.makeDecimator(sampleRate: sampleRate, factor: factor, cutoffHz: layout.cutoffHz)
         samplesPerBit = basebandRate / baud

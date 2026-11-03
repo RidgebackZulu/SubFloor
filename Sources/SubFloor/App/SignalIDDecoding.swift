@@ -26,9 +26,11 @@ struct TrialDecode: Sendable, Equatable {
 ///
 /// - **FT8** (`ft8`): the latest complete 15 s slot the ring holds within `ft8RingSeconds`, read as a channel around the
 ///   signal (or its group) and demodulated as USB to a 3 kHz box of 12 kHz audio (`ModemChannel`), and decoded
-///   (`FT8Modem.decode`). Only with a true time (the RSP's): the slot is placed by it. Every message in the box is kept
-///   (`SlotDecodes`, per slot start and box), so a scan decodes a slot once. A checked message names the trace it lies
-///   on (`applied`).
+///   (`FT8Modem.decode`). Only with a true time (the RSP's): the slot is placed by it, and it is the latest complete one
+///   the point's own trace was on the air in (`OnAir.covers`): stations keep a parity, so the slot before the one now
+///   on is mostly other stations'. Every message in the box is kept (`SlotDecodes`, per slot start and box), so a scan
+///   decodes a slot once. A checked message names the trace it lies on, when that trace offers FT8 and was on the air in
+///   the slot (`applied`).
 /// - **RTTY and PSK31** (`stream`): the newest `streamSeconds` around the signal, demodulated the same way, through an
 ///   RTTY decoder at the measured shift (the standard one it is: 170, 425 or 850 Hz) and each standard speed within
 ///   `rttyBaudSearch` of the measured one (45.45, 50, 75 Bd: a character's 1.5 stop bits can make its keying read 7/7.5
@@ -47,7 +49,7 @@ enum SignalIDDecoding {
     /// The most of a decode's text kept.
     static let maxTextCharacters = 500
     /// Text reading at least this well (`ReadableText.score`) is evidence for the mode that printed it.
-    static let readableScore: Float = 0.5
+    static let readableScore = ReadableText.readableScore
     /// A checked FT8 message names a trace when it lies inside its extent widened by this much each side (a tone).
     static let ft8MatchHz = FT8Encoder.toneSpacing
     /// A trace wider than this is no FT8's (two tones' width over FT8's 50 Hz): a decode inside it names nothing.
@@ -85,7 +87,7 @@ enum SignalIDDecoding {
     static let ft8Name = "FT8", rttyName = "RTTY", pskName = "PSK31 / PSK63"
 
     static let noTrueTimeNote = "No FT8 decode: the IQ has no true time to find its slots by"
-    static let noSlotNote = "No FT8 decode: no complete slot in reach of the ring; named from its tones and slots"
+    static let noSlotNote = "No FT8 decode: no complete slot it was on the air in is in reach of the ring; named from its tones and slots"
 
     // MARK: Plans
 
@@ -188,6 +190,8 @@ enum SignalIDDecoding {
     /// to keep (nil when it reused one, or made none), and a note when it couldn't try (no true time, no slot in reach).
     struct Attempt: Sendable, Equatable {
         var decodes: [TrialDecode] = []
+        /// The FT8 slot `decodes` are of: a trace is named by them only when it was on the air in it.
+        var slotStart: Date?
         var slot: SlotDecodes?
         var note: String?
     }
@@ -202,8 +206,8 @@ enum SignalIDDecoding {
         switch plan {
         case .ft8(let targetHz):
             guard trueTime else { return Attempt(note: noTrueTimeNote) }
-            return ft8(targetHz: targetHz, ownHz: state.centerHz + identity.measurement.offsetHz, state: state,
-                       known: known, chunks: chunks, barrier: barrier, decoders: decoders, cancelled: cancelled)
+            return ft8(targetHz: targetHz, own: identity, state: state, known: known, chunks: chunks, barrier: barrier,
+                       decoders: decoders, cancelled: cancelled)
         case .stream(let streams, let centre):
             return stream(streams, centerHz: centre, state: state, chunks: chunks, barrier: barrier,
                           decoders: decoders, cancelled: cancelled)
@@ -229,9 +233,10 @@ enum SignalIDDecoding {
         return made.decodes.filter { texts.contains($0.text) }.min { abs($0.rfHz - atHz) < abs($1.rfHz - atHz) }
     }
 
-    /// The latest complete FT8 slot within `ft8RingSeconds`, decoded in the box around `targetHz` (or one decoded
-    /// already that covers the signal at `ownHz`).
-    static func ft8(targetHz: Double, ownHz: Double, state: TuneBarrier.State, known: [SlotDecodes],
+    /// The latest complete FT8 slot within `ft8RingSeconds` that `own` (the point's signal) was on the air in, decoded in
+    /// the box around `targetHz` (or one decoded already that covers `own`). The decode is kept once it is made, though
+    /// the job was then cancelled (stopped for the owner: its retry uses it); a retune drops it.
+    static func ft8(targetHz: Double, own: SignalIdentity, state: TuneBarrier.State, known: [SlotDecodes],
                     chunks: SignalIDService.ChunkProvider, barrier: TuneBarrier, decoders: Decoders,
                     cancelled: () -> Bool) -> Attempt? {
         // Where the ring ends now.
@@ -241,9 +246,17 @@ enum SignalIDDecoding {
         }
         guard !cancelled(), barrier.current == state else { return nil }
         let slotSeconds = FT8Modem.slotSeconds
-        let slotStart = SlotRecorder.slotStart(for: probe.endTime.addingTimeInterval(-slotSeconds), slotSeconds: slotSeconds)
+        let ownHz = state.centerHz + own.measurement.offsetHz
+        // The complete slots in reach, newest first: the first `own` was on the air in.
+        var slotStart = SlotRecorder.slotStart(for: probe.endTime.addingTimeInterval(-slotSeconds), slotSeconds: slotSeconds)
+        while !onAir(own, in: slotStart) {
+            slotStart = slotStart.addingTimeInterval(-slotSeconds)
+            guard probe.endTime.timeIntervalSince(slotStart) + slotMarginSeconds <= ft8RingSeconds else {
+                return Attempt(note: noSlotNote)
+            }
+        }
         if let hit = known.first(where: { $0.state == state && $0.slotStart == slotStart && $0.covers(ownHz) }) {
-            return Attempt(decodes: hit.decodes)
+            return Attempt(decodes: hit.decodes, slotStart: slotStart)
         }
         let back = probe.endTime.timeIntervalSince(slotStart) + slotMarginSeconds
         guard back <= ft8RingSeconds else { return Attempt(note: noSlotNote) }
@@ -274,9 +287,10 @@ enum SignalIDDecoding {
                 TrialDecode(mode: ft8Name, text: clean($0.message), strength: .checked,
                             rfHz: dial + $0.frequencyHz + 3.5 * FT8Encoder.toneSpacing)
             }.filter { !$0.text.isEmpty }
-            guard !cancelled(), barrier.current == state else { return nil }
+            // Made: kept though cancelled meanwhile (the decode can't be stopped, and a retry would make it again).
+            guard barrier.current == state else { return nil }
             let slot = SlotDecodes(state: state, slotStart: slotStart, dialHz: dial, decodes: decodes)
-            return Attempt(decodes: decodes, slot: slot)
+            return Attempt(decodes: decodes, slotStart: slotStart, slot: slot)
         }
     }
 
@@ -339,35 +353,18 @@ enum SignalIDDecoding {
 
     // MARK: Text
 
-    /// `text` as kept: control and format characters out (line breaks and tabs become spaces), runs of spaces as one,
-    /// at most `maxTextCharacters`. It stays radio text: shown, never interpreted.
-    static func clean(_ text: String) -> String {
-        var out = ""
-        var space = false
-        for scalar in text.unicodeScalars {
-            let category = scalar.properties.generalCategory
-            let blank = scalar.properties.isWhitespace || category == .lineSeparator || category == .paragraphSeparator
-            if blank {
-                space = !out.isEmpty
-                continue
-            }
-            guard category != .control, category != .format, category != .surrogate, category != .privateUse,
-                  category != .unassigned else { continue }
-            if space { out.unicodeScalars.append(" ") }
-            space = false
-            out.unicodeScalars.append(scalar)
-            if out.count >= maxTextCharacters { break }
-        }
-        return String(out.prefix(maxTextCharacters))
-    }
+    /// `text` as kept (`ReadableText.cleaned`): control and format characters out (line breaks and tabs become spaces),
+    /// runs of spaces as one, at most `maxTextCharacters` scalars. It stays radio text: shown, never interpreted.
+    static func clean(_ text: String) -> String { ReadableText.cleaned(text, maxScalars: maxTextCharacters) }
 
     // MARK: Applying
 
     /// `identity` (in the frame of a capture centred on `centerHz`) with what the trial made:
     /// - a checked FT8 message names FT8 at 1.0 (`confirmedByDecode`, its text in `decodedText`) the signal it lies on —
     ///   the point's own, or one under the point: inside its extent widened by `ft8MatchHz` each side, and no wider than
-    ///   `ft8WidestTraceHz`, the nearest where two would; a message on no signal names nothing. A name inherited is then
-    ///   the signal's own;
+    ///   `ft8WidestTraceHz`, the nearest where two would — when that signal offers FT8 (named, offered or inherited) and
+    ///   its trace was on the air in the message's slot (`onAir`). A message on no such signal names nothing; a signal
+    ///   that wasn't on then, or offers no FT8, keeps its own answer. A name inherited is then the signal's own;
     /// - readable text names the point's own signal when the mode table does, given it (`readableDecode`), and its text
     ///   is kept: it satisfies what a row asks a decode for (RTTY outside the amateur segments). Text that doesn't name
     ///   its mode is kept as heard and changes nothing else;
@@ -375,12 +372,15 @@ enum SignalIDDecoding {
     static func applied(_ made: Attempt, to identity: SignalIdentity, centerHz: Double) -> SignalIdentity {
         var out = identity
         if let note = made.note { out.note = [out.note, note].compactMap { $0 }.joined(separator: "; ") }
-        // The signals a message may lie on: those under the point (the point's own among them), else the point's own.
+        // The signals a message may lie on: those under the point (the point's own among them), else the point's own; only
+        // one that offers FT8 and was on the air in the message's slot.
         let traces = out.signals.isEmpty ? [out] : out.signals
+        let eligible = made.slotStart.map { slot in traces.map { offersFT8($0) && onAir($0, in: slot) } }
+            ?? traces.map { _ in false }
         var claimed: [Int: TrialDecode] = [:]
         for d in made.decodes where d.strength == .checked && d.mode == ft8Name {
             // The one it lies on, the nearest; and on that one, the nearest message.
-            guard let k = traces.indices.filter({ lies(d, on: traces[$0], centerHz: centerHz) })
+            guard let k = traces.indices.filter({ eligible[$0] && lies(d, on: traces[$0], centerHz: centerHz) })
                 .min(by: { distance(d, traces[$0], centerHz) < distance(d, traces[$1], centerHz) }) else { continue }
             if let other = claimed[k], distance(other, traces[k], centerHz) <= distance(d, traces[k], centerHz) { continue }
             claimed[k] = d
@@ -400,6 +400,20 @@ enum SignalIDDecoding {
             }
         }
         return out
+    }
+
+    /// Whether `s`'s trace was on the air for the transmission of the FT8 slot starting at `slotStart` (`OnAir.covers`),
+    /// and in neither slot beside it as far as its read saw (`OnAir.heard`): stations keep a parity, so a line on in both
+    /// is two stations, and a message of one slot isn't said to be its.
+    static func onAir(_ s: SignalIdentity, in slotStart: Date) -> Bool {
+        guard let air = s.measurement.onAir else { return false }
+        func transmission(_ slot: Date) -> ClosedRange<Double> {
+            let start = slot.timeIntervalSince1970 + FT8Encoder.startSeconds
+            return start...(start + Double(FT8Encoder.toneCount) * FT8Encoder.symbolSeconds)
+        }
+        let slot = FT8Modem.slotSeconds
+        return air.covers(transmission(slotStart))
+            && ![-slot, slot].contains { air.heard(during: transmission(slotStart.addingTimeInterval($0))) }
     }
 
     /// Whether the FT8 message `d` lies on `s`'s extent (see `applied`).

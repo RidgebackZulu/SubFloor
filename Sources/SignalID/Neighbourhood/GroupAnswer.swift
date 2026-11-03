@@ -122,7 +122,8 @@ extension SignalIdentifier {
                 guard let row = entry.identity.best.flatMap({ ModeTable.row($0.name) }), row.slotted else { return false }
                 return fitsSameSlot(c, as: entry.candidate, readSeconds: seconds, endTime: endTime, row: row)
             }.min { abs($0.identity.measurement.offsetHz - centre) < abs($1.identity.measurement.offsetHz - centre) }
-            answers.append(unmeasured(c, seconds: seconds, captureCenterHz: captureCenterHz, from: from?.identity))
+            answers.append(unmeasured(c, seconds: seconds, captureCenterHz: captureCenterHz, from: from?.identity,
+                                      endTime: endTime))
             spans.append((c.lowerHz, c.upperHz))
         }
         guard answers.count >= 2 else { return point }
@@ -162,7 +163,7 @@ extension SignalIdentifier {
         let line = c.tones == nil && c.traces.count == 1 && view.traces.contains(c.traces[0]) ? c.traces[0] : nil
         guard let found = located(view, signal: line == nil ? c : nil, signals: signals, map: hood.map, pointHz: centre,
                                   radiusHz: (c.upperHz - c.lowerHz) / 2) else {
-            return unmeasured(c, seconds: seconds, captureCenterHz: captureCenterHz, from: nil)
+            return unmeasured(c, seconds: seconds, captureCenterHz: captureCenterHz, from: nil, endTime: endTime)
         }
         let narrow = line.flatMap { mayBeNarrowMFSK($0) ? ($0, hood.map) : nil }
         let pass = firstMeasurement(first, sampleRate: sampleRate, captureCenterHz: captureCenterHz,
@@ -173,13 +174,17 @@ extension SignalIdentifier {
     }
 
     /// A signal under the point that wasn't measured: unknown, with `from`'s slot-mode name as its likely one (its only
-    /// alternative, at `inheritedConfidence`, and `nameInherited`) when it fits `from`'s slot and width.
+    /// alternative, at `inheritedConfidence`, and `nameInherited`) when it fits `from`'s slot and width. With a true time
+    /// (`endTime`, when the read's last sample was on the air), a single line's on-times are its `onAir`.
     static func unmeasured(_ c: SignalCandidate, seconds: Double, captureCenterHz: Double,
-                           from: SignalIdentity?) -> SignalIdentity {
+                           from: SignalIdentity?, endTime: Date? = nil) -> SignalIdentity {
         let width = c.upperHz - c.lowerHz
         var m = SignalMeasurement(offsetHz: (c.lowerHz + c.upperHz) / 2, occupiedBandwidthHz: width,
                                   bandwidth6dBHz: width, snrDb: level(c), family: .unknown, seconds: seconds,
                                   notes: ["Not measured: one of several signals under the point"])
+        if c.tones == nil, c.traces.count == 1 {
+            m.onAir = SlotEvidence.onAir(onTimes: c.traces[0].onTimes, readEnd: endTime, readSeconds: seconds)
+        }
         guard let from, let name = from.best else { return SignalIdentity(measurement: m) }
         let at = String(format: "%.0f Hz", captureCenterHz + from.measurement.offsetHz)
         m.notes = ["Not measured: its transmissions and width are those of the \(name.name) at \(at)"]

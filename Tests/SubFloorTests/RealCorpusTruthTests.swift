@@ -107,6 +107,91 @@ struct RealCorpusTruthTests {
         }
     }
 
+    /// The card's trial decode on the real FT8 points: each decoded point's trace read as the card reads it (the newest 3 s,
+    /// and the 16 s longer read, from the recording at its time) and its trial made on the ring up to then (28 s at
+    /// most). A message names a trace only when that trace was on the air in its slot: no trace may get a message of the
+    /// slot of the other parity (stations keep theirs), and a point's own trace named in its own slot must have its own
+    /// message. Prints how many were confirmed.
+    @Test func ft8TrialAttribution() throws {
+        let manifest = try Self.manifest()
+        let recording = try #require(manifest.recordings.first { $0.tag == "14MHz" })
+        let rate = 62_500.0, centre = recording.clipCenterHz
+        let start = try #require(ISO8601DateFormatter().date(from: "2026-11-01T18:18:44Z"))
+        let length = recording.clips.map { $0.startSeconds + $0.seconds }.max() ?? 0
+        let all = try Self.iq(recording.clips, seconds: 0..<length, rate: rate)
+        let points = manifest.points.filter { $0.truth == "FT8" && $0.how.hasPrefix("decoded") }
+        let barrier = TuneBarrier()
+        barrier.end(centerHz: centre)
+        var known: [SignalIDDecoding.SlotDecodes] = []
+        var tried = 0, confirmed = 0, members = 0, right = 0, unverified = 0
+        var wrong: [String] = []
+        for point in points {
+            guard let clip = recording.clips.first(where: { $0.name == point.clip }),
+                  let pointSlot = point.parameters?["slotSeconds"] else { continue }
+            let t = clip.startSeconds + point.endSeconds
+            let endFrame = Int((t * rate).rounded())
+            let iq = Array(all.prefix(2 * endFrame))
+            func newest(_ seconds: Double) -> [Float] { Array(iq.suffix(2 * Int((seconds * rate).rounded()))) }
+            let endTime = start.addingTimeInterval(t)
+            // The card's read: the newest 3 s, then (asked for) the 16 s longer read.
+            var identity = SignalIdentifier.identify(iq: newest(3), sampleRate: rate, captureCenterHz: centre, atHz: point.atHz,
+                                                     bandwidthHz: nil, spectrumDb: nil, longer: nil, pointRadiusHz: 60,
+                                                     endTime: endTime)
+            if identity.needsLongerRead {
+                let long = newest(16), seconds = Double(long.count / 2) / rate
+                identity = SignalIdentifier.identify(iq: long, sampleRate: rate, captureCenterHz: centre, atHz: point.atHz,
+                                                     bandwidthHz: nil, spectrumDb: nil, longer: { (long, seconds) },
+                                                     pointRadiusHz: 60, endTime: endTime)
+            }
+            guard let plan = SignalIDDecoding.plan(for: identity, centerHz: centre) else { continue }
+            let read: SignalIDService.ChunkProvider = { lastSeconds, chunkFrames, visit in
+                let frames = min(iq.count / 2, Int((lastSeconds * rate).rounded()))
+                let tail = iq.suffix(2 * frames)
+                var at = tail.startIndex
+                while at < tail.endIndex {
+                    let to = min(at + 2 * max(1, chunkFrames), tail.endIndex)
+                    guard tail[at..<to].withUnsafeBufferPointer(visit) else { return nil }
+                    at = to
+                }
+                return IQRead(frames: frames, sampleRate: rate, endTime: endTime)
+            }
+            tried += 1
+            guard let made = SignalIDDecoding.attempt(for: identity, plan: plan, state: barrier.current, trueTime: true,
+                                                      known: known, chunks: read, barrier: barrier, cancelled: { false })
+            else { continue }
+            if let slot = made.slot { known.append(slot) }
+            let named = SignalIDDecoding.applied(made, to: identity, centerHz: centre)
+            guard let decodedSlot = made.slotStart?.timeIntervalSince(start) else { continue }
+            // Slots 15 s apart alternate parity.
+            func otherParity(_ a: Double, _ b: Double) -> Bool { Int(((a - b) / 15).rounded()) % 2 != 0 }
+            // Every trace named (the point's own, and any under it): against the decoded points on it.
+            for trace in [named] + named.signals where trace.decodedText != nil {
+                guard let text = trace.decodedText else { continue }
+                let isOwn = trace.measurement.offsetHz == named.measurement.offsetHz
+                if !isOwn { members += 1 } else if trace == named { confirmed += 1 } else { continue }
+                let hz = centre + trace.measurement.offsetHz
+                let reach = max(trace.measurement.occupiedBandwidthHz, trace.measurement.bandwidth6dBHz) / 2 + 6.25
+                let there = points.filter { abs(($0.parameters?["toneZeroHz"] ?? 0) + 3.5 * 6.25 - hz) <= reach }
+                let sameSlot = there.filter { $0.parameters?["slotSeconds"] == decodedSlot }
+                let label = String(format: "%.1f Hz at %.1f s (slot %.0f decoded)", hz, t, decodedSlot)
+                if sameSlot.contains(where: { $0.how.contains("\"\(text)\"") }) {
+                    right += 1
+                } else if !sameSlot.isEmpty {
+                    wrong.append("\(label): another station's message")
+                } else if !there.isEmpty, there.allSatisfy({ otherParity(decodedSlot, $0.parameters?["slotSeconds"] ?? 0) }) {
+                    wrong.append("\(label): its stations are on the other parity")
+                } else {
+                    unverified += 1
+                }
+            }
+        }
+        print("ft8TrialAttribution: \(points.count) decoded points, \(tried) tried: \(confirmed) points' own traces and "
+              + "\(members) members named by a decode (\(right) checked against a decoded point on them, \(unverified) with "
+              + "none there), \(known.count) slot decodes, \(wrong.count) wrong")
+        for line in wrong { print("ft8TrialAttribution wrong: \(line)") }
+        #expect(wrong.isEmpty)
+    }
+
     /// The trial decode on the real 2-FSK at 11.688 MHz (75 Bd, 850 Hz): what the RTTY decoder prints from it, at the
     /// keying measured, and how it reads. It must never be named RTTY unless that reads; so far it doesn't (no text
     /// kept, still `2-FSK`). Prints the decoder's output over the whole recording, and the trial's at two times, the

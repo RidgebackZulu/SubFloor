@@ -9,17 +9,20 @@ import Foundation
 ///    terms), or "A" or "I": no other single letter counts, since noise through Varicode is mostly its shortest codes,
 ///    the commonest letters;
 ///  - a callsign (`K1ABC`, `G4XYZ`, `2E0ABC`) or a Maidenhead locator (`FN42`, `IO91wm`);
-///  - a number of up to four digits, with or without a unit (`599`, `1200Z`, `25KT`): half, as a number in a run of
-///    noise is common. Five-figure groups (a cypher's) don't count.
+///  - a number of up to four digits, with or without a unit (`599`, `1200Z`, `25KT`): `numberWeight` of it, as a number
+///    in a run of noise is common. Five-figure groups (a cypher's) don't count.
 ///
 /// A word whose case changes inside it (`iIan`, `poV`) never counts: text is in one case, or capitalised. The score is
 /// the share of the text's characters (its words' and its stray symbols', not spaces or ordinary punctuation) that
 /// count, scaled down while fewer than `minimumCharacters` count: a word or two in a burst of noise is no proof.
 public enum ReadableText {
+    /// Text scoring this or more reads: evidence for the mode that printed it. Numbers alone stay under it
+    /// (`numberWeight`).
+    public static let readableScore: Float = 0.5
     /// The counted characters at which the score stops being scaled down.
     public static let minimumCharacters = 12
-    /// A number counts this share of its characters.
-    static let numberWeight = 0.5
+    /// A number counts this share of its characters: under `readableScore`, so numbers alone never read.
+    static let numberWeight = 0.4
 
     /// 0…1: how much of `text` reads as words, not noise.
     public static func score(_ text: String) -> Float {
@@ -44,6 +47,31 @@ public enum ReadableText {
         guard total > 0 else { return 0 }
         let share = counted / total
         return Float(share * min(1, counted / Double(minimumCharacters)))
+    }
+
+    /// `text` as a decode's text is kept: control, format, surrogate, private-use and unassigned scalars out, whitespace
+    /// (line breaks and tabs too) as single spaces, trimmed, at most `maxScalars` scalars. A decode's text is scored as
+    /// kept.
+    public static func cleaned(_ text: String, maxScalars: Int) -> String {
+        var out = String.UnicodeScalarView()
+        var space = false
+        for scalar in text.unicodeScalars {
+            let category = scalar.properties.generalCategory
+            if scalar.properties.isWhitespace || category == .lineSeparator || category == .paragraphSeparator {
+                space = !out.isEmpty
+                continue
+            }
+            guard category != .control, category != .format, category != .surrogate, category != .privateUse,
+                  category != .unassigned else { continue }
+            if space {
+                guard out.count + 2 <= maxScalars else { break }   // never a space last
+                out.append(" ")
+            }
+            space = false
+            guard out.count < maxScalars else { break }
+            out.append(scalar)
+        }
+        return String(out)
     }
 
     /// Punctuation ordinary text has, which neither counts for nor against it.

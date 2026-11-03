@@ -21,8 +21,9 @@ struct ReadableTextTests {
         var random = SynthRandom(seed: 8, stream: 1)
         var most: Float = 0
         for _ in 0..<200 {
-            most = max(most, ReadableText.score(Self.baudot(codes: 300, &random)))
-            most = max(most, ReadableText.score(Self.varicode(bits: 800, &random)))
+            // Scored as kept (`ReadableText.cleaned`): control characters out.
+            most = max(most, ReadableText.score(ReadableText.cleaned(Self.baudot(codes: 300, &random), maxScalars: 500)))
+            most = max(most, ReadableText.score(ReadableText.cleaned(Self.varicode(bits: 800, &random), maxScalars: 500)))
         }
         #expect(most <= 0.3, "noise read \(most)")
         // Words whose case changes inside them are noise's, not text's.
@@ -49,7 +50,7 @@ struct ReadableTextTests {
         #expect(ReadableText.score("THE") < 0.3)
         #expect(ReadableText.score("TU 599 05 NJ") < 0.5)
         // Numbers alone (which noise in figures prints) count for half: never words.
-        #expect(ReadableText.score("412 37 1200Z 25KT 1013 0800 2359 1500Z 61") < 0.6)
+        #expect(ReadableText.score("412 37 1200Z 25KT 1013 0800 2359 1500Z 61") < ReadableText.readableScore)
     }
 
     // MARK: What decoders print from noise

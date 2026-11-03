@@ -131,7 +131,11 @@ private func makeDecoder(_ hz: Double = 1_500) -> any SignalDecoder {
             let reach = shift / 2 + 2 * baud
             #expect(layout.cutoffHz - 250 >= reach - 1e-9, "\(baud) Bd \(shift) Hz")
             #expect(layout.basebandTarget - (layout.cutoffHz + 250) - reach >= 124 - 1e-6, "\(baud) Bd \(shift) Hz")
+            // As realised at 12 kHz (a whole decimation, rounded down: the rate at or over the target).
+            let rate = RTTYSignalDecoder(frequencyHz: 1_500, baud: baud, shiftHz: shift).basebandRateHz
+            #expect(rate - (layout.cutoffHz + 250) - reach >= 124 - 1e-6, "\(baud) Bd \(shift) Hz at \(rate) Hz")
         }
+        #expect(RTTYSignalDecoder(frequencyHz: 1_500).basebandRateHz == 1_000)
         for (baud, shift) in [(50.0, 425.0), (75, 850), (45.45, 850), (75, 170)] {
             let clear = RTTYEncoder.audio(text: text, centerHz: 1_500, baud: baud, shiftHz: shift)
             let audio = ModemTestSignals.awgn(clear, snrDb: 10, seed: 4001, signalPower: rttyPower)

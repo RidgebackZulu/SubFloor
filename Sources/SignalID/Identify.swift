@@ -636,10 +636,12 @@ public enum SignalIdentifier {
         // steps don't cut its transmissions): its slots, and its longest transmission.
         var timing: (map: TimeFrequencyMap, onTimes: [ClosedRange<Double>])?
         var slots: [SlotFit] = []
+        var onAir: OnAir?
         var during = 0...readSeconds
         if let narrow {
             timing = narrowTiming(long, sampleRate: sampleRate, trace: narrow.trace)
             slots = timing.map { SlotEvidence.all(onTimes: $0.onTimes, readEnd: endTime, readSeconds: readSeconds) } ?? []
+            onAir = timing.flatMap { SlotEvidence.onAir(onTimes: $0.onTimes, readEnd: endTime, readSeconds: readSeconds) }
         }
         if let run = timing.flatMap({ longestTransmission($0.onTimes, readSeconds: readSeconds) }) {
             let lower = 2 * Int((run.lowerBound * sampleRate).rounded())
@@ -673,6 +675,7 @@ public enum SignalIdentifier {
                 longReading = true
             }
             slow.slotFits = slots
+            slow.onAir = onAir
             if Task.isCancelled { return cancelled(slow) }
         }
         var refined = identify(slow, rfHz: captureCenterHz + slow.offsetHz)
@@ -680,6 +683,7 @@ public enum SignalIdentifier {
         // neighbour's turn, or the receiver's gain stepping down).
         if !longReading, refined.best == nil || slow.family == .psk, var firstReading {
             if !slots.isEmpty { firstReading.slotFits = slots }
+            if let onAir { firstReading.onAir = onAir }
             let kept = identify(firstReading, rfHz: captureCenterHz + firstReading.offsetHz)
             if kept.best != nil { refined = kept }
         }
@@ -748,6 +752,7 @@ public enum SignalIdentifier {
                 out.firstReading = read
             }
             m.slotFits = slots
+            m.onAir = SlotEvidence.onAir(onTimes: narrow.trace.onTimes, readEnd: endTime, readSeconds: seconds)
             out.m = m
             if Task.isCancelled { out.cancelled = true; return out }
             out.tonesUnread = !readsTones && out.firstReading == nil && m.family != .psk
