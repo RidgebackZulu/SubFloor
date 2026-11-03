@@ -215,10 +215,10 @@ tuning, on the 1 MS/s recordings themselves (and, in brackets, on the small clip
 
 | Test | Result |
 | --- | --- |
-| FT8, hover (no decode) | named FT8 in 48% of windows (78/163; clips 82/163) |
+| FT8, hover (no decode) | named FT8 in 48% of windows (78/163; clips 83/163) |
 | FT8, card with its trial decode | 51% (83/163), the same as its first answer: 13 of all 196 FT8 windows (both parts) got a message checked against the decoded truth, none another station's |
-| FT4, hover | 7/12 |
-| FT8 group at the owner's zoom | 72% (118/163; clips 115/163) |
+| FT4, hover | 8/12 |
+| FT8 group at the owner's zoom | 72% (118/163; clips 117/163) |
 | The 2-FSK (one emitter, split by time) | 6/8 (clips 7/8) |
 | Interference comb lines | 14/14 labelled comb or No signal, never a mode |
 | Empty spectrum read as `No signal` | 35/36 |
