@@ -154,7 +154,7 @@ extension SubFloorTools {
             let short = FrequencyFormatter.short
             throw ToolError("\(short(hz)) is outside the capture (\(short(m.centerHz - m.sampleRate / 2)) – \(short(m.centerHz + m.sampleRate / 2))). Tune within it first (about \(short(hz))), or use identify_signals across a wider range.")
         }
-        let id = await m.signalID.identify(atHz: hz, bandwidthHz: bandwidth)
+        let id = await m.signalID.identify(atHz: hz, bandwidthHz: bandwidth, tryDecode: true)
         try Task.checkCancellation()
         guard let id else {
             // With the radio stopped the ring is read as it is: nil is an empty one.
@@ -403,13 +403,14 @@ extension SubFloorTools {
                         break pieceLoop
                     }
                     if interrupted(run) { break pieceLoop }
-                    // A stepped scan's ring holds only the first read since its step: no longer read is made.
-                    var identity = await m.signalID.identify(atHz: peak.hz, longerRead: !run.stepping)
+                    // A stepped scan's ring holds only the first read since its step: no longer read is made, nor a
+                    // trial decode (one within the capture is; an FT8 slot's once, for all its signals).
+                    var identity = await m.signalID.identify(atHz: peak.hz, longerRead: !run.stepping, tryDecode: !run.stepping)
                     try Task.checkCancellation()
                     if identity?.note == SignalIdentifier.tooSoonNote {
                         // The ring hadn't filled since a retune: once more when it has.
                         guard try await waitForRing(run) else { break pieceLoop }
-                        identity = await m.signalID.identify(atHz: peak.hz, longerRead: !run.stepping)
+                        identity = await m.signalID.identify(atHz: peak.hz, longerRead: !run.stepping, tryDecode: !run.stepping)
                         try Task.checkCancellation()
                     }
                     guard let identity else {

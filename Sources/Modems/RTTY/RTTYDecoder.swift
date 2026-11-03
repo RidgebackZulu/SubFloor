@@ -81,21 +81,28 @@ public enum RTTYModem: StreamingModem {
 public final class RTTYSignalDecoder: SignalDecoder {
     /// The tracked centre, midway between mark and space.
     public var frequencyHz: Double { tunedHz }
-    public var submode: String { "RTTY 45" }
+    public var submode: String { "RTTY \(Int(bitRate))" }
     /// The reverse-polarity path (mark the lower tone) is in use.
     var isReversed: Bool { active == 1 }
 
     // MARK: Constants
 
-    static let baud = 45.45
-    static let shiftHz = 170.0
+    /// The keying it decodes unless told otherwise (`init(frequencyHz:sampleRate:baud:shiftHz:)`): the amateur
+    /// standard's.
+    public static let baud = 45.45
+    public static let shiftHz = 170.0
     private static let basebandTarget = 1_000.0
     private static let channelCutoffHz = 450.0
     private static let channelTransitionHz = 500.0
+    /// How far the default keying reaches from the centre (the tone and two bit rates), and the margins the default
+    /// channel keeps beyond it: another keying's channel and baseband rate keep the same margins
+    /// (`layout`).
+    private static let defaultEdgeHz = shiftHz / 2 + 2 * baud
     /// Baseband samples per internal processing block.
     private static let blockOutputs = 32
-    private static let ringSize = 512
-    private static let ringMask = ringSize - 1
+    /// The rings hold at least this many samples, and at least `ringBits` bits.
+    private static let minRingSize = 512
+    private static let ringBits = 23.0
 
     /// Squelch: open above, close below, on the weaker tone's contrast.
     private static let contrastOpen: Float = 0.36
@@ -155,6 +162,12 @@ public final class RTTYSignalDecoder: SignalDecoder {
     // MARK: State
 
     private let sampleRate: Double
+    /// The keying: bits per second, and the tones' spacing.
+    private let bitRate: Double
+    private let shift: Double
+    private let cutoffHz: Double
+    private let ringSize: Int
+    private let ringMask: Int
     private let originHz: Double
     private var tunedHz: Double
     private var nco: NCO
@@ -268,24 +281,36 @@ public final class RTTYSignalDecoder: SignalDecoder {
         }
     }
 
-    public init(frequencyHz: Double, sampleRate: Double = 12_000) {
+    /// One signal centred on `frequencyHz`, keyed at `baud` with its tones `shiftHz` apart (the amateur 45.45 Bd and
+    /// 170 Hz unless given: 50 and 75 Bd, 425 and 850 Hz are decoded the same way, the channel and baseband rate laid
+    /// out for them: `layout`).
+    public init(frequencyHz: Double, sampleRate: Double = 12_000, baud: Double = RTTYSignalDecoder.baud,
+                shiftHz: Double = RTTYSignalDecoder.shiftHz) {
         self.sampleRate = sampleRate
+        bitRate = baud
+        shift = shiftHz
+        let layout = Self.layout(baud: baud, shiftHz: shiftHz)
+        cutoffHz = layout.cutoffHz
         originHz = frequencyHz
         tunedHz = frequencyHz
         nco = NCO(frequency: -frequencyHz, sampleRate: sampleRate)
-        factor = max(1, Int((sampleRate / Self.basebandTarget).rounded()))
+        factor = max(1, Int((sampleRate / layout.basebandTarget).rounded()))
         basebandRate = sampleRate / Double(factor)
-        decimator = Self.makeDecimator(sampleRate: sampleRate, factor: factor)
-        samplesPerBit = basebandRate / Self.baud
+        decimator = Self.makeDecimator(sampleRate: sampleRate, factor: factor, cutoffHz: layout.cutoffHz)
+        samplesPerBit = basebandRate / baud
         half = max(2, Int((samplesPerBit / 2).rounded()))
         length = 2 * half
         quarter = max(1, half / 2)
-        let w = 2 * Double.pi * (Self.shiftHz / 2) / basebandRate
+        var size = Self.minRingSize
+        while Double(size) < Self.ringBits * samplesPerBit { size *= 2 }
+        ringSize = size
+        ringMask = size - 1
+        let w = 2 * Double.pi * (shiftHz / 2) / basebandRate
         toneStep = SIMD2(Float(cos(w)), Float(sin(w)))
         pending = .init(repeating: DSPComplex(real: 0, imag: 0), count: factor * Self.blockOutputs)
-        ringM = .init(repeating: .zero, count: Self.ringSize)
+        ringM = .init(repeating: .zero, count: size)
         ringS = ringM; halfRingM = ringM; halfRingS = ringM
-        envM = .init(repeating: 0, count: Self.ringSize)
+        envM = .init(repeating: 0, count: size)
         envS = envM; decision = envM
         let bit = Float(length)
         attack = min(1, 4 / bit)
@@ -296,9 +321,22 @@ public final class RTTYSignalDecoder: SignalDecoder {
         baseband.reserveCapacity(Self.blockOutputs + 1)
     }
 
-    private static func makeDecimator(sampleRate: Double, factor: Int) -> ComplexDecimator {
+    /// The channel's cutoff and the baseband rate aimed at for a keying: the default's 450 Hz and 1 kHz
+    /// exactly; another's keep its margins. The cutoff sits as far beyond the keying's reach (its tone and two bit
+    /// rates) as the default's does; the baseband rate keeps what aliases (from past the transition) as far from the
+    /// keying's reach, and about the default's samples per bit.
+    static func layout(baud: Double, shiftHz: Double) -> (cutoffHz: Double, basebandTarget: Double) {
+        let edge = shiftHz / 2 + 2 * baud
+        let cutoff = channelCutoffHz + (edge - defaultEdgeHz)
+        let stop = cutoff + channelTransitionHz / 2
+        let aliasMargin = basebandTarget - (channelCutoffHz + channelTransitionHz / 2) - defaultEdgeHz
+        let target = max(basebandTarget * baud / Self.baud, stop + edge + aliasMargin)
+        return (cutoff, target)
+    }
+
+    private static func makeDecimator(sampleRate: Double, factor: Int, cutoffHz: Double) -> ComplexDecimator {
         let taps = FIRDesign.tapCount(transition: channelTransitionHz / sampleRate)
-        return ComplexDecimator(taps: FIRDesign.lowpass(taps: max(taps, factor), cutoff: channelCutoffHz / sampleRate),
+        return ComplexDecimator(taps: FIRDesign.lowpass(taps: max(taps, factor), cutoff: cutoffHz / sampleRate),
                                 factor: factor)
     }
 
@@ -332,7 +370,7 @@ public final class RTTYSignalDecoder: SignalDecoder {
     private func basebandSample(_ z: SIMD2<Float>) {
         let n = sampleIndex
         sampleIndex += 1
-        let mask = Self.ringMask
+        let mask = ringMask
         let slot = n & mask
 
         // Mark (upper tone, +85 Hz) and space (−85 Hz) to DC.
@@ -462,7 +500,7 @@ public final class RTTYSignalDecoder: SignalDecoder {
             guard k <= n else { return }
             framers[index].scan = k + 1
             let sign = framers[index].sign
-            let a = sign * decision[(k - 1) & Self.ringMask], b = sign * decision[k & Self.ringMask]
+            let a = sign * decision[(k - 1) & ringMask], b = sign * decision[k & ringMask]
             guard a > 0 && b <= 0 else { continue }
             let crossing = Double(k - 1) + Double(a / (a - b))
             let predicted = framers[index].predictedEdge
@@ -478,7 +516,7 @@ public final class RTTYSignalDecoder: SignalDecoder {
     private func decisionAt(_ t: Double) -> Float {
         let i = Int(t.rounded(.down))
         let f = Float(t - Double(i))
-        let a = decision[i & Self.ringMask], b = decision[(i + 1) & Self.ringMask]
+        let a = decision[i & ringMask], b = decision[(i + 1) & ringMask]
         return a + f * (b - a)
     }
 
@@ -524,7 +562,7 @@ public final class RTTYSignalDecoder: SignalDecoder {
         var envelopes = SIMD8<Float>.zero
         var upper: UInt8 = 0
         for k in 0...6 {
-            let slot = Int((first + Double(k) * bit).rounded()) & Self.ringMask
+            let slot = Int((first + Double(k) * bit).rounded()) & ringMask
             let isUpper = (values[k] > 0) == (sign > 0)
             envelopes[k] = isUpper ? envM[slot] : envS[slot]
             if isUpper { upper |= 1 << UInt8(k) }
@@ -644,7 +682,7 @@ public final class RTTYSignalDecoder: SignalDecoder {
     /// Accumulates the half-bit and quarter-bit phase advance over the bits in `bitEnds`, in the
     /// filter of the tone each bit was sent on, and retunes every `afcBits` bits.
     private func measureFrequency() {
-        let mask = Self.ringMask
+        let mask = ringMask
         for t in bitEnds {
             let v = decision[t & mask]
             guard abs(v) >= 0.5 * decisionScale else { continue }
@@ -709,7 +747,7 @@ public final class RTTYSignalDecoder: SignalDecoder {
     // MARK: Constellation
 
     private func addPoints() {
-        let mask = Self.ringMask
+        let mask = ringMask
         for t in bitEnds {
             let m = envM[t & mask], s = envS[t & mask]
             // Each tone's level at its own bit decisions.
@@ -734,11 +772,11 @@ public final class RTTYSignalDecoder: SignalDecoder {
     public func reset() {
         tunedHz = originHz
         nco = NCO(frequency: -originHz, sampleRate: sampleRate)
-        decimator = Self.makeDecimator(sampleRate: sampleRate, factor: factor)
+        decimator = Self.makeDecimator(sampleRate: sampleRate, factor: factor, cutoffHz: cutoffHz)
         pendingCount = 0
         sampleIndex = 0
         tone = SIMD2(1, 0)
-        for i in 0..<Self.ringSize {
+        for i in 0..<ringSize {
             ringM[i] = .zero; ringS[i] = .zero; halfRingM[i] = .zero; halfRingS[i] = .zero
             envM[i] = 0; envS[i] = 0; decision[i] = 0
         }

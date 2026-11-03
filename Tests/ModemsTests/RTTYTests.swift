@@ -120,6 +120,20 @@ private func makeDecoder(_ hz: Double = 1_500) -> any SignalDecoder {
         }
     }
 
+    /// Signal ID's trial decodes use other keyings (`init(frequencyHz:sampleRate:baud:shiftHz:)`): each decodes at
+    /// 10 dB, the channel laid out for it, and the default's layout is the 45.45 Bd, 170 Hz one exactly.
+    @Test func otherKeyingsDecode() {
+        #expect(RTTYSignalDecoder.layout(baud: 45.45, shiftHz: 170) == (450, 1_000))
+        for (baud, shift) in [(50.0, 425.0), (75, 850), (45.45, 850), (75, 170)] {
+            let clear = RTTYEncoder.audio(text: text, centerHz: 1_500, baud: baud, shiftHz: shift)
+            let audio = ModemTestSignals.awgn(clear, snrDb: 10, seed: 4001, signalPower: rttyPower)
+            let decoder = RTTYSignalDecoder(frequencyHz: 1_500, baud: baud, shiftHz: shift)
+            let out = run(decoder, audio)
+            #expect(accuracy(out) == 1.0, "\(baud) Bd \(shift) Hz: '\(out)'")
+            #expect(decoder.submode == "RTTY \(Int(baud))")
+        }
+    }
+
     /// The plan's gate: seeds 1...5 (parameters were tuned on seeds 101...160 only).
     @Test func minus5dB() {
         let clear = RTTYEncoder.audio(text: text, centerHz: 1_500)

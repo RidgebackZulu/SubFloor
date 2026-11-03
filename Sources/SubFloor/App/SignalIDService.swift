@@ -218,8 +218,15 @@ final class SignalIDQueue {
 /// `moveTolerance` points from where it
 /// came to rest, leaving, the spectrum moving under it (zoom, pan) or a retune cancels it and clears the answer.
 ///
-/// **Card.** A right click (`openCard`) identifies the signal there the same way and fills `card` in as it comes;
-/// the UI shows it as a popover at the click. A retune that drops its longer read leaves the first answer, saying so
+/// **Trial decodes** (`SignalIDDecoding`). The card's and agents' identifications (`tryDecode`), never hover's, then
+/// try a private decode where one applies (FT8's latest complete slot; RTTY, PSK31): a queued job of its own in the same
+/// lane, after the answer is out (`firstAnswer`). A checked FT8 message names the signal it lies on at 1.0; readable
+/// text is evidence for RTTY or PSK31. Its decoders are its own: the decoder panel, its settings and the decode history
+/// never see it. An FT8 slot's messages are kept per slot and box (`slotDecodes`, forgotten on a retune): a scan decodes
+/// a slot once.
+///
+/// **Card.** A right click (`openCard`) identifies the signal there the same way, with a trial decode, and fills `card`
+/// in as it comes; the UI shows it as a popover at the click. A retune that drops its longer read leaves the first answer, saying so
 /// (`longerReadCutNote`).
 @MainActor @Observable
 final class SignalIDService {
@@ -337,6 +344,8 @@ final class SignalIDService {
     @ObservationIgnored var combFinder: CombFinder = { CaptureComb.find(spectrumDb: $0, sampleRate: $1, centerHz: $2) }
     /// Test hook: the most reads a look-back makes.
     @ObservationIgnored var lookBackReads = SignalIDService.lookBackMaxReads
+    /// Test hook: the decoders a trial decode runs (`SignalIDDecoding`), fresh ones each time: never the panel's.
+    @ObservationIgnored var decoders = SignalIDDecoding.Decoders.standard
     /// Test hook: where the IQ comes from (`AppModel.sourceKind`): only the RSP's samples carry a true time.
     @ObservationIgnored var sourceKind: @MainActor () -> SourceKind? = { nil }
     /// Test hook: the clock decodes are confirmed and answers cached by.
@@ -363,6 +372,8 @@ final class SignalIDService {
     }
 
     @ObservationIgnored private var cache: [CacheEntry] = []
+    /// FT8 slots a trial decoded, each box's messages: a scan's other points in that slot and box use them.
+    @ObservationIgnored private var slotDecodes: [SignalIDDecoding.SlotDecodes] = []
     /// The capture's comb as last found, for the tuning it was found in, and when.
     @ObservationIgnored private var combCache: (state: TuneBarrier.State, at: Date, comb: CombReading)?
     /// When the last tune failed (nil: it didn't), by `now`.
@@ -393,17 +404,81 @@ final class SignalIDService {
     /// soon as it is made (on the main actor, not after this call returned): the one to show, as measuring, while the
     /// rest runs. With `longerRead` false none is made (a stepped scan's ring holds only the first read): the first
     /// answer is returned, still wanting it.
+    ///
+    /// `tryDecode` (the card's and agents', never hover's, and not with `longerRead` false): when a trial decode
+    /// applies (`SignalIDDecoding.plan`), the answer is given to `firstAnswer` and then decoded, a queued job of its own
+    /// in the same lane, and the answer returned is the decoded one (`SignalIDDecoding.applied`); nil when the radio
+    /// retuned or it was cancelled meanwhile. FT8 slots decoded are kept (`slotDecodes`): another point in the same slot
+    /// and box uses them.
     func identify(atHz: Double, bandwidthHz: Double? = nil, radiusHz: Double? = nil, longerRead: Bool = true,
-                  priority: SignalIDPriority = .background,
+                  priority: SignalIDPriority = .background, tryDecode: Bool = false,
                   firstAnswer: (@MainActor (SignalIdentity) -> Void)? = nil) async -> SignalIdentity? {
         await identify(atHz: atHz, bandwidthHz: bandwidthHz, radiusHz: radiusHz, longerRead: longerRead,
-                       priority: priority, hover: false, firstAnswer: firstAnswer)
+                       priority: priority, hover: false, tryDecode: tryDecode, firstAnswer: firstAnswer)
     }
 
     /// `identify`, as a hover's when `hover` (a newer hover replaces it while it is queued).
     func identify(atHz: Double, bandwidthHz: Double? = nil, radiusHz: Double? = nil, longerRead: Bool = true,
-                  priority: SignalIDPriority, hover: Bool,
+                  priority: SignalIDPriority, hover: Bool, tryDecode: Bool = false,
                   firstAnswer: (@MainActor (SignalIdentity) -> Void)? = nil) async -> SignalIdentity? {
+        guard let answer = await analysed(atHz: atHz, bandwidthHz: bandwidthHz, radiusHz: radiusHz,
+                                          longerRead: longerRead, priority: priority, hover: hover,
+                                          firstAnswer: firstAnswer) else { return nil }
+        let state = tuning.current
+        guard tryDecode, longerRead, !hover,
+              let plan = SignalIDDecoding.plan(for: answer, centerHz: state.centerHz) else { return answer }
+        // Out while the decode runs: nothing waits on it.
+        firstAnswer?(answer)
+        return await decoded(answer, plan: plan, state: state, priority: priority)
+    }
+
+    /// `answer`, measured in the tuning `state`, with its trial decode (`plan`): run on the executor in `priority`'s
+    /// lane as an identification is (stopped for the owner and asked again, when a background one). Nil when the radio
+    /// retuned or the caller was cancelled.
+    private func decoded(_ answer: SignalIdentity, plan: SignalIDDecoding.Plan, state: TuneBarrier.State,
+                         priority: SignalIDPriority) async -> SignalIdentity? {
+        var again = false
+        while true {
+            let ticket = SignalIDQueue.Ticket(priority: priority, hover: false, again: again)
+            guard await queue.turn(ticket) else { return nil }
+            guard !Task.isCancelled, state == tuning.current else {
+                queue.finished(ticket)
+                return nil
+            }
+            let known = slotDecodes.filter { $0.state == state }
+            let trueTime = sourceKind() == .sdrplay
+            let chunks = chunkProvider, barrier = tuning, decoders = self.decoders
+            let task = Task.detached(executorPreference: executor, priority: .userInitiated) {
+                SignalIDDecoding.attempt(for: answer, plan: plan, state: state, trueTime: trueTime, known: known,
+                                         chunks: chunks, barrier: barrier, decoders: decoders,
+                                         cancelled: { Task.isCancelled })
+            }
+            ticket.cancel = { task.cancel() }
+            if ticket.preempted { task.cancel() }
+            let made = await withTaskCancellationHandler { await task.value } onCancel: { task.cancel() }
+            queue.finished(ticket)
+            if ticket.preempted, made == nil, !Task.isCancelled {
+                again = true
+                continue
+            }
+            guard !Task.isCancelled, let made, state == tuning.current else { return nil }
+            if let slot = made.slot {
+                let now = self.now()
+                slotDecodes.removeAll {
+                    $0.state != state
+                        || now.timeIntervalSince($0.slotStart) > FT8Modem.slotSeconds + SignalIDDecoding.slotKeepSeconds
+                        || ($0.slotStart == slot.slotStart && $0.dialHz == slot.dialHz)
+                }
+                slotDecodes.append(slot)
+            }
+            return SignalIDDecoding.applied(made, to: answer, centerHz: state.centerHz)
+        }
+    }
+
+    /// The identification itself (`identify` without the trial decode).
+    private func analysed(atHz: Double, bandwidthHz: Double?, radiusHz: Double?, longerRead: Bool,
+                          priority: SignalIDPriority, hover: Bool,
+                          firstAnswer: (@MainActor (SignalIdentity) -> Void)?) async -> SignalIdentity? {
         guard model != nil else { return nil }
         // The first answer reaches the main actor in a task of its own: dropped once this call has returned.
         let finished = Finished()
@@ -1271,7 +1346,7 @@ final class SignalIDService {
         cardTask = Task { [weak self] in
             guard let self else { return }
             let identity = await identify(atHz: hz, radiusHz: Self.radiusHz(hzPerPoint: hzPerPoint),
-                                          priority: .owner) { [weak self] first in
+                                          priority: .owner, tryDecode: true) { [weak self] first in
                 guard let self, cardGeneration == generation else { return }
                 fill(first, measuring: true)
             }
@@ -1323,6 +1398,7 @@ final class SignalIDService {
         tuneFailedAt = displayCenterHz == nil ? now() : nil
         cache.removeAll()
         combCache = nil
+        slotDecodes.removeAll()
         endHover()
     }
 }

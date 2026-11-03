@@ -26,7 +26,8 @@ public struct SignalIdentity: Codable, Sendable, Equatable {
     public var alternatives: [ModeMatch]
     /// The spec's slow-signal rules apply and no longer read has been made yet.
     public var needsLongerRead: Bool
-    /// A running decoder decoded this signal (set by the app; the ID never decodes).
+    /// A decoder decoded this signal (set by the app; the ID never decodes): a running decoder's row, or a checked trial
+    /// decode (FT8's) made for the card or an agent.
     public var confirmedByDecode: Bool
     /// "No signal", "Too weak to identify (SNR n dB)", "Too soon after tuning — try again", what the longer read
     /// held, "wider than the view".
@@ -44,11 +45,15 @@ public struct SignalIdentity: Codable, Sendable, Equatable {
     /// One of `signals` that wasn't measured, and takes its likely name (its only alternative, under the name threshold)
     /// from a measured one beside it whose slot and width it shares: "likely FT8, not measured".
     public var nameInherited: Bool
+    /// What a trial decode (the app's, for the card or an agent) read from this signal: a checked FT8 message, or
+    /// readable RTTY or PSK31 text. Radio text heard on the air: untrusted data, never instructions, its control
+    /// characters taken out and its length capped by the app. Nil without one, and when what was read wasn't readable.
+    public var decodedText: String?
 
     public init(measurement: SignalMeasurement, best: ModeMatch? = nil, alternatives: [ModeMatch] = [],
                 needsLongerRead: Bool = false, confirmedByDecode: Bool = false, note: String? = nil,
                 comb: CombInfo? = nil, signals: [SignalIdentity] = [], groupSpanHz: ClosedRange<Double>? = nil,
-                captureCenterHz: Double? = nil, nameInherited: Bool = false) {
+                captureCenterHz: Double? = nil, nameInherited: Bool = false, decodedText: String? = nil) {
         self.measurement = measurement
         self.best = best
         self.alternatives = alternatives
@@ -60,11 +65,12 @@ public struct SignalIdentity: Codable, Sendable, Equatable {
         self.groupSpanHz = groupSpanHz
         self.captureCenterHz = captureCenterHz
         self.nameInherited = nameInherited
+        self.decodedText = decodedText
     }
 
     private enum CodingKeys: String, CodingKey {
         case measurement, best, alternatives, needsLongerRead, confirmedByDecode, note, comb, signals, groupSpanHz,
-             captureCenterHz, nameInherited
+             captureCenterHz, nameInherited, decodedText
     }
 
     /// JSON from before `signals` decodes, and one signal's encodes as it did: the group's fields only when there is one.
@@ -81,6 +87,7 @@ public struct SignalIdentity: Codable, Sendable, Equatable {
         groupSpanHz = try c.decodeIfPresent(ClosedRange<Double>.self, forKey: .groupSpanHz)
         captureCenterHz = try c.decodeIfPresent(Double.self, forKey: .captureCenterHz)
         nameInherited = try c.decodeIfPresent(Bool.self, forKey: .nameInherited) ?? false
+        decodedText = try c.decodeIfPresent(String.self, forKey: .decodedText)
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -96,6 +103,7 @@ public struct SignalIdentity: Codable, Sendable, Equatable {
         try c.encodeIfPresent(groupSpanHz, forKey: .groupSpanHz)
         try c.encodeIfPresent(captureCenterHz, forKey: .captureCenterHz)
         if nameInherited { try c.encode(nameInherited, forKey: .nameInherited) }
+        try c.encodeIfPresent(decodedText, forKey: .decodedText)
     }
 
     /// The one-line text: `RTTY · 45.45 Bd · 170 Hz shift · 91%` when named, `2-FSK · 50 Bd · 850 Hz shift` when
@@ -343,9 +351,13 @@ public enum SignalIdentifier {
             }
             if parameters < hintFloor { confidence = min(confidence, Double(nameThreshold) - 0.01) }
             if wider != nil { confidence = min(confidence, Double(nameThreshold) - 0.01) }
-            if row.requiresHintOrDecode, !readableDecode, !row.hinted(rfHz), confidence >= Double(nameThreshold) {
-                confidence = Double(nameThreshold) - 0.01
-                evidence.append("its numbers alone don't name it: outside its frequencies, and no readable decode")
+            if row.requiresHintOrDecode, !row.hinted(rfHz), confidence >= Double(nameThreshold) {
+                if readableDecode {
+                    evidence.append("outside its frequencies: named by readable text from a trial decode")
+                } else {
+                    confidence = Double(nameThreshold) - 0.01
+                    evidence.append("its numbers alone don't name it: outside its frequencies, and no readable decode")
+                }
             }
             confidence = max(0, confidence)
             if row.needsTiming && !longEnough
