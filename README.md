@@ -136,8 +136,8 @@ Then ask, for example:
 The **Event log** tab shows every call an agent makes. Agents never transmit, never delete a recording or
 your bookmarks, and every recording they start stops by itself. They can ask what a signal is, too: a scan
 steps the radio across a band and puts it back, but never while you're recording. A scan wider than the capture
-reads each step for only about 3 s, so slow signals such as FT8 and WSPR come back unnamed until the agent tunes to
-one and asks again. Not built yet: recording at a
+reads each step for only about 3 s and names from tone numbers only, so slow signals such as FT8 and WSPR come back
+unnamed until the agent tunes to one and asks again, or scans with a longer `dwell_seconds` (up to 30 s a step). Not built yet: recording at a
 set time with no agent present, and a measured noise floor. Agents work around them for now.
 
 ## Build from source
@@ -192,6 +192,40 @@ measured (bandwidth, SNR, symbol rate, shift, tones), the other things it could 
 **Tune** to it (in the mode and width that suit it), **Bookmark** it (into an **Identified** group) or **Copy**
 it. A very slow or narrow signal, like WSPR, takes a few seconds longer; the line says it's still measuring.
 
+At a wide zoom one point covers several signals, and the answer says what's there: `FT8 · 9 signals ·
+14.0731–14.0755 MHz` for a group of FT8 stations, `Several signals: FT8 ×6, unknown ×2` for a mix. The card lists
+each one with its frequency, its name and its own **Tune**. A station SubFloor didn't measure itself, only found
+beside measured FT8 ones with the same slots and width, reads `likely FT8 · not measured`. A line of an interference
+comb across the capture says `Interference comb · 19.3 kHz spacing`; it can be copied but not bookmarked. Empty
+spectrum says `No signal`: before saying so it looks back up to 16 s, since FT8 stations often send only every other
+slot.
+
+The card's evidence now includes what it saw of the signal itself, such as "transmissions start on 15 s UTC
+boundaries" and "the two tones take turns", and, where SubFloor could decode it, what was heard: the card tries a
+decode of its own on the IQ it holds (an FT8's latest complete slot, a likely RTTY or PSK31), privately, without
+touching the decoder panel or its history. A checked FT8 message names the signal for certain. The hover line never
+decodes; the card does, and so do agents' `identify_signal` and their scans inside the view or with a dwell (their
+`get_cursor` doesn't). The IQ ring reaches back
+as far as the IQ pre-roll, 30 s by default, so an FT8 station you click while it's transmitting may not be confirmed;
+the card says so.
+
+**Tested on real signals:** FT8, FT4 and one 2-FSK signal, from the owner's recordings. Every other mode is
+tested on generated signals only. The figures below come from those real recordings, from parts held out from all
+tuning, as measured now:
+
+| Test | Result |
+| --- | --- |
+| FT8, hover (no decode) | named FT8 in about 50% of windows (82/163) |
+| FT4, hover | 7/12 |
+| FT8 group at the default zoom | 71% (115/163) |
+| The 2-FSK (one emitter, split by time) | 7/8 |
+| Interference comb lines | 14/14 labelled comb or No signal, never a mode |
+| Empty spectrum read as `No signal` | 35/36 |
+| Wrong names | 0 |
+
+The 2-FSK is a single emitter, its recording split by time into the tuning and held-out parts, so its figure says
+less than the count suggests.
+
 It names SSB and AM voice, CW, RTTY, PSK31, FT8, WSPR and other HF data modes, and VHF and up ones such as
 NFM, WFM, DMR, P25, APRS, POCSAG and AIS. **It never guesses.** A name needs 70%
 confidence; below that you get the family and its numbers (`2-FSK · 50 Bd · 850 Hz shift`), with the
@@ -201,7 +235,8 @@ says "confirmed by decode".
 
 The decoder panel's **Auto-detect** is separate: it has its own, narrower classifier, which looks only at the
 signals in the passband and the modes the decoders handle, to pick a decoder for each, and recognises RTTY
-(45.45, 50 and 75 Bd; 170, 425 and 850 Hz shift). Signal ID never starts a decoder by itself.
+(45.45, 50 and 75 Bd; 170, 425 and 850 Hz shift). Signal ID never starts the panel's decoders: its trial decodes
+are its own.
 
 ## Recording
 The save buffer is always running: each stream keeps its last 5–120 s (Settings, default 30 s) in

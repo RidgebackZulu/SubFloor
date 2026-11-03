@@ -5,16 +5,20 @@ import SwiftUI
 
 /// Signal ID's card for the signal at `atHz` (display Hz), shown in a popover at a right click: what it is (the
 /// name, or the family when nothing is sure enough to name), how sure, whether a decoder confirmed it, the measured
-/// parameters, the other candidates and the evidence; and **Tune**, **Bookmark** and **Copy**.
+/// parameters, the other candidates and the evidence, any text a trial decode heard; and **Tune**, **Bookmark** and
+/// **Copy**. Several signals under the point are listed first, each with its frequency, name and its own **Tune**; the
+/// rest of the card is the one nearest the point.
 ///
 /// `identity` nil is either "Identifying…" (`pending`) or no data to identify from (the radio stopped, or retuned
-/// meanwhile). `measuring`: `identity` is the first pass's answer and a longer read is running.
+/// meanwhile). `measuring`: `identity` is the first pass's answer and a longer read (or, `decoding`, a trial decode)
+/// is running.
 struct SignalIDCard: View {
     @Environment(AppModel.self) private var model
     let identity: SignalIdentity?
     let atHz: Double
     var pending = false
     var measuring = false
+    var decoding = false
     var close: () -> Void = {}
 
     @State private var bookmarked = false
@@ -23,12 +27,16 @@ struct SignalIDCard: View {
     private static let width: CGFloat = 340
     /// Evidence lines shown, notes included.
     private static let evidenceLines = 8
+    /// Signals listed before the list scrolls.
+    private static let memberRows = 8
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             header
             if let identity {
-                if identity.measurement.occupiedBandwidthHz > 0 { details(identity) }
+                let members = SignalIDText.members(identity, fallbackCenterHz: fallbackCenterHz(identity))
+                if !members.isEmpty { signals(members) }
+                if identity.measurement.occupiedBandwidthHz > 0 { details(identity, nearest: !members.isEmpty) }
                 else if let note = identity.note, identity.best == nil, note != title(identity) { caveat(note) }
             }
             Divider()
@@ -41,8 +49,16 @@ struct SignalIDCard: View {
     // MARK: Head
 
     private func title(_ identity: SignalIdentity) -> String {
-        identity.best == nil && identity.measurement.occupiedBandwidthHz == 0 ? identity.label : SignalIDText.name(identity)
+        // Several signals, and a comb's line, are what the label says they are: the group, the interference.
+        if !identity.signals.isEmpty || identity.comb != nil { return identity.label }
+        return identity.best == nil && identity.measurement.occupiedBandwidthHz == 0 ? identity.label : SignalIDText.name(identity)
     }
+
+    /// The centre a group's offsets are from when it doesn't carry its own: the card's signal less its offset.
+    private func fallbackCenterHz(_ identity: SignalIdentity) -> Double { atHz - identity.measurement.offsetHz }
+
+    /// The head's confidence is the answer's own: for several signals each row carries its own instead.
+    private func headBest(_ identity: SignalIdentity) -> ModeMatch? { identity.signals.isEmpty ? identity.best : nil }
 
     @ViewBuilder private var header: some View {
         if let identity {
@@ -50,13 +66,13 @@ struct SignalIDCard: View {
                 HStack(alignment: .firstTextBaseline, spacing: 8) {
                     Text(title(identity)).font(.system(size: 17, weight: .semibold)).lineLimit(2)
                     Spacer(minLength: 4)
-                    if let best = identity.best {
+                    if let best = headBest(identity) {
                         Text("\(Int((100 * best.confidence).rounded()))%")
                             .font(.system(size: 15, weight: .semibold, design: .monospaced))
                     }
                 }
                 Text(subtitle(identity)).font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary)
-                if let best = identity.best { ConfidenceBar(value: best.confidence).frame(height: 5) }
+                if let best = headBest(identity) { ConfidenceBar(value: best.confidence).frame(height: 5) }
                 HStack(spacing: 8) {
                     if identity.confirmedByDecode {
                         Label("Confirmed by decode", systemImage: "checkmark.seal.fill")
@@ -65,7 +81,8 @@ struct SignalIDCard: View {
                     }
                     if measuring {
                         ProgressView().controlSize(.mini)
-                        Text("Measuring longer…").font(.system(size: 11)).foregroundStyle(.secondary)
+                        Text(decoding ? "Trying a decode…" : "Measuring longer…").font(.system(size: 11))
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
@@ -91,16 +108,51 @@ struct SignalIDCard: View {
 
     /// The frequency, and the family when the title is the name (no mode named when it is the family).
     private func subtitle(_ identity: SignalIdentity) -> String {
-        guard identity.measurement.occupiedBandwidthHz > 0 else { return frequency }
+        if !identity.signals.isEmpty { return "\(identity.signals.count) signals under the pointer" }
+        guard identity.measurement.occupiedBandwidthHz > 0, identity.comb == nil else { return frequency }
         guard identity.best != nil, let family = identity.summary["Family"] else { return "\(frequency) · no mode named" }
         return "\(frequency) · \(family)"
     }
 
     // MARK: Body
 
-    private func details(_ identity: SignalIdentity) -> some View {
+    /// Each signal under the point: its frequency, its name (a likely one marked not measured) and a Tune that plans
+    /// its own tuning.
+    private func signals(_ members: [SignalIDText.Member]) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Divider()
+            let rows = VStack(alignment: .leading, spacing: 3) {
+                ForEach(Array(members.enumerated()), id: \.offset) { _, member in
+                    HStack(spacing: 8) {
+                        Text(FrequencyFormatter.grouped(member.hz)).font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        Text(member.name).font(.system(size: 12)).lineLimit(1)
+                            .foregroundStyle(member.identity.best == nil ? .secondary : .primary)
+                        Spacer(minLength: 4)
+                        Button("Tune") {
+                            model.tuneToMember(member)
+                            close()
+                        }
+                        .controlSize(.small)
+                        .help("Tune to this signal with the matched mode's demodulator")
+                    }
+                }
+            }
+            if members.count > Self.memberRows {
+                ScrollView { rows }.frame(height: CGFloat(Self.memberRows) * 22)
+            } else {
+                rows
+            }
+        }
+    }
+
+    private func details(_ identity: SignalIdentity, nearest: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             Divider()
+            if nearest {
+                Text("Nearest the pointer · \(frequency)").font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.secondary)
+            }
             Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 14, verticalSpacing: 3) {
                 ForEach(SignalIDText.parameters(identity), id: \.name) { row in
                     GridRow {
@@ -127,9 +179,7 @@ struct SignalIDCard: View {
                     }
                 }
             }
-            let evidence = Array(((identity.best?.evidence ?? []) + identity.measurement.notes)
-                .reduce(into: [String]()) { if !$1.isEmpty, !$0.contains($1) { $0.append($1) } }
-                .prefix(Self.evidenceLines))
+            let evidence = Array(SignalIDText.evidence(identity).prefix(Self.evidenceLines))
             if !evidence.isEmpty {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Why").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
@@ -142,14 +192,29 @@ struct SignalIDCard: View {
                     }
                 }
             }
+            if let heard = identity.decodedText { decoded(heard) }
             if let note = identity.note { caveat(note) }
         }
     }
 
+    /// A trial decode's text, shown as words heard on the air (untrusted radio text), verbatim.
+    private func decoded(_ text: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text("Heard on the air (decoded)").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+            Text(verbatim: text).font(.system(size: 11, design: .monospaced)).textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// The answer's note, each of its parts on a line of its own (a ring that reached back only 30 s, a look-back).
     private func caveat(_ note: String) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 5) {
-            Image(systemName: "info.circle").font(.system(size: 11))
-            Text(note).fixedSize(horizontal: false, vertical: true)
+        VStack(alignment: .leading, spacing: 2) {
+            ForEach(Array(SignalIDText.noteLines(note).enumerated()), id: \.offset) { _, line in
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Image(systemName: "info.circle").font(.system(size: 11))
+                    Text(verbatim: line).fixedSize(horizontal: false, vertical: true)
+                }
+            }
         }
         .font(.system(size: 11)).foregroundStyle(.orange)
     }
@@ -172,11 +237,14 @@ struct SignalIDCard: View {
             }
             .disabled(identity.map { !SignalIDText.canBookmark($0) } ?? true || bookmarked)
             .help(identity.map { SignalIDText.canBookmark($0) } == true
-                  ? "Bookmark the signal in the “Identified” group, with the ID in the notes" : "No signal to bookmark")
+                  ? "Bookmark the signal in the “Identified” group, with the ID in the notes"
+                  : identity?.comb != nil ? "Interference, not a station: nothing to bookmark" : "No signal to bookmark")
             Button {
                 guard let identity else { return }
                 NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(SignalIDText.copyText(identity, atHz: atHz), forType: .string)
+                NSPasteboard.general.setString(SignalIDText.copyText(identity, atHz: atHz,
+                                                                     fallbackCenterHz: fallbackCenterHz(identity)),
+                                               forType: .string)
                 copied = true
             } label: {
                 Label(copied ? "Copied" : "Copy", systemImage: copied ? "checkmark" : "doc.on.doc")

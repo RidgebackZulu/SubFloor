@@ -103,7 +103,7 @@ enum SignalIDDecoding {
     /// The note when the ring reached back only `seconds` (its pre-roll, or a retune since), and no complete slot the
     /// signal was on the air in.
     static func ringShortNote(_ seconds: Double) -> String {
-        String(format: "No FT8 decode: the ring reached back only %.0f s (%.0f wanted), and it was on the air in no complete slot of them; named from its tones and slots",
+        String(format: "No FT8 decode: the ring reached back only %.0f s (%.0f wanted), and it was on the air in no complete slot of them, so a station clicked while it transmits may not be confirmed; named from its tones and slots",
                seconds, ft8RingSeconds)
     }
 

@@ -56,9 +56,10 @@ extension SubFloorTools {
                 decoder is on or nothing is locked) and vfo. Each gives hz, level_dbfs (the live spectrum there; \
                 for the VFO, the passband's signal level), the nearest bookmark and the decodes within ± half the \
                 bandwidth. And signal: what kind of signal is there (identify_signal's answer: family, name or null, \
-                confidence, parameters, alternatives), or null with signal_note saying why not (the mouse only if it \
-                rested within 30 s). A slow signal's first answer comes with needs_longer_read; ask again in a few \
-                seconds for the longer read's.
+                confidence, parameters, alternatives; signals when several are under it, interference on a comb's \
+                line), or null with signal_note saying why not (the mouse only if it rested within 30 s). It is the \
+                quick answer and never waits: no trial decode (identify_signal makes one). A slow signal's first \
+                answer comes with needs_longer_read; ask again in a few seconds for the longer read's.
                 """) { t, _, _ in await t.cursor() },
 
             SubFloorTool("get_spectrum", title: "Get spectrum", readOnly: true, description: """

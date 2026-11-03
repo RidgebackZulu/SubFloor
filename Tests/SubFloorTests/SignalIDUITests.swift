@@ -144,6 +144,166 @@ struct SignalIDUITests {
     static let noSignal = SignalIdentity(measurement: SignalMeasurement(offsetHz: 5_000, family: .noise, seconds: 3),
                                          note: "No signal")
 
+    // MARK: Several signals, and the new evidence
+
+    /// An FT8 member of a group, `offsetHz` from the group's capture centre: measured and named, or (`inherited`)
+    /// named only from its neighbour, or unknown.
+    static func member(_ offsetHz: Double, named: Bool = true, inherited: Bool = false) -> SignalIdentity {
+        let m = SignalMeasurement(offsetHz: offsetHz, occupiedBandwidthHz: 50, bandwidth6dBHz: 50, snrDb: 12,
+                                  envelope: .bursty, family: named ? .mfsk : .unknown, familyConfidence: 0.8,
+                                  symbolRate: named ? 6.25 : nil, toneCount: named ? 8 : nil, seconds: 16)
+        if named { return SignalIdentity(measurement: m, best: ModeMatch(name: "FT8", confidence: 0.9, evidence: [])) }
+        guard inherited else { return SignalIdentity(measurement: m) }
+        return SignalIdentity(measurement: m, alternatives: [ModeMatch(name: "FT8", confidence: 0.65, evidence: [])],
+                              nameInherited: true)
+    }
+
+    /// Three signals under the point, recentred: their offsets and span are from the group's own capture centre,
+    /// 14.070 MHz, while the answer's top-level offset (the point's own, 14.074 MHz) is from the tuning's, 14.000 MHz.
+    static let groupCentre = 14_070_000.0
+    static var group: SignalIdentity {
+        var top = member(4_000)
+        top.measurement.offsetHz = 74_000
+        top.signals = [member(5_000, named: false), member(4_000), member(4_400, named: false, inherited: true)]
+        top.groupSpanHz = 3_975...5_025
+        top.captureCenterHz = groupCentre
+        return top
+    }
+
+    /// A named FT8 with a checked message, slot evidence and the ring's note.
+    static var decoded: SignalIdentity {
+        var id = member(0)
+        id.measurement.offsetHz = 74_000
+        id.measurement.slotFits = [SlotFit(periodSeconds: 15, lengthSeconds: 12.64, fit: 0.9, events: 3)]
+        id.decodedText = "CQ K1ABC FN42"
+        id.confirmedByDecode = true
+        id.note = SignalIDDecoding.ringShortNote(30)
+        return id
+    }
+
+    static let comb = SignalIdentity(measurement: SignalMeasurement(offsetHz: 12_000, occupiedBandwidthHz: 30,
+                                                                    bandwidth6dBHz: 20, snrDb: 18, envelope: .steady,
+                                                                    family: .carrier, familyConfidence: 0.8, seconds: 3),
+                                     comb: CombInfo(spacingHz: 19_300, lineCount: 23))
+
+    /// The card lists each signal: its frequency (the group's centre plus its own offset), its name, a likely name
+    /// never shown as a plain one, and a Tune that plans that signal's own tuning.
+    @Test func cardListsEachSignal() async throws {
+        let m = idleModel()
+        defer { m.shutdown() }
+        let atHz = 14_074_000.0
+        let rows = SignalIDText.members(Self.group, fallbackCenterHz: atHz - Self.group.measurement.offsetHz)
+        #expect(rows.map(\.hz) == [14_074_000, 14_074_400, 14_075_000])
+        #expect(rows.map(\.name) == ["FT8 · 90%", "likely FT8 · not measured", "Unknown · 50 Hz"])
+        #expect(!rows.contains { $0.name == "FT8" })
+        // The span is the group's own centre's too.
+        #expect(SignalIDText.groupSpanHz(Self.group, fallbackCenterHz: 14_000_000) == 14_073_975...14_075_025)
+        // Without a centre of its own, the fallback.
+        var plain = Self.group
+        plain.captureCenterHz = nil
+        #expect(SignalIDText.members(plain, fallbackCenterHz: 14_000_000).first?.hz == 14_004_000)
+
+        // Each row's Tune is that signal's own plan, at its own frequency.
+        for row in rows {
+            m.setMode(.am)
+            m.tuneToMember(row)
+            let plan = SignalIDTuning.plan(for: row.identity, atHz: row.hz)
+            #expect(m.mode == plan.demod && abs(m.vfoHz - plan.vfoHz) < 1, "\(row.name)")
+            #expect(m.displayedPassband.contains(row.hz), "\(row.name)")
+        }
+        // The copy has them too.
+        let copy = SignalIDText.copyText(Self.group, atHz: atHz)
+        #expect(copy.contains("14.074.400 Hz: likely FT8 · not measured"), "\(copy)")
+
+        // Drawn: the rows make the card taller than the same signal alone.
+        var alone = Self.group
+        alone.signals = []
+        alone.groupSpanHz = nil
+        let listed = try render(card: Self.group, atHz: atHz, dark: false, model: m)
+        let single = try render(card: alone, atHz: atHz, dark: false, model: m)
+        #expect(listed.pixelsHigh > single.pixelsHigh + 40, "\(listed.pixelsHigh) vs \(single.pixelsHigh)")
+    }
+
+    /// Transmissions on a slot mode's UTC slots are evidence on the card, as the identifier counts them, once.
+    @Test func cardShowsSlotEvidence() {
+        var id = Self.member(0, named: false)
+        id.measurement.slotFits = [SlotFit(periodSeconds: 15, lengthSeconds: 12.64, fit: 0.9, events: 3),
+                                   SlotFit(periodSeconds: 7.5, lengthSeconds: 4.48, fit: 0.4, events: 3)]
+        #expect(SignalIDText.evidence(id).contains("transmissions start on 15 s UTC boundaries"))
+        // FT4's grid.
+        id.measurement.slotFits = [SlotFit(periodSeconds: 7.5, lengthSeconds: 4.48, fit: 0.8, events: 2)]
+        #expect(SignalIDText.evidence(id).first == "transmissions start on 7.5 s UTC boundaries")
+        // One event, or a poor fit, is no evidence.
+        id.measurement.slotFits = [SlotFit(periodSeconds: 15, lengthSeconds: 12.64, fit: 1, events: 1),
+                                   SlotFit(periodSeconds: 7.5, lengthSeconds: 4.48, fit: 0.5, events: 4)]
+        #expect(!SignalIDText.evidence(id).contains { $0.contains("UTC boundaries") })
+        // A name that counted it already says it (with what it added): not twice.
+        var named = Self.member(0)
+        named.measurement.slotFits = [SlotFit(periodSeconds: 15, lengthSeconds: 12.64, fit: 0.9, events: 3)]
+        named.best?.evidence = ["transmissions start on 15 s UTC boundaries (+0.15)"]
+        #expect(SignalIDText.evidence(named).filter { $0.contains("UTC boundaries") }.count == 1)
+        // Agents get it too.
+        id.measurement.slotFits = [SlotFit(periodSeconds: 15, lengthSeconds: 12.64, fit: 0.9, events: 3)]
+        #expect(SignalIDText.evidence(id, notes: false) == ["transmissions start on 15 s UTC boundaries"])
+    }
+
+    /// A trial decode's text is on the card as heard on the air, and nowhere among the evidence.
+    @Test func cardShowsDecodedText() throws {
+        let m = idleModel()
+        defer { m.shutdown() }
+        var id = Self.member(0)
+        id.measurement.offsetHz = 74_000
+        id.decodedText = "CQ K1ABC FN42"
+        id.confirmedByDecode = true
+        let line = try #require(SignalIDText.decodedLine(id))
+        #expect(line.contains("CQ K1ABC FN42") && line.lowercased().contains("heard on the air"), "\(line)")
+        #expect(!SignalIDText.evidence(id).contains { $0.contains("K1ABC") })
+        #expect(SignalIDText.copyText(id, atHz: 14_074_000).contains(line))
+        #expect(SignalIDText.decodedLine(Self.member(0)) == nil)
+        // Drawn: the decoded text adds to the card.
+        var plain = id
+        plain.decodedText = nil
+        let with = try render(card: id, atHz: 14_074_000, dark: false, model: m)
+        let without = try render(card: plain, atHz: 14_074_000, dark: false, model: m)
+        #expect(with.pixelsHigh > without.pixelsHigh + 20, "\(with.pixelsHigh) vs \(without.pixelsHigh)")
+    }
+
+    /// A 2-FSK whose two tones were seen taking turns says so, in the brief's words, instead of the measurer's.
+    @Test func cardShowsTakingTurns() {
+        var fsk = Self.familyOnly
+        fsk.measurement.notes = ["2 tones 850 Hz apart take turns", "The keying line and the tone runs agree on 75.00 Bd"]
+        let lines = SignalIDText.evidence(fsk)
+        #expect(lines.first == "the two tones take turns")
+        #expect(!lines.contains("2 tones 850 Hz apart take turns"))
+        #expect(lines.contains("The keying line and the tone runs agree on 75.00 Bd"))
+        // An FSK read only by its numbers makes no such claim.
+        #expect(!SignalIDText.evidence(Self.familyOnly).contains("the two tones take turns"))
+    }
+
+    /// An interference comb's line is no station: no Bookmark, but Copy works, and its title is the comb.
+    @Test func combHasNoBookmark() throws {
+        let m = idleModel()
+        defer { m.shutdown() }
+        let comb = Self.comb
+        #expect(!SignalIDText.canBookmark(comb))
+        #expect(m.bookmarkIdentified(comb, atHz: 14_012_000) == nil)
+        let copy = SignalIDText.copyText(comb, atHz: 14_012_000)
+        #expect(copy.hasPrefix("Interference comb · 19.3 kHz spacing"), "\(copy)")
+        #expect(copy.contains("Frequency: 14.012.000 Hz"))
+        #expect(SignalIDText.evidence(comb).contains { $0.contains("23 lines") && $0.contains("interference") })
+        // A station still can be.
+        #expect(SignalIDText.canBookmark(Self.rtty))
+        _ = try render(card: comb, atHz: 14_012_000, dark: true, model: m)
+    }
+
+    /// The ring's reach (30 s at the default pre-roll) is said on the card, each part of the note on its own line.
+    @Test func cardSaysHowFarTheRingReached() throws {
+        let note = SignalIDDecoding.ringShortNote(30)
+        let lines = SignalIDText.noteLines("Read 2.1 s of the 3 s asked for; " + note)
+        try #require(lines.count == 3, "\(lines)")
+        #expect(lines[1].contains("reached back only 30 s") && lines[1].contains("may not be confirmed"), "\(lines)")
+    }
+
     // MARK: Hover
 
     /// The dwell is gated, not timed: the first hover's dwell is cancelled by the 10 px move (it is never let go and
@@ -586,6 +746,9 @@ struct SignalIDUITests {
             ("no-signal", Self.noSignal, false, false, 7_105_000),
             ("identifying", nil, true, false, 7_105_000),
             ("unavailable", nil, false, false, 7_105_000),
+            ("group", Self.group, false, false, 14_074_000),
+            ("decoded", Self.decoded, false, false, 14_074_000),
+            ("comb", Self.comb, false, false, 14_012_000),
         ]
         // The three identities the card is for; the rest of the states only when pictures are asked for.
         let wanted = ProcessInfo.processInfo.environment["SIGNAL_ID_UI_PNG_DIR"] != nil

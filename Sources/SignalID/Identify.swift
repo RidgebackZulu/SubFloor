@@ -257,8 +257,8 @@ public enum SignalIdentifier {
     static let hintFloor = 0.55
     /// A slot row's match gains `slotBonus` when the signal's transmissions fit its slots this well, over this many
     /// events at least (`SlotEvidence`; one edge fits FT4's grid by chance two times in three).
-    static let minSlotFit: Float = 0.75
-    static let minSlotEvents = 2
+    public static let minSlotFit: Float = 0.75
+    public static let minSlotEvents = 2
     static let slotBonus = 0.15
     static let firstSeconds = 3.0
     static let longSeconds = 16.0
