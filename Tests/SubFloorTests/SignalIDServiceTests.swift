@@ -109,12 +109,11 @@ struct SignalIDServiceTests {
         m.signalID.now = { now }
     }
 
-    /// The real identifier, counting its runs.
+    /// The real identifier, counting its first passes (the identifications run: not a longer read's or a look-back's).
     private static func counting(_ runs: Locked<Int>) -> SignalIDService.Analysis {
-        { iq, rate, centre, at, width, spectrum, longer in
-            runs.withLock { $0 += 1 }
-            return SignalIdentifier.identify(iq: iq, sampleRate: rate, captureCenterHz: centre, atHz: at,
-                                             bandwidthHz: width, spectrumDb: spectrum, longer: longer)
+        { a in
+            if a.longer == nil { runs.withLock { $0 += 1 } }
+            return SignalIDService.identifier(a)
         }
     }
 
@@ -122,7 +121,8 @@ struct SignalIDServiceTests {
     nonisolated private static func stub(name: String? = nil, alternatives: [ModeMatch] = [], widthHz: Double = 100,
                              family: SignalFamily = .fsk, note: String? = nil, seconds: Double = 0,
                              asked: Locked<[Double]>? = nil) -> SignalIDService.Analysis {
-        { _, _, centre, at, _, _, _ in
+        { a in
+            let (centre, at) = (a.captureCenterHz, a.atHz)
             asked?.withLock { $0.append(at) }
             if seconds > 0 { Thread.sleep(forTimeInterval: seconds) }
             return SignalIdentity(measurement: SignalMeasurement(offsetHz: at - centre, occupiedBandwidthHz: widthHz,
@@ -139,7 +139,8 @@ struct SignalIDServiceTests {
         m.signalID.snapshotProvider = Self.provider(snap)
         m.signalID.chunkProvider = Self.chunks(snap)
         let id = try #require(await m.signalID.identify(atHz: m.centerHz + 5_000))
-        #expect(id.best?.name == "RTTY", "\(id.label)")
+        // RTTY's numbers, away from the amateur segments: not shown to be RTTY.
+        #expect(id.label.hasPrefix("2-FSK · 45.45 Bd · 170 Hz shift"), "\(id.label)")
         #expect(abs(id.measurement.offsetHz - 5_000) < 50, "\(id.measurement.offsetHz)")
         #expect(!id.confirmedByDecode)
     }
@@ -157,7 +158,7 @@ struct SignalIDServiceTests {
         m.signalID.snapshotProvider = Self.provider(snap)
         m.signalID.chunkProvider = Self.chunks(snap)
         let id = try #require(await m.signalID.identify(atHz: m.centerHz + 5_000))
-        #expect(id.best?.name == "RTTY", "\(id.label)")
+        #expect(id.label.hasPrefix("2-FSK · 45.45 Bd"), "\(id.label)")
     }
 
     /// A point on the same signal within 5 s reuses the result, and an empty point its own; a point elsewhere, or a
@@ -166,7 +167,8 @@ struct SignalIDServiceTests {
         guard let m = runningModel() else { return }
         defer { m.shutdown() }
         let runs = Locked(0)
-        let snap = Self.snapshot(.rtty(), seconds: 3.1, offsetHz: 5_000)
+        // 16 s and more: the empty point's look-back reads all it asks for, so its "No signal" is kept.
+        let snap = Self.snapshot(.rtty(), seconds: 16.1, offsetHz: 5_000)
         m.signalID.snapshotProvider = Self.provider(snap)
         m.signalID.chunkProvider = Self.chunks(snap)
         m.signalID.analysis = Self.counting(runs)
@@ -214,14 +216,14 @@ struct SignalIDServiceTests {
         ], now: now)
         m.showDecodeLog(log)
         m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
-        let ft8 = ModeMatch(name: "FT8 / FT4", confidence: 0.5, evidence: [])
+        let ft8 = ModeMatch(name: "FT8", confidence: 0.5, evidence: [])
         m.signalID.analysis = Self.stub(alternatives: [ft8], widthHz: 50)
 
         let id = try #require(await m.signalID.identify(atHz: rf + 5))
         #expect(id.confirmedByDecode)
-        #expect(id.best?.name == "FT8 / FT4")
+        #expect(id.best?.name == "FT8")
         #expect(id.best?.confidence == 1)
-        #expect(!id.alternatives.contains { $0.name == "FT8 / FT4" })
+        #expect(!id.alternatives.contains { $0.name == "FT8" })
 
         // Named otherwise: no confirmation.
         m.showDecodeLog(log)
@@ -257,7 +259,10 @@ struct SignalIDServiceTests {
                        timeOffset: 0.2, message: "CQ K1ABC FN42"),
         ], now: now)
         m.showDecodeLog(log)
-        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
+        // 16 s and more: "No signal" looks back over all it asks for, and stays "No signal".
+        let noise = Self.snapshot(.noise, seconds: 16.1, offsetHz: 0)
+        m.signalID.snapshotProvider = Self.provider(noise)
+        m.signalID.chunkProvider = Self.chunks(noise)
         func identify(_ analysis: @escaping SignalIDService.Analysis) async throws -> SignalIdentity {
             m.showDecodeLog(log)
             m.signalID.invalidateCache()
@@ -274,7 +279,7 @@ struct SignalIDServiceTests {
         #expect(!psk.confirmedByDecode && psk.best == nil)
         // An unnamed FSK (FT8's family) is.
         let fsk = try await identify(Self.stub(widthHz: 50, family: .fsk))
-        #expect(fsk.confirmedByDecode && fsk.best?.name == "FT8 / FT4" && fsk.best?.confidence == 1)
+        #expect(fsk.confirmedByDecode && fsk.best?.name == "FT8" && fsk.best?.confidence == 1)
     }
 
     /// A first read shorter than the 3 s asked for (but over the 1 s the identifier needs) says so in `note`, and
@@ -301,11 +306,11 @@ struct SignalIDServiceTests {
         let retuned = Locked(false), started = Locked(false)
         m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
         let inner = Self.stub(asked: asked)
-        m.signalID.analysis = { iq, rate, centre, at, width, spectrum, longer in
+        m.signalID.analysis = { a in
             started.withLock { $0 = true }
             let deadline = Date().addingTimeInterval(120)
             while !retuned.withLock({ $0 }), Date() < deadline { Thread.sleep(forTimeInterval: 0.005) }
-            return inner(iq, rate, centre, at, width, spectrum, longer)
+            return inner(a)
         }
         let at = m.centerHz + 5_000
         let running = Task { await m.signalID.identify(atHz: at) }
@@ -325,12 +330,14 @@ struct SignalIDServiceTests {
         defer { m.shutdown() }
         let reads = Locked(0)
         m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
-        m.signalID.chunkProvider = { _, _, _ in
-            reads.withLock { $0 += 1 }
+        m.signalID.chunkProvider = { seconds, _, _ in
+            // The longer reads (not the comb's short read of the ring, which fails too).
+            if seconds > SignalIDService.firstSeconds { reads.withLock { $0 += 1 } }
             return nil
         }
-        m.signalID.analysis = { _, _, centre, at, _, _, _ in
-            SignalIdentity(measurement: SignalMeasurement(offsetHz: at - centre, occupiedBandwidthHz: 50,
+        m.signalID.analysis = { a in
+            let (centre, at) = (a.captureCenterHz, a.atHz)
+            return SignalIdentity(measurement: SignalMeasurement(offsetHz: at - centre, occupiedBandwidthHz: 50,
                                                           family: .carrier, seconds: 3),
                            needsLongerRead: true)
         }
@@ -349,7 +356,8 @@ struct SignalIDServiceTests {
         let r = m.engine.iqRecorder
         #expect(await eventually { r.status.preRollFill >= 1 })
         let second = Locked<(frames: Int, rate: Double)?>(nil)
-        m.signalID.analysis = { iq, rate, centre, at, _, _, longer in
+        m.signalID.analysis = { a in
+            let (iq, rate, centre, at, longer) = (a.iq, a.sampleRate, a.captureCenterHz, a.atHz, a.longer)
             if longer != nil { second.withLock { $0 = (iq.count / 2, rate) } }
             return SignalIdentity(measurement: SignalMeasurement(offsetHz: at - centre, occupiedBandwidthHz: 50,
                                                                  family: .carrier, seconds: 3),
@@ -396,7 +404,8 @@ struct SignalIDServiceTests {
             return IQRead(frames: frames, sampleRate: fs, endTime: Date())
         }
         let second = Locked<(frames: Int, rate: Double, centre: Double, longer: Int, toneDb: Double)?>(nil)
-        m.signalID.analysis = { iq, rate, centre, _, _, _, longer in
+        m.signalID.analysis = { a in
+            let (iq, rate, centre, longer) = (a.iq, a.sampleRate, a.captureCenterHz, a.longer)
             guard longer != nil else {   // the first pass, on its own channel: the signal in that channel's frame
                 return SignalIdentity(measurement: SignalMeasurement(offsetHz: captureCentre + signalHz - centre,
                                                                      occupiedBandwidthHz: 50, family: .carrier,
@@ -469,14 +478,14 @@ struct SignalIDServiceTests {
             return snap
         }
         let analysis = Self.stub()
-        m.signalID.analysis = { iq, rate, centre, at, width, spectrum, longer in
+        m.signalID.analysis = { a in
             let main = Thread.isMainThread
             offMain.withLock { $0.analysis = $0.analysis && !main }
             let before = ticks.withLock { $0 }
             let deadline = Date().addingTimeInterval(120)
             while ticks.withLock({ $0 }) <= before, Date() < deadline { Thread.sleep(forTimeInterval: 0.005) }
             ticked.withLock { $0 = ticks.withLock { $0 } > before }
-            return analysis(iq, rate, centre, at, width, spectrum, longer)
+            return analysis(a)
         }
         let probe = Task { @MainActor in
             while !Task.isCancelled {
@@ -546,14 +555,15 @@ struct SignalIDServiceTests {
         let inner = Self.stub(asked: asked)
         m.hover(at: CGPoint(x: 0.3, y: 0.2), viewSize: Self.view)
         let first = m.hover!.hz
-        m.signalID.analysis = { iq, rate, centre, at, width, spectrum, longer in
+        m.signalID.analysis = { a in
+            let at = a.atHz
             if at == first {
                 started.withLock { $0 = true }
                 let deadline = Date().addingTimeInterval(120)
                 while !Task.isCancelled, Date() < deadline { Thread.sleep(forTimeInterval: 0.005) }
                 cancelled.withLock { $0 = Task.isCancelled }
             }
-            return inner(iq, rate, centre, at, width, spectrum, longer)
+            return inner(a)
         }
 
         #expect(await eventually { started.withLock { $0 } })
@@ -576,7 +586,8 @@ struct SignalIDServiceTests {
         guard let m = runningModel(preRollSeconds: 5) else { return }
         defer { m.shutdown() }
         let seen = Locked<(frames: Int, rate: Double, centre: Double, at: Double)?>(nil)
-        m.signalID.analysis = { iq, rate, centre, at, _, _, _ in
+        m.signalID.analysis = { a in
+            let (iq, rate, centre, at) = (a.iq, a.sampleRate, a.captureCenterHz, a.atHz)
             seen.withLock { $0 = (iq.count / 2, rate, centre, at) }
             return SignalIdentity(measurement: SignalMeasurement(seconds: Double(iq.count / 2) / rate))
         }
@@ -609,14 +620,14 @@ struct SignalIDServiceTests {
         let running = Locked(0), most = Locked(0), runs = Locked(0), queues = Locked<Set<String>>([])
         m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
         let inner = Self.stub(widthHz: 0, family: .noise, note: "No signal")   // a point each: none reused
-        m.signalID.analysis = { iq, rate, centre, at, width, spectrum, longer in
+        m.signalID.analysis = { a in
             let now = running.withLock { $0 += 1; return $0 }
             most.withLock { $0 = max($0, now) }
             _ = queues.withLock { $0.insert(String(cString: __dispatch_queue_get_label(nil))) }
             Thread.sleep(forTimeInterval: 0.02)
             runs.withLock { $0 += 1 }
             running.withLock { $0 -= 1 }
-            return inner(iq, rate, centre, at, width, spectrum, longer)
+            return inner(a)
         }
         let service = m.signalID, centre = m.centerHz
         let asked = (0..<6).map { k in Task { await service.identify(atHz: centre + 1_000 * Double(k)) } }
@@ -674,10 +685,9 @@ struct SignalIDServiceTests {
             return IQRead(frames: frames, sampleRate: fs, endTime: Date())
         }
         m.signalID.chunkProvider = chunks
-        m.signalID.analysis = { iq, rate, centre, at, width, spectrum, longer in
-            analysed.withLock { $0 = (iq.count, rate) }
-            return SignalIdentifier.identify(iq: iq, sampleRate: rate, captureCenterHz: centre, atHz: at,
-                                             bandwidthHz: width, spectrumDb: spectrum, longer: longer)
+        m.signalID.analysis = { a in
+            analysed.withLock { $0 = (a.iq.count, a.sampleRate) }
+            return SignalIDService.identifier(a)
         }
         // The first pass only: a carrier asks for the longer read (it could be WSPR), which is R26's (its own test).
         let id = try #require(await m.signalID.identify(atHz: m.centerHz + toneHz, longerRead: false))
@@ -716,7 +726,7 @@ struct SignalIDServiceTests {
         #expect(outside.note == SignalIdentifier.tooSoonNote && outside.best == nil, "\(outside.label)")
         #expect(calls.withLock { $0 } == 0)   // nothing read for it
         let inside = try #require(await m.signalID.identify(atHz: old + 5_000))
-        #expect(inside.best?.name == "RTTY", "\(inside.label)")
+        #expect(inside.label.hasPrefix("2-FSK · 45.45 Bd"), "\(inside.label)")
         #expect(calls.withLock { $0 } == 1)
     }
 
@@ -738,9 +748,8 @@ struct SignalIDServiceTests {
         let snap = IQSnapshot(samples: iq, sampleRate: fs, endTime: Date())
         let barrier = TuneBarrier()
         barrier.end(centerHz: centre)
-        let analysis: SignalIDService.Analysis = { iq, rate, centre, at, width, spectrum, longer in
-            SignalIdentifier.identify(iq: iq, sampleRate: rate, captureCenterHz: centre, atHz: at, bandwidthHz: width,
-                                      spectrumDb: spectrum, longer: longer)
+        let analysis: SignalIDService.Analysis = { a in
+            SignalIDService.identifier(a)
         }
         for point in full ? [250_000.0, -300_000, 600_000] : [250_000, 600_000] {
             func run(whole: Bool) throws -> SignalIdentity {
@@ -758,5 +767,1079 @@ struct SignalIDServiceTests {
             #expect(abs(channel.measurement.occupiedBandwidthHz - width) <= 0.05 * max(width, 100), "\(label)")
             print("theChannelledFirstReadKeepsTheAnswer: \(label) (\(clock.now - start))")
         }
+    }
+
+    // MARK: Whose request goes first (Task 7)
+
+    /// Waits (bounded, 120 s) until `flag` is set; `cancellable`: a cancellation ends it too.
+    nonisolated private static func hold(_ flag: Locked<Bool>, cancellable: Bool = false) {
+        let deadline = Date().addingTimeInterval(120)
+        while !flag.withLock({ $0 }), !(cancellable && Task.isCancelled), Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+    }
+
+    /// A background job running and one queued, then the owner's: the owner's runs next (the running one is stopped
+    /// for it and asked again, ahead of the queued one). The running one ignores the cancellation, so all of them are
+    /// queued while it holds.
+    @Test func ownerGoesAheadOfQueuedWork() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let started = Locked<[Double]>([]), release = Locked(false)
+        let service = m.signalID, centre = m.centerHz
+        let running = centre + 1_000, queued = centre + 2_000, owner = centre + 3_000
+        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
+        let inner = Self.stub()
+        m.signalID.analysis = { a in
+            started.withLock { $0.append(a.atHz) }
+            if a.atHz == running { Self.hold(release) }
+            return inner(a)
+        }
+        let first = Task { await service.identify(atHz: running) }
+        #expect(await eventually { started.withLock { $0 } == [running] })
+        let second = Task { await service.identify(atHz: queued) }
+        #expect(await eventually { service.queue.waiting == 1 })
+        let third = Task { await service.identify(atHz: owner, priority: .owner) }
+        #expect(await eventually { service.queue.waiting == 2 })
+        release.withLock { $0 = true }
+        let answers = [await third.value, await second.value, await first.value]
+        #expect(answers.allSatisfy { $0 != nil })
+        #expect(started.withLock { $0 } == [running, owner, running, queued], "\(started.withLock { $0 })")
+    }
+
+    /// Two hovers queued: the newer replaces the older at once (nil), and only it runs.
+    @Test func newerHoverReplacesOlder() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let started = Locked<[Double]>([]), release = Locked(false)
+        let service = m.signalID, centre = m.centerHz
+        let running = centre + 1_000, older = centre + 2_000, newer = centre + 3_000
+        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
+        let inner = Self.stub()
+        m.signalID.analysis = { a in
+            started.withLock { $0.append(a.atHz) }
+            if a.atHz == running { Self.hold(release) }
+            return inner(a)
+        }
+        let busy = Task { await service.identify(atHz: running) }
+        #expect(await eventually { started.withLock { $0 } == [running] })
+        let first = Task { await service.identify(atHz: older, priority: .owner, hover: true) }
+        #expect(await eventually { service.queue.waiting == 1 })
+        let second = Task { await service.identify(atHz: newer, priority: .owner, hover: true) }
+        #expect(await first.value == nil)   // replaced while the queue still holds
+        release.withLock { $0 = true }
+        let answers = [await second.value, await busy.value]
+        #expect(answers.allSatisfy { $0 != nil })
+        #expect(started.withLock { $0 } == [running, newer, running], "\(started.withLock { $0 })")
+    }
+
+    /// A running background job stops at its next cancellation check when the owner asks; the owner's answer comes,
+    /// and the background one, its caller still waiting, is asked again and answers.
+    @Test func ownerStopsBackgroundAtNextCheck() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let started = Locked<[Double]>([]), stopped = Locked(false), never = Locked(false)
+        let service = m.signalID, centre = m.centerHz
+        let background = centre + 1_000, owner = centre + 3_000
+        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
+        let inner = Self.stub()
+        m.signalID.analysis = { a in
+            let n = started.withLock { $0.append(a.atHz); return $0.count }
+            if n == 1 {
+                Self.hold(never, cancellable: true)
+                stopped.withLock { $0 = Task.isCancelled }
+            }
+            return inner(a)
+        }
+        let job = Task { await service.identify(atHz: background) }
+        #expect(await eventually { started.withLock { $0 } == [background] })
+        let answer = await service.identify(atHz: owner, priority: .owner)
+        #expect(answer.map { abs($0.measurement.offsetHz - 3_000) < 1e-6 } == true)
+        #expect(stopped.withLock { $0 }, "the background job never saw the cancellation")
+        #expect(await job.value != nil)
+        #expect(started.withLock { $0 } == [background, owner, background], "\(started.withLock { $0 })")
+    }
+
+    /// A queued identification whose caller is cancelled leaves the queue at once (nil while the running one still
+    /// holds) and never runs.
+    @Test func aCancelledQueuedOneLeavesAtOnce() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let started = Locked<[Double]>([]), release = Locked(false), returned = Locked(false)
+        let service = m.signalID, centre = m.centerHz
+        let running = centre + 1_000, queued = centre + 2_000
+        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
+        let inner = Self.stub()
+        m.signalID.analysis = { a in
+            started.withLock { $0.append(a.atHz) }
+            if a.atHz == running { Self.hold(release) }
+            return inner(a)
+        }
+        let busy = Task { await service.identify(atHz: running) }
+        #expect(await eventually { started.withLock { $0 } == [running] })
+        let waiting = Task { () -> SignalIdentity? in
+            let id = await service.identify(atHz: queued)   // background: the running one isn't stopped for it
+            returned.withLock { $0 = true }
+            return id
+        }
+        #expect(await eventually { service.queue.waiting == 1 })
+        waiting.cancel()
+        #expect(await eventually(10) { returned.withLock { $0 } }, "a cancelled queued caller waited for its turn")
+        #expect(service.queue.waiting == 0)
+        release.withLock { $0 = true }
+        let answers = [await waiting.value, await busy.value]
+        #expect(answers[0] == nil && answers[1] != nil)
+        #expect(started.withLock { $0 } == [running], "\(started.withLock { $0 })")
+    }
+
+    /// The owner's, the background's and hovers asked together: never two at once, every caller but a replaced hover
+    /// answered, all on the service's queue.
+    @Test func oneAtATime() async {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let running = Locked(0), most = Locked(0), queues = Locked<Set<String>>([])
+        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
+        let inner = Self.stub()
+        m.signalID.analysis = { a in
+            let now = running.withLock { $0 += 1; return $0 }
+            most.withLock { $0 = max($0, now) }
+            _ = queues.withLock { $0.insert(String(cString: __dispatch_queue_get_label(nil))) }
+            Thread.sleep(forTimeInterval: 0.02)
+            running.withLock { $0 -= 1 }
+            return inner(a)
+        }
+        let service = m.signalID, centre = m.centerHz
+        let asked = (0..<8).map { k in
+            Task { () -> SignalIdentity? in
+                let at = centre + 1_000 * Double(k)
+                switch k % 3 {
+                case 0: return await service.identify(atHz: at)
+                case 1: return await service.identify(atHz: at, priority: .owner)
+                default: return await service.identify(atHz: at, priority: .owner, hover: true)
+                }
+            }
+        }
+        var answered = 0
+        for task in asked where await task.value != nil { answered += 1 }
+        #expect(answered >= 6, "\(answered) of 8 answered")   // the hovers but the last may be replaced
+        #expect(most.withLock { $0 } == 1, "\(most.withLock { $0 }) ran at once")
+        #expect(queues.withLock { $0 } == ["app.subfloor.signal-id"], "\(queues.withLock { $0 })")
+    }
+
+    /// Hover's and the card's radius is `radiusPixels` worth of Hz at the zoom, `maxRadiusHz` at most (the widest zoom, a
+    /// 10 MS/s capture across 1500 points, would give 27 kHz and a first answer over 150 ms); nil without a zoom.
+    @Test func hoverRadiusFollowsTheZoomUpToACap() {
+        #expect(SignalIDService.radiusHz(hzPerPoint: nil) == nil)
+        #expect(SignalIDService.radiusHz(hzPerPoint: 0) == nil)
+        #expect(SignalIDService.radiusHz(hzPerPoint: -5) == nil)
+        #expect(SignalIDService.radiusHz(hzPerPoint: .infinity) == nil)
+        #expect(SignalIDService.radiusHz(hzPerPoint: 25) == 100)
+        #expect(SignalIDService.radiusHz(hzPerPoint: 500) == 2_000)
+        #expect(SignalIDService.radiusHz(hzPerPoint: 1_000) == SignalIDService.maxRadiusHz)
+        // Never under the pointer's own point: at the widest zoom a point is wider than the cap.
+        #expect(SignalIDService.radiusHz(hzPerPoint: 10_000_000.0 / 1_500) == 10_000_000.0 / 1_500)
+        #expect(SignalIDService.maxRadiusHz == 2_000)
+    }
+
+    // MARK: A silent moment isn't an empty frequency (Task 7)
+
+    /// `seconds` of noise at 48 kS/s (unit power) with an RTTY 20 dB over it in 250 Hz, `offsetHz` from the centre, on
+    /// only from `on.lowerBound` to `on.upperBound` seconds; heard up to `endTime`.
+    nonisolated private static func burst(seconds: Double, on: ClosedRange<Double>, offsetHz: Double,
+                                          endTime: Date = Date()) -> IQSnapshot {
+        let rate = 48_000.0
+        var iq = SignalSynth.make(.noise, sampleRate: rate, seconds: seconds, snrDb: 0, seed: 21)
+        let rtty = SignalSynth.make(.rtty(), sampleRate: rate, seconds: seconds, snrDb: .infinity, offsetHz: offsetHz, seed: 22)
+        let gain = Float((pow(10, 20.0 / 10) * 250 / rate).squareRoot())
+        for k in 0..<(iq.count / 2) where on ~= Double(k) / rate {
+            iq[2 * k] += gain * rtty[2 * k]
+            iq[2 * k + 1] += gain * rtty[2 * k + 1]
+        }
+        return IQSnapshot(samples: iq, sampleRate: rate, endTime: endTime)
+    }
+
+    /// The longer read from `snap`, as `chunks`, but heard up to `endTime`.
+    nonisolated private static func chunks(_ snap: IQSnapshot, endTime: Date) -> SignalIDService.ChunkProvider {
+        let inner = chunks(snap)
+        return { seconds, frames, visit in
+            inner(seconds, frames, visit).map { IQRead(frames: $0.frames, sampleRate: $0.sampleRate, endTime: endTime) }
+        }
+    }
+
+    /// A stub that says "No signal" everywhere, recording each analysis: its IQ's length and end time.
+    nonisolated private static func silence(_ seen: Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>)
+        -> SignalIDService.Analysis {
+        { a in
+            seen.withLock { $0.append((Double(a.iq.count / 2) / a.sampleRate, a.endTime, a.longer != nil)) }
+            return SignalIdentity(measurement: SignalMeasurement(offsetHz: a.atHz - a.captureCenterHz, family: .noise,
+                                                                 seconds: 3),
+                                  note: SignalIdentifier.noSignalNote)
+        }
+    }
+
+    /// An RTTY heard 7 to 13 s ago, silent since: not "No signal" but the RTTY, saying how long it has been silent; the
+    /// first answer ("No signal") is out first, as measuring.
+    @Test func silentNewest3sLooksBack() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let snap = Self.burst(seconds: 16.1, on: 3.1...9.1, offsetHz: 5_000)
+        m.signalID.snapshotProvider = Self.provider(snap)
+        m.signalID.chunkProvider = Self.chunks(snap)
+        let firsts = Locked<[String]>([])
+        let id = try #require(await m.signalID.identify(atHz: m.centerHz + 5_000) { first in
+            firsts.withLock { $0.append(first.label) }
+        })
+        #expect(id.measurement.family == .fsk && abs(id.measurement.offsetHz - 5_000) < 50, "\(id.label)")
+        #expect(id.note == SignalIDService.silentFor(6), "\(id.note ?? "no note")")   // one note, the window 6–9 s back
+        #expect(firsts.withLock { $0 } == [SignalIdentifier.noSignalNote], "\(firsts.withLock { $0 })")
+    }
+
+    /// Nothing in 16 s: "No signal", having looked back `firstSeconds` at a time, each window ending where it ends (by
+    /// the first read's end: the ring moved on 0.2 s by the look-back's read); kept for the point.
+    @Test func noSignalAfterLookingBack() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let end = Date().addingTimeInterval(-30)
+        let snap = IQSnapshot(samples: [Float](repeating: 0, count: 2 * 17 * 48_000), sampleRate: 48_000, endTime: end)
+        let calls = Locked(0)
+        m.signalID.snapshotProvider = Self.provider(snap, calls: calls)
+        m.signalID.chunkProvider = Self.chunks(snap, endTime: end.addingTimeInterval(0.2))
+        m.signalID.sourceKind = { .sdrplay }
+        let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
+        m.signalID.analysis = Self.silence(seen)
+        let at = m.centerHz + 5_000
+        let reads = m.signalID.lookBackStats.withLock { $0.reads }
+        let id = try #require(await m.signalID.identify(atHz: at))
+        #expect(id.label == SignalIdentifier.noSignalNote && id.note == SignalIdentifier.noSignalNote, "\(id.label)")
+        // One read: its margin takes in how far the ring moved on since the first read.
+        #expect(m.signalID.lookBackStats.withLock { $0.reads } == reads + 1)
+        let windows = seen.withLock { $0 }.dropFirst()
+        #expect(windows.map { Int($0.seconds.rounded()) } == [13, 10, 7, 4, 1], "\(windows.map(\.seconds))")
+        let ends = windows.compactMap { $0.endTime?.timeIntervalSince(end) }
+        #expect(ends.count == 5 && zip(ends, [-3.0, -6, -9, -12, -15]).allSatisfy { abs($0 - $1) < 1e-6 }, "\(ends)")
+        #expect(windows.allSatisfy { $0.longer })
+        _ = await m.signalID.identify(atHz: at)
+        #expect(calls.withLock { $0 } == 1)   // kept
+        // A ring of exactly 16 s, its settle and the read's margin short of them: covered, nothing said of the ring.
+        let sixteen = Self.zeroRing(rate: 48_000, seconds: 16, endTime: end)
+        m.signalID.snapshotProvider = sixteen.snapshot
+        m.signalID.chunkProvider = sixteen.chunks
+        let full = try #require(await m.signalID.identify(atHz: at + 1_000))
+        #expect(full.note == SignalIdentifier.noSignalNote, "\(full.note ?? "no note")")
+    }
+
+    /// A real IQ recorder at 48 kS/s, its pre-roll `preRoll` s, fed `iq` in blocks of a second with its clock at `heard`
+    /// for the last of them (`heard` − 1 s before), then its clock the wall clock: what the reads say of when the IQ
+    /// was heard must come from the pushes, not from the reads.
+    nonisolated private static func recorder(_ iq: [Float], heard: Date, preRoll: Double = 20) -> StreamRecorder {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("SignalIDServiceTests-\(UUID().uuidString)")
+        let r = StreamRecorder(kind: .iq, rollsOnContextChange: true)
+        r.configure(StreamRecorder.Setup(sampleRate: 48_000, channels: 2, fileFormat: .wav, sampleFormat: .float32,
+                                         preRollSeconds: preRoll, memoryLimitBytes: 1 << 30, folder: dir))
+        let block = 2 * 48_000
+        var start = 0
+        while start < iq.count {
+            let end = min(start + block, iq.count)
+            r.now = { end == iq.count ? heard : heard.addingTimeInterval(-1) }
+            iq[start..<end].withUnsafeBufferPointer { r.push($0) }
+            start = end
+        }
+        r.now = { Date() }
+        return r
+    }
+
+    /// The radio stopped: the ring's IQ is read through the real recorder, and the analysis gets when it was heard (the
+    /// last push), not when it is read; the longer read, ending at the same newest frame, gets that time too. The
+    /// look-back's windows, placed by frame, are each stamped that many seconds before it.
+    @Test func stoppedRadioUsesTheRing() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        m.stop()
+        let heard = Date().addingTimeInterval(-600)
+        let burst = Self.burst(seconds: 3.1, on: 0...3.1, offsetHz: 5_000, endTime: heard)
+        let recorder = Self.recorder(burst.samples, heard: heard)
+        defer { recorder.shutdown() }
+        m.signalID.snapshotProvider = { recorder.snapshot(lastSeconds: $0) }
+        m.signalID.chunkProvider = { recorder.snapshot(lastSeconds: $0, chunkFrames: $1, $2) }
+        m.signalID.sourceKind = { .sdrplay }
+        let ends = Locked<[Date?]>([])
+        let inner = Self.stub()
+        m.signalID.analysis = { a in
+            ends.withLock { $0.append(a.endTime) }
+            var id = inner(a)
+            id.needsLongerRead = a.longer == nil
+            return id
+        }
+        #expect(await m.signalID.identify(atHz: m.centerHz + 5_000) != nil)
+        #expect(ends.withLock { $0 } == [heard, heard], "\(ends.withLock { $0.map { $0?.timeIntervalSince(heard) } })")
+
+        // 17 s of silence heard up to `heard`: each window the look-back analyses ends 3, 6, … 15 s before it.
+        let silent = Self.recorder([Float](repeating: 0, count: 2 * 17 * 48_000), heard: heard)
+        defer { silent.shutdown() }
+        m.signalID.snapshotProvider = { silent.snapshot(lastSeconds: $0) }
+        m.signalID.chunkProvider = { silent.snapshot(lastSeconds: $0, chunkFrames: $1, $2) }
+        m.signalID.invalidateCache()
+        let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
+        m.signalID.analysis = Self.silence(seen)
+        let id = try #require(await m.signalID.identify(atHz: m.centerHz + 5_000))
+        #expect(id.note == SignalIdentifier.noSignalNote, "\(id.note ?? "no note")")
+        let windows = seen.withLock { $0 }.filter(\.longer)
+        let backs = windows.compactMap { $0.endTime?.timeIntervalSince(heard) }
+        #expect(backs.count == 5 && zip(backs, [-3.0, -6, -9, -12, -15]).allSatisfy { abs($0 - $1) < 1e-6 }, "\(backs)")
+    }
+
+    /// A 5 s ring: the look-back reads what it holds (less the 50 ms after the barrier) and says so; that is the whole
+    /// ring, so its "No signal" is kept (ruling, fix round 1).
+    @Test func shortRingSaysSo() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let snap = IQSnapshot(samples: [Float](repeating: 0, count: 2 * 5 * 48_000), sampleRate: 48_000, endTime: Date())
+        let calls = Locked(0)
+        m.signalID.snapshotProvider = Self.provider(snap, calls: calls)
+        m.signalID.chunkProvider = Self.chunks(snap)
+        let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
+        m.signalID.analysis = Self.silence(seen)
+        let id = try #require(await m.signalID.identify(atHz: m.centerHz + 5_000))
+        let said = String(format: "Looked back %.1f s of the 16 s asked for", 4.95)
+        #expect(id.note == "\(SignalIdentifier.noSignalNote); \(said)", "\(id.note ?? "no note")")
+        #expect(seen.withLock { $0.map { ($0.seconds * 100).rounded() / 100 } } == [3, 1.95], "\(seen.withLock { $0 })")
+        _ = await m.signalID.identify(atHz: m.centerHz + 5_000)
+        #expect(calls.withLock { $0 } == 1)   // kept: the look-back read all the ring held
+    }
+
+    /// A retune during the look-back drops the answer (nil), and nothing is kept for the old centre.
+    @Test func retuneDuringLookBackDropsIt() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let snap = IQSnapshot(samples: [Float](repeating: 0, count: 2 * Int(16.1 * 48_000)), sampleRate: 48_000,
+                              endTime: Date())
+        m.signalID.snapshotProvider = Self.provider(snap)
+        m.signalID.chunkProvider = Self.chunks(snap)
+        let started = Locked(false), retuned = Locked(false)
+        let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
+        let inner = Self.silence(seen)
+        m.signalID.analysis = { a in
+            if a.longer != nil {   // a look-back window
+                started.withLock { $0 = true }
+                Self.hold(retuned)
+            }
+            return inner(a)
+        }
+        let at = m.centerHz + 5_000
+        let running = Task { await m.signalID.identify(atHz: at) }
+        #expect(await eventually { started.withLock { $0 } })
+        m.setVFO(m.centerHz + 0.6 * m.sampleRate)
+        retuned.withLock { $0 = true }
+        #expect(await running.value == nil)
+        #expect(seen.withLock { $0.count } == 2)   // the first pass and the window it was in: no more
+    }
+
+    /// Only the RSP's samples carry a true time: an IQ file and the demo source give the analysis none (no slots).
+    @Test func filePlaybackGetsNoSlots() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let snap = Self.snapshot(.noise, seconds: 3.1, offsetHz: 0)
+        m.signalID.snapshotProvider = Self.provider(snap)
+        let ends = Locked<[Date?]>([])
+        let inner = Self.stub()
+        m.signalID.analysis = { a in
+            ends.withLock { $0.append(a.endTime) }
+            return inner(a)
+        }
+        #expect(m.sourceKind == .synthetic)
+        _ = await m.signalID.identify(atHz: m.centerHz + 5_000)   // the model's own: the demo source
+        for kind in [SourceKind.file, .sdrplay] {
+            m.signalID.invalidateCache()
+            m.signalID.sourceKind = { kind }
+            _ = await m.signalID.identify(atHz: m.centerHz + 5_000)
+        }
+        #expect(ends.withLock { $0 } == [nil, nil, snap.endTime], "\(ends.withLock { $0 })")
+    }
+
+    /// Hover and card ask within 4 view points' worth of Hz at the zoom: 1380 Hz at 345 Hz a point, 40 Hz at 10.
+    /// Agents' get the identifier's default (nil).
+    @Test func radiusFollowsZoom() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
+        m.signalID.dwell = {}
+        let radii = Locked<[Double?]>([])
+        let inner = Self.stub()
+        m.signalID.analysis = { a in
+            radii.withLock { $0.append(a.pointRadiusHz) }
+            return inner(a)
+        }
+        for (k, hzPerPoint) in [345.0, 10].enumerated() {
+            let view = CGSize(width: m.viewport.spanHz / hzPerPoint, height: 500)
+            m.hover(at: CGPoint(x: 0.3 + 0.2 * Double(k), y: 0.2), viewSize: view)
+            #expect(await eventually { radii.withLock { $0.count } == 2 * k + 1 })
+            m.openIDCard(atUnit: CGPoint(x: 0.35 + 0.2 * Double(k), y: 0.2), viewSize: view)
+            #expect(await eventually { radii.withLock { $0.count } == 2 * k + 2 })
+        }
+        _ = await m.signalID.identify(atHz: m.centerHz - 9_000)
+        // The same point at another radius isn't the answer kept for it: the signals under it differ.
+        _ = await m.signalID.identify(atHz: m.centerHz - 9_000, radiusHz: 1_380)
+        let asked = radii.withLock { $0 }
+        #expect(asked.count == 6 && zip(asked.prefix(4), [1380.0, 1380, 40, 40]).allSatisfy { abs(($0 ?? 0) - $1) < 1e-6 }
+                && asked[4] == nil && asked[5] == 1_380, "\(asked)")
+    }
+
+    /// A tune that failed leaves the IQ at the old centre: a point it doesn't hold is "Too soon" for the first second,
+    /// then says the radio isn't there, and that isn't kept.
+    @Test func failedTuneNoteAfterGrace() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let probes = Locked(0), clock = Locked(Date())
+        let snap = Self.snapshot(.rtty(), seconds: 3.1, offsetHz: 5_000)
+        let inner = Self.provider(snap)
+        m.signalID.snapshotProvider = { seconds in
+            if seconds <= SignalIDService.probeSeconds { probes.withLock { $0 += 1 } }
+            return inner(seconds)
+        }
+        m.signalID.now = { clock.withLock { $0 } }
+        let old = m.centerHz - 100_000
+        m.signalID.retuneBegins()
+        m.signalID.retuned(displayCenterHz: old)    // the IQ at the old centre
+        m.signalID.retuneBegins()
+        m.signalID.retuned(displayCenterHz: nil)    // the tune that failed
+        let outside = m.centerHz + 30_000
+        let soon = try #require(await m.signalID.identify(atHz: outside))
+        #expect(soon.note == SignalIdentifier.tooSoonNote, "\(soon.label)")
+        clock.withLock { $0 += 1.5 }
+        let failed = try #require(await m.signalID.identify(atHz: outside))
+        #expect(failed.note == SignalIDService.notAtFrequencyNote && failed.label == SignalIDService.notAtFrequencyNote,
+                "\(failed.label)")
+        let before = probes.withLock { $0 }
+        let again = try #require(await m.signalID.identify(atHz: outside))
+        #expect(again.note == SignalIDService.notAtFrequencyNote)
+        #expect(probes.withLock { $0 } > before)   // read again: not kept
+        // A tune that works forgets it (here the IQ stays the old centre's: "Too soon" again), and a point the IQ holds
+        // is identified there throughout.
+        m.signalID.retuneBegins()
+        m.signalID.retuned(displayCenterHz: old)
+        clock.withLock { $0 += 1.5 }
+        let worked = try #require(await m.signalID.identify(atHz: outside))
+        #expect(worked.note == SignalIdentifier.tooSoonNote, "\(worked.label)")
+        let held = try #require(await m.signalID.identify(atHz: old + 5_000))
+        #expect(held.label.hasPrefix("2-FSK · 45.45 Bd"), "\(held.label)")
+    }
+
+    // MARK: The comb, the frame and the group's first answer (Task 7)
+
+    /// The comb is found once for the capture, not for each point: kept 5 s for the tuning, found again after that and
+    /// after a retune, and handed to every analysis. With no app spectrum of the capture it is found on the ring's newest
+    /// IQ, at the app's resolution.
+    @Test func combIsFoundOncePerSpectrum() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
+        m.signalID.chunkProvider = Self.chunks(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
+        let clock = Locked(Date())
+        m.signalID.now = { clock.withLock { $0 } }
+        let found = Locked<[Int]>([])
+        let comb = CaptureComb(info: CombInfo(spacingHz: 6000, lineCount: 9), linesHz: [m.centerHz + 6000])
+        m.signalID.combFinder = { db, _, _ in
+            found.withLock { $0.append(db.count) }
+            return comb
+        }
+        let given = Locked<[CaptureComb?]>([])
+        let inner = Self.stub()
+        m.signalID.analysis = { a in
+            given.withLock { $0.append(a.comb) }
+            return inner(a)
+        }
+        for k in 0..<3 { _ = await m.signalID.identify(atHz: m.centerHz + 1_000 * Double(k)) }
+        #expect(found.withLock { $0 } == [CaptureComb.spectrumSize])
+        clock.withLock { $0 += SignalIDService.combSeconds + 1 }
+        _ = await m.signalID.identify(atHz: m.centerHz + 4_000)
+        #expect(found.withLock { $0.count } == 2)
+        m.signalID.retuneBegins()
+        m.signalID.retuned(displayCenterHz: m.centerHz)
+        _ = await m.signalID.identify(atHz: m.centerHz + 5_000)
+        #expect(found.withLock { $0.count } == 3)
+        #expect(given.withLock { $0 }.count == 5 && given.withLock { $0 }.allSatisfy { $0 == comb })
+    }
+
+    /// The frame (carried item 5): an answer measured on a channel comes back with its measurement, its signals and its
+    /// group's span all moved into the capture's frame, and `captureCenterHz` the capture's centre.
+    @Test func aGroupAnswerComesBackInTheCaptureFrame() {
+        let member = { (offset: Double) in
+            SignalIdentity(measurement: SignalMeasurement(offsetHz: offset, occupiedBandwidthHz: 50, family: .mfsk))
+        }
+        let onChannel = SignalIdentity(measurement: SignalMeasurement(offsetHz: 10, occupiedBandwidthHz: 50, family: .mfsk),
+                                       signals: [member(-200), member(10), member(300)], groupSpanHz: -225...325,
+                                       captureCenterHz: 14_074_000)
+        let out = SignalIDService.recentred(onChannel, by: 74_000, captureCenterHz: 14_000_000)
+        #expect(out.measurement.offsetHz == 74_010)
+        #expect(out.signals.map(\.measurement.offsetHz) == [73_800, 74_010, 74_300])
+        #expect(out.groupSpanHz == 73_775...74_325)
+        #expect(out.captureCenterHz == 14_000_000)
+        #expect(out.label == onChannel.label, "\(out.label) vs \(onChannel.label)")
+        // One signal stays as it was, but for its offset.
+        let one = SignalIDService.recentred(member(10), by: 74_000, captureCenterHz: 14_000_000)
+        #expect(one.measurement.offsetHz == 74_010 && one.captureCenterHz == nil && one.signals.isEmpty)
+    }
+
+    /// The quick hover on a group whose members it couldn't name on 3 s (`unknown ×3`): it asks for the longer read
+    /// though the point's own wants none, shows that first answer as measuring, and the longer read's replaces it.
+    @Test func aGroupsFirstAnswerIsMeasuring() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        m.signalID.snapshotProvider = Self.provider(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
+        m.signalID.chunkProvider = Self.chunks(Self.snapshot(.noise, seconds: 3.1, offsetHz: 0))
+        m.signalID.dwell = {}
+        let hold = Locked(false)
+        m.signalID.analysis = { a in
+            let refined = a.longer != nil
+            if refined { Self.hold(hold) }
+            let centre = a.atHz - a.captureCenterHz
+            func member(_ dx: Double) -> SignalIdentity {
+                var m = SignalMeasurement(offsetHz: centre + dx, occupiedBandwidthHz: 50, family: refined ? .mfsk : .unknown,
+                                          seconds: 3)
+                m.toneCount = refined ? 8 : nil
+                return SignalIdentity(measurement: m,
+                                      best: refined ? ModeMatch(name: "FT8", confidence: 0.9, evidence: []) : nil,
+                                      needsLongerRead: !refined)
+            }
+            let members = [member(-100), member(0), member(100)]
+            var id = members[1]
+            id.best = ModeMatch(name: "FT8", confidence: 0.9, evidence: [])
+            id.needsLongerRead = false
+            id.signals = members
+            id.groupSpanHz = refined ? (centre - 125)...(centre + 125) : nil
+            id.captureCenterHz = a.captureCenterHz
+            return id
+        }
+        m.hover(at: CGPoint(x: 0.4, y: 0.2), viewSize: Self.view)
+        #expect(await eventually { m.signalID.hoverMeasuring })
+        let first = try #require(m.signalID.hoverIdentity)
+        #expect(first.label == "Several signals: unknown ×3", "\(first.label)")
+        #expect(SignalIDText.hoverLine(identity: first, pending: false, measuring: true)?.hasSuffix("measuring…") == true)
+        hold.withLock { $0 = true }
+        #expect(await eventually { !m.signalID.hoverMeasuring && m.signalID.hoverIdentity != first })
+        let final = try #require(m.signalID.hoverIdentity)
+        #expect(final.label.hasPrefix("FT8 · 3 signals"), "\(final.label)")
+    }
+
+    /// A group answer's members as measured on a read centred `centre` (its `captureCenterHz`), `dx` apart about the
+    /// point; `width` > 0, so no look-back.
+    nonisolated private static func group(_ a: SignalIDService.AnalysisInput, needsLongerRead: Bool = false) -> SignalIdentity {
+        let at = a.atHz - a.captureCenterHz
+        let members = [-100.0, 0, 100].map {
+            SignalIdentity(measurement: SignalMeasurement(offsetHz: at + $0, occupiedBandwidthHz: 50, family: .mfsk, seconds: 3),
+                           best: ModeMatch(name: "FT8", confidence: 0.9, evidence: []))
+        }
+        var id = members[1]
+        id.signals = members
+        id.groupSpanHz = (at - 125)...(at + 125)
+        id.captureCenterHz = a.captureCenterHz
+        id.needsLongerRead = needsLongerRead
+        return id
+    }
+
+    /// Whether `id` is `group`'s answer for `hz` in the capture's frame at `centre`.
+    private static func inCaptureFrame(_ id: SignalIdentity?, hz: Double, centre: Double) -> Bool {
+        guard let id else { return false }
+        let at = hz - centre
+        return abs(id.measurement.offsetHz - at) < 1e-6 && id.captureCenterHz == centre
+            && zip(id.signals.map(\.measurement.offsetHz), [at - 100, at, at + 100]).allSatisfy { abs($0 - $1) < 1e-6 }
+            && id.groupSpanHz.map { abs($0.lowerBound - (at - 125)) < 1e-6 && abs($0.upperBound - (at + 125)) < 1e-6 } == true
+    }
+
+    /// The capture's own rate (2 MS/s, the demo source's): the first read is a channel around the point, the comb is
+    /// found on the app's spectrum (none of the ring read for it), and a group answer measured on the channel comes back
+    /// in the capture's frame.
+    @Test func theFirstReadsChannelKeepsTheFrame() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        #expect(await eventually { m.spectrumSnapshot() != nil })
+        let fs = m.sampleRate
+        try #require(fs > SignalIDService.channelAboveRate)
+        m.signalID.snapshotProvider = { seconds in
+            IQSnapshot(samples: [Float](repeating: 0, count: 2 * Int(seconds * fs)), sampleRate: fs, endTime: Date())
+        }
+        let piece = [Float](repeating: 0, count: 2 << 19), asked = Locked<[Double]>([])
+        m.signalID.chunkProvider = { seconds, chunkFrames, visit in
+            asked.withLock { $0.append(seconds) }
+            let frames = Int((seconds * fs).rounded())
+            var done = 0
+            while done < frames {
+                let n = min(chunkFrames, frames - done, piece.count / 2)
+                guard piece[0..<(2 * n)].withUnsafeBufferPointer(visit) else { return nil }
+                done += n
+            }
+            return IQRead(frames: frames, sampleRate: fs, endTime: Date())
+        }
+        let found = Locked<[Int]>([]), centres = Locked<[Double]>([])
+        m.signalID.combFinder = { db, _, _ in
+            found.withLock { $0.append(db.count) }
+            return nil
+        }
+        m.signalID.analysis = { a in
+            centres.withLock { $0.append(a.captureCenterHz) }
+            return Self.group(a)
+        }
+        let hz = m.centerHz + 250_000
+        let id = await m.signalID.identify(atHz: hz, longerRead: false)
+        #expect(Self.inCaptureFrame(id, hz: hz, centre: m.centerHz), "\(String(describing: id))")
+        #expect(centres.withLock { $0 }.allSatisfy { abs($0 - hz) < 1_000 }, "a channel's centre: \(centres.withLock { $0 })")
+        #expect(found.withLock { $0 } == [m.spectrumSnapshot()?.average.count ?? -1], "\(found.withLock { $0 })")
+        #expect(asked.withLock { $0 }.allSatisfy { $0 >= SignalIDService.firstSeconds }, "\(asked.withLock { $0 })")
+    }
+
+    /// At 500 kS/s the first read is the whole capture, and the longer read and the look-back are channels around the
+    /// signal and the point: a group answer measured on either comes back in the capture's frame.
+    @Test func theLongerReadsChannelKeepsTheFrame() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let fs = 500_000.0
+        let snap = IQSnapshot(samples: [Float](repeating: 0, count: 2 * Int(16.1 * fs)), sampleRate: fs, endTime: Date())
+        m.signalID.snapshotProvider = Self.provider(snap)
+        m.signalID.chunkProvider = Self.chunks(snap)
+        let refined = m.centerHz + 100_000, silent = m.centerHz - 120_000
+        let centres = Locked<[Double]>([])
+        m.signalID.analysis = { a in
+            centres.withLock { $0.append(a.captureCenterHz) }
+            if a.atHz == silent && a.longer == nil {   // nothing now; the group, looking back
+                return SignalIdentity(measurement: SignalMeasurement(offsetHz: a.atHz - a.captureCenterHz, family: .noise),
+                                      note: SignalIdentifier.noSignalNote)
+            }
+            return Self.group(a, needsLongerRead: a.longer == nil)
+        }
+        let long = await m.signalID.identify(atHz: refined)
+        #expect(Self.inCaptureFrame(long, hz: refined, centre: m.centerHz), "\(String(describing: long))")
+        let back = await m.signalID.identify(atHz: silent)
+        #expect(Self.inCaptureFrame(back, hz: silent, centre: m.centerHz), "\(String(describing: back))")
+        // The first reads on the capture's centre, the others on channels around the signal and the point.
+        let seen = centres.withLock { $0 }
+        #expect(seen.count == 4 && seen[0] == m.centerHz && seen[2] == m.centerHz
+                && abs(seen[1] - refined) < 1 && abs(seen[3] - silent) < 1, "\(seen)")
+    }
+
+    // MARK: Fix round 1
+
+    /// A ring of `seconds` of zeros at `rate`, heard up to `endTime`, made a piece at a time as it is read (never held):
+    /// the first read's snapshot, and the chunked reads, counting those over a second asked and what they asked.
+    nonisolated private static func zeroRing(rate: Double, seconds: Double, endTime: Date, asked: Locked<[Double]>? = nil)
+        -> (snapshot: SignalIDService.SnapshotProvider, chunks: SignalIDService.ChunkProvider) {
+        let ringFrames = Int(seconds * rate)
+        let snapshot: SignalIDService.SnapshotProvider = { last in
+            let frames = min(ringFrames, Int((last * rate).rounded()))
+            return IQSnapshot(samples: [Float](repeating: 0, count: 2 * frames), sampleRate: rate, endTime: endTime)
+        }
+        let chunks: SignalIDService.ChunkProvider = { last, chunkFrames, visit in
+            asked?.withLock { $0.append(last) }
+            let frames = min(ringFrames, Int((last * rate).rounded()))
+            let piece = [Float](repeating: 0, count: 2 * min(chunkFrames, frames))
+            var done = 0
+            while done < frames {
+                let n = min(chunkFrames, frames - done)
+                guard piece[0..<(2 * n)].withUnsafeBufferPointer(visit) else { return nil }
+                done += n
+            }
+            return IQRead(frames: frames, sampleRate: rate, endTime: endTime)
+        }
+        return (snapshot, chunks)
+    }
+
+    /// The look-back at the rig's channel rates: a 48 kHz channel runs at 312.5 kS/s from 10 MS/s and at 375 kS/s from
+    /// 6 MS/s, where the 32 MB budget holds 13.4 s and 11.2 s. Rings at 625 and 750 kS/s give those channel rates for a
+    /// fraction of the IQ. An empty point still looks back over the whole 16 s (one read at 312.5 kS/s, two at 375),
+    /// every window whole and ending where it should, no read over the budget and none copied to be trimmed; and its
+    /// "No signal" says nothing of the ring and is kept for the point.
+    @Test func aLookBackAtTheRigsRatesCovers16s() async throws {
+        #expect(Channel.outputRate(sampleRate: 10_000_000, bandwidthHz: SignalIDService.minimumChannelHz) == 312_500)
+        #expect(Channel.outputRate(sampleRate: 6_000_000, bandwidthHz: SignalIDService.minimumChannelHz) == 375_000)
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        m.signalID.sourceKind = { .sdrplay }
+        for (rate, reads) in [(625_000.0, 1), (750_000.0, 2)] {
+            #expect(Channel.outputRate(sampleRate: rate, bandwidthHz: SignalIDService.minimumChannelHz) == rate / 2)
+            let end = Date().addingTimeInterval(-5)
+            let ring = Self.zeroRing(rate: rate, seconds: 30, endTime: end)
+            m.signalID.snapshotProvider = ring.snapshot
+            m.signalID.chunkProvider = ring.chunks
+            m.signalID.invalidateCache()
+            let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
+            m.signalID.analysis = Self.silence(seen)
+            let before = m.signalID.lookBackStats.withLock { $0 }
+            let at = m.centerHz + 5_000
+            let id = try #require(await m.signalID.identify(atHz: at))
+            let after = m.signalID.lookBackStats.withLock { $0 }
+            #expect(id.note == SignalIdentifier.noSignalNote, "\(rate): \(id.note ?? "no note")")
+            let windows = seen.withLock { $0 }.filter(\.longer)
+            let ends = windows.compactMap { $0.endTime?.timeIntervalSince(end) }
+            #expect(ends.count == 5 && zip(ends, [-3.0, -6, -9, -12, -15]).allSatisfy { abs($0 - $1) < 1e-6 },
+                    "\(rate): \(ends)")
+            // Each window holds its own 3 s (the last its 1 s) and what came before it in its read.
+            #expect(zip(windows.map(\.seconds), [3.0, 3, 3, 3, 1]).allSatisfy { $0 >= $1 - 0.06 }, "\(rate): \(windows.map(\.seconds))")
+            #expect(after.reads - before.reads == reads, "\(rate): \(after.reads - before.reads) reads")
+            #expect(after.copies == before.copies, "\(rate): the look-back's read was copied to be trimmed")
+            #expect(after.mostFloats * MemoryLayout<Float>.size <= SignalIDService.longReadBudgetBytes,
+                    "\(rate): \(after.mostFloats * 4) bytes reserved")
+            let runs = seen.withLock { $0.count }
+            _ = await m.signalID.identify(atHz: at)
+            #expect(seen.withLock { $0.count } == runs, "\(rate): not kept for the point")
+        }
+    }
+
+    /// Windows that are "Too weak" don't stop the look-back as if something had been on: the first that measured a
+    /// signal does, with one note, not also what its own longer read held. Only "Too weak" in 16 s is "No signal".
+    @Test func aTooWeakWindowDoesNotStopTheLookBack() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let ring = Self.zeroRing(rate: 48_000, seconds: 20, endTime: Date())
+        m.signalID.snapshotProvider = ring.snapshot
+        m.signalID.chunkProvider = ring.chunks
+        let windows = Locked(0), signalAt = Locked(2)
+        m.signalID.analysis = { a in
+            let offset = a.atHz - a.captureCenterHz
+            guard a.longer != nil else {
+                return SignalIdentity(measurement: SignalMeasurement(offsetHz: offset, family: .noise),
+                                      note: SignalIdentifier.noSignalNote)
+            }
+            let n = windows.withLock { $0 += 1; return $0 }
+            if n == signalAt.withLock({ $0 }) {
+                return SignalIdentity(measurement: SignalMeasurement(offsetHz: offset, occupiedBandwidthHz: 100,
+                                                                     family: .fsk, seconds: 3),
+                                      note: "Read 10.0 s of the 16 s asked for")
+            }
+            return SignalIdentity(measurement: SignalMeasurement(offsetHz: offset, family: .unknown, seconds: 3),
+                                  note: "Too weak to identify (SNR 2 dB)")
+        }
+        let id = try #require(await m.signalID.identify(atHz: m.centerHz + 5_000))
+        #expect(id.measurement.family == .fsk && id.note == SignalIDService.silentFor(6), "\(id.note ?? "no note")")
+        windows.withLock { $0 = 0 }
+        signalAt.withLock { $0 = 0 }   // never
+        let weak = try #require(await m.signalID.identify(atHz: m.centerHz + 9_000))
+        #expect(weak.note == SignalIdentifier.noSignalNote && windows.withLock { $0 } == 5, "\(weak.note ?? "no note")")
+    }
+
+    /// The comb's ring read keeps the retune's settle: a ring holding less than it asks for (0.3 s since the retune)
+    /// finds no comb (none of the old centre's IQ is read for it); one found while the first read is short (1.5 s) is
+    /// used but not kept; one found with 3 s of the tuning is kept. It is read before the first read, so that isn't held
+    /// meanwhile.
+    @Test func theCombIsNeverFoundOnTheRetunesSettle() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let found = Locked(0), order = Locked<[String]>([])
+        m.signalID.combFinder = { _, _, _ in
+            found.withLock { $0 += 1 }
+            return nil
+        }
+        m.signalID.analysis = Self.stub()
+        var point = m.centerHz
+        for (seconds, finds) in [(0.3, 0), (1.5, 2), (3.1, 1)] {
+            let ring = Self.zeroRing(rate: 48_000, seconds: seconds, endTime: Date())
+            m.signalID.snapshotProvider = { last in
+                if last >= SignalIDService.firstSeconds { order.withLock { $0.append("first") } }
+                return ring.snapshot(last)
+            }
+            m.signalID.chunkProvider = { last, frames, visit in
+                order.withLock { $0.append("comb") }
+                return ring.chunks(last, frames, visit)
+            }
+            m.signalID.retuneBegins()
+            m.signalID.retuned(displayCenterHz: m.centerHz)
+            found.withLock { $0 = 0 }
+            order.withLock { $0 = [] }
+            for _ in 0..<2 {
+                point += 1_000
+                _ = await m.signalID.identify(atHz: point)
+            }
+            #expect(found.withLock { $0 } == finds, "\(seconds) s since the retune: found \(found.withLock { $0 }) times")
+            #expect(order.withLock { $0 }.first == "comb", "\(seconds) s: \(order.withLock { $0 })")
+        }
+    }
+
+    /// A comb given for one tuning is never given to IQ heard in another (M1).
+    @Test nonisolated func aCombIsOnlyForItsTuning() {
+        let snap = Self.snapshot(.noise, seconds: 3.1, offsetHz: 0)
+        let barrier = TuneBarrier()
+        barrier.end(centerHz: 7_000_000)
+        let comb = CaptureComb(info: CombInfo(spacingHz: 6000, lineCount: 9), linesHz: [7_006_000])
+        let given = Locked<[CaptureComb?]>([])
+        let inner = Self.stub()
+        let analysis: SignalIDService.Analysis = { a in
+            given.withLock { $0.append(a.comb) }
+            return inner(a)
+        }
+        var other = barrier.current
+        other.sequence += 2
+        for state in [barrier.current, other] {
+            let request = SignalIDService.Request(atHz: 7_005_000, bandwidthHz: nil, spectrum: nil, longer: false,
+                                                  comb: SignalIDService.KnownComb(state: state,
+                                                                                  reading: .init(comb: comb)))
+            let finder: SignalIDService.CombFinder = { _, _, _ in nil }
+            let outcome = SignalIDService.run(request, provider: Self.provider(snap), chunks: Self.chunks(snap),
+                                              analysis: analysis, combFinder: finder, barrier: barrier)
+            #expect(outcome != nil)
+        }
+        #expect(given.withLock { $0 } == [comb, nil], "\(given.withLock { $0 })")
+        // Found now, then a retune before the first read (at its probe of the ring's rate): the comb is neither given to
+        // the new tuning's IQ nor kept for it.
+        let probes = Locked(0)
+        let inner2 = Self.provider(snap)
+        let retuning: SignalIDService.SnapshotProvider = { seconds in
+            if seconds <= SignalIDService.probeSeconds, probes.withLock({ $0 += 1; return $0 }) == 2 {
+                barrier.begin()
+                barrier.end(centerHz: 7_000_000)
+            }
+            return inner2(seconds)
+        }
+        given.withLock { $0 = [] }
+        let finder: SignalIDService.CombFinder = { _, _, _ in comb }
+        let outcome = SignalIDService.run(SignalIDService.Request(atHz: 7_005_000, bandwidthHz: nil, spectrum: nil,
+                                                                  longer: false),
+                                          provider: retuning, chunks: Self.chunks(snap), analysis: analysis,
+                                          combFinder: finder, barrier: barrier)
+        #expect(probes.withLock { $0 } >= 2)
+        #expect(given.withLock { $0 } == [nil] && outcome != nil && outcome?.comb == nil,
+                "\(given.withLock { $0 }), kept \(String(describing: outcome?.comb))")
+    }
+
+    // MARK: Fix round 2: a ring that moves on
+
+    /// A ring at `rate` that moves on with `clock` (its end, in seconds), as the radio's does: it holds `holds` seconds,
+    /// says where its reads end (`endFrame`) and when (`endTime`, the clock), and a read of the chunked kind takes
+    /// `readCost` of clock a second it visits. Its IQ is zeros, with a tone `toneHz` from the centre while the ring's
+    /// position lies in `tone` (seconds on the clock). Made a piece at a time, never held. `lag`: the ring moves on that
+    /// much just after each probe of its rate says where it ends (a read then finds it further on). `stopped`: the radio
+    /// is stopped, so the ring ends where it did at the start while its reads are stamped with the clock, as the
+    /// recorder stamps them.
+    nonisolated private static func movingRing(rate: Double, clock: Locked<Double>, holds: Double = 30,
+                                               readCost: Double = 0.03, toneHz: Double = 5_000,
+                                               tone: ClosedRange<Double>? = nil, lag: Double = 0,
+                                               stopped: Bool = false)
+        -> (snapshot: SignalIDService.SnapshotProvider, chunks: SignalIDService.ChunkProvider) {
+        @Sendable func fill(_ out: inout [Float], from first: Int, count: Int) {
+            out.withUnsafeMutableBufferPointer { $0.update(repeating: 0) }
+            guard let tone, Double(first + count) / rate >= tone.lowerBound,
+                  Double(first) / rate <= tone.upperBound else { return }
+            for k in 0..<count {
+                let n = first + k
+                guard tone ~= Double(n) / rate else { continue }
+                let phase = 2 * Double.pi * toneHz * Double(n) / rate
+                out[2 * k] = Float(cos(phase))
+                out[2 * k + 1] = Float(sin(phase))
+            }
+        }
+        let stoppedAt = clock.withLock { $0 }
+        @Sendable func ringEnd(_ now: Double) -> Int { Int(((stopped ? stoppedAt : now) * rate).rounded()) }
+        let snapshot: SignalIDService.SnapshotProvider = { last in
+            let now = clock.withLock { $0 }
+            if last <= SignalIDService.probeSeconds { clock.withLock { $0 += lag } }
+            let end = ringEnd(now), frames = min(Int((last * rate).rounded()), Int(holds * rate))
+            var samples = [Float](repeating: 0, count: 2 * frames)
+            fill(&samples, from: end - frames, count: frames)
+            return IQSnapshot(samples: samples, sampleRate: rate, endTime: Date(timeIntervalSinceReferenceDate: now),
+                              endFrame: end)
+        }
+        let chunks: SignalIDService.ChunkProvider = { last, chunkFrames, visit in
+            let now = clock.withLock { $0 }
+            let end = ringEnd(now), frames = min(Int((last * rate).rounded()), Int(holds * rate))
+            var piece = [Float](repeating: 0, count: 2 * min(chunkFrames, frames))
+            var done = 0
+            while done < frames {
+                let n = min(chunkFrames, frames - done)
+                fill(&piece, from: end - frames + done, count: n)
+                guard piece[0..<(2 * n)].withUnsafeBufferPointer(visit) else { return nil }
+                done += n
+            }
+            clock.withLock { $0 += readCost * Double(frames) / rate }
+            return IQRead(frames: frames, sampleRate: rate, endTime: Date(timeIntervalSinceReferenceDate: now),
+                          endFrame: end)
+        }
+        return (snapshot, chunks)
+    }
+
+    /// The look-back on a ring that moves on while it works (N1): each analysis takes 0.35 s or 0.6 s of the test's
+    /// clock and each read 3 % of what it visits, at the channel rates of 10 MS/s and 6 MS/s. Its span is fixed in sample
+    /// time when it starts, so every window holds its own 3 s (the last its 1 s), in one read and two; "No signal" is
+    /// right, says nothing more, and is kept. With a signal heard 9 to 12 s before the first read ended, that is the
+    /// answer, 9 s back.
+    @Test func aLookBackOnAMovingRing() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        for (rate, reads, cost) in [(625_000.0, 1, 0.35), (750_000.0, 2, 0.6)] {
+            do {
+                let clock = Locked(1_000.0)
+                let ring = Self.movingRing(rate: rate, clock: clock)
+                m.signalID.snapshotProvider = ring.snapshot
+                m.signalID.chunkProvider = ring.chunks
+                m.signalID.invalidateCache()
+                let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
+                let silence = Self.silence(seen)
+                m.signalID.analysis = { a in
+                    clock.withLock { $0 += cost }
+                    return silence(a)
+                }
+                let before = m.signalID.lookBackStats.withLock { $0.reads }
+                let at = m.centerHz + 5_000
+                let id = try #require(await m.signalID.identify(atHz: at))
+                let label = "\(rate) S/s, \(cost) s an analysis"
+                #expect(id.note == SignalIdentifier.noSignalNote, "\(label): \(id.note ?? "no note")")
+                #expect(m.signalID.lookBackStats.withLock { $0.reads } - before == reads, "\(label)")
+                let windows = seen.withLock { $0 }.filter(\.longer).map(\.seconds)
+                #expect(windows.count == 5 && zip(windows, [3.0, 3, 3, 3, 1]).allSatisfy { $0 >= $1 - 0.06 },
+                        "\(label): \(windows)")
+                let runs = seen.withLock { $0.count }
+                _ = await m.signalID.identify(atHz: at)
+                #expect(seen.withLock { $0.count } == runs, "\(label): not kept")
+            }
+        }
+        // A signal 8.6 to 12 s before the first read's end, at the 6 MS/s channel rate (two reads): the windows ending 3
+        // and 6 s back are mostly silent.
+        do {
+            let rate = 750_000.0
+            let clock = Locked(1_000.0)
+            let ring = Self.movingRing(rate: rate, clock: clock, tone: (1_000 - 12)...(1_000 - 8.6))
+            m.signalID.snapshotProvider = ring.snapshot
+            m.signalID.chunkProvider = ring.chunks
+            m.signalID.invalidateCache()
+            m.signalID.analysis = { a in
+                clock.withLock { $0 += 0.6 }
+                // Something there when the window's newest 3 s (or all it holds) are mostly tone.
+                let frames = min(a.iq.count / 2, Int(3 * a.sampleRate))
+                var power = 0.0
+                for k in (a.iq.count / 2 - frames)..<(a.iq.count / 2) {
+                    power += Double(a.iq[2 * k] * a.iq[2 * k] + a.iq[2 * k + 1] * a.iq[2 * k + 1])
+                }
+                let on = power / Double(max(frames, 1)) > 0.5
+                return SignalIdentity(measurement: SignalMeasurement(offsetHz: a.atHz - a.captureCenterHz,
+                                                                     occupiedBandwidthHz: on ? 100 : 0,
+                                                                     family: on ? .carrier : .noise, seconds: 3),
+                                      note: on ? nil : SignalIdentifier.noSignalNote)
+            }
+            let found = try #require(await m.signalID.identify(atHz: m.centerHz + 5_000))
+            #expect(found.measurement.family == .carrier && found.note == SignalIDService.silentFor(9),
+                    "\(rate): \(found.note ?? "no note")")
+        }
+    }
+
+    /// A look-back that reaches its most reads before covering its span says so (not that a read failed), and isn't
+    /// kept (N2).
+    @Test func aLookBackStopsAtItsMostReads() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let clock = Locked(1_000.0)
+        let ring = Self.movingRing(rate: 750_000, clock: clock)   // a 375 kS/s channel: two reads
+        m.signalID.snapshotProvider = ring.snapshot
+        m.signalID.chunkProvider = ring.chunks
+        m.signalID.lookBackReads = 1
+        let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
+        m.signalID.analysis = Self.silence(seen)
+        let at = m.centerHz + 5_000
+        let id = try #require(await m.signalID.identify(atHz: at))
+        #expect(id.note == "\(SignalIdentifier.noSignalNote); \(SignalIDService.lookBackStopped(after: 1))",
+                "\(id.note ?? "no note")")
+        let runs = seen.withLock { $0.count }
+        _ = await m.signalID.identify(atHz: at)
+        #expect(seen.withLock { $0.count } > runs, "kept")
+    }
+
+    /// A ring that outruns where its probe said it ended, past the 0.25 s margin, never makes the look-back read again.
+    /// Outrun by 0.5 s, the oldest window loses what the ring moved past and too little of it is left (under 1 s): it is
+    /// passed over, the look-back covers 15 s, and says the ring moved on (not kept). Outrun by 1.5 s, the window 12 to
+    /// 15 s back is analysed with what it holds (2.75 s), and the look-back covers 14.75 s. One read each.
+    @Test func aRingThatOutrunsItsProbe() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        for (lag, note, kept) in [(0.5, SignalIdentifier.noSignalNote + "; Looked back 15.0 s of the 16 s asked for: the ring moved on",
+                                   false),
+                                  (1.5, SignalIdentifier.noSignalNote + "; Looked back 14.8 s of the 16 s asked for: the ring moved on",
+                                   false)] {
+            let clock = Locked(1_000.0)
+            let ring = Self.movingRing(rate: 625_000, clock: clock, lag: lag)
+            m.signalID.snapshotProvider = ring.snapshot
+            m.signalID.chunkProvider = ring.chunks
+            m.signalID.invalidateCache()
+            let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
+            m.signalID.analysis = Self.silence(seen)
+            let before = m.signalID.lookBackStats.withLock { $0.reads }
+            let at = m.centerHz + 5_000
+            let id = try #require(await m.signalID.identify(atHz: at))
+            #expect(id.note == note, "\(lag) s: \(id.note ?? "no note")")
+            #expect(m.signalID.lookBackStats.withLock { $0.reads } - before == 1, "\(lag) s")
+            let runs = seen.withLock { $0.count }
+            _ = await m.signalID.identify(atHz: at)
+            #expect((seen.withLock { $0.count } == runs) == kept, "\(lag) s: kept \(kept)")
+        }
+    }
+
+    /// A ring rebuilt after the first read (`StreamRecorder.configure` on a change of plan: its frames count from 0
+    /// again) can't be placed against the look-back's span: a probe, or a read, that ends before the ring was last seen
+    /// to end gives no look-back, said in the note, and nothing is kept (the next call reads again), never the newest
+    /// frames analysed as the windows before them.
+    @Test func aRebuiltRingHasNoLookBack() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let rate = 48_000.0
+        for readDrops in [false, true] {
+            // 30 s in the ring at first; once the first pass has run, 2 s (seen by the probe, or only by the read).
+            let rebuilt = Locked(false)
+            @Sendable func end(probe: Bool) -> Int {
+                rebuilt.withLock { $0 } && !(probe && readDrops) ? Int(2 * rate) : Int(30 * rate)
+            }
+            m.signalID.snapshotProvider = { last in
+                let end = end(probe: last <= SignalIDService.probeSeconds)
+                let frames = min(end, Int((last * rate).rounded()))
+                return IQSnapshot(samples: [Float](repeating: 0, count: 2 * frames), sampleRate: rate, endTime: Date(),
+                                  endFrame: end)
+            }
+            m.signalID.chunkProvider = { last, chunkFrames, visit in
+                let end = end(probe: false)
+                let frames = min(end, Int((last * rate).rounded()))
+                let piece = [Float](repeating: 0, count: 2 * min(chunkFrames, frames))
+                var done = 0
+                while done < frames {
+                    let n = min(chunkFrames, frames - done)
+                    guard piece[0..<(2 * n)].withUnsafeBufferPointer(visit) else { return nil }
+                    done += n
+                }
+                return IQRead(frames: frames, sampleRate: rate, endTime: Date(), endFrame: end)
+            }
+            m.signalID.invalidateCache()
+            let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
+            let silence = Self.silence(seen)
+            m.signalID.analysis = { a in
+                if a.longer == nil { rebuilt.withLock { $0 = true } }
+                return silence(a)
+            }
+            let at = m.centerHz + 5_000
+            let id = try #require(await m.signalID.identify(atHz: at))
+            let label = readDrops ? "the read ends before the ring did" : "the probe ends before the ring did"
+            #expect(id.note == SignalIdentifier.noSignalNote + "; " + SignalIDService.lookBackFailedNote,
+                    "\(label): \(id.note ?? "no note")")
+            #expect(seen.withLock { $0.filter(\.longer).isEmpty }, "\(label): the newest frames were analysed as a window")
+            // Not kept: asked again, the point is read again.
+            _ = await m.signalID.identify(atHz: at)
+            #expect(seen.withLock { $0.filter { !$0.longer }.count } == 2, "\(label): kept")
+        }
+    }
+
+    /// The radio stopped: the ring ends where it did, though each read is stamped with the clock as it is made. Placed
+    /// in sample time, every window still holds its own 3 s (by the reads' end times it would be placed 0.6 s an analysis
+    /// off).
+    @Test func aStoppedRingIsPlacedBySampleTime() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let clock = Locked(1_000.0)
+        let ring = Self.movingRing(rate: 625_000, clock: clock, stopped: true)
+        m.signalID.snapshotProvider = ring.snapshot
+        m.signalID.chunkProvider = ring.chunks
+        let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
+        let silence = Self.silence(seen)
+        m.signalID.analysis = { a in
+            clock.withLock { $0 += 0.6 }
+            return silence(a)
+        }
+        let id = try #require(await m.signalID.identify(atHz: m.centerHz + 5_000))
+        #expect(id.note == SignalIdentifier.noSignalNote, "\(id.note ?? "no note")")
+        let windows = seen.withLock { $0 }.filter(\.longer).map(\.seconds)
+        // Each window and what came before it, and the read's margin at its old end (the ring didn't move into it).
+        let margin = SignalIDService.lookBackMarginSeconds
+        #expect(windows.count == 5 && zip(windows, [13.0, 10, 7, 4, 1]).allSatisfy { abs($0 - ($1 + margin)) < 0.06 },
+                "\(windows)")
     }
 }

@@ -28,7 +28,7 @@ public enum SynthSpec: Sendable, Hashable {
     case psk(PSK)
     /// OFDM with a cyclic prefix.
     case ofdm(OFDM)
-    /// The inner signal keyed on and off on a fixed schedule (TDMA bursts, FT8/FT4/WSPR slots).
+    /// The inner signal keyed on and off on a fixed schedule (TDMA bursts, FT8, FT4 and WSPR slots).
     indirect case bursts(SynthSpec, Bursts)
 
     /// What modulates an AM or FM carrier. Every kind is peak-normalised to ±1.
@@ -200,6 +200,12 @@ public enum SynthSpec: Sendable, Hashable {
     /// `SignalSynth.occupiedBandwidthHz(for:)`).
     public var occupiedBandwidthHz: Double { SignalSynth.occupiedBandwidthHz(for: self) }
 
+    /// The FSK it is, when it is one.
+    var keyedFSK: FSK? {
+        if case .fsk(let f) = self { return f }
+        return nil
+    }
+
     /// The lowest capture rate that holds the signal comfortably (1.25 × its occupied bandwidth).
     public var minimumSampleRate: Double { max(1.25 * occupiedBandwidthHz, 100) }
 }
@@ -212,11 +218,15 @@ public struct SynthImpairments: Sendable, Equatable {
     public var fadeDepthDb: Double
     /// Typical rate of the fade.
     public var fadeRateHz: Double
+    /// An FSK's one tone that fades, alone (selective fading); `fadeDepthDb` and `fadeRateHz` then say how. Nil: all of it.
+    public var fadingToneIndex: Int?
 
-    public init(driftHzPerSecond: Double = 0, fadeDepthDb: Double = 0, fadeRateHz: Double = 0.2) {
+    public init(driftHzPerSecond: Double = 0, fadeDepthDb: Double = 0, fadeRateHz: Double = 0.2,
+                fadingToneIndex: Int? = nil) {
         self.driftHzPerSecond = driftHzPerSecond
         self.fadeDepthDb = fadeDepthDb
         self.fadeRateHz = fadeRateHz
+        self.fadingToneIndex = fadingToneIndex
     }
 
     public static let none = SynthImpairments()
@@ -254,6 +264,103 @@ public enum SignalSynth {
         return out
     }
 
+    /// One of several signals in a capture (`several`): at `offsetHz`, `snrDb` over the noise in its own occupied bandwidth,
+    /// with its own channel effects (a station fading while its neighbours hold).
+    public struct Placed: Sendable {
+        public var spec: SynthSpec
+        public var offsetHz: Double
+        public var snrDb: Double
+        public var seed: UInt64
+        public var impairments: SynthImpairments
+
+        public init(_ spec: SynthSpec, offsetHz: Double, snrDb: Double, seed: UInt64, impairments: SynthImpairments = .none) {
+            self.spec = spec
+            self.offsetHz = offsetHz
+            self.snrDb = snrDb
+            self.seed = seed
+            self.impairments = impairments
+        }
+    }
+
+    /// Several signals in one capture over the same noise (a band of FT8 stations): each as `make` would put it alone, the
+    /// noise from `noiseSeed`, of unit power over the whole sample rate.
+    public static func several(_ signals: [Placed], sampleRate: Double, seconds: Double, noiseSeed: UInt64) -> [Float] {
+        var out = make(.noise, sampleRate: sampleRate, seconds: seconds, snrDb: 0, seed: noiseSeed)
+        for signal in signals {
+            let x = render(signal.spec, sampleRate: sampleRate, seconds: seconds, offsetHz: signal.offsetHz, seed: signal.seed,
+                           impairments: signal.impairments)
+            let gain = Float((pow(10, signal.snrDb / 10) * occupiedBandwidthHz(for: signal.spec) / sampleRate).squareRoot())
+            for k in 0..<min(out.count, x.count) { out[k] += gain * x[k] }
+        }
+        return out
+    }
+
+    /// One tone of an FSK fading by up to `depthDb` while the others hold, as selective fading does.
+    public static func fading(toneIndex: Int, depthDb: Double, rateHz: Double = 0.5) -> SynthImpairments {
+        SynthImpairments(fadeDepthDb: depthDb, fadeRateHz: rateHz, fadingToneIndex: toneIndex)
+    }
+
+    /// When a capture `seconds` long of `spec` ends by UTC, its bursts' schedule on UTC boundaries as a slot mode's is
+    /// (each period starting on a whole multiple of it, counted from `slotEpoch`), read by a clock `clockErrorSeconds`
+    /// fast. Nil for a spec without bursts.
+    public static func endTime(_ spec: SynthSpec, seconds: Double, clockErrorSeconds: Double = 0) -> Date? {
+        guard case .bursts(_, let bursts) = spec else { return nil }
+        return Date(timeIntervalSince1970: slotEpoch + bursts.captureStartSeconds + seconds + clockErrorSeconds)
+    }
+
+    /// 2026-11-01 18:00:00 UTC: a whole number of 2 min, 15 s and 7.5 s slots since 1970.
+    public static let slotEpoch = 1_793_556_000.0
+
+    /// `iq` with its level changed by `db` from `atSeconds` on, signal and noise alike: a receiver's gain changing.
+    public static func levelStep(_ iq: [Float], sampleRate: Double, atSeconds: Double, db: Double) -> [Float] {
+        var out = iq
+        let gain = Float(pow(10, db / 20))
+        let start = min(out.count, 2 * max(0, Int((atSeconds * sampleRate).rounded())))
+        for k in start..<out.count { out[k] *= gain }
+        return out
+    }
+
+    /// An interference comb to add to a capture: `count` steady lines `spacingHz` apart from `firstHz` (from the capture
+    /// centre), each of `amplitude` (a unit tone reads 0 dB) with its own phase, jittering in frequency about ±`wanderHz`
+    /// (the sum of `wanderTerms` sinusoids of its own, 8 to 40 Hz: each moment shows the whole even hump, its peak where
+    /// it was, as the owner's comb's lines do, about 130 Hz wide). The lines at `skipping` (indices from 0) are left out,
+    /// for something else to sit on the grid.
+    public static func comb(firstHz: Double, spacingHz: Double, count: Int, amplitude: Float, sampleRate: Double,
+                            seconds: Double, wanderHz: Double = 0, skipping: Set<Int> = [], seed: UInt64) -> [Float] {
+        let n = Int((seconds * sampleRate).rounded())
+        var out = [Float](repeating: 0, count: 2 * n)
+        var random = SynthRandom(seed: seed, stream: 4)
+        var phase = [Float](repeating: 0, count: n)
+        var sine = [Float](repeating: 0, count: n), cosine = [Float](repeating: 0, count: n)
+        // The wander, worked out every `wanderStep` samples (0.25 ms) and held between.
+        let wanderStep = max(1, Int(sampleRate / 4000))
+        for line in 0..<count {
+            let start = random.uniform() * 2 * Double.pi
+            let terms = (0..<wanderTerms).map { _ in (rate: random.uniform(8...40), phase: random.uniform() * 2 * Double.pi) }
+            guard !skipping.contains(line) else { continue }
+            let hz = firstHz + Double(line) * spacingHz
+            var p = start, wander = 0.0
+            for k in 0..<n {
+                if wanderHz != 0 && k % wanderStep == 0 {
+                    let t = Double(k) / sampleRate
+                    wander = wanderHz / 3 * terms.reduce(0) { $0 + sin(2 * Double.pi * $1.rate * t + $1.phase) }
+                }
+                p += 2 * Double.pi * (hz + wander) / sampleRate
+                if abs(p) > Double.pi { p -= 2 * Double.pi * (p / (2 * Double.pi)).rounded() }
+                phase[k] = Float(p)
+            }
+            var count32 = Int32(n)
+            vvsincosf(&sine, &cosine, phase, &count32)
+            for k in 0..<n {
+                out[2 * k] += amplitude * cosine[k]
+                out[2 * k + 1] += amplitude * sine[k]
+            }
+        }
+        return out
+    }
+
+    static let wanderTerms = 5
+
     /// The noise-free signal at unit mean power.
     static func render(_ spec: SynthSpec, sampleRate: Double, seconds: Double, offsetHz: Double = 0, seed: UInt64,
                        impairments: SynthImpairments = .none) -> [Float] {
@@ -270,7 +377,7 @@ public enum SignalSynth {
         var random = SynthRandom(seed: seed, stream: 0)
         var x = SynthModulators.baseband(spec, rate: rate, count: used + SynthDSP.interpolatorHalfSpan + 1,
                                          random: &random)
-        SynthDSP.impair(&x, impairments, rate: rate, seconds: Double(used) / rate, random: &random)
+        SynthDSP.impair(&x, impairments, fsk: spec.keyedFSK, rate: rate, seconds: Double(used) / rate, random: &random)
         x.normalisePower(over: used)
         SynthDSP.interpolate(x, factor: factor, into: &out, count: n)
         if offsetHz != 0 { SynthDSP.mix(&out, frequency: offsetHz, sampleRate: sampleRate) }

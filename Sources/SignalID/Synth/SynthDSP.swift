@@ -214,7 +214,8 @@ enum SynthDSP {
     // MARK: Impairments
 
     /// Linear drift (centred on the middle of the span) and a smooth fade of up to `fadeDepthDb`.
-    static func impair(_ x: inout Baseband, _ impairments: SynthImpairments, rate: Double, seconds: Double,
+    static func impair(_ x: inout Baseband, _ impairments: SynthImpairments, fsk: SynthSpec.FSK? = nil, rate: Double,
+                       seconds: Double,
                        random: inout SynthRandom) {
         let n = x.count
         let drift = impairments.driftHzPerSecond
@@ -236,8 +237,25 @@ enum SynthDSP {
                 let u = 0.5 + s / 6                         // 0…1
                 return Float(pow(10, -depth * u / 20))
             }
-            x.multiply(by: gain)
+            if let tone = impairments.fadingToneIndex, let fsk {
+                x.multiply(by: selective(gain, x: x, fsk: fsk, tone: tone, rate: rate))
+            } else {
+                x.multiply(by: gain)
+            }
         }
+    }
+
+    /// `gain` where `x` (an FSK at its working rate, not yet faded, centred) sits nearest tone `tone`, and 1 elsewhere.
+    private static func selective(_ gain: [Float], x: Baseband, fsk: SynthSpec.FSK, tone: Int, rate: Double) -> [Float] {
+        let centre = Double(fsk.tones - 1) / 2
+        let toneHz = (Double(tone) - centre) * fsk.spacingHz
+        var out = [Float](repeating: 1, count: x.count)
+        for k in 1..<max(1, x.count) {
+            let re = x.re[k] * x.re[k - 1] + x.im[k] * x.im[k - 1], im = x.im[k] * x.re[k - 1] - x.re[k] * x.im[k - 1]
+            let hz = Double(atan2(im, re)) * rate / (2 * .pi)
+            if abs(hz - toneHz) < fsk.spacingHz / 2 { out[k] = gain[k] }
+        }
+        return out
     }
 
     // MARK: Shaped noise

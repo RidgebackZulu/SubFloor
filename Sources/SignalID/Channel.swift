@@ -114,7 +114,8 @@ public struct Channel {
         /// Passes the band, stops whatever would alias onto ±bandwidth/2 at the output rate.
         static func antiAlias(rate: Double, factor: Int, bandwidth: Double) -> Stage {
             let pass = bandwidth / 2
-            let stop = rate / Double(factor) - pass
+            // A channel as wide as the rate leaves no transition to design: nothing can alias, and it stays that wide.
+            let stop = max(rate / Double(factor) - pass, pass * 1.01)
             return Stage(rate: rate, factor: factor, pass: pass, stop: stop)
         }
 

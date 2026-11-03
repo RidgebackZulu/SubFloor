@@ -95,7 +95,9 @@ private struct SignalIDCardPopover: View {
                      arrowEdge: .trailing) {
                 if let card = model.signalID.card, card.id == cardID {
                     SignalIDCard(identity: card.identity, atHz: card.signalHz, pending: card.pending,
-                                 measuring: card.measuring) { model.signalID.closeCard(id: cardID) }
+                                 measuring: card.measuring, decoding: card.decoding) {
+                        model.signalID.closeCard(id: cardID)
+                    }
                 }
             }
             .position(x: point.x, y: point.y)

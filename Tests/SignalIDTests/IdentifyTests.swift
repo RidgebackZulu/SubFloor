@@ -40,7 +40,8 @@ import Testing
         case "RTTY": p.rfHz = 14_085_000
         case "NAVTEX / SITOR-B": p.rfHz = 518_000
         case "PSK31 / PSK63": p.rfHz = 14_071_000
-        case "FT8 / FT4": p.rfHz = spec.label.hasPrefix("FT4") ? 14_081_500 : 14_075_500
+        case "FT8": p.rfHz = 14_075_500
+        case "FT4": p.rfHz = 14_081_500
         case "WSPR": p.rfHz = 14_097_100
         case "Olivia": p.rfHz = 14_106_000
         case "MFSK16": p.rfHz = 14_108_000
@@ -80,7 +81,7 @@ import Testing
     /// a transmission); wider captures get `p.seconds`, and a slow pass synthesises its 16 s afresh.
     static func capture(_ p: Placement, snr: Double, seed: UInt64) -> (iq: [Float], longer: () -> (iq: [Float], seconds: Double)?) {
         var spec = p.spec
-        // FT8/FT4: the newest 3 s inside a transmission, at a slot phase that varies with the seed.
+        // FT8 and FT4: the newest 3 s inside a transmission, at a slot phase that varies with the seed.
         if case .bursts(let inner, var bursts) = spec, bursts.periodSeconds < 60 {
             let end = bursts.startSeconds + 3.5 + Double(seed % 7) / 7 * (bursts.onSeconds - 3.5)
             bursts.captureStartSeconds = (end - longSeconds).truncatingRemainder(dividingBy: bursts.periodSeconds)
@@ -114,18 +115,35 @@ import Testing
 
     // MARK: Every row
 
-    /// Each row's first placement (the time signal's last: WWV at 5 MHz, inside the 60 m broadcast band, R22), or with
+    /// Each row's first placement (the time signal's last: WWV at 5 MHz, inside the 60 m broadcast band, R22), but for
+    /// the rows another default test names from a synthetic capture through `identify(iq:…)` (`namedElsewhere`); or with
     /// the matrix every placement.
     static var namedPlacements: [Int] {
         guard !Sweep.full else { return Array(placements.indices) }
         let wwv = placements.count - 1
         return placements.indices.filter { i in
             placements[i].name == placements[wwv].name ? i == wwv
-                : !placements[..<i].contains { $0.name == placements[i].name }
+                : !placements[..<i].contains { $0.name == placements[i].name } && namedElsewhere[placements[i].name] == nil
         }
     }
 
-    /// Each row, synthesised at 20 dB at a frequency inside its hints, is named.
+    /// The rows a default run names in another test, and that test: `eachRowIsNamed` names them only with the matrix, so
+    /// each row is still named once by default (Task 10's load pass; each was shown by a mutation of its row).
+    static let namedElsewhere = [
+        "SSB voice (USB/LSB)": "GroupAnswerTests.aPointInAnAreaIsThatSignal",
+        "AM voice/broadcast": "InterferenceCombTests.aStationOnACombPlaceKeepsItsName",
+        "CW": "InterferenceCombTests.keyedSignalOnTheGridIsNamed",
+        "RTTY": "GroupAnswerTests.oneSignalIsUnchanged",
+        "NAVTEX / SITOR-B": "IdentifyTests.anAgentsBandwidthIsTheSeed",
+        "PSK31 / PSK63": "SlotEvidenceTests.pskInASlotModesFrequenciesWaits",
+        "FT8": "SlotEvidenceTests.ft8AndFT4AreToldApart",
+        "FT4": "SlotEvidenceTests.ft8AndFT4AreToldApart",
+        "WSPR": "IdentifyTests.wsprNeedsTheLongerRead",
+        "NFM voice": "IdentifyTests.identifyFirstPassBudget",
+    ]
+
+    /// Each row, synthesised at 20 dB at a frequency inside its hints, is named. (By default, the rows no other default
+    /// test names: `namedPlacements`.)
     @Test(arguments: namedPlacements)
     func eachRowIsNamed(index: Int) {
         let p = Self.placements[index]
@@ -206,9 +224,10 @@ import Testing
     }
 
     /// Weak CW: its SNR read 1–5 dB high on 3 s, the occupied width narrow under the noise (R12). The slow pass reads
-    /// it again and its width comes from its keying speed (R16), and its SNR is then within −2/+4 dB (R18).
+    /// it again and its width comes from its keying speed (R16), and its SNR is then within −2/+4 dB (R18). (By default
+    /// 20 WPM alone; 8 and 40 WPM with the matrix.)
     @Test func weakCWSNRAfterTheSlowPass() {
-        for (index, wpm) in [20.0, 8, 40].enumerated() {
+        for (index, wpm) in Sweep.cases([20.0, 8, 40], default: [0]) {
             let cw = Placement(name: "CW", spec: .cw(wpm: wpm), rfHz: 7_020_000)
             for seed in Sweep.seeds(UInt64(27 + 2 * index)...UInt64(28 + 2 * index)) {
                 let id = Self.identified(cw, snr: 10, seed: seed)
@@ -223,12 +242,15 @@ import Testing
         }
     }
 
+    /// 3 s at 2 MS/s with a 12.5 kHz NFM 250 kHz from the centre: made once for the two tests that time a first pass on it.
+    static let wideNFMRate = 2_000_000.0
+    static let wideNFM = SignalSynth.make(.nfmVoice(deviationHz: 5000), sampleRate: wideNFMRate, seconds: 3, snrDb: 20,
+                                          offsetHz: 250_000, seed: 7)
+
     /// The whole first pass as the app runs it (the read's own spectra, the extent, the measurement and the match)
     /// on 3 s at 2 MS/s with a 12.5 kHz NFM: ≤ 150 ms in a release build, like `firstPassBudget`.
     @Test func identifyFirstPassBudget() {
-        let fs = 2_000_000.0
-        let iq = SignalSynth.make(.nfmVoice(deviationHz: 5000), sampleRate: fs, seconds: 3, snrDb: 20,
-                                  offsetHz: 250_000, seed: 7)
+        let fs = Self.wideNFMRate, iq = Self.wideNFM
         func run() -> SignalIdentity {
             SignalIdentifier.identify(iq: iq, sampleRate: fs, captureCenterHz: 446_000_000 - 250_000,
                                       atHz: 446_000_000, bandwidthHz: nil, spectrumDb: nil, longer: nil)
@@ -345,8 +367,9 @@ import Testing
         let sitor = SignalMeasurement(occupiedBandwidthHz: 1300, snrDb: 20, envelope: .steady, family: .fsk,
                                       familyConfidence: 1, symbolRate: 50, fskShiftHz: 850, toneCount: 2,
                                       toneSpacingHz: 850, seconds: 3)
-        // 850 Hz RTTY outside the amateur segments (weather, military) is still RTTY by its parameters.
-        #expect(SignalIdentifier.identify(sitor, rfHz: 8_000_000).best?.name == "RTTY")
+        // RTTY's numbers outside the amateur segments (weather, military) aren't shown to be RTTY: the spec's "2-FSK".
+        #expect(SignalIdentifier.identify(sitor, rfHz: 8_000_000).best == nil)
+        #expect(SignalIdentifier.identify(sitor, rfHz: 8_000_000).label == "2-FSK · 50 Bd · 850 Hz shift")
         var unnamed = sitor
         unnamed.symbolRate = 57
         #expect(SignalIdentifier.identify(unnamed, rfHz: 8_000_000).label == "2-FSK · 57 Bd · 850 Hz shift")
@@ -356,9 +379,7 @@ import Testing
     /// on): the first pass on 3 s at 2 MS/s, cancelled once it is under way, returns with the cancelled note before
     /// a whole pass's time (about 50 ms against 1.2 s unloaded). Under heavy load the pass can finish before the cancel lands: that run is tolerated.
     @Test func cancellingStopsPromptly() async {
-        let fs = 2_000_000.0
-        let iq = SignalSynth.make(.nfmVoice(deviationHz: 5000), sampleRate: fs, seconds: 3, snrDb: 20,
-                                  offsetHz: 250_000, seed: 7)
+        let fs = Self.wideNFMRate, iq = Self.wideNFM
         @Sendable func run() -> SignalIdentity {
             SignalIdentifier.identify(iq: iq, sampleRate: fs, captureCenterHz: 446_000_000 - 250_000,
                                       atHz: 446_000_000, bandwidthHz: nil, spectrumDb: nil, longer: nil)
@@ -524,9 +545,9 @@ import Testing
                                            captureCenterHz: 14_074_000, atHz: 14_074_000 + audioHz, bandwidthHz: nil,
                                            spectrumDb: nil, longer: { (iq, Double(iq.count / 2) / rate) })
         print("realFT8Track at \(audioHz) Hz: \(Self.describe(id)) needsLongerRead \(id.needsLongerRead)")
-        #expect(id.best == nil || id.best?.name == "FT8 / FT4", "FT8 at \(audioHz) Hz: \(Self.describe(id))")
-        let offered = id.best?.name == "FT8 / FT4"
-            || (id.needsLongerRead && id.alternatives.contains { $0.name == "FT8 / FT4" })
+        #expect(id.best == nil || id.best?.name == "FT8", "FT8 at \(audioHz) Hz: \(Self.describe(id))")
+        let offered = id.best?.name == "FT8"
+            || (id.needsLongerRead && id.alternatives.contains { $0.name == "FT8" })
         #expect(offered, "FT8 at \(audioHz) Hz: \(Self.describe(id)), needsLongerRead \(id.needsLongerRead)")
     }
 

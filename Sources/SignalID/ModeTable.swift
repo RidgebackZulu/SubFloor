@@ -4,8 +4,8 @@ import Foundation
 /// sets it may have, and its frequency hints in display Hz.
 ///
 /// A row's parameter score (`ModeTable.score`) is the weighted mean of its features' matches, each from −1 (a
-/// mismatch) to +1, the family counting with weight 2; a row with several variants (FT8 and FT4, NXDN's two
-/// speeds) takes its best. Hints never name a signal on their own: `SignalIdentifier` adds them afterwards.
+/// mismatch) to +1, the family counting with weight 2; a row with several variants (NXDN's two speeds) takes its
+/// best. Hints never name a signal on their own: `SignalIdentifier` adds them afterwards.
 public struct ModeRow: Sendable {
     public let name: String
     /// The families it is measured as.
@@ -19,16 +19,25 @@ public struct ModeRow: Sendable {
     /// Slots, fax lines or ticks: a candidate asks for the longer read (the spec's slow-signal rule).
     let needsTiming: Bool
     /// Transmits in slots with silence between (FT8, FT4): the longer read measures one transmission.
-    let slotted: Bool
+    public let slotted: Bool
     /// Its longest transmission (FT8's 79 symbols, 12.64 s): a shorter read can't show all of one.
     let slotSeconds: Double
-    /// How its FSK is keyed by its standard (WSPR and MFSK16 rectangular, FT8/FT4 and Olivia Gaussian): when
+    /// Its slots, on UTC boundaries (FT8's 15 s, FT4's 7.5 s); 0 for a row without them.
+    public let slotPeriodSeconds: Double
+    /// How its FSK is keyed by its standard (WSPR and MFSK16 rectangular, FT8, FT4 and Olivia Gaussian): when
     /// named, its width comes from its parameters where the edges sit under the noise (`ParameterWidth`, R16).
     let shaping: ParameterWidth.Shaping?
+    /// Its numbers are shared by what isn't it, so they can't name it alone: it takes its hint's frequencies, or a
+    /// readable decode. Otherwise it is offered, below the name threshold (RTTY: the same keying is used well outside the
+    /// amateur bands, by stations that aren't sending RTTY).
+    let requiresHintOrDecode: Bool
+    /// What its numbers can't tell it from, said with its name.
+    let caveat: String?
 
     init(_ name: String, _ families: Set<SignalFamily>, partial: [SignalFamily: Double] = [:],
          _ variants: [[ModeFeature]], hints: [ModeHint] = [], needsTiming: Bool = false, slotted: Bool = false,
-         slotSeconds: Double = 0, shaping: ParameterWidth.Shaping? = nil) {
+         slotSeconds: Double = 0, slotPeriodSeconds: Double = 0, shaping: ParameterWidth.Shaping? = nil,
+         requiresHintOrDecode: Bool = false, caveat: String? = nil) {
         self.name = name
         self.families = families
         self.partialFamilies = partial
@@ -37,7 +46,17 @@ public struct ModeRow: Sendable {
         self.needsTiming = needsTiming
         self.slotted = slotted
         self.slotSeconds = slotSeconds
+        self.slotPeriodSeconds = slotPeriodSeconds
         self.shaping = shaping
+        self.requiresHintOrDecode = requiresHintOrDecode
+        self.caveat = caveat
+    }
+
+    /// The row with its hints' tolerance kept out of `exclusions` (`ModeHint.excluding`).
+    func excluding(_ exclusions: [ClosedRange<Double>]) -> ModeRow {
+        ModeRow(name, families, partial: partialFamilies, variants, hints: hints.map { $0.excluding(exclusions) },
+                needsTiming: needsTiming, slotted: slotted, slotSeconds: slotSeconds, slotPeriodSeconds: slotPeriodSeconds,
+                shaping: shaping, requiresHintOrDecode: requiresHintOrDecode, caveat: caveat)
     }
 
     /// Each variant's width from its parameters, (n − 1) × spacing + 2 × rate (a slotted row's: its transmissions').
@@ -132,23 +151,44 @@ struct ModeFeature: Sendable {
 /// A frequency hint: inside any of `ranges` (display Hz) a match gains `inside`; a row may also lose `outside`
 /// when the signal lies outside every one (modes that live only there). With `families`, it applies only to a
 /// signal measured as one of them (LSB below 10 MHz, USB above).
+///
+/// A hint on a mode's dial frequencies reaches `toleranceHz` further either side (`tuningErrorHz`), for a receiver tuned
+/// that far off (the owner's HamItUp puts 20 m's FT8 1.1 kHz low), but never into `exclusions`: another row's own ranges,
+/// or a dial its mode shares with one the table doesn't hold (JS8, FT8's own keying). Segments and bands keep their edges:
+/// RTTY's name stays inside its segments.
 struct ModeHint: Sendable {
     let name: String
     let ranges: [ClosedRange<Double>]
     let families: Set<SignalFamily>?
     let inside: Double
     let outside: Double
+    let toleranceHz: Double
+    let exclusions: [ClosedRange<Double>]
+
+    static let tuningErrorHz = 2000.0
 
     init(_ name: String, _ ranges: [ClosedRange<Double>], families: Set<SignalFamily>? = nil, inside: Double = 0.15,
-         outside: Double = 0) {
+         outside: Double = 0, toleranceHz: Double = 0, exclusions: [ClosedRange<Double>] = []) {
         self.name = name
         self.ranges = ranges
         self.families = families
         self.inside = inside
         self.outside = outside
+        self.toleranceHz = toleranceHz
+        self.exclusions = exclusions
     }
 
-    func contains(_ hz: Double) -> Bool { ranges.contains { $0.contains(hz) } }
+    func contains(_ hz: Double) -> Bool {
+        if ranges.contains(where: { $0.contains(hz) }) { return true }
+        guard toleranceHz > 0, !exclusions.contains(where: { $0.contains(hz) }) else { return false }
+        return ranges.contains { ($0.lowerBound - toleranceHz)...($0.upperBound + toleranceHz) ~= hz }
+    }
+
+    /// This hint with its tolerance kept out of `ranges` too.
+    func excluding(_ more: [ClosedRange<Double>]) -> ModeHint {
+        ModeHint(name, ranges, families: families, inside: inside, outside: outside, toleranceHz: toleranceHz,
+                 exclusions: exclusions + more)
+    }
 }
 
 /// The spec's mode tables. Frequencies are display Hz; parameter ranges follow the published parameters with room
@@ -179,12 +219,15 @@ public enum ModeTable {
                              mhz(50.0, 50.1)]
     static let rttySegments = [mhz(3.58, 3.6), mhz(7.04, 7.05), mhz(7.08, 7.1), mhz(10.14, 10.15), mhz(14.08, 14.099),
                                mhz(18.1, 18.11), mhz(21.08, 21.11), mhz(24.92, 24.93), mhz(28.08, 28.15)]
+    /// On 20 and 15 m PSK keeps below FT8's dial (14.074, 21.074), where FT8 starts.
     static let pskSegments = [mhz(3.58, 3.59), mhz(7.035, 7.045), mhz(7.07, 7.08), mhz(10.14, 10.15),
-                              mhz(14.07, 14.074), mhz(18.1, 18.106), mhz(21.07, 21.074), mhz(24.92, 24.925),
+                              mhz(14.07, 14.073), mhz(18.1, 18.106), mhz(21.07, 21.073), mhz(24.92, 24.925),
                               mhz(28.12, 28.125)]
     static let navtex = [khz(490, 1), khz(518, 1), khz(4209.5, 1)]
     static let ft8Dials = [1.84, 3.573, 5.357, 7.074, 10.136, 14.074, 18.1, 21.074, 24.915, 28.074, 50.313, 144.174]
     static let ft4Dials = [3.5755, 7.0475, 10.14, 14.08, 18.104, 21.14, 24.919, 28.18, 50.318]
+    /// JS8's dials: JS8 Normal is FT8's keying, so FT8's tolerance stays off them.
+    static let js8Dials = [1.842, 3.578, 7.078, 10.13, 14.078, 18.104, 21.078, 24.922, 28.078, 50.318]
     static let wsprDials = [0.1375, 0.4742, 1.8366, 3.5686, 5.2872, 7.0386, 10.1387, 14.0956, 18.1046, 21.0946,
                             24.9246, 28.1246, 50.293, 144.489]
     /// HF fax stations' assigned frequencies (kHz), from 1 kHz below to 2.5 kHz above (centre or USB dial
@@ -206,8 +249,17 @@ public enum ModeTable {
         ModeFeature(.bandwidth(range, softness: softness), weight: weight)
     }
 
-    /// Every row of the spec's two tables, in the spec's order.
-    public static let rows: [ModeRow] = [
+    /// Every row of the spec's two tables, in the spec's order; a hint's tolerance kept out of every other row's own ranges
+    /// (the amateur bands' SSB hints, which apply only to a signal measured USB or LSB, aside).
+    public static let rows: [ModeRow] = {
+        let rows = tableRows
+        return rows.map { row in
+            row.excluding(rows.filter { $0.name != row.name }
+                .flatMap { $0.hints.filter { $0.families == nil }.flatMap(\.ranges) })
+        }
+    }()
+
+    static let tableRows: [ModeRow] = [
         // HF
         ModeRow("SSB voice (USB/LSB)", [.usb, .lsb], [[width(1800...3600), ModeFeature(.envelope([.voice]))]],
                 hints: [ModeHint("amateur LSB below 10 MHz", amateurBelow10MHz, families: [.lsb], inside: 0.1),
@@ -224,26 +276,36 @@ public enum ModeTable {
                 hints: [ModeHint("CW sub-band", cwSubBands, inside: 0.1)]),
         ModeRow("RTTY", [.fsk], [[tones([2]), rate([45.45, 50, 75]), ModeFeature(.shift([170, 425, 850], tolerance: 0.04),
                                                                                   weight: 2)]],
-                hints: [ModeHint("amateur RTTY segment", rttySegments, inside: 0.1)]),
+                hints: [ModeHint("amateur RTTY segment", rttySegments, inside: 0.1)], requiresHintOrDecode: true),
         ModeRow("NAVTEX / SITOR-B", [.fsk], [[tones([2]), rate([100]), ModeFeature(.shift([170], tolerance: 0.04),
                                                                                     weight: 2)]],
                 hints: [ModeHint("NAVTEX frequency", navtex)]),
         ModeRow("PSK31 / PSK63", [.psk], [[ModeFeature(.pskOrder([2, 4])), rate([31.25, 62.5]), width(25...160)]],
                 hints: [ModeHint("digital sub-band", pskSegments, inside: 0.1)]),
-        ModeRow("FT8 / FT4", [.fsk],
-                [[tones([8]), rate([6.25], 0.03), ModeFeature(.spacing([6.25], tolerance: 0.05))],
-                 [tones([4]), rate([12_000 / 576], 0.03), ModeFeature(.spacing([12_000 / 576], tolerance: 0.05))]],
-                hints: [ModeHint("FT8/FT4 frequency", dials(ft8Dials, 0, 3200) + dials(ft4Dials, 0, 3200),
-                                 outside: 0.05)],
-                needsTiming: true, slotted: true, slotSeconds: 79 / 6.25, shaping: .gaussian([8: 2, 4: 1])),
+        // FT8: 79 symbols (12.64 s) from 0.5 s into each 15 s slot. FT4: 105 symbols of 48 ms (5.04 s) into each 7.5 s.
+        ModeRow("FT8", [.fsk], [[tones([8]), rate([6.25], 0.03), ModeFeature(.spacing([6.25], tolerance: 0.05))]],
+                hints: [ModeHint("FT8 frequency", dials(ft8Dials, 0, 3200), outside: 0.05,
+                                 toleranceHz: ModeHint.tuningErrorHz, exclusions: dials(js8Dials, 0, 3200))],
+                needsTiming: true, slotted: true, slotSeconds: 79 / 6.25, slotPeriodSeconds: 15,
+                shaping: .gaussian([8: 2]), caveat: "can't be told from JS8 Normal (the same keying) without a decode"),
+        ModeRow("FT4", [.fsk],
+                [[tones([4]), rate([12_000 / 576], 0.03), ModeFeature(.spacing([12_000 / 576], tolerance: 0.05))]],
+                hints: [ModeHint("FT4 frequency", dials(ft4Dials, 0, 3200), outside: 0.05,
+                                 toleranceHz: ModeHint.tuningErrorHz, exclusions: dials(js8Dials, 0, 3200))],
+                needsTiming: true, slotted: true, slotSeconds: 105 * 576 / 12_000, slotPeriodSeconds: 7.5,
+                shaping: .gaussian([4: 1]),
+                caveat: "can't be told by its numbers from another 4-FSK within a few per cent of its speed"),
         ModeRow("WSPR", [.fsk],
                 [[tones([4]), rate([12_000 / 8192], 0.03), ModeFeature(.spacing([12_000 / 8192], tolerance: 0.06)),
                   width(3...15, softness: 0.5)]],
-                hints: [ModeHint("WSPR frequency", dials(wsprDials, 1350, 1650), outside: 0.1)], needsTiming: true,
+                hints: [ModeHint("WSPR frequency", dials(wsprDials, 1350, 1650), outside: 0.1,
+                                 toleranceHz: ModeHint.tuningErrorHz, exclusions: dials(js8Dials, 0, 3200))],
+                needsTiming: true,
                 shaping: .rectangular),
         ModeRow("Olivia", [.fsk, .mfsk],
                 [[tones([4, 8, 16, 32, 64]), ModeFeature(.spacingIsRate), ModeFeature(.oliviaConfiguration, weight: 2)]],
-                shaping: .gaussian([0: 1])),
+                shaping: .gaussian([0: 1]),
+                caveat: "32 tones 7.8 Hz apart are MFSK8's numbers too: can't be told from it by them"),
         ModeRow("MFSK16", [.mfsk, .fsk],
                 [[tones([16]), rate([15.625]), ModeFeature(.spacing([15.625], tolerance: 0.04))]],
                 shaping: .rectangular),

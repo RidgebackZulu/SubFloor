@@ -120,6 +120,32 @@ private func makeDecoder(_ hz: Double = 1_500) -> any SignalDecoder {
         }
     }
 
+    /// Signal ID's trial decodes use other keyings (`init(frequencyHz:sampleRate:baud:shiftHz:)`): each decodes at
+    /// 10 dB, the channel laid out for it, and the default's layout is the 45.45 Bd, 170 Hz one exactly.
+    @Test func otherKeyingsDecode() {
+        #expect(RTTYSignalDecoder.layout(baud: 45.45, shiftHz: 170) == (450, 1_000))
+        // Another keying keeps the default's margins: its tones and two bit rates inside the passband (the cutoff less
+        // half the 500 Hz transition), and what aliases from past the transition as far from them (124 Hz).
+        for (baud, shift) in [(50.0, 425.0), (75, 850), (45.45, 850)] {
+            let layout = RTTYSignalDecoder.layout(baud: baud, shiftHz: shift)
+            let reach = shift / 2 + 2 * baud
+            #expect(layout.cutoffHz - 250 >= reach - 1e-9, "\(baud) Bd \(shift) Hz")
+            #expect(layout.basebandTarget - (layout.cutoffHz + 250) - reach >= 124 - 1e-6, "\(baud) Bd \(shift) Hz")
+            // As realised at 12 kHz (a whole decimation, rounded down: the rate at or over the target).
+            let rate = RTTYSignalDecoder(frequencyHz: 1_500, baud: baud, shiftHz: shift).basebandRateHz
+            #expect(rate - (layout.cutoffHz + 250) - reach >= 124 - 1e-6, "\(baud) Bd \(shift) Hz at \(rate) Hz")
+        }
+        #expect(RTTYSignalDecoder(frequencyHz: 1_500).basebandRateHz == 1_000)
+        for (baud, shift) in [(50.0, 425.0), (75, 850), (45.45, 850), (75, 170)] {
+            let clear = RTTYEncoder.audio(text: text, centerHz: 1_500, baud: baud, shiftHz: shift)
+            let audio = ModemTestSignals.awgn(clear, snrDb: 10, seed: 4001, signalPower: rttyPower)
+            let decoder = RTTYSignalDecoder(frequencyHz: 1_500, baud: baud, shiftHz: shift)
+            let out = run(decoder, audio)
+            #expect(accuracy(out) == 1.0, "\(baud) Bd \(shift) Hz: '\(out)'")
+            #expect(decoder.submode == "RTTY \(Int(baud))")
+        }
+    }
+
     /// The plan's gate: seeds 1...5 (parameters were tuned on seeds 101...160 only).
     @Test func minus5dB() {
         let clear = RTTYEncoder.audio(text: text, centerHz: 1_500)

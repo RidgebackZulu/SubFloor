@@ -59,6 +59,10 @@ public struct SignalMeasurement: Codable, Sendable, Equatable {
     /// The −20 dB edges lie within 3 dB of the noise or under it, so the measured width reads narrow; where the
     /// family's parameters fix the width it is taken from them instead (noted "bandwidth from parameters").
     public var edgesUnderNoise: Bool
+    /// How well its transmissions fit each slot mode's UTC slots (`SlotEvidence`); empty without a true time.
+    public var slotFits: [SlotFit]
+    /// The best of `slotFits`.
+    public var slotFit: SlotFit? { slotFits.max { ($0.fit, $0.events) < ($1.fit, $1.events) } }
     /// Length of IQ analysed.
     public var seconds: Double
     /// Evidence and caveats, for the ID card.
@@ -71,7 +75,7 @@ public struct SignalMeasurement: Codable, Sendable, Equatable {
                 fmDeviationHz: Double? = nil, cwWPM: Double? = nil, burstPeriodSeconds: Double? = nil,
                 burstDuty: Double? = nil, subcarriersHz: [Double] = [], seconds: Double = 0, notes: [String] = [],
                 audioEnvelope: EnvelopeKind? = nil, modulationPeriodSeconds: Double? = nil,
-                edgesUnderNoise: Bool = false) {
+                edgesUnderNoise: Bool = false, slotFits: [SlotFit] = []) {
         self.offsetHz = offsetHz
         self.occupiedBandwidthHz = occupiedBandwidthHz
         self.bandwidth6dBHz = bandwidth6dBHz
@@ -93,6 +97,7 @@ public struct SignalMeasurement: Codable, Sendable, Equatable {
         self.audioEnvelope = audioEnvelope
         self.modulationPeriodSeconds = modulationPeriodSeconds
         self.edgesUnderNoise = edgesUnderNoise
+        self.slotFits = slotFits
         self.seconds = seconds
         self.notes = notes
     }

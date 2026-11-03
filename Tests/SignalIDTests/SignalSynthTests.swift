@@ -104,7 +104,8 @@ private func runs(_ x: [Float], above threshold: Float) -> [(start: Int, length:
         for (index, entry) in Sweep.cases(catalogue, default: Array(stride(from: 0, to: catalogue.count, by: 6))) {
             let plan = analysisPlan(entry.spec)
             let b = entry.spec.occupiedBandwidthHz
-            for snr in [10.0, 3.0] {
+            // The 3 dB repeat under `SUBFLOOR_SIGNALID_MATRIX=1`: the same estimate at another level.
+            for snr in Sweep.full ? [10.0, 3.0] : [10] {
                 let iq = SignalSynth.make(entry.spec, sampleRate: plan.rate, seconds: plan.seconds, snrDb: snr,
                                           seed: UInt64(300 + index))
                 let p = linear(PowerSpectrum.average(iq, size: plan.size, maxFrames: 4096))
@@ -122,7 +123,7 @@ private func runs(_ x: [Float], above threshold: Float) -> [(start: Int, length:
         // The declared width is the rendered one by construction; an independent render (another seed, rate
         // and resolution, this file's own fixed-point search) agrees within 6%.
         let catalogue = SynthSpec.catalogue
-        for (index, entry) in Sweep.cases(catalogue, default: Array(stride(from: 3, to: catalogue.count, by: 6))) {
+        for (index, entry) in Sweep.cases(catalogue, default: Array(stride(from: 3, to: catalogue.count, by: 12))) {
             let declared = entry.spec.occupiedBandwidthHz
             #expect(declared == SignalSynth.occupiedBandwidthHz(for: entry.spec))
             guard entry.spec != .carrier else { continue }
@@ -224,8 +225,11 @@ private func runs(_ x: [Float], above threshold: Float) -> [(start: Int, length:
     }
 
     @Test func everyCatalogueEntrySynthesises() {
-        #expect(Set(SynthSpec.catalogue.map(\.name)).count == 30)
-        for (index, entry) in SynthSpec.catalogue.enumerated() {
+        // One name for each row of the mode table (FT8 and FT4 are rows of their own).
+        #expect(Set(SynthSpec.catalogue.map(\.name)).count == 31)
+        #expect(Set(SynthSpec.catalogue.map(\.name)) == Set(ModeTable.rows.map(\.name)))
+        let catalogue = SynthSpec.catalogue
+        for (index, entry) in Sweep.cases(catalogue, default: Array(stride(from: 0, to: catalogue.count, by: 3))) {
             let fs = max(2 * entry.spec.minimumSampleRate, 8000)
             let iq = SignalSynth.make(entry.spec, sampleRate: fs, seconds: 0.5, snrDb: 10, offsetHz: 0.05 * fs,
                                       seed: UInt64(index))
