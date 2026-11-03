@@ -264,18 +264,21 @@ public enum SignalSynth {
         return out
     }
 
-    /// One of several signals in a capture (`several`): at `offsetHz`, `snrDb` over the noise in its own occupied bandwidth.
+    /// One of several signals in a capture (`several`): at `offsetHz`, `snrDb` over the noise in its own occupied bandwidth,
+    /// with its own channel effects (a station fading while its neighbours hold).
     public struct Placed: Sendable {
         public var spec: SynthSpec
         public var offsetHz: Double
         public var snrDb: Double
         public var seed: UInt64
+        public var impairments: SynthImpairments
 
-        public init(_ spec: SynthSpec, offsetHz: Double, snrDb: Double, seed: UInt64) {
+        public init(_ spec: SynthSpec, offsetHz: Double, snrDb: Double, seed: UInt64, impairments: SynthImpairments = .none) {
             self.spec = spec
             self.offsetHz = offsetHz
             self.snrDb = snrDb
             self.seed = seed
+            self.impairments = impairments
         }
     }
 
@@ -284,7 +287,8 @@ public enum SignalSynth {
     public static func several(_ signals: [Placed], sampleRate: Double, seconds: Double, noiseSeed: UInt64) -> [Float] {
         var out = make(.noise, sampleRate: sampleRate, seconds: seconds, snrDb: 0, seed: noiseSeed)
         for signal in signals {
-            let x = render(signal.spec, sampleRate: sampleRate, seconds: seconds, offsetHz: signal.offsetHz, seed: signal.seed)
+            let x = render(signal.spec, sampleRate: sampleRate, seconds: seconds, offsetHz: signal.offsetHz, seed: signal.seed,
+                           impairments: signal.impairments)
             let gain = Float((pow(10, signal.snrDb / 10) * occupiedBandwidthHz(for: signal.spec) / sampleRate).squareRoot())
             for k in 0..<min(out.count, x.count) { out[k] += gain * x[k] }
         }

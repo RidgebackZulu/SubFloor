@@ -18,7 +18,9 @@ import Testing
 /// - the full matrix (`accuracyMatrix`): every SNR, 5 seeds a cell; its targets reach 95% at the spec's tolerances;
 /// - the subset (`accuracySubset`, ruling R20's, once always on): 10 and 3 dB, one seed a cell, the captures of
 ///   96 kS/s or less. Its targets must reach 90% where they have 10 cases or more, and where they have fewer every
-///   case must fall within twice its tolerance (rulings R23, R24).
+///   case must fall within twice its tolerance (rulings R23, R24);
+/// - the scenes (`scenesHaveNoWrongNames`): the HF modes the owner listens for among neighbours, fading, on an
+///   interference comb and through a receiver's level jumps, and groups of FT8, every signal at 3 dB: no wrong name.
 @Suite(.serialized) struct AccuracyMatrixTests {
     static let snrs = [20.0, 10, 6, 3]
     static func seedsPerCell(full: Bool) -> Int { full ? 5 : 1 }
@@ -249,5 +251,224 @@ import Testing
             }
         }
         return lines.joined(separator: "\n")
+    }
+}
+// MARK: The scenes
+
+/// The spec's added synthetic scenes: neighbours, fading, a comb, level jumps and groups of FT8, the signals in them at
+/// 3 dB. A name at 0.7 or more, on the point's answer or on any signal under it, is wrong unless a signal of that mode
+/// lies where it was measured. Only with `SUBFLOOR_SIGNALID_MATRIX=1`.
+extension AccuracyMatrixTests {
+    /// Something in a scene, from the capture's centre: what may be named there (nil: nothing, as on a comb line).
+    struct Source: Sendable {
+        var offsetHz: Double
+        var halfWidthHz: Double
+        var name: String?
+    }
+
+    /// One scene: the whole capture (the first pass gets its newest `firstSeconds`, the longer read all of it), the points
+    /// looked at (offset from the centre, and radius), and what is in it.
+    struct Scene {
+        var label: String
+        var iq: [Float]
+        var rate: Double
+        var centreHz: Double
+        var points: [(offsetHz: Double, radiusHz: Double)]
+        var sources: [Source]
+        var captureSpectrumDb: [Float]? = nil
+        var endTime: Date?
+        var firstSeconds = SignalIdentifier.firstSeconds
+    }
+
+    enum SceneKind: String, CaseIterable, Sendable { case neighbours, fading, comb, levelJumps, ft8Group }
+
+    static let sceneSNR = 3.0
+    static let sceneSeeds = Array(UInt64(1)...8)
+    /// How far from where a source lies a measurement may stand and still be that source's.
+    static let sceneSlackHz = 50.0
+    /// The HF modes the owner listens for, as `IdentifyTests` places them (16 s at 48 kS/s, the pointer as there).
+    static let sceneTargets = ["FT8", "FT4", "RTTY", "PSK31 / PSK63", "CW", "SSB voice (USB/LSB)"]
+        .map { name in IdentifyTests.placements.first { $0.name == name }! }
+
+    /// `spec` on the slot clock of a capture that starts `startSeconds` after a slot boundary (a slot mode's bursts; any
+    /// other spec as it is).
+    static func onClock(_ spec: SynthSpec, startSeconds: Double) -> SynthSpec {
+        guard case .bursts(let inner, var bursts) = spec else { return spec }
+        bursts.captureStartSeconds = startSeconds.truncatingRemainder(dividingBy: bursts.periodSeconds)
+        return .bursts(inner, bursts)
+    }
+
+    /// Where a 16 s capture starts on the slot clock: as `IdentifyTests.capture` puts a slot mode (its newest 3 s inside
+    /// a transmission, at a phase that varies with the seed), by FT8's schedule for the rest.
+    static func captureStart(_ spec: SynthSpec, seed: UInt64) -> Double {
+        var bursts: SynthSpec.Bursts
+        if case .bursts(_, let b) = spec, b.periodSeconds < 60 { bursts = b } else {
+            guard case .bursts(_, let b) = SynthSpec.ft8() else { return 0 }
+            bursts = b
+        }
+        let end = bursts.startSeconds + 3.5 + Double(seed % 7) / 7 * (bursts.onSeconds - 3.5)
+        return (end - IdentifyTests.longSeconds).truncatingRemainder(dividingBy: bursts.periodSeconds) + bursts.periodSeconds
+    }
+
+    static func source(_ spec: SynthSpec, at offsetHz: Double, _ name: String?) -> Source {
+        Source(offsetHz: offsetHz, halfWidthHz: spec.occupiedBandwidthHz / 2, name: name)
+    }
+
+    /// The scenes of one kind on one seed (each target's, or the FT8 groups).
+    static func scenes(_ kind: SceneKind, seed: UInt64) -> [Scene] {
+        let seconds = IdentifyTests.longSeconds, snr = sceneSNR
+        if kind == .ft8Group { return [ft8Group(seed: seed)] }
+        return sceneTargets.map { p -> Scene in
+            let start = captureStart(p.spec, seed: seed)
+            let spec = onClock(p.spec, startSeconds: start)
+            let end = Date(timeIntervalSince1970: SignalSynth.slotEpoch + start + seconds)
+            let target = source(spec, at: p.offsetHz, p.name)
+            let pointHz = p.offsetHz + p.pointHz
+            let label = "\(kind.rawValue) \(p.name) seed \(seed)"
+            switch kind {
+            case .neighbours:
+                // A CW below and an FT8 above, 300 Hz past the target's edges and 15 dB over the noise.
+                let cw = SynthSpec.cw(wpm: 20), ft8 = onClock(.ft8(), startSeconds: start)
+                let below = p.offsetHz - target.halfWidthHz - 300 - cw.occupiedBandwidthHz / 2
+                let above = p.offsetHz + target.halfWidthHz + 300 + ft8.occupiedBandwidthHz / 2
+                let iq = SignalSynth.several([.init(spec, offsetHz: p.offsetHz, snrDb: snr, seed: seed),
+                                              .init(cw, offsetHz: below, snrDb: 15, seed: seed + 100),
+                                              .init(ft8, offsetHz: above, snrDb: 15, seed: seed + 200)],
+                                             sampleRate: p.sampleRate, seconds: seconds, noiseSeed: seed + 300)
+                return Scene(label: label, iq: iq, rate: p.sampleRate, centreHz: p.captureCenterHz,
+                             points: [(pointHz, SignalIdentifier.defaultRadiusHz), (pointHz, 345)],
+                             sources: [target, source(cw, at: below, "CW"), source(ft8, at: above, "FT8")], endTime: end)
+            case .fading:
+                // 20 dB deep at about 0.5 Hz; an FSK's one tone alone on every other seed (selective fading).
+                let fsk = spec.keyedFSK != nil && seed % 2 == 0
+                let fade = fsk ? SignalSynth.fading(toneIndex: 0, depthDb: 20) : SynthImpairments(fadeDepthDb: 20, fadeRateHz: 0.5)
+                let iq = SignalSynth.several([.init(spec, offsetHz: p.offsetHz, snrDb: snr, seed: seed, impairments: fade)],
+                                             sampleRate: p.sampleRate, seconds: seconds, noiseSeed: seed + 300)
+                return Scene(label: label, iq: iq, rate: p.sampleRate, centreHz: p.captureCenterHz,
+                             points: [(pointHz, SignalIdentifier.defaultRadiusHz)], sources: [target], endTime: end)
+            case .levelJumps:
+                // The receiver's gain 10 dB up (or down, on odd seeds) 1.4 s into the newest 3 s, and 6 dB the other
+                // way 6 s into the capture; and an empty point 5 kHz off, through the same jumps.
+                let iq = SignalSynth.several([.init(spec, offsetHz: p.offsetHz, snrDb: snr, seed: seed)],
+                                             sampleRate: p.sampleRate, seconds: seconds, noiseSeed: seed + 300)
+                let sign = seed % 2 == 0 ? 1.0 : -1.0
+                let stepped = SignalSynth.levelStep(SignalSynth.levelStep(iq, sampleRate: p.sampleRate, atSeconds: 6,
+                                                                          db: -6 * sign),
+                                                    sampleRate: p.sampleRate, atSeconds: seconds - 1.6, db: 10 * sign)
+                let empty = p.offsetHz + 5000 < p.sampleRate / 2 - 2000 ? p.offsetHz + 5000 : p.offsetHz - 5000
+                return Scene(label: label, iq: stepped, rate: p.sampleRate, centreHz: p.captureCenterHz,
+                             points: [(pointHz, SignalIdentifier.defaultRadiusHz), (empty, SignalIdentifier.defaultRadiusHz)],
+                             sources: [target], endTime: end)
+            case .comb:
+                // The target between two of the comb's lines (`InterferenceCombTests`' comb, wandering as the owner's
+                // does), and two of the lines looked at too: they are never named.
+                let rate = InterferenceCombTests.rate
+                var iq = SignalSynth.several([.init(spec, offsetHz: p.pointHz == 0 ? 0 : -p.pointHz, snrDb: snr, seed: seed)],
+                                             sampleRate: rate, seconds: seconds, noiseSeed: seed + 300)
+                let comb = SignalSynth.comb(firstHz: InterferenceCombTests.firstHz, spacingHz: InterferenceCombTests.spacingHz,
+                                            count: InterferenceCombTests.lines,
+                                            amplitude: TraceFinderTests.amplitude(db: 25, rate: rate), sampleRate: rate,
+                                            seconds: seconds, wanderHz: 60, seed: seed + 400)
+                for k in iq.indices { iq[k] += comb[k] }
+                let lines = (0..<InterferenceCombTests.lines).map {
+                    Source(offsetHz: InterferenceCombTests.lineHz($0), halfWidthHz: 150, name: nil)
+                }
+                let centred = source(spec, at: p.pointHz == 0 ? 0 : -p.pointHz, p.name)
+                return Scene(label: label, iq: iq, rate: rate, centreHz: p.rfHz,
+                             points: [(0, SignalIdentifier.defaultRadiusHz),
+                                      (InterferenceCombTests.lineHz(4), SignalIdentifier.defaultRadiusHz),
+                                      (InterferenceCombTests.lineHz(7), SignalIdentifier.defaultRadiusHz)],
+                             sources: [centred] + lines,
+                             captureSpectrumDb: InterferenceCombTests.spectrum(iq, rate: rate), endTime: end)
+            case .ft8Group:
+                fatalError("made above")
+            }
+        }
+    }
+
+    /// Seven FT8 stations 250 Hz apart (as `GroupAnswerTests` makes them: the slot's first 3 s, every other one 0.2 s
+    /// late), and on odd seeds a PSK31 keying up between two of them: looked at from the group's middle at the owner's
+    /// zoom (345 Hz) and wider (700 Hz), and on one station.
+    static func ft8Group(seed: UInt64) -> Scene {
+        let rate = GroupAnswerTests.rate, seconds = GroupAnswerTests.seconds
+        var placed: [SignalSynth.Placed] = (0..<7).map { (k: Int) -> SignalSynth.Placed in
+            let late: Double = k % 2 == 0 ? 0 : 0.2
+            return GroupAnswerTests.ft8(Double(k - 3) * 250, snrDb: sceneSNR, seed: 1000 * seed + UInt64(k), lateSeconds: late)
+        }
+        var sources = placed.map { source($0.spec, at: $0.offsetHz, "FT8") }
+        if seed % 2 == 1 {
+            let psk = SignalSynth.Placed(.psk31, offsetHz: 125, snrDb: sceneSNR, seed: 1000 * seed + 50)
+            placed.append(psk)
+            sources.append(source(.psk31, at: 125, "PSK31 / PSK63"))
+        }
+        let iq = SignalSynth.several(placed, sampleRate: rate, seconds: seconds, noiseSeed: 1000 * seed + 99)
+        // The on-time stations' clock: their capture starts on a slot boundary.
+        let end = Date(timeIntervalSince1970: SignalSynth.slotEpoch + 15 + seconds)
+        return Scene(label: "ft8Group seed \(seed)", iq: iq, rate: rate, centreHz: GroupAnswerTests.centreHz,
+                     points: [(0, RealCorpus.groupRadiusHz), (0, 700), (250, SignalIdentifier.defaultRadiusHz)],
+                     sources: sources, endTime: end, firstSeconds: seconds)
+    }
+
+    /// What the scene's points answer, as the hover's refining call (the longer read is the whole capture), and the wrong
+    /// names among them (the point's answer and every signal under it).
+    static func judged(_ scene: Scene) -> (answers: [SignalIdentity], wrong: [String]) {
+        let seconds = Double(scene.iq.count / 2) / scene.rate
+        let first = Array(scene.iq.suffix(2 * Int((scene.firstSeconds * scene.rate).rounded())))
+        var answers: [SignalIdentity] = [], wrong: [String] = []
+        for point in scene.points {
+            let id = SignalIdentifier.identify(iq: first, sampleRate: scene.rate, captureCenterHz: scene.centreHz,
+                                               atHz: scene.centreHz + point.offsetHz, bandwidthHz: nil, spectrumDb: nil,
+                                               longer: { (scene.iq, seconds) }, pointRadiusHz: point.radiusHz,
+                                               endTime: scene.endTime, captureSpectrumDb: scene.captureSpectrumDb,
+                                               captureRate: scene.captureSpectrumDb == nil ? nil : scene.rate)
+            answers.append(id)
+            for answer in [id] + id.signals {
+                guard let best = answer.best, best.confidence >= SignalIdentifier.nameThreshold else { continue }
+                let hz = answer.measurement.offsetHz
+                let there = scene.sources.contains {
+                    $0.name == best.name && abs(hz - $0.offsetHz) <= $0.halfWidthHz + sceneSlackHz
+                }
+                if !there {
+                    wrong.append(String(format: "%@, point %+.0f Hz r %.0f: %@ at %+.0f Hz (%@)", scene.label,
+                                        point.offsetHz, point.radiusHz, best.name, hz, id.label))
+                }
+            }
+        }
+        return (answers, wrong)
+    }
+
+    /// Every scene, every signal in it at 3 dB: no wrong name. Prints how often the point's own signal was named.
+    @Test(.enabled(if: Sweep.full)) func scenesHaveNoWrongNames() async {
+        let cases = SceneKind.allCases.flatMap { kind in Self.sceneSeeds.map { (kind, $0) } }
+        typealias Result = (kind: SceneKind, answers: Int, named: Int, wrong: [String])
+        let results = await withTaskGroup(of: Result.self) { group in
+            for (kind, seed) in cases {
+                group.addTask {
+                    var points = 0, named = 0, wrong: [String] = []
+                    for scene in Self.scenes(kind, seed: seed) {
+                        let judged = Self.judged(scene)
+                        points += judged.answers.count
+                        wrong += judged.wrong
+                        // The first point is on a signal: named as it is.
+                        if let own = judged.answers.first, let name = own.best?.name,
+                           scene.sources.contains(where: { $0.name == name }) { named += 1 }
+                    }
+                    return (kind, points, named, wrong)
+                }
+            }
+            var all: [Result] = []
+            for await r in group { all.append(r) }
+            return all
+        }
+        for kind in SceneKind.allCases {
+            let mine = results.filter { $0.kind == kind }
+            let wrong = mine.flatMap { $0.wrong }
+            let scenes = kind == .ft8Group ? Self.sceneSeeds.count : Self.sceneSeeds.count * Self.sceneTargets.count
+            let answers = mine.map { $0.answers }.reduce(0, +), named = mine.map { $0.named }.reduce(0, +)
+            print("scenesHaveNoWrongNames \(kind.rawValue): \(scenes) scenes, \(answers) answers, "
+                  + "first point named \(named) of \(scenes), wrong names \(wrong.count)")
+            for line in wrong { print("scenesHaveNoWrongNames wrong: \(line)") }
+            #expect(wrong.isEmpty, "\(kind.rawValue) at \(Self.sceneSNR) dB: \(wrong)")
+        }
     }
 }

@@ -1,3 +1,4 @@
+import Accelerate
 import DSPCore
 import Foundation
 import Modems
@@ -26,8 +27,11 @@ struct RealCorpusTruthTests {
 
     struct Manifest: Decodable {
         struct Recording: Decodable {
-            struct Clip: Decodable { let name: String; let startSeconds: Double; let seconds: Double }
+            struct Clip: Decodable { let name: String; let part: String; let startSeconds: Double; let seconds: Double }
+            let file: String
             let tag: String
+            let captureRate: Double
+            let captureCenterHz: Double
             let clipCenterHz: Double
             let clips: [Clip]
         }
@@ -38,6 +42,7 @@ struct RealCorpusTruthTests {
             let truth: String
             let parameters: [String: Double]?
             let how: String
+            let transmitting: Bool
         }
         let recordings: [Recording]
         let points: [Point]
@@ -263,6 +268,311 @@ struct RealCorpusTruthTests {
             #expect(named.best?.name != "RTTY" || named.decodedText != nil)
             #expect(named.decodedText == nil, "the real 2-FSK read as text: \(named.decodedText ?? "")")
             #expect(named == first && named.label.hasPrefix("2-FSK · 75 Bd · "), "\(named.label)")
+        }
+    }
+}
+
+// MARK: The card with its trial decode
+
+/// The card's row of the scorecard (`RealCorpusTests.printScorecard`): every FT8 point of the corpus as the owner's card
+/// makes it, on the recordings themselves at their 1 MS/s, through the service's own read (`SignalIDService.run`: the
+/// newest 3 s, then the 16 s longer read) and its trial decode (`SignalIDDecoding.attempt`, the ring read as the app's
+/// default IQ pre-roll plans it), the points taken in the order of their time with the boxes and slots kept from one to
+/// the next as the service keeps them. Its first answer is the hover's; the card must name FT8 at least as often, never a
+/// wrong name, and never give a trace another station's message. `SUBFLOOR_SIGNALID_CARD_ROWS=<path>` writes its rows
+/// there for the scorecard.
+extension RealCorpusTruthTests {
+    /// One of the owner's recordings on disk, read as the ring would hand it over at a moment of it.
+    struct RecordingRing: Sendable {
+        let url: URL
+        let dataOffset: Int
+        let frames: Int
+        let rate: Double
+        let start: Date
+        /// The most the ring holds, in frames.
+        let capacity: Int
+
+        init(file: String, rate: Double, start: Date, capacity: Int) throws {
+            url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Music/SubFloor/\(file)")
+            let handle = try FileHandle(forReadingFrom: url)
+            defer { try? handle.close() }
+            let head = try handle.read(upToCount: 4096) ?? Data()
+            var at = 12, found: (Int, Int)?
+            func u32(_ k: Int) -> Int { Int(head[k..<(k + 4)].withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }.littleEndian) }
+            while at + 8 <= head.count {
+                let id = String(decoding: head[at..<(at + 4)], as: UTF8.self), size = u32(at + 4)
+                if id == "data" { found = (at + 8, size); break }
+                at += 8 + size + size % 2
+            }
+            guard let (offset, size) = found else { throw CocoaError(.fileReadCorruptFile) }
+            dataOffset = offset
+            frames = size / 4
+            self.rate = rate
+            self.start = start
+            self.capacity = capacity
+        }
+
+        /// Frames `range` as interleaved Floats in ±1.
+        func read(_ range: Range<Int>, from handle: FileHandle) throws -> [Float] {
+            try handle.seek(toOffset: UInt64(dataOffset + 4 * range.lowerBound))
+            let data = try handle.read(upToCount: 4 * range.count) ?? Data()
+            var out = [Float](repeating: 0, count: data.count / 2)
+            data.withUnsafeBytes { raw in
+                guard let base = raw.bindMemory(to: Int16.self).baseAddress else { return }
+                vDSP_vflt16(base, 1, &out, 1, vDSP_Length(out.count))
+            }
+            var scale: Float = 32768
+            vDSP_vsdiv(out, 1, &scale, &out, 1, vDSP_Length(out.count))
+            return out
+        }
+
+        /// The newest frames up to `lastSeconds` when the ring ends at `endFrame`, as far back as it holds.
+        func span(_ lastSeconds: Double, endFrame: Int) -> Range<Int> {
+            let oldest = max(0, endFrame - capacity)
+            return max(oldest, endFrame - Int((lastSeconds * rate).rounded()))..<endFrame
+        }
+
+        func endTime(_ endFrame: Int) -> Date { start.addingTimeInterval(Double(endFrame) / rate) }
+
+        func snapshots(endFrame: Int) -> SignalIDService.SnapshotProvider {
+            { lastSeconds in
+                let range = span(lastSeconds, endFrame: endFrame)
+                guard !range.isEmpty, let handle = try? FileHandle(forReadingFrom: url),
+                      let samples = try? read(range, from: handle) else { return nil }
+                try? handle.close()
+                return IQSnapshot(samples: samples, sampleRate: rate, endTime: endTime(endFrame), endFrame: endFrame)
+            }
+        }
+
+        func chunks(endFrame: Int) -> SignalIDService.ChunkProvider {
+            { lastSeconds, chunkFrames, visit in
+                let range = span(lastSeconds, endFrame: endFrame)
+                guard !range.isEmpty, let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+                defer { try? handle.close() }
+                var at = range.lowerBound
+                while at < range.upperBound {
+                    let to = min(range.upperBound, at + max(1, chunkFrames))
+                    guard let piece = try? read(at..<to, from: handle),
+                          piece.withUnsafeBufferPointer(visit) else { return nil }
+                    at = to
+                }
+                return IQRead(frames: range.count, sampleRate: rate, endTime: endTime(endFrame), endFrame: endFrame)
+            }
+        }
+    }
+
+    /// A scorecard row, as `RealCorpusTests.ScoreRow` reads it.
+    struct CardRow: Codable {
+        var path: String
+        var part: String
+        var truth = "FT8"
+        var windows = 0
+        var right = 0
+        var wrong = 0
+        var others: [String: Int] = [:]
+    }
+
+    /// What a card answer is called, for the tally of the windows not named FT8: as `RealCorpusTests.shortLabel` puts it
+    /// (the family and the width to 100 Hz).
+    static func shortLabel(_ id: SignalIdentity) -> String {
+        if id.comb != nil { return "Interference comb" }
+        if let best = id.best { return best.name }
+        let m = id.measurement
+        if m.occupiedBandwidthHz == 0 { return id.note ?? "none" }
+        let width = (m.occupiedBandwidthHz / 100).rounded() * 100
+        let hz = width < 1000 ? "\(Int(width)) Hz" : String(format: "%.1f kHz", width / 1000)
+        return "\(SignalIdentity.familyName(m)) · \(hz)"
+    }
+
+    /// How long the service takes to give its first answer on the recordings (meant for a release build): from the
+    /// request to `onFirst` (or to the answer, when there is no longer read), the ring read from the recording as the ring
+    /// would hand it over, through `SignalIDService.run`. Cold: the capture's comb found from the app's spectrum first, as
+    /// on the first hover after a tune; warm: the comb known, as for the next 5 s. 4 held-out points of each truth, at
+    /// the default radius and FT8's at the owner's zoom too. Prints each kind's median and slowest; asserts nothing.
+    @Test func serviceFirstAnswerTiming() throws {
+        let manifest = try Self.manifest()
+        let finder: SignalIDService.CombFinder = { CaptureComb.find(spectrumDb: $0, sampleRate: $1, centerHz: $2) }
+        var lines: [String] = []
+        for recording in manifest.recordings {
+            let start = try #require(Self.startUTC(recording.file))
+            let rate = recording.captureRate, centre = recording.captureCenterHz
+            let ring = try RecordingRing(file: recording.file, rate: rate, start: start, capacity: Int(40 * rate))
+            let data = try Data(contentsOf: Self.folder.appendingPathComponent("\(recording.tag)-heldOut.bin"))
+            let spectrum = SpectrumSnapshot(centerHz: centre, spanHz: rate,
+                                            average: data.withUnsafeBytes { Array($0.bindMemory(to: Float32.self)) })
+            let clips = Dictionary(uniqueKeysWithValues: recording.clips.filter { $0.part == "heldOut" }.map { ($0.name, $0) })
+            let held = manifest.points.filter { clips[$0.clip] != nil && ($0.transmitting || $0.truth == "none") }
+            let barrier = TuneBarrier()
+            barrier.end(centerHz: centre)
+            for (truth, radius) in [("FT8", nil), ("FT8", 345.0), ("FT4", nil), ("2-FSK", nil), ("comb", nil), ("none", nil)] as [(String, Double?)] {
+                let mine = held.filter { $0.truth == truth }
+                guard !mine.isEmpty else { continue }
+                let picks = stride(from: 0, to: mine.count, by: max(1, mine.count / 4)).prefix(4).map { mine[$0] }
+                var cold: [Double] = [], warm: [Double] = []
+                for point in picks {
+                    let endFrame = Int(((clips[point.clip]!.startSeconds + point.endSeconds) * rate).rounded())
+                    var known: SignalIDService.KnownComb?
+                    for pass in 0..<2 {
+                        let request = SignalIDService.Request(atHz: point.atHz, bandwidthHz: nil, radiusHz: radius, spectrum: spectrum,
+                                                              longer: true, modelCenterHz: centre, trueTime: true, comb: known)
+                        let began = ContinuousClock.now
+                        let firstAt = Mutex<ContinuousClock.Instant?>(nil)
+                        let outcome = SignalIDService.run(request, provider: ring.snapshots(endFrame: endFrame),
+                                                          chunks: ring.chunks(endFrame: endFrame), analysis: SignalIDService.identifier,
+                                                          combFinder: finder, barrier: barrier,
+                                                          onFirst: { _, _ in firstAt.withLock { $0 = ContinuousClock.now } })
+                        let done = ContinuousClock.now
+                        let elapsed = (firstAt.withLock { $0 } ?? done) - began
+                        let msTaken = Double(elapsed.components.seconds) * 1000 + Double(elapsed.components.attoseconds) / 1e15
+                        if pass == 0 { cold.append(msTaken) } else { warm.append(msTaken) }
+                        known = outcome?.comb ?? SignalIDService.KnownComb(state: barrier.current,
+                                                                           reading: .init(comb: finder(spectrum.average, rate, centre)))
+                    }
+                }
+                cold.sort(); warm.sort()
+                let line = String(format: "serviceFirstAnswerTiming %@ %@ r %@: cold median %.0f ms, slowest %.0f ms; warm median %.0f ms, slowest %.0f ms",
+                                  recording.tag, truth, radius.map { "\(Int($0)) Hz" } ?? "default", cold[cold.count / 2], cold.last!,
+                                  warm[warm.count / 2], warm.last!)
+                lines.append(line)
+                print(line)
+            }
+        }
+        #expect(!lines.isEmpty)
+    }
+
+    /// `SubFloor_YYYYMMDD_HHMMSSZ_…`: the first sample's time.
+    static func startUTC(_ file: String) -> Date? {
+        let parts = file.split(separator: "_")
+        guard parts.count >= 3 else { return nil }
+        let format = DateFormatter()
+        format.locale = Locale(identifier: "en_US_POSIX")
+        format.timeZone = TimeZone(identifier: "UTC")
+        format.dateFormat = "yyyyMMdd HHmmss'Z'"
+        return format.date(from: "\(parts[1]) \(parts[2])")
+    }
+
+    @Test func cardWithDecode() throws {
+        let manifest = try Self.manifest()
+        let recording = try #require(manifest.recordings.first { $0.tag == "14MHz" })
+        let start = try #require(ISO8601DateFormatter().date(from: "2026-11-01T18:18:44Z"))
+        let rate = recording.captureRate, centre = recording.captureCenterHz
+        // The app's IQ ring at its defaults (`RecordingSettings`: 30 s of pre-roll, int16 IQ, 2 GiB at most).
+        let defaults = RecordingSettings()
+        let plan = StreamRecorder.plan(sampleRate: rate, bytesPerFrame: 4, preRollSeconds: defaults.preRollSeconds,
+                                       memoryLimitBytes: defaults.iqMemoryLimitBytes)
+        let ring = try RecordingRing(file: recording.file, rate: rate, start: start, capacity: plan.capacityBytes / 4)
+        func spectrum(_ part: String) throws -> SpectrumSnapshot {
+            let data = try Data(contentsOf: Self.folder.appendingPathComponent("\(recording.tag)-\(part).bin"))
+            let db = data.withUnsafeBytes { Array($0.bindMemory(to: Float32.self)) }
+            return SpectrumSnapshot(centerHz: centre, spanHz: rate, average: db)
+        }
+        let spectra = try ["tuning": spectrum("tuning"), "heldOut": spectrum("heldOut")]
+        let clips = Dictionary(uniqueKeysWithValues: recording.clips.map { ($0.name, $0) })
+        let ft8 = manifest.points.filter { $0.truth == "FT8" && clips[$0.clip] != nil }
+        let decodedPoints = ft8.filter { $0.how.hasPrefix("decoded") }
+        func time(_ p: Manifest.Point) -> Double { clips[p.clip]!.startSeconds + p.endSeconds }
+        let ordered = ft8.sorted { time($0) < time($1) }
+        let barrier = TuneBarrier()
+        barrier.end(centerHz: centre)
+        let runs = Mutex(0)
+        var decoders = SignalIDDecoding.Decoders.standard
+        let standard = decoders.ft8
+        decoders.ft8 = { audio, slot in runs.withLock { $0 += 1 }; return standard(audio, slot) }
+        var boxes: [SignalIDDecoding.BoxRead] = [], slots: [SignalIDDecoding.SlotDecodes] = []
+        var first: [String: CardRow] = [:], card: [String: CardRow] = [:]
+        var wrongNames: [String] = [], otherMessages: [String] = []
+        var own = 0, members = 0, checked = 0, unverified = 0
+        for point in ordered {
+            let part = clips[point.clip]!.part
+            let t = time(point), endFrame = Int((t * rate).rounded())
+            let request = SignalIDService.Request(atHz: point.atHz, bandwidthHz: nil, spectrum: spectra[part], longer: true,
+                                                  modelCenterHz: centre, trueTime: true)
+            let chunks = ring.chunks(endFrame: endFrame)
+            let finder: SignalIDService.CombFinder = { CaptureComb.find(spectrumDb: $0, sampleRate: $1, centerHz: $2) }
+            guard let outcome = SignalIDService.run(request, provider: ring.snapshots(endFrame: endFrame), chunks: chunks,
+                                                    analysis: SignalIDService.identifier, combFinder: finder,
+                                                    barrier: barrier) else {
+                Issue.record("no answer at \(point.atHz) Hz, \(time(point)) s")
+                continue
+            }
+            let hover = outcome.identity
+            var named = hover
+            var made: SignalIDDecoding.Attempt?
+            if let trial = SignalIDDecoding.plan(for: hover, centerHz: centre) {
+                made = SignalIDDecoding.attempt(for: hover, plan: trial, state: barrier.current, trueTime: true,
+                                                known: boxes, slots: slots, chunks: chunks, barrier: barrier,
+                                                decoders: decoders, cancelled: { false })
+            }
+            if let made {
+                // Kept as the service keeps them.
+                if let box = made.box {
+                    boxes.removeAll {
+                        $0.dialHz == box.dialHz || box.map.readEndUTC - $0.map.readEndUTC > SignalIDDecoding.boxReuseSeconds
+                    }
+                    boxes.append(box)
+                }
+                if let slot = made.slot { slots = SignalIDDecoding.keeping(slots, slot) }
+                named = SignalIDDecoding.applied(made, to: hover, centerHz: centre)
+            }
+            let label = String(format: "%.1f Hz at %.1f s", point.atHz, t)
+            // No name the truth rules out, on the point's answer or any signal under it (FT8's frequencies hold FT8 alone).
+            for answer in [named] + named.signals {
+                if let best = answer.best, best.confidence >= SignalIdentifier.nameThreshold, best.name != "FT8" {
+                    wrongNames.append("\(label): \(best.name) in \(named.label)")
+                }
+            }
+            // Each message against the decoded points on its trace in its slot (as `ft8TrialAttribution` checks them).
+            if let made, let decodedSlot = made.slotStart?.timeIntervalSince(start) {
+                for trace in [named] + named.signals {
+                    guard let text = trace.decodedText else { continue }
+                    if trace.measurement.offsetHz == named.measurement.offsetHz { own += 1 } else { members += 1 }
+                    let hz = centre + trace.measurement.offsetHz
+                    let reach = max(trace.measurement.occupiedBandwidthHz, trace.measurement.bandwidth6dBHz) / 2 + 6.25
+                    let sameSlot = decodedPoints.filter { p in
+                        abs((p.parameters?["toneZeroHz"] ?? 0) + 21.875 - hz) <= reach && p.parameters?["slotSeconds"] == decodedSlot
+                    }
+                    if sameSlot.contains(where: { $0.how.contains("\"\(text)\"") }) {
+                        checked += 1
+                    } else if !sameSlot.isEmpty {
+                        otherMessages.append(String(format: "%@: %.1f Hz, slot %.0f", label, hz, decodedSlot))
+                    } else {
+                        unverified += 1
+                    }
+                }
+            }
+            func count(_ rows: inout [String: CardRow], _ id: SignalIdentity, _ path: String) {
+                var row = rows[part] ?? CardRow(path: path, part: part)
+                if point.transmitting {
+                    row.windows += 1
+                    if id.best?.name == "FT8" { row.right += 1 } else { row.others[Self.shortLabel(id), default: 0] += 1 }
+                }
+                if ([id] + id.signals).contains(where: {
+                    ($0.best?.confidence ?? 0) >= SignalIdentifier.nameThreshold && $0.best?.name != "FT8"
+                }) { row.wrong += 1 }
+                rows[part] = row
+            }
+            count(&first, hover, "Card's first answer (service, before its decode), 1 MS/s")
+            count(&card, named, "Card with its trial decode, 1 MS/s")
+        }
+        for part in ["tuning", "heldOut"] {
+            for row in [first[part], card[part]].compactMap({ $0 }) {
+                print(String(format: "cardWithDecode %@ %@: %d/%d named FT8 (%.0f%%), %d wrong names; others %@", part,
+                             row.path, row.right, row.windows, 100 * Double(row.right) / Double(max(1, row.windows)),
+                             row.wrong, "\(row.others.sorted { $0.value > $1.value })"))
+            }
+            #expect((card[part]?.right ?? 0) >= (first[part]?.right ?? 0), "\(part): the card names FT8 less than the hover")
+        }
+        print("cardWithDecode: ring \(plan.capacityBytes / 4) frames (\(Double(plan.capacityBytes / 4) / rate) s); "
+              + "\(ordered.count) FT8 points, \(runs.withLock { $0 }) decoder runs over \(boxes.count) boxes kept; messages on "
+              + "\(own) points' own traces and \(members) members: \(checked) checked against a decoded point, \(unverified) "
+              + "with none there, \(otherMessages.count) another station's")
+        for line in wrongNames { print("cardWithDecode wrong name: \(line)") }
+        for line in otherMessages { print("cardWithDecode another station's message: \(line)") }
+        #expect(wrongNames.isEmpty)
+        #expect(otherMessages.isEmpty)
+        if let path = ProcessInfo.processInfo.environment["SUBFLOOR_SIGNALID_CARD_ROWS"] {
+            let rows = ["tuning", "heldOut"].flatMap { [first[$0], card[$0]].compactMap { $0 } }
+            try JSONEncoder().encode(rows).write(to: URL(fileURLWithPath: path))
         }
     }
 }

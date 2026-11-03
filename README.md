@@ -149,7 +149,7 @@ scripts/bundle.sh                    # build build/SubFloor.app (with its icon)
 VERSION=0.1.0 SIGN_IDENTITY="Developer ID Application: …" scripts/make_dmg.sh   # signed release DMG
 python3 scripts/make_icon.py Sources/SubFloor/Resources/AppIcon.png   # redraw the icon (needs Pillow, NumPy)
 swift test                           # unit tests
-SUBFLOOR_SIGNALID_MATRIX=1 swift test --filter SignalIDTests   # also Signal ID's full accuracy matrix and sweeps
+SUBFLOOR_SIGNALID_MATRIX=1 swift test --filter SignalIDTests   # also Signal ID's full accuracy matrix, scenes and sweeps
 SUBFLOOR_HW=1 swift test             # also run the RSP1B hardware smoke test
 ```
 
@@ -211,20 +211,22 @@ the card says so.
 
 **Tested on real signals:** FT8, FT4 and one 2-FSK signal, from the owner's recordings. Every other mode is
 tested on generated signals only. The figures below come from those real recordings, from parts held out from all
-tuning, as measured now:
+tuning, on the 1 MS/s recordings themselves (and, in brackets, on the small clips cut from them for the tests):
 
 | Test | Result |
 | --- | --- |
-| FT8, hover (no decode) | named FT8 in about 50% of windows (82/163) |
+| FT8, hover (no decode) | named FT8 in 48% of windows (78/163; clips 82/163) |
+| FT8, card with its trial decode | 51% (83/163), the same as its first answer: 13 of all 236 FT8 windows got a message checked against the decoded truth, none another station's |
 | FT4, hover | 7/12 |
-| FT8 group at the default zoom | 71% (115/163) |
-| The 2-FSK (one emitter, split by time) | 7/8 |
+| FT8 group at the owner's zoom | 72% (118/163; clips 115/163) |
+| The 2-FSK (one emitter, split by time) | 6/8 (clips 7/8) |
 | Interference comb lines | 14/14 labelled comb or No signal, never a mode |
 | Empty spectrum read as `No signal` | 35/36 |
 | Wrong names | 0 |
 
-The 2-FSK is a single emitter, its recording split by time into the tuning and held-out parts, so its figure says
-less than the count suggests.
+The targets were 80% for FT8, FT4 and the 2-FSK, and 95% for empty spectrum; FT8, FT4 and the FT8 group miss
+theirs, and so does the 2-FSK on the recording, by one window in eight. The 2-FSK is a single emitter, its recording
+split by time into the tuning and held-out parts, so its figure says less than the count suggests.
 
 It names SSB and AM voice, CW, RTTY, PSK31, FT8, WSPR and other HF data modes, and VHF and up ones such as
 NFM, WFM, DMR, P25, APRS, POCSAG and AIS. **It never guesses.** A name needs 70%
