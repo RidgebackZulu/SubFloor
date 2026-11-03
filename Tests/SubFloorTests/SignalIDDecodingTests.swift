@@ -525,9 +525,8 @@ struct SignalIDDecodingTests {
                                       amplitude: 0.1, leadInSeconds: 0.2)
         let ring = Self.iq(audio: Array(audio.prefix(Int(11 * Self.rate))), shiftHz: 0)
         let first = Self.identified(ring, centerHz: Self.fskCaptureCentre, atHz: Self.fskCentre)
-        // Unnamed on its numbers (its 1.5 stop bits read its keying at 7/7.5 of 75 Bd: 70).
-        #expect(first.best == nil && first.label.hasPrefix("2-FSK · ") && first.label.contains("850 Hz shift"),
-                "\(first.label)")
+        // Unnamed on its numbers (75 Bd and 850 Hz outside the amateur segments): RTTY's name needs readable text.
+        #expect(first.best == nil && first.label.hasPrefix("2-FSK · 75 Bd · 850 Hz shift"), "\(first.label)")
         let (made, named) = Self.trial(first, centerHz: Self.fskCaptureCentre, chunks: Self.chunks(ring))
         #expect(made?.decodes.first?.strength == .readable)
         #expect(named.best?.name == "RTTY", "\(named.label)")

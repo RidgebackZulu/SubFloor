@@ -36,8 +36,8 @@ struct TrialDecode: Sendable, Equatable {
 ///   trace offers FT8 and was on the air in the slot (`applied`).
 /// - **RTTY and PSK31** (`stream`): the newest `streamSeconds` around the signal, demodulated the same way, through an
 ///   RTTY decoder at the measured shift (the standard one it is: 170, 425 or 850 Hz) and each standard speed within
-///   `rttyBaudSearch` of the measured one (45.45, 50, 75 Bd: a character's 1.5 stop bits can make its keying read 7/7.5
-///   of its speed), or a PSK31 one at 31.25 Bd. Its text counts only when it reads (`ReadableText.score` ≥
+///   `rttyBaudSearch` of the measured one (45.45, 50, 75 Bd: the tones read a start-stop signal's speed within 1 %, its
+///   1.5 stop bits allowed for), or a PSK31 one at 31.25 Bd. Its text counts only when it reads (`ReadableText.score` ≥
 ///   `readableScore`), the best reading if several did; RTTY's speed and shift are then the decoder's.
 /// - **None** for WSPR (its 2 minute slot doesn't fit the ring) or FT4 (no full decoder).
 ///
@@ -81,11 +81,11 @@ enum SignalIDDecoding {
     static let boxReuseSeconds = 5.0
     /// The ring read short of `ft8RingSeconds` by more than this held less than it.
     static let ringShortSeconds = 0.5
-    /// RTTY's standard speeds and shifts; a speed is tried within `rttyBaudSearch` of the measured one (a character's
-    /// stop bits can make it read 7 % low), a shift taken within `rttyShiftTolerance`.
+    /// RTTY's standard speeds and shifts; a speed is tried within `rttyBaudSearch` of the measured one (the tones read a
+    /// start-stop signal's speed within 1 %: `DirectFSK`), a shift taken within `rttyShiftTolerance`.
     static let rttyBauds = [45.45, 50, 75]
     static let rttyShiftsHz = [170.0, 425, 850]
-    static let rttyBaudSearch = 0.1
+    static let rttyBaudSearch = 0.03
     static let rttyShiftTolerance = 0.04
     /// PSK31's speed, and how near a measurement must be.
     static let pskBaud = PSK31Encoder.symbolRate

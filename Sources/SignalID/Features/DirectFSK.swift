@@ -28,9 +28,11 @@ struct FSKReading: Equatable {
 /// - **The speed** comes from two things, which must agree. The *keying line* is the strongest periodicity in the times
 ///   the tone changes. The *tone runs* are how long each tone stays on: a rate fits when at least `minRunFit` of them
 ///   last a whole number of symbols, and at least `minUnitRuns` last just one (a line at twice the speed passes the
-///   first and not the second, half the speed the second and not the first). Amateur RTTY's 1.5 stop bits put a
-///   start-stop signal's edges on a half-symbol grid, and cancel its line at the speed: so a line at twice a rate speaks
-///   for that rate too, when the runs say so.
+///   first and not the second, half the speed the second and not the first). A start-stop signal's 1.5 stop bits
+///   (amateur RTTY's) put its edges on a half-symbol grid and cancel its line at the speed, leaving the line at twice it
+///   and the character rate's harmonics (7/7.5 of the speed among them): so a line at twice a rate speaks for that rate
+///   too, and there the run holding each stop bit, a half-symbol longer than whole, fits as well, when those runs are
+///   all on one tone (the mark's: `stopBitShare`), as a stop bit's are and a signal read at half its speed's never are.
 /// - **The tones** are put right from the phase each one turns through while it is on, so the shift doesn't depend on
 ///   where the map's bins fall.
 /// - **The SNR** is the power in the tones' band, less the noise there, over the noise in the signal's width. The noise
@@ -69,6 +71,9 @@ enum DirectFSK {
     static let solidRunFit = 0.9
     static let runTolerance = 0.25
     static let minUnitRuns = 0.12
+    /// On the half-symbol grid's line, runs a half-symbol longer than whole count when at least this share of them are
+    /// on one tone (a start-stop signal's stop bits, all mark).
+    static let stopBitShare = 0.9
     static let longestRunSymbols = 16.0
     static let settledConfidence: Float = 0.9
     /// Agreement this faint is no speed: keying with no clock behind it reaches 0.55, the real FSK's tuning part falls to 0.63,
@@ -372,7 +377,8 @@ enum DirectFSK {
         static func speed(_ runs: [Run], dt: Double, filterSeconds: Double) -> (baud: Double, confidence: Float)? {
             let changes = runs.filter(\.joined).map(\.steps.lowerBound)
             guard changes.count >= DirectFSK.minChanges, let last = changes.last else { return nil }
-            let durations = zip(runs, runs.dropFirst()).filter { $1.joined && $0.joined }.map { Double($0.0.steps.count) * dt }
+            let durations = zip(runs, runs.dropFirst()).filter { $1.joined && $0.joined }
+                .map { (seconds: Double($0.0.steps.count) * dt, tone: $0.0.tone) }
             guard !durations.isEmpty else { return nil }
             let size = FFT.size(atLeast: DirectFSK.spectrumPadding * (last + 1))
             var re = [Float](repeating: 0, count: size), im = re
@@ -393,11 +399,13 @@ enum DirectFSK {
                 let curve = a - 2 * b + c
                 let hz = (Double(peak) + (curve < 0 ? 0.5 * (a - c) / curve : 0)) * binHz
                 let contrast = b / Double(typical)
+                // The line's own rate first; then half of it, the line being the half-symbol grid's (a start-stop
+                // signal's, its stop bits' runs a half-symbol longer than whole).
                 for baud in [hz, hz / 2] where baud >= DirectFSK.lowestBaud {
-                    guard let fit = fit(durations, baud: baud) else { continue }
+                    guard let fit = fit(durations, baud: baud, halfGrid: baud != hz) else { continue }
                     let confidence = min(SignalMeasurer.score(contrast, DirectFSK.minLineContrast, DirectFSK.solidLineContrast),
                                          SignalMeasurer.score(fit, DirectFSK.minRunFit, DirectFSK.solidRunFit))
-                    // (A start-stop signal's half-grid line stands lower, and its runs fit less, and it is told by the rest.)
+                    // (A line at a rate the runs barely fit is a harmonic of something else, and is told by the rest.)
                     guard baud != hz || confidence >= DirectFSK.minConfidence else { continue }
                     return (baud, confidence)
                 }
@@ -405,16 +413,27 @@ enum DirectFSK {
             return nil
         }
 
-        /// How much of `durations` lasts a whole number of symbols at `baud`, when enough of them last just one.
-        static func fit(_ durations: [Double], baud: Double) -> Double? {
+        /// How much of `durations` (each run's length and tone) lasts a whole number of symbols at `baud`, when enough of
+        /// them last just one. With `halfGrid` (the line is at twice `baud`: the half-symbol grid), a run a half-symbol
+        /// longer than whole counts too, when `stopBitShare` of such runs are on one tone: a start-stop signal's stop bits.
+        static func fit(_ durations: [(seconds: Double, tone: Int)], baud: Double, halfGrid: Bool = false) -> Double? {
             var whole = 0, unit = 0
+            var halves: [Int: Int] = [:]   // by tone
             for d in durations {
-                let symbols = d * baud
+                let symbols = d.seconds * baud
                 let nearest = symbols.rounded()
-                guard nearest >= 1, nearest <= DirectFSK.longestRunSymbols,
-                      abs(symbols - nearest) <= DirectFSK.runTolerance else { continue }
-                whole += 1
-                if nearest == 1 { unit += 1 }
+                if nearest >= 1, nearest <= DirectFSK.longestRunSymbols, abs(symbols - nearest) <= DirectFSK.runTolerance {
+                    whole += 1
+                    if nearest == 1 { unit += 1 }
+                } else if halfGrid {
+                    let half = (symbols - 0.5).rounded() + 0.5
+                    if half >= 1.5, half <= DirectFSK.longestRunSymbols, abs(symbols - half) <= DirectFSK.runTolerance {
+                        halves[d.tone, default: 0] += 1
+                    }
+                }
+            }
+            if let most = halves.values.max(), Double(most) >= DirectFSK.stopBitShare * Double(halves.values.reduce(0, +)) {
+                whole += most
             }
             let total = Double(durations.count)
             guard Double(whole) >= DirectFSK.minRunFit * total, Double(unit) >= DirectFSK.minUnitRuns * total else { return nil }
