@@ -216,7 +216,7 @@ tuning, on the 1 MS/s recordings themselves (and, in brackets, on the small clip
 | Test | Result |
 | --- | --- |
 | FT8, hover (no decode) | named FT8 in 48% of windows (78/163; clips 82/163) |
-| FT8, card with its trial decode | 51% (83/163), the same as its first answer: 13 of all 236 FT8 windows got a message checked against the decoded truth, none another station's |
+| FT8, card with its trial decode | 51% (83/163), the same as its first answer: 13 of all 196 FT8 windows (both parts) got a message checked against the decoded truth, none another station's |
 | FT4, hover | 7/12 |
 | FT8 group at the owner's zoom | 72% (118/163; clips 115/163) |
 | The 2-FSK (one emitter, split by time) | 6/8 (clips 7/8) |
@@ -224,8 +224,8 @@ tuning, on the 1 MS/s recordings themselves (and, in brackets, on the small clip
 | Empty spectrum read as `No signal` | 35/36 |
 | Wrong names | 0 |
 
-The targets were 80% for FT8, FT4 and the 2-FSK, and 95% for empty spectrum; FT8, FT4 and the FT8 group miss
-theirs, and so does the 2-FSK on the recording, by one window in eight. The 2-FSK is a single emitter, its recording
+The targets were 80% for FT8, FT4, the FT8 group and the 2-FSK, and 95% for empty spectrum; FT8, FT4 and the FT8
+group miss theirs, and so does the 2-FSK on the recording, by one window in eight. The 2-FSK is a single emitter, its recording
 split by time into the tuning and held-out parts, so its figure says less than the count suggests.
 
 It names SSB and AM voice, CW, RTTY, PSK31, FT8, WSPR and other HF data modes, and VHF and up ones such as

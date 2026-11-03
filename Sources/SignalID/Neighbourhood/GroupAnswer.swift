@@ -58,8 +58,9 @@ extension SignalIdentifier {
     ///   (`memberAnswer`).
     /// - When the names among them are one slot mode's (FT8, FT4) alone, the signals are its whole connected group
     ///   (`groupGapHz` apart at most, as far as the view goes), and `groupSpanHz` its span.
-    /// - One not measured takes the slot-mode name of the nearest measured one it fits the same slot and width as
-    ///   (`fitsSameSlot`); otherwise it is unknown, until it is measured itself.
+    /// - One not measured is *likely* the slot mode of the nearest measured one it fits the same slot and width as
+    ///   (`fitsSameSlot`): named from its neighbours (`nameInherited`), that name an alternative capped at
+    ///   `inheritedConfidence` and never its `best`; otherwise it is unknown, until it is measured itself.
     static func underThePoint(_ point: SignalIdentity, first: [Float], sampleRate: Double, captureCenterHz: Double,
                               hood: Neighbourhood, view: NeighbourhoodView, signals: [SignalCandidate], pointHz: Double,
                               radiusHz: Double, seconds: Double, endTime: Date?, readsTones: Bool,

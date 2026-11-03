@@ -67,6 +67,12 @@ import Testing
     /// The tuning part's comb windows, with a longer read of 5 s (the hover's goes to 16 s; `heldOutTargets` takes that
     /// path): a line whose level dips with the receiver's gain (12 s, keeping step with its pair), and one whose doubled
     /// pair with a slot mode's tracks beside it would make an area of them (15 s), are both labelled comb.
+    ///
+    /// A margin to know of: on the held-out part the 14076917 Hz line stands 2.91 dB over its floor against
+    /// `InterferenceComb.bareDb`'s 3 dB cut (0.09 dB, measured once the code was final, not tuned on), so a change to the
+    /// app's spectrum averaging, `backgroundHz` or `floorShare` can flip it, and the gated `heldOutTargets` comb row with
+    /// it. The principled fix is a separate, higher cut for dropping one line from an otherwise-bare grid, chosen on the
+    /// tuning part (the Task 5 note); `bareDb` is not to be retuned on held-out data.
     @Test func realCombLinesAreLabelled() throws {
         let clips = try RealCorpus.clips()
         for (atHz, end) in [(14_077_955.0, 12.0), (14_076_917, 15)] {

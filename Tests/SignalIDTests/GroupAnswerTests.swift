@@ -191,10 +191,19 @@ import Testing
                                                atHz: Self.centreHz, bandwidthHz: nil, spectrumDb: nil,
                                                longer: { (iq, Self.seconds) }, pointRadiusHz: 700, endTime: end)
             let keyedUp = id.signals.filter { abs(abs($0.measurement.offsetHz) - 600) < 80 }
+            let label = end == nil ? "no time" : "true time"
             #expect(keyedUp.count == 2, "\(Self.describe(id))")
             #expect(keyedUp.allSatisfy { member in
                 member.best.map { !["FT8", "FT4"].contains($0.name) || $0.confidence < SignalIdentifier.nameThreshold } ?? true
-            }, "\(end == nil ? "no time" : "true time"): \(Self.describe(id))")
+            }, "\(label): \(Self.describe(id))")
+            // Each either has no FT8/FT4 among its alternatives, or is named only from its neighbours, that name capped
+            // at `inheritedConfidence`.
+            for member in keyedUp {
+                let slotModes = member.alternatives.filter { ["FT8", "FT4"].contains($0.name) }
+                #expect(slotModes.isEmpty
+                        || (member.nameInherited && member.alternatives.first.map { $0.confidence <= SignalIdentifier.inheritedConfidence } == true),
+                        "\(label): \(member.label), inherited \(member.nameInherited), alternatives \(member.alternatives.map { ($0.name, $0.confidence) })")
+            }
         }
     }
 

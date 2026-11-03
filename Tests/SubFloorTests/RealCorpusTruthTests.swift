@@ -388,8 +388,10 @@ extension RealCorpusTruthTests {
     /// request to `onFirst` (or to the answer, when there is no longer read), the ring read from the recording as the ring
     /// would hand it over, through `SignalIDService.run`. Cold: the capture's comb found from the app's spectrum first, as
     /// on the first hover after a tune; warm: the comb known, as for the next 5 s. 4 held-out points of each truth, at
-    /// the default radius and FT8's at the owner's zoom too. Prints each kind's median and slowest; asserts nothing.
-    @Test func serviceFirstAnswerTiming() throws {
+    /// the default radius and FT8's at the owner's zoom too. Prints each kind's median and slowest; asserts nothing, and
+    /// takes minutes, so it also wants `SUBFLOOR_SIGNALID_TIMING=1`, as `RealCorpusTests.releaseTimings` does.
+    @Test(.enabled(if: ProcessInfo.processInfo.environment["SUBFLOOR_SIGNALID_TIMING"] == "1"))
+    func serviceFirstAnswerTiming() throws {
         let manifest = try Self.manifest()
         let finder: SignalIDService.CombFinder = { CaptureComb.find(spectrumDb: $0, sampleRate: $1, centerHz: $2) }
         var lines: [String] = []
@@ -454,7 +456,8 @@ extension RealCorpusTruthTests {
     @Test func cardWithDecode() throws {
         let manifest = try Self.manifest()
         let recording = try #require(manifest.recordings.first { $0.tag == "14MHz" })
-        let start = try #require(ISO8601DateFormatter().date(from: "2026-11-01T18:18:44Z"))
+        // The recording's start, from its file name (as `serviceFirstAnswerTiming` takes it).
+        let start = try #require(Self.startUTC(recording.file))
         let rate = recording.captureRate, centre = recording.captureCenterHz
         // The app's IQ ring at its defaults (`RecordingSettings`: 30 s of pre-roll, int16 IQ, 2 GiB at most).
         let defaults = RecordingSettings()

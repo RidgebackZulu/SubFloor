@@ -54,9 +54,6 @@ struct SymbolTonesReading: Equatable {
 ///   positions used at least. Then it is an MFSK only when every `Check` holds; otherwise nil, and the signal is measured
 ///   as before. Each check alone stops a case the others let through (`SymbolTonesTests.eachCheckStopsWhatOnlyItCan`):
 ///   - `contrast`: a CW key at 10 dB;
-///   - `halves`: each symbol's two halves agree on its frequency (`minHalfAgreement`), as one tone held throughout does.
-///     A CW key's frames don't (PSK31 ≤ 0.36, CW ≤ 0.21; FT8 and FT4 at 4 dB ≥ 0.41). On the corpus's tuning part it
-///     also turns away 5 readings of real FT8 that would have passed (a cost; the name came from the other read);
 ///   - `exclusivity`: one tone at a time, the strongest of its tones `minExclusivity` times over the rest in each symbol.
 ///     An interference comb's lines, all there at once with its pulses a symbol apart, read 5.1 on the tuning part (noise
 ///     alone about 3.3); FT4 at 4 dB 6.4–7.4, FT8 9 or more;
@@ -105,8 +102,6 @@ enum SymbolTones {
     /// The share of symbols on the grid a reading is half sure at (`confidence`).
     static let minOnGrid = 0.6
     static let solidOnGrid = 0.9
-    /// Each symbol's two halves' frequencies correlate at least this well.
-    static let minHalfAgreement = 0.4
     /// In a symbol, its tone's power over the mean of the others', at least (the median over symbols).
     static let minExclusivity = 6.0
     /// An MFSK's symbols change tone: one position holding more than this share of them is a line (an interference comb's
@@ -159,8 +154,6 @@ enum SymbolTones {
     enum Check: CaseIterable, Hashable {
         /// The swing stands `minContrast` over the median.
         case contrast
-        /// Each symbol's two halves agree (`minHalfAgreement`).
-        case halves
         /// No tone holds more than `maxToneShare` of the symbols.
         case toneShare
         /// The tones fill `minSpanFill` of their span.
@@ -314,8 +307,6 @@ enum SymbolTones {
         var last: Int
         var seen: Int
         var onGrid: Double
-        /// The correlation of each symbol's two halves' frequencies.
-        var halfAgreement: Double
         /// The median over symbols of its tone's power over the mean of the others'.
         var exclusivity: Double
         /// How much more often neighbouring symbols keep their tone from an even symbol than from an odd one, or the
@@ -387,8 +378,7 @@ enum SymbolTones {
             return top / max(rest, 1e-30)
         })
         return Tones(values: values, grid: grid, counts: counts, placed: placed, first: first, last: last,
-                     seen: seen.count, onGrid: Double(placed) / Double(values.count),
-                     halfAgreement: correlation(kept.map { aligned.halvesHz[$0] }), exclusivity: exclusivity,
+                     seen: seen.count, onGrid: Double(placed) / Double(values.count), exclusivity: exclusivity,
                      pairing: pairing)
     }
 
@@ -396,9 +386,6 @@ enum SymbolTones {
     static func rejection(_ t: Tones, checks: Set<Check> = Set(Check.allCases)) -> Check? {
         let span = t.last - t.first + 1
         let failed: [Check: Bool] = [
-            // Each symbol holds one tone throughout: its two halves agree. Frames of several symbols of something else (a
-            // PSK's reversals) don't.
-            .halves: t.halfAgreement < minHalfAgreement,
             .toneShare: Double(t.counts.values.max() ?? 0) > maxToneShare * Double(t.placed),
             .spanFill: Double(t.seen) < minSpanFill * Double(span),
             // With symbols enough for every tone several times over, none between the outermost goes unused.
@@ -417,19 +404,6 @@ enum SymbolTones {
         return values.sorted()[values.count / 2]
     }
 
-    /// The correlation of pairs' first and second values (0 for fewer than 3).
-    static func correlation(_ pairs: [(Double, Double)]) -> Double {
-        guard pairs.count >= 3 else { return 0 }
-        let n = Double(pairs.count)
-        let ma = pairs.reduce(0) { $0 + $1.0 } / n, mb = pairs.reduce(0) { $0 + $1.1 } / n
-        var ab = 0.0, aa = 0.0, bb = 0.0
-        for (a, b) in pairs {
-            ab += (a - ma) * (b - mb)
-            aa += (a - ma) * (a - ma)
-            bb += (b - mb) * (b - mb)
-        }
-        return aa > 0 && bb > 0 ? ab / (aa * bb).squareRoot() : 0
-    }
 
     /// The largest power of two under `n`.
     static func powerOfTwo(below n: Int) -> Int {
@@ -509,13 +483,12 @@ enum SymbolTones {
     }
 
     /// What `frames` gives: each frame's concentration and weight, their weighted mean, and (with peaks asked for) the
-    /// frequency of each symbol's middle 80% and of its two halves, and its place in the run.
+    /// frequency of each symbol's middle 80%, and its place in the run.
     struct Frames {
         var meanConcentration = 0.0
         var concentrations: [Double] = []
         var weights: [Double] = []
         var peaksHz: [Double] = []
-        var halvesHz: [(Double, Double)] = []
         /// Each symbol's middle's power spectrum (with peaks asked for), `binHz` apart from 0 Hz, wrapping.
         var spectra: [[Float]] = []
         var binHz = 0.0
@@ -583,9 +556,6 @@ enum SymbolTones {
                 let middle = samples(symbolMiddle.lowerBound), count = max(4, samples(symbolMiddle.upperBound) - middle)
                 out.peaksHz.append(peakHz(from + middle, count))
                 out.spectra.append(power)
-                let half = samples(0.5)
-                out.halvesHz.append((peakHz(from + middle, max(4, half - middle)),
-                                     peakHz(from + half, max(4, samples(symbolMiddle.upperBound) - half))))
             }
         }
         let sum = out.weights.reduce(0, +)

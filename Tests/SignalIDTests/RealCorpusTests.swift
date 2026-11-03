@@ -227,11 +227,14 @@ import Testing
     }
 
     /// The hover's path (`RealCorpus.hover`) at a point of a clip, on the recording the clip was cut from: its 1 MS/s read
-    /// ending at the point's time, with the capture's spectrum.
+    /// ending at the point's time, with the capture's spectrum. A recording that can't be read (missing from
+    /// `~/Music/SubFloor`) fails the test loudly at the first point that needs it: never an empty read scored as "Too
+    /// soon".
     static func recordingHover(_ manifest: RealCorpus.Manifest) -> (CorpusClip, CorpusPoint) -> SignalIdentity {
         { clip, point in
             guard let recording = manifest.recordings.first(where: { $0.clips.contains { $0.name == clip.name } }),
                   let entry = recording.clips.first(where: { $0.name == clip.name }) else {
+                Issue.record("\(clip.name) is no recording's clip in the manifest")
                 return SignalIdentity(measurement: SignalMeasurement(), note: "no recording")
             }
             let end = entry.startSeconds + point.endSeconds
@@ -240,7 +243,12 @@ import Testing
                                     endTime: recording.startUTC?.addingTimeInterval(end),
                                     capture: (clip.captureSpectrumDb, recording.captureRate, recording.captureCenterHz),
                                     radiusHz: point.truth == RealCorpus.groupTruth ? RealCorpus.groupRadiusHz : 60) { seconds in
-                (try? RealCorpus.readRecording(recording.file, seconds: max(0, end - seconds)..<end)) ?? []
+                do {
+                    return try RealCorpus.readRecording(recording.file, seconds: max(0, end - seconds)..<end)
+                } catch {
+                    Issue.record("\(recording.file) can't be read (\(error)): the recordings must be in ~/Music/SubFloor")
+                    return []
+                }
             }
         }
     }

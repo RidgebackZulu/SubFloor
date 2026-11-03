@@ -97,7 +97,6 @@ extension SymbolTonesTests {
         }
         let cases: [(SymbolTones.Check, String, [Float], Double)] = [
             (.contrast, "a CW key", Self.at(cw, seconds: 3, snr: 10, seed: 2), 60),
-            (.halves, "a CW key", Self.at(cw, seconds: 3, snr: 10, seed: 3), 100),
             (.spanFill, "two CW keys 40 Hz apart", twoKeys(3, 10, 2), 100),
             (.emptyTone, "a 2-FSK 85 Hz wide", Self.at(fsk85, seconds: 3, snr: 3, seed: 1), 150),
             (.exclusivity, "a 2-FSK 85 Hz wide", Self.at(fsk85, seconds: 12, snr: 3, seed: 1), 150),
