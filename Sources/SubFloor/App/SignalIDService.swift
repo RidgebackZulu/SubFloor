@@ -337,11 +337,6 @@ final class SignalIDService {
     /// The open card (nil: none). Shown as a popover at its point.
     private(set) var card: Card?
 
-    /// What the owner last asked of Signal ID: a hover's identification or a card. A scan that dwells gives way to it.
-    enum OwnerAsk: Sendable { case hover, card }
-    /// How many times the owner has asked (a hover's identification begun, a card opened), and the last ask.
-    @ObservationIgnored private(set) var ownerAsks: (count: Int, last: OwnerAsk?) = (0, nil)
-
     /// Test hook: where the IQ comes from (`AppModel` points it at its IQ recorder).
     @ObservationIgnored var snapshotProvider: SnapshotProvider = { _ in nil }
     /// Test hook: where the longer read comes from.
@@ -1323,7 +1318,6 @@ final class SignalIDService {
             guard let dwell = self?.dwell else { return }
             await dwell()
             guard !Task.isCancelled, let self else { return }
-            ownerAsks = (ownerAsks.count + 1, .hover)
             hoverPending = true
             let identity = await identify(atHz: hz, radiusHz: Self.radiusHz(hzPerPoint: hzPerPoint), priority: .owner,
                                           hover: true) { [weak self] first in
@@ -1361,7 +1355,6 @@ final class SignalIDService {
     func openCard(at point: CGPoint, hz: Double, hzPerPoint: Double? = nil) {
         closeCard()
         endHover()
-        ownerAsks = (ownerAsks.count + 1, .card)
         let generation = cardGeneration
         card = Card(id: generation, point: point, hz: hz, signalHz: hz)
         cardTask = Task { [weak self] in

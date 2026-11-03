@@ -112,11 +112,17 @@ enum SignalIDText {
     /// The card's line for an FSK whose two tones were seen taking turns.
     static let takingTurnsLine = "the two tones take turns"
 
-    /// The slot evidence the measurement holds, as the identifier counts it (`SignalIdentifier.minSlotFit` over
-    /// `minSlotEvents` events at least): the best-fitting period's line, nil without one (or without a true time).
-    static func slotEvidence(_ m: SignalMeasurement) -> String? {
-        let good = m.slotFits.filter {
-            $0.fit >= SignalIdentifier.minSlotFit && $0.events >= SignalIdentifier.minSlotEvents
+    /// The slot evidence `identity` holds, as the identifier counts it (`SignalIdentifier.minSlotFit` over
+    /// `minSlotEvents` events at least), for a slot mode it matched (its name, or one of its candidates, whose tones fit):
+    /// timing alone fits FT4's grid by chance, so a signal no slot row matched gets no line. The best-fitting period's
+    /// line, nil without one (or without a true time).
+    static func slotEvidence(_ identity: SignalIdentity) -> String? {
+        let periods = Set(([identity.best].compactMap { $0 } + identity.alternatives).compactMap {
+            ModeTable.row($0.name).flatMap { $0.slotted ? $0.slotPeriodSeconds : nil }
+        })
+        let good = identity.measurement.slotFits.filter {
+            periods.contains($0.periodSeconds)
+                && $0.fit >= SignalIdentifier.minSlotFit && $0.events >= SignalIdentifier.minSlotEvents
         }
         guard let best = good.max(by: { ($0.fit, $0.events, $0.periodSeconds) < ($1.fit, $1.events, $1.periodSeconds) })
         else { return nil }
@@ -138,7 +144,7 @@ enum SignalIDText {
         let m = identity.measurement
         let own = identity.best?.evidence ?? []
         var lines: [String] = []
-        if let slot = slotEvidence(m), !own.contains(where: { $0.hasPrefix(slot) }) { lines.append(slot) }
+        if let slot = slotEvidence(identity), !own.contains(where: { $0.hasPrefix(slot) }) { lines.append(slot) }
         let turns = takesTurns(m)
         if turns { lines.append(takingTurnsLine) }
         if let comb = identity.comb {

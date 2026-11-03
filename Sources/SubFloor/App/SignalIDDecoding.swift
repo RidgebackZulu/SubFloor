@@ -94,16 +94,16 @@ enum SignalIDDecoding {
     static let ft8Name = "FT8", rttyName = "RTTY", pskName = "PSK31 / PSK63"
 
     static let noTrueTimeNote = "No FT8 decode: the IQ has no true time to find its slots by"
-    static let noOwnSlotNote = String(format: "No FT8 decode: it was on the air in no complete slot of the last %.0f s; named from its tones and slots",
+    static let noOwnSlotNote = String(format: "No FT8 decode: it was on the air in no complete slot of the last %.0f s, so it is named from its tones and slots",
                                       ft8RingSeconds)
     /// The ring gave nothing to read (not running, or cleared): nothing was timed.
-    static let ringEmptyNote = "No FT8 decode: the ring gave nothing to read; named from its tones and slots"
+    static let ringEmptyNote = "No FT8 decode: the ring gave nothing to read, so it is named from its tones and slots"
     /// The ring's read failed after it had given its newest sample: it was overwritten or reconfigured as it was read.
-    static let readFailedNote = "No FT8 decode: the ring's read failed (overwritten or reconfigured as it was read); named from its tones and slots"
+    static let readFailedNote = "No FT8 decode: the ring's read failed (overwritten or reconfigured as it was read), so it is named from its tones and slots"
     /// The note when the ring reached back only `seconds` (its pre-roll, or a retune since), and no complete slot the
     /// signal was on the air in.
     static func ringShortNote(_ seconds: Double) -> String {
-        String(format: "No FT8 decode: the ring reached back only %.0f s (%.0f wanted), and it was on the air in no complete slot of them, so a station clicked while it transmits may not be confirmed; named from its tones and slots",
+        String(format: "No FT8 decode: the ring reached back only %.0f s (%.0f wanted), and it was on the air in no complete slot of them (a station still transmitting when asked may need its next slot), so it is named from its tones and slots",
                seconds, ft8RingSeconds)
     }
 

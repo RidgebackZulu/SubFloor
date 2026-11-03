@@ -226,7 +226,10 @@ struct SignalIDUITests {
 
     /// Transmissions on a slot mode's UTC slots are evidence on the card, as the identifier counts them, once.
     @Test func cardShowsSlotEvidence() {
+        // An FT8 candidate under the name threshold: its own slots are evidence.
         var id = Self.member(0, named: false)
+        id.alternatives = [ModeMatch(name: "FT8", confidence: 0.55, evidence: []),
+                           ModeMatch(name: "FT4", confidence: 0.4, evidence: [])]
         id.measurement.slotFits = [SlotFit(periodSeconds: 15, lengthSeconds: 12.64, fit: 0.9, events: 3),
                                    SlotFit(periodSeconds: 7.5, lengthSeconds: 4.48, fit: 0.4, events: 3)]
         #expect(SignalIDText.evidence(id).contains("transmissions start on 15 s UTC boundaries"))
@@ -237,6 +240,17 @@ struct SignalIDUITests {
         id.measurement.slotFits = [SlotFit(periodSeconds: 15, lengthSeconds: 12.64, fit: 1, events: 1),
                                    SlotFit(periodSeconds: 7.5, lengthSeconds: 4.48, fit: 0.5, events: 4)]
         #expect(!SignalIDText.evidence(id).contains { $0.contains("UTC boundaries") })
+        // Timing alone, with no slot mode the tones fit: chance (a start fits FT4's grid two times in three), no line.
+        var unmatched = Self.member(0, named: false)
+        unmatched.measurement.slotFits = [SlotFit(periodSeconds: 7.5, lengthSeconds: 4.48, fit: 0.9, events: 3)]
+        #expect(!SignalIDText.evidence(unmatched).contains { $0.contains("UTC boundaries") })
+        unmatched.alternatives = [ModeMatch(name: "RTTY", confidence: 0.5, evidence: [])]
+        #expect(!SignalIDText.evidence(unmatched).contains { $0.contains("UTC boundaries") })
+        // Only the period of the slot mode matched: an FT8 candidate's tones say nothing of FT4's grid.
+        var ft8Only = Self.member(0, named: false)
+        ft8Only.alternatives = [ModeMatch(name: "FT8", confidence: 0.55, evidence: [])]
+        ft8Only.measurement.slotFits = [SlotFit(periodSeconds: 7.5, lengthSeconds: 4.48, fit: 0.9, events: 3)]
+        #expect(!SignalIDText.evidence(ft8Only).contains { $0.contains("UTC boundaries") })
         // A name that counted it already says it (with what it added): not twice.
         var named = Self.member(0)
         named.measurement.slotFits = [SlotFit(periodSeconds: 15, lengthSeconds: 12.64, fit: 0.9, events: 3)]
@@ -280,6 +294,19 @@ struct SignalIDUITests {
         #expect(!SignalIDText.evidence(Self.familyOnly).contains("the two tones take turns"))
     }
 
+    /// The take-turns line follows its real producer: a 2-FSK run through the identifier's own measurer, whose note the
+    /// card recognises (so a change of the measurer's words shows here).
+    @Test func takingTurnsComesFromTheMeasurer() throws {
+        let rate = 48_000.0, centre = 7_000_000.0
+        let iq = SignalSynth.make(.rtty(baud: 75, shiftHz: 850), sampleRate: rate, seconds: 3, snrDb: 20, offsetHz: 2000,
+                                  seed: 1)
+        let id = SignalIdentifier.identify(iq: iq, sampleRate: rate, captureCenterHz: centre, atHz: centre + 2000,
+                                           bandwidthHz: nil, spectrumDb: nil, longer: nil)
+        #expect(id.measurement.family == .fsk && id.measurement.toneCount ?? 2 == 2, "\(id.label)")
+        #expect(SignalIDText.takesTurns(id.measurement), "\(id.measurement.notes)")
+        #expect(SignalIDText.evidence(id).contains(SignalIDText.takingTurnsLine), "\(SignalIDText.evidence(id))")
+    }
+
     /// An interference comb's line is no station: no Bookmark, but Copy works, and its title is the comb.
     @Test func combHasNoBookmark() throws {
         let m = idleModel()
@@ -300,8 +327,10 @@ struct SignalIDUITests {
     @Test func cardSaysHowFarTheRingReached() throws {
         let note = SignalIDDecoding.ringShortNote(30)
         let lines = SignalIDText.noteLines("Read 2.1 s of the 3 s asked for; " + note)
-        try #require(lines.count == 3, "\(lines)")
-        #expect(lines[1].contains("reached back only 30 s") && lines[1].contains("may not be confirmed"), "\(lines)")
+        // One line for the decode's note: what limited it, and what it was named from instead.
+        try #require(lines.count == 2, "\(lines)")
+        #expect(lines[1].contains("reached back only 30 s") && lines[1].contains("may need its next slot")
+                    && lines[1].contains("named from its tones and slots"), "\(lines)")
     }
 
     // MARK: Hover

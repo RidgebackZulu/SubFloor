@@ -19,11 +19,11 @@ public struct ModeRow: Sendable {
     /// Slots, fax lines or ticks: a candidate asks for the longer read (the spec's slow-signal rule).
     let needsTiming: Bool
     /// Transmits in slots with silence between (FT8, FT4): the longer read measures one transmission.
-    let slotted: Bool
+    public let slotted: Bool
     /// Its longest transmission (FT8's 79 symbols, 12.64 s): a shorter read can't show all of one.
     let slotSeconds: Double
     /// Its slots, on UTC boundaries (FT8's 15 s, FT4's 7.5 s); 0 for a row without them.
-    let slotPeriodSeconds: Double
+    public let slotPeriodSeconds: Double
     /// How its FSK is keyed by its standard (WSPR and MFSK16 rectangular, FT8, FT4 and Olivia Gaussian): when
     /// named, its width comes from its parameters where the edges sit under the noise (`ParameterWidth`, R16).
     let shaping: ParameterWidth.Shaping?

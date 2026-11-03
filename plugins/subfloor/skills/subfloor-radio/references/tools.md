@@ -195,7 +195,7 @@ Finds every signal across a range and identifies each. Use it to scan a band.
 | `to_hz` **(required)** | number or string | Upper edge, display Hz. |
 | `min_snr_db` | number | A line must stand this many dB over the floor (default 10, 0–60). |
 | `max_signals` | integer | At most this many signals (default 40, 1–200); it stops there (`truncated`, `resume_from_hz`). |
-| `dwell_seconds` | number | A stepped scan's wait at each step, 0–30 s (more is refused). Default: about 3 s, naming from tone numbers only. |
+| `dwell_seconds` | number | A stepped scan's wait at each step, 0–30 s (more is refused). Default: about 3 s, naming from tone numbers only; 0 is the same as leaving it out. |
 
 - **Inside the current capture** it does not touch the radio.
 - **Across a wider range** it retunes the radio, one capture at a time (about 90% of `span_hz` a step, at most 60
@@ -209,18 +209,18 @@ Finds every signal across a range and identifies each. Use it to scan a band.
   WSPR, slow CW, time signals) come back unnamed, with `needs_longer_read: true`, and are listed in
   `needs_longer_read_hz`. To name one, `tune` there (its `identity.tune`) and call `identify_signal` after about
   16 s, or scan with `dwell_seconds`.
-- **`dwell_seconds`** (0–30) makes each step wait until the ring holds that much since the retune, and then identify
+- **`dwell_seconds`** (over 0, up to 30) makes each step wait until the ring holds that much since the retune, and then identify
   with the look-back, slot evidence and trial decode, from what it holds: 16 s for the look-back, a whole FT8 slot and
-  more for a decode. The scan takes that much longer a step. While it dwells, the owner pointing at the spectrum or
-  opening a Signal ID card stops it too, as a retune does. Inside the capture `dwell_seconds` changes nothing: the
-  ring already holds the history.
+  more for a decode. The scan takes that much longer a step. The owner's hover and Signal ID card don't stop it
+  (they only read, and go first in Signal ID's queue); a retune does, as below. A signal the dwell's ring still
+  couldn't give its longer read stays in `needs_longer_read_hz`. Inside the capture `dwell_seconds` changes nothing:
+  the ring already holds the history.
 - **It refuses** while the owner is recording (audio or IQ) or Auto is on, because a retune would split their file
   or cut an Auto recording: the error reads "The owner is recording: scan only within the current view, or ask
   the owner". Scan inside the capture then, or ask. It also refuses while an IQ file is playing (a range outside
   it), or a range the RSP1B cannot reach.
 - **It stops early** if the radio is changed under it (the VFO, mode, bandwidth, capture or HamItUp, or it is
-  stopped), or, when it steps, a recording or Auto is started (and, with `dwell_seconds`, the owner points at the
-  spectrum or opens a card). It checks before every step and before putting the
+  stopped), or, when it steps, a recording or Auto is started. It checks before every step and before putting the
   radio back, keeps what it found and writes nothing more to the radio, so the owner's change stands:
   `stopped_early` says what happened and `restored` is false. Inside the capture only a change of the capture
   itself stops it.
@@ -237,14 +237,15 @@ needs_longer_read_hz?, notes?}`:
     `from_hz`, `to_hz` and `signals` (each in `identify_signal`'s shape, at its own `hz`); `identity` is the station
     nearest the line that found it. It counts once towards `max_signals`.
   - **A comb's line** has `interference: true` (and `identity.interference`): it does not count towards
-    `max_signals`.
+    `max_signals`. At most 8 are listed; `notes` counts the rest. Past those 8, a line on the comb's grid gets only the
+    first read (a station there is still listed as itself).
   Every line over `min_snr_db` is looked at, however many there are. `at_receiver_centre: true` marks a line
   within a few bins of the capture's centre, where the receiver's own DC spike can show: treat it as doubtful.
 - `pieces`: the captures read. `restored`: the VFO, mode, bandwidth and HamItUp are as they were (true when it
   never moved the radio).
 - `truncated`: `max_signals` was reached, so there may be more above `resume_from_hz`: call `identify_signals`
   again with `from_hz` set to it (and the same `to_hz`). `needs_longer_read_hz`: the signals a stepped scan could
-  not give their longer read (see above). `notes`: pieces skipped, points that could not be read, that list, and for a
+  not give their longer read (see above), or a dwell's ring still couldn't. `notes`: pieces skipped, points that could not be read, that list, and for a
   stepped scan without `dwell_seconds`, that it named from tone numbers only.
 
 Log what it finds with `add_bookmark`, in the `Identified` group the owner's own ID bookmarks use: `name` from

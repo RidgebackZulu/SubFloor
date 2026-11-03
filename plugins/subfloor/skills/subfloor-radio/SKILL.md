@@ -209,10 +209,11 @@ A line marked `at_receiver_centre` may be the receiver's own DC spike, not a sig
 each capture for only about 3 s, so it names from tone numbers only (its `notes` say so): no 16 s look-back, slot
 evidence or trial decode, and slow signals (FT8, WSPR, slow CW, time signals) come back unnamed with
 `needs_longer_read` (listed in `needs_longer_read_hz`). For one you care about, `tune` to its `identity.tune` and call
-`identify_signal` after about 16 s, or scan again with `dwell_seconds` (0–30): it waits that long at each step and
-buys the look-back (16 s), slot evidence and trial decode (an FT8 decode wants a whole slot more), at that many
-seconds a step; while it waits, the owner pointing at the spectrum or opening a card stops it too. A scan inside the
-capture gives them all from the ring itself. If `truncated` is
+`identify_signal` after about 16 s, or scan again with `dwell_seconds` (up to 30; 0 is the same as none): it waits
+that long at each step and buys the look-back (16 s), slot evidence and trial decode (an FT8 decode wants a whole slot
+more), at that many seconds a step. The owner pointing at the spectrum or opening a card doesn't stop it; a retune
+does, as ever. A scan inside the capture gives them all from the ring itself. Interference comb lines are listed up to
+8; the rest are one note. If `truncated` is
 true, `max_signals` was reached: carry on with `identify_signals {from_hz: resume_from_hz, to_hz: <the same>}`
 (bookmark what you have first), or ask for a narrower range. Tell the owner how many you found
 and what stayed unnamed. A signal worth a closer look: `tune` to its `identity.tune` settings and `listen`.

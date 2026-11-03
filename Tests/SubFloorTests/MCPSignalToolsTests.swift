@@ -941,52 +941,111 @@ struct MCPSignalToolsTests {
         #expect(r.structured?["restored"]?.bool == true)
         #expect(Tuning(m) == before)
 
-        // The owner opens a card while the second step dwells: it stops, and leaves the radio there.
-        func dwellStopped(_ owner: @escaping @MainActor () -> Void, saying fragment: String,
-                          sourceLocation: SourceLocation = #_sourceLocation) async {
+        /// A dwelling scan whose owner acts as the second step dwells: the first step's ring is ready, the second's
+        /// only once the owner has acted.
+        func dwelling(_ owner: @escaping @MainActor () -> Void) async -> (MCPToolResult, parked: Double) {
             let calls = Shared(0), parked = Shared(0.0)
-            // The first step's ring is ready; the second's never is, and the owner acts as it dwells.
             tools.ringReady = { _ in
                 let n = calls.withLock { n -> Int in n += 1; return n }
-                if n == 1 { return true }
                 if n == 2 {
                     parked.withLock { $0 = m.centerHz }
                     owner()
+                    return false
                 }
-                return false
+                return true
             }
             let r = await call(tools, "identify_signals", wide.merging(["dwell_seconds": .number(15)]) { a, _ in a })
-            #expect(!r.isError, "\(r.content)", sourceLocation: sourceLocation)
-            #expect(r.structured?["stopped_early"]?.string?.contains(fragment) == true,
-                    "\(String(describing: r.structured?["stopped_early"]))", sourceLocation: sourceLocation)
-            #expect(r.structured?["pieces"]?.double == 1, sourceLocation: sourceLocation)
-            #expect(r.structured?["restored"]?.bool == false, sourceLocation: sourceLocation)
-            #expect(m.centerHz == parked.withLock { $0 }, sourceLocation: sourceLocation)
-            m.signalID.closeCard()
-            m.signalID.endHover()
-            m.tune(to: 7_150_000)
+            return (r, parked.withLock { $0 })
         }
-        await dwellStopped({ m.signalID.openCard(at: CGPoint(x: 10, y: 10), hz: m.centerHz + 1_000) }, saying: "card")
-        m.signalID.dwell = {}
-        await dwellStopped({ m.signalID.hover(at: CGPoint(x: 40, y: 40), hz: m.centerHz + 2_000) }, saying: "pointed")
-        await dwellStopped({ m.setVFO(m.centerHz + 250_000) }, saying: "retuned")
-
-        // Without dwell_seconds, the owner's card doesn't stop a scan (as before).
-        let calls = Shared(0)
-        tools.ringReady = { _ in
-            if calls.withLock({ n -> Int in n += 1; return n }) == 2 {
-                m.signalID.openCard(at: CGPoint(x: 10, y: 10), hz: m.centerHz + 1_000)
-            }
-            return true
-        }
-        let quick = await call(tools, "identify_signals", wide)
-        #expect(quick.structured?["stopped_early"] == nil, "\(String(describing: quick.structured?["stopped_early"]))")
-        #expect(quick.structured?["pieces"]?.double == 3)
+        // The owner's card and hover only read the radio: the scan carries on, and puts the radio back.
+        let (card, _) = await dwelling { m.signalID.openCard(at: CGPoint(x: 10, y: 10), hz: m.centerHz + 1_000) }
+        #expect(!card.isError, "\(card.content)")
+        #expect(card.structured?["stopped_early"] == nil, "\(String(describing: card.structured?["stopped_early"]))")
+        #expect(card.structured?["pieces"]?.double == 3)
+        #expect(card.structured?["restored"]?.bool == true)
+        #expect(Tuning(m) == before)
         m.signalID.closeCard()
+        m.signalID.dwell = {}
+        let (hover, _) = await dwelling { m.signalID.hover(at: CGPoint(x: 40, y: 40), hz: m.centerHz + 2_000) }
+        #expect(hover.structured?["stopped_early"] == nil, "\(String(describing: hover.structured?["stopped_early"]))")
+        #expect(hover.structured?["pieces"]?.double == 3)
+        #expect(hover.structured?["restored"]?.bool == true)
+        #expect(Tuning(m) == before)
+        m.signalID.endHover()
+
+        // The owner's retune as it dwells stops it, and the radio is left where the owner put it.
+        let target = Shared(0.0)
+        let (retuned, parked) = await dwelling {
+            target.withLock { $0 = m.centerHz + 250_000 }
+            m.setVFO(m.centerHz + 250_000)
+        }
+        #expect(retuned.structured?["stopped_early"]?.string?.contains("retuned") == true,
+                "\(String(describing: retuned.structured?["stopped_early"]))")
+        #expect(retuned.structured?["pieces"]?.double == 1)
+        #expect(retuned.structured?["restored"]?.bool == false)
+        #expect(m.centerHz == parked)
+        #expect(m.vfoHz == target.withLock { $0 })
     }
 
-    /// A stepped scan without dwell_seconds says it named from tone numbers only; inside the capture, or with a
-    /// dwell, it doesn't.
+    /// A dwell too short for the look-back keeps the signals that still want a longer read in needs_longer_read_hz.
+    @Test func aShortDwellKeepsTheFollowUpList() async {
+        guard let (m, tools) = runningModel() else { return }
+        defer { m.shutdown() }
+        m.tune(to: 7_150_000)
+        let span = m.sampleRate, from = 6_000_000.0
+        let lines = [from + 0.4 * span, from + 1.3 * span]
+        tools.scanSpectrum = { Self.spectrum(of: m, lines: lines) }
+        // Slow, and still slow after its longer read (the ring held too little of it).
+        m.signalID.analysis = { a in
+            var id = Self.rtty()(a)
+            id.needsLongerRead = true
+            return id
+        }
+        let r = await call(tools, "identify_signals", ["from_hz": .number(from), "to_hz": .number(from + 2.5 * span),
+                                                       "dwell_seconds": .number(5)])
+        #expect(!r.isError, "\(r.content)")
+        let slow = r.structured?["needs_longer_read_hz"]?.array?.compactMap(\.double) ?? []
+        #expect(slow.count == 2 && zip(slow, lines).allSatisfy { abs($0 - $1) < 2_000 }, "\(slow)")
+        let notes = (r.structured?["notes"]?.array ?? []).compactMap(\.string)
+        #expect(notes.contains { $0.contains("still wanted a longer read") && $0.contains("dwell longer") }, "\(notes)")
+        #expect(!notes.contains { $0.contains("named from tone numbers only") })
+    }
+
+    /// At most `maxCombRows` comb lines are listed, the rest one note; past them a line on the comb's grid gets the
+    /// first read only, and a station on it is still listed.
+    @Test func combRowsAreBounded() async {
+        guard let (m, tools) = runningModel() else { return }
+        defer { m.shutdown() }
+        let cap = SubFloorTools.maxCombRows
+        let comb = (0..<(cap + 4)).map { m.centerHz - 300_000 + Double($0) * 19_300 }
+        let station = comb[cap + 2]   // a station on a comb place, past the cap
+        let off = m.centerHz + 200_000
+        let longer = Shared<[Double]>([])
+        m.signalID.analysis = { a in
+            if a.longer != nil { longer.withLock { $0.append(a.atHz) } }
+            if abs(a.atHz - station) < 1_000 || abs(a.atHz - off) < 1_000 { return Self.rtty()(a) }
+            var id = Self.ft8Group([], comb: comb)(a)
+            id.needsLongerRead = a.longer == nil   // a comb line's longer read, judging its steadiness
+            return id
+        }
+        tools.scanSpectrum = { Self.spectrum(of: m, lines: comb + [off]) }
+        let r = await call(tools, "identify_signals", ["from_hz": .number(m.centerHz - 450_000),
+                                                       "to_hz": .number(m.centerHz + 450_000)])
+        #expect(!r.isError, "\(r.content)")
+        let rows = r.structured?["signals"]?.array ?? []
+        #expect(rows.filter { $0["interference"]?.bool == true }.count == cap, "\(rows.count)")
+        let stations = rows.filter { $0["interference"] == nil }.compactMap { $0["hz"]?.double }
+        #expect(stations.count == 2 && stations.contains { abs($0 - station) < 2_000 }, "\(stations)")
+        let notes = (r.structured?["notes"]?.array ?? []).compactMap(\.string)
+        #expect(notes.contains { $0.contains("3 more lines of the interference comb") }, "\(notes)")
+        // Past the cap, the comb's grid got no longer read; the off-grid station did.
+        let reads = longer.withLock { $0 }
+        #expect(!reads.contains { hz in comb[cap...].contains { abs($0 - hz) < 1_000 } }, "\(reads)")
+        #expect(reads.filter { hz in comb[..<cap].contains { abs($0 - hz) < 1_000 } }.count == cap, "\(reads)")
+    }
+
+    /// A stepped scan without dwell_seconds (or with 0, the same) says it named from tone numbers only, and makes no
+    /// longer read or trial decode; inside the capture, or with a dwell, it doesn't say so.
     @Test func quickScanSaysSo() async {
         guard let (m, tools) = runningModel() else { return }
         defer { m.shutdown() }
@@ -1000,8 +1059,28 @@ struct MCPSignalToolsTests {
         let quick = await call(tools, "identify_signals", wide)
         #expect(!quick.isError, "\(quick.content)")
         #expect(says(quick), "\(String(describing: quick.structured?["notes"]))")
-        let dwelt = await call(tools, "identify_signals", wide.merging(["dwell_seconds": .number(0)]) { a, _ in a })
+        // 0 is no dwell: the same as leaving it out.
+        let longer = Shared(0), asked = Shared<[Double]>([])
+        m.signalID.analysis = { a in
+            if a.longer != nil { longer.withLock { $0 += 1 } }
+            var id = Self.rtty()(a)
+            id.needsLongerRead = a.longer == nil
+            return id
+        }
+        let reads = m.signalID.chunkProvider
+        m.signalID.chunkProvider = { seconds, frames, visit in
+            asked.withLock { $0.append(seconds) }
+            return reads(seconds, frames, visit)
+        }
+        let zero = await call(tools, "identify_signals", wide.merging(["dwell_seconds": .number(0)]) { a, _ in a })
+        #expect(!zero.isError && says(zero), "\(String(describing: zero.structured?["notes"]))")
+        #expect(longer.withLock { $0 } == 0, "a longer read was made")
+        #expect(!asked.withLock { $0 }.contains { $0 >= SignalIDDecoding.streamSeconds }, "a trial decode was made")
+        #expect(zero.structured?["needs_longer_read_hz"]?.array?.count == 1)
+        // A dwell over 0 buys them.
+        let dwelt = await call(tools, "identify_signals", wide.merging(["dwell_seconds": .number(1)]) { a, _ in a })
         #expect(!dwelt.isError && !says(dwelt))
+        #expect(longer.withLock { $0 } == 1)
         tools.scanSpectrum = { Self.spectrum(of: m, lines: [m.centerHz + 40_000]) }
         let inside = await call(tools, "identify_signals", ["from_hz": .number(m.centerHz - 100_000),
                                                             "to_hz": .number(m.centerHz + 100_000)])
