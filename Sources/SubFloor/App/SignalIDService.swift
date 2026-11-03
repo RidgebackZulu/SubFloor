@@ -1331,9 +1331,10 @@ final class SignalIDService {
     static let maxRadiusHz = 2_000.0
 
     /// The radius hover and card ask within at a zoom of `hzPerPoint` (nil: the identifier's default): `radiusPixels`
-    /// worth of Hz, `maxRadiusHz` at most.
+    /// worth of Hz, `maxRadiusHz` at most, but never less than the one point under the pointer, so a station the owner
+    /// can see under it at the widest zooms is still taken in.
     static func radiusHz(hzPerPoint: Double?) -> Double? {
-        hzPerPoint.flatMap { $0 > 0 && $0.isFinite ? min(radiusPixels * $0, maxRadiusHz) : nil }
+        hzPerPoint.flatMap { $0 > 0 && $0.isFinite ? min(radiusPixels * $0, max(maxRadiusHz, $0)) : nil }
     }
 
     /// The pointer rests at `point` (view points) over `hz` (display Hz), the view showing `hzPerPoint` (nil: not

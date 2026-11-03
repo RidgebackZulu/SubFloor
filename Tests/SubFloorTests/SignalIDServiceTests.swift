@@ -935,7 +935,9 @@ struct SignalIDServiceTests {
         #expect(SignalIDService.radiusHz(hzPerPoint: .infinity) == nil)
         #expect(SignalIDService.radiusHz(hzPerPoint: 25) == 100)
         #expect(SignalIDService.radiusHz(hzPerPoint: 500) == 2_000)
-        #expect(SignalIDService.radiusHz(hzPerPoint: 10_000_000 / 1_500) == SignalIDService.maxRadiusHz)
+        #expect(SignalIDService.radiusHz(hzPerPoint: 1_000) == SignalIDService.maxRadiusHz)
+        // Never under the pointer's own point: at the widest zoom a point is wider than the cap.
+        #expect(SignalIDService.radiusHz(hzPerPoint: 10_000_000.0 / 1_500) == 10_000_000.0 / 1_500)
         #expect(SignalIDService.maxRadiusHz == 2_000)
     }
 
