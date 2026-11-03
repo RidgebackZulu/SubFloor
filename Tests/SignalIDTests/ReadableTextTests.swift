@@ -25,6 +25,8 @@ struct ReadableTextTests {
             most = max(most, ReadableText.score(Self.varicode(bits: 800, &random)))
         }
         #expect(most <= 0.3, "noise read \(most)")
+        // Words whose case changes inside them are noise's, not text's.
+        #expect(ReadableText.score("tHE wInD iS sTrOnG tHeN bEcOmInG gAlE lAtEr") < 0.3)
         // Nothing at all, or only symbols.
         #expect(ReadableText.score("") == 0)
         #expect(ReadableText.score("#$%&'()*+") == 0)
@@ -46,6 +48,8 @@ struct ReadableTextTests {
     @Test func aWordOrTwoIsNoProof() {
         #expect(ReadableText.score("THE") < 0.3)
         #expect(ReadableText.score("TU 599 05 NJ") < 0.5)
+        // Numbers alone (which noise in figures prints) count for half: never words.
+        #expect(ReadableText.score("412 37 1200Z 25KT 1013 0800 2359 1500Z 61") < 0.6)
     }
 
     // MARK: What decoders print from noise

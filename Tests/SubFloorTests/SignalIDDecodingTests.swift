@@ -281,6 +281,26 @@ struct SignalIDDecodingTests {
         #expect((named.decodedText ?? "").contains("DE K1ABC K1ABC PSE K"), "\(named.decodedText ?? "")")
     }
 
+    /// Text counts at `readableScore` and over: text reading 0.4 is no decode, 0.6 is one.
+    @Test func readableScoreIsTheBar() throws {
+        let words = "CQ CQ DE K1ABC K1ABC PSE K"
+        let low = words + " " + String(repeating: "XQZVBWJ ", count: 4), high = words + " XQZVBWJXQZVB"
+        #expect((0.35...0.45).contains(ReadableText.score(low)) && (0.55...0.65).contains(ReadableText.score(high)))
+        let m = SignalMeasurement(offsetHz: 3000, occupiedBandwidthHz: 1000, bandwidth6dBHz: 1000, snrDb: 30,
+                                  envelope: .steady, family: .fsk, familyConfidence: 0.7, symbolRate: 75, fskShiftHz: 850,
+                                  toneCount: 2, toneSpacingHz: 850, seconds: 3)
+        let identity = SignalIdentifier.identify(m, rfHz: Self.fskCentre)
+        let ring = [Float](repeating: 0, count: 2 * Int(4 * Self.rate))
+        for (text, decodes) in [(low, false), (high, true)] {
+            var decoders = SignalIDDecoding.Decoders.standard
+            decoders.stream = { _, _ in text }
+            let (made, named) = Self.trial(identity, centerHz: Self.fskCaptureCentre, chunks: Self.chunks(ring),
+                                           decoders: decoders)
+            #expect((made?.decodes.isEmpty == false) == decodes, "\(text)")
+            #expect((named.decodedText != nil) == decodes)
+        }
+    }
+
     /// Readable text names only its own mode: PSK31 text on an RTTY-like 2-FSK outside the amateur segments (which
     /// readable RTTY would name) leaves it unnamed, its text kept as heard.
     @Test func readableTextNamesOnlyItsMode() {
@@ -376,7 +396,9 @@ struct SignalIDDecodingTests {
         let open = Shared(false)
         m.signalID.decoders.ft8 = { _, _ in
             calls.withLock { $0 += 1 }
-            while !open.withLock({ $0 }) { Thread.sleep(forTimeInterval: 0.005) }
+            // Held until the card's answer has been seen (a bound, so a decode that shouldn't run fails, not hangs).
+            let until = Date().addingTimeInterval(20)
+            while !open.withLock({ $0 }), Date() < until { Thread.sleep(forTimeInterval: 0.005) }
             return []
         }
         m.signalID.decoders.stream = { _, _ in calls.withLock { $0 += 1 }; return "" }
