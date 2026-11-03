@@ -237,8 +237,8 @@ needs_longer_read_hz?, notes?}`:
     `from_hz`, `to_hz` and `signals` (each in `identify_signal`'s shape, at its own `hz`); `identity` is the station
     nearest the line that found it. It counts once towards `max_signals`.
   - **A comb's line** has `interference: true` (and `identity.interference`): it does not count towards
-    `max_signals`. At most 8 are listed; `notes` counts the rest. Past those 8, a line on the comb's grid gets only the
-    first read (a station there is still listed as itself).
+    `max_signals`. At most 8 are listed; `notes` counts the rest. Every line is still read in full: a station on a comb
+    place gets its longer read and decode, and is listed as itself.
   Every line over `min_snr_db` is looked at, however many there are. `at_receiver_centre: true` marks a line
   within a few bins of the capture's centre, where the receiver's own DC spike can show: treat it as doubtful.
 - `pieces`: the captures read. `restored`: the VFO, mode, bandwidth and HamItUp are as they were (true when it

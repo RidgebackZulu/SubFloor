@@ -289,7 +289,7 @@ struct SignalIDDecodingTests {
         let ten = Self.ft8Ring([("CQ K1ABC FN42", 1000, [])], seconds: 10)
         // The ring (S+7 to S+17) holds the end of the transmission (S+0.5 to S+13.14): the station is there, its slot not.
         let map = OnAirMap(iq: ten, sampleRate: Self.rate, centerOffsetHz: 0, halfSpanHz: 2000, readEnd: Self.ringEnd)
-        let air = try? #require(map.onAir(SignalIDDecoding.band(own)!))
+        let air = map.onAir(SignalIDDecoding.band(own)!)
         #expect(air?.runs.contains { $0.upperBound - $0.lowerBound > 4 } == true, "\(air?.runs ?? [])")
         let (made, named) = Self.trial(own, centerHz: Self.ft8Centre, chunks: Self.chunks(ten), decoders: decoders)
         #expect(made?.decodes.isEmpty == true && calls.withLock { $0 } == 0)

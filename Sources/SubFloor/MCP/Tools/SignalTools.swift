@@ -67,12 +67,14 @@ extension SubFloorTools {
                 each step instead and buys those (16 s for the look-back; an FT8 decode wants a full slot more); 0 is no dwell. \
                 Inside the capture they get them from the ring as identify_signal does. \
                 A group of one slot mode (6 FT8 stations) is one entry with count, from_hz, to_hz and signals, and \
-                counts once towards max_signals; an interference comb's line has interference true and doesn't count. \
+                counts once towards max_signals; an interference comb's line has interference true and doesn't count \
+                (the first 8 are listed, the rest counted in notes). \
                 It holds the radio lock and puts the VFO, mode, bandwidth and HamItUp back afterwards; \
                 each step restarts the owner's IQ pre-roll. The owner hears each step. It refuses while the owner \
                 is recording or Auto is on (a retune would split the \
                 file), and stops early, leaving the radio as it is, if the owner retunes or starts recording. \
-                min_snr_db (default 10) is how far a line stands over the floor; every such line is identified, \
+                min_snr_db (default 10) is how far a line stands over the floor; every such line is identified \
+                (comb lines past the first 8 unlisted), \
                 up to max_signals (default 40, up to 200): then truncated is set with resume_from_hz, to call again \
                 from. Log what it finds with add_bookmark. Returns {signals: [{hz, level_dbfs, identity, count?, \
                 from_hz?, to_hz?, signals?, interference?}], pieces, restored, stopped_early?, truncated?, \
@@ -275,8 +277,8 @@ extension SubFloorTools {
     static let dcBins = 4.0
     /// The most a scan lists as its own notes.
     private static let maxScanNotes = 10
-    /// The most lines of an interference comb a scan lists: the rest are one note. Past it, a line on a listed comb's grid
-    /// gets the first read only (a station there is still listed; a comb line costs no longer read or decode).
+    /// The most lines of an interference comb a scan lists: the rest are one note. Every line is still read in full (a
+    /// station on a comb place gets its longer read and decode, as anywhere).
     static let maxCombRows = 8
     /// The longest `dwell_seconds` a stepped scan waits at a step.
     static let maxDwellSeconds = 30.0
@@ -436,14 +438,6 @@ extension SubFloorTools {
         func counted() -> Int { found.filter(\.counts).count }
         var combsUnlisted = 0
         func combsListed() -> Int { found.filter { $0.identity.comb != nil }.count }
-        /// Whether `hz` lies on the grid of a comb line listed, within `tolerance` (and a share of the way, its spacing
-        /// being an average): from the nearest listed line.
-        func onCombGrid(_ hz: Double, tolerance: Double) -> Bool {
-            guard let row = found.filter({ $0.identity.comb != nil }).min(by: { abs($0.hz - hz) < abs($1.hz - hz) }),
-                  let comb = row.identity.comb, comb.spacingHz > 0 else { return false }
-            let k = ((hz - row.hz) / comb.spacingHz).rounded()
-            return abs(hz - row.hz - k * comb.spacingHz) <= max(tolerance, 0.002 * abs(hz - row.hz))
-        }
         var extents: [ClosedRange<Double>] = []
         var notes: [String] = []
         var truncated = false, resume = from, scanned = 0
@@ -498,15 +492,12 @@ extension SubFloorTools {
                     if interrupted(run) { break pieceLoop }
                     // A stepped scan's ring holds only the first read since its step: no longer read is made, nor a
                     // trial decode, unless it dwelt (one within the capture is; an FT8 slot's once, for all its signals).
-                    // With the comb's rows all listed, a line on its grid gets the first read only.
-                    let full = run.reads
-                        && !(combsListed() >= Self.maxCombRows && onCombGrid(peak.hz, tolerance: 2 * snap.binHz))
-                    var identity = await m.signalID.identify(atHz: peak.hz, longerRead: full, tryDecode: full)
+                    var identity = await m.signalID.identify(atHz: peak.hz, longerRead: run.reads, tryDecode: run.reads)
                     try Task.checkCancellation()
                     if identity?.note == SignalIdentifier.tooSoonNote {
                         // The ring hadn't filled since a retune: once more when it has.
                         guard try await waitForRing(run) else { break pieceLoop }
-                        identity = await m.signalID.identify(atHz: peak.hz, longerRead: full, tryDecode: full)
+                        identity = await m.signalID.identify(atHz: peak.hz, longerRead: run.reads, tryDecode: run.reads)
                         try Task.checkCancellation()
                     }
                     guard let identity else {

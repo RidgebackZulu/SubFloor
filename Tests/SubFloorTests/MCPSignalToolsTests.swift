@@ -1011,8 +1011,8 @@ struct MCPSignalToolsTests {
         #expect(!notes.contains { $0.contains("named from tone numbers only") })
     }
 
-    /// At most `maxCombRows` comb lines are listed, the rest one note; past them a line on the comb's grid gets the
-    /// first read only, and a station on it is still listed.
+    /// At most `maxCombRows` comb lines are listed, the rest one note; every line is still read in full, and a station on
+    /// a comb place past them is listed.
     @Test func combRowsAreBounded() async {
         guard let (m, tools) = runningModel() else { return }
         defer { m.shutdown() }
@@ -1038,10 +1038,39 @@ struct MCPSignalToolsTests {
         #expect(stations.count == 2 && stations.contains { abs($0 - station) < 2_000 }, "\(stations)")
         let notes = (r.structured?["notes"]?.array ?? []).compactMap(\.string)
         #expect(notes.contains { $0.contains("3 more lines of the interference comb") }, "\(notes)")
-        // Past the cap, the comb's grid got no longer read; the off-grid station did.
+        // Every comb line got its longer read, past the cap too (the station on a comb place wanted none).
         let reads = longer.withLock { $0 }
-        #expect(!reads.contains { hz in comb[cap...].contains { abs($0 - hz) < 1_000 } }, "\(reads)")
+        #expect(reads.filter { hz in comb[cap...].contains { abs($0 - hz) < 1_000 } }.count == 3, "\(reads)")
         #expect(reads.filter { hz in comb[..<cap].contains { abs($0 - hz) < 1_000 } }.count == cap, "\(reads)")
+    }
+
+    /// With the comb's rows all listed, a later FT8 on a comb place still gets its longer read, and is named by it.
+    @Test func anFT8OnACombPlacePastTheCapIsStillRead() async {
+        guard let (m, tools) = runningModel() else { return }
+        defer { m.shutdown() }
+        let cap = SubFloorTools.maxCombRows
+        let comb = (0..<(cap + 2)).map { m.centerHz - 300_000 + Double($0) * 19_300 }
+        let ft8 = comb[cap + 1]
+        m.signalID.analysis = { a in
+            guard abs(a.atHz - ft8) < 1_000 else { return Self.ft8Group([], comb: comb)(a) }
+            // Unnamed on the first read; the longer read names it.
+            var id = Self.ft8(a.atHz - a.captureCenterHz)
+            if a.longer == nil {
+                id.best = nil
+                id.alternatives = [ModeMatch(name: "FT8", confidence: 0.5, evidence: [])]
+                id.needsLongerRead = true
+            }
+            return id
+        }
+        tools.scanSpectrum = { Self.spectrum(of: m, lines: comb) }
+        let r = await call(tools, "identify_signals", ["from_hz": .number(m.centerHz - 450_000),
+                                                       "to_hz": .number(m.centerHz + 450_000)])
+        #expect(!r.isError, "\(r.content)")
+        let rows = r.structured?["signals"]?.array ?? []
+        #expect(rows.filter { $0["interference"]?.bool == true }.count == cap)
+        let station = rows.first { abs(($0["hz"]?.double ?? 0) - ft8) < 2_000 }
+        #expect(station?["identity"]?["name"]?.string == "FT8", "\(String(describing: station))")
+        #expect(station?["identity"]?["needs_longer_read"]?.bool == false)
     }
 
     /// A stepped scan without dwell_seconds (or with 0, the same) says it named from tone numbers only, and makes no
