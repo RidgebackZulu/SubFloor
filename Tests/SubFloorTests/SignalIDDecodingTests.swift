@@ -300,6 +300,24 @@ struct SignalIDDecodingTests {
         #expect(named2.best?.name == "RTTY")
     }
 
+    /// A message names the nearest of the traces it lies on, and a trace takes the nearest of the messages on it.
+    @Test func aTraceTakesItsNearestMessage() {
+        func message(_ text: String, at hz: Double) -> TrialDecode {
+            TrialDecode(mode: "FT8", text: text, strength: .checked, rfHz: Self.ft8Centre + hz)
+        }
+        var wide = Self.ft8Identity(toneZeroHz: 1000)   // centre 1021.875
+        wide.measurement.occupiedBandwidthHz = 90
+        var group = wide
+        group.signals = [wide, Self.ft8Identity(toneZeroHz: 1040)]   // centre 1061.875: overlaps the first
+        let made = SignalIDDecoding.Attempt(decodes: [message("FIRST", at: 1050), message("SECOND", at: 1025),
+                                                      message("THIRD", at: 1010)])
+        let named = SignalIDDecoding.applied(made, to: group, centerHz: Self.ft8Centre)
+        // 1025 and 1010 lie on the first only (36.9 Hz and more from the second's centre: past its 25 and a tone), and
+        // 1025 is the nearer: the first's. 1050 lies on both, nearer the second: the second's.
+        #expect(named.signals[0].decodedText == "SECOND" && named.decodedText == "SECOND")
+        #expect(named.signals[1].decodedText == "FIRST")
+    }
+
     /// Radio text is kept as data: control and format characters out, at most `maxTextCharacters`.
     @Test func decodedTextIsCleaned() {
         #expect(SignalIDDecoding.clean("CQ\u{7}\r\nDE\u{202E} K1ABC\u{0}  K") == "CQ DE K1ABC K")
@@ -355,7 +373,12 @@ struct SignalIDDecodingTests {
         guard let (m, _) = runningModel(ring: Self.ft8Ring([("CQ K1ABC FN42", 1000)]),
                                         analysis: Self.ft8Analysis()) else { return }
         defer { m.shutdown() }
-        m.signalID.decoders.ft8 = { _, _ in calls.withLock { $0 += 1 }; return [] }
+        let open = Shared(false)
+        m.signalID.decoders.ft8 = { _, _ in
+            calls.withLock { $0 += 1 }
+            while !open.withLock({ $0 }) { Thread.sleep(forTimeInterval: 0.005) }
+            return []
+        }
         m.signalID.decoders.stream = { _, _ in calls.withLock { $0 += 1 }; return "" }
         let hz = m.centerHz + 1000 + 3.5 * FT8Encoder.toneSpacing
         m.signalID.hover(at: CGPoint(x: 10, y: 10), hz: hz)
@@ -366,8 +389,11 @@ struct SignalIDDecodingTests {
         _ = await m.signalID.identify(atHz: hz, priority: .owner, hover: true, tryDecode: true)
         _ = await m.signalID.identify(atHz: hz, longerRead: false, tryDecode: true)
         #expect(calls.withLock { $0 } == 0)
-        // The card decodes.
+        // The card decodes, its answer up meanwhile.
         m.signalID.openCard(at: CGPoint(x: 10, y: 10), hz: hz)
+        #expect(await eventually { calls.withLock { $0 } == 1 })
+        #expect(await eventually { m.signalID.card?.identity != nil && m.signalID.card?.measuring == true })
+        open.withLock { $0 = true }
         #expect(await eventually { m.signalID.card?.pending == false && m.signalID.card?.measuring == false })
         #expect(calls.withLock { $0 } == 1)
     }
@@ -419,6 +445,8 @@ struct SignalIDDecodingTests {
         let calls = Shared(0)
         let members = (0..<6).map { Self.ft8Identity(toneZeroHz: 600 + 300 * Double($0)) }
         let analysis: SignalIDService.Analysis = { a in
+            // A lone FT8 far from the group, outside the box its slot was decoded in.
+            if a.atHz - a.captureCenterHz > 5000 { return SignalIDDecodingTests.ft8Identity(toneZeroHz: 6000) }
             let near = members.min { abs($0.measurement.offsetHz - (a.atHz - a.captureCenterHz))
                 < abs($1.measurement.offsetHz - (a.atHz - a.captureCenterHz)) }!
             var id = near
@@ -434,6 +462,9 @@ struct SignalIDDecodingTests {
             _ = await m.signalID.identify(atHz: m.centerHz + member.measurement.offsetHz, tryDecode: true)
         }
         #expect(calls.withLock { $0 } == 1)
+        // One outside that box is decoded in its own.
+        _ = await m.signalID.identify(atHz: m.centerHz + 6000 + 3.5 * FT8Encoder.toneSpacing, tryDecode: true)
+        #expect(calls.withLock { $0 } == 2)
     }
 }
 
