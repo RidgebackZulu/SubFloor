@@ -708,12 +708,14 @@ struct SignalIDDecodingTests {
         _ = await m.signalID.identify(atHz: hz, priority: .owner, hover: true, tryDecode: true)
         _ = await m.signalID.identify(atHz: hz, longerRead: false, tryDecode: true)
         #expect(calls.withLock { $0 } == 0)
-        // The card decodes, its answer up meanwhile.
+        // The card decodes, its answer up meanwhile, saying it is decoding; once decoded, it no longer is.
         m.signalID.openCard(at: CGPoint(x: 10, y: 10), hz: hz)
         #expect(await eventually { calls.withLock { $0 } == 1 })
         #expect(await eventually { m.signalID.card?.identity != nil && m.signalID.card?.measuring == true })
+        #expect(m.signalID.card?.decoding == true)
         open.withLock { $0 = true }
         #expect(await eventually { m.signalID.card?.pending == false && m.signalID.card?.measuring == false })
+        #expect(m.signalID.card?.decoding == false)
         #expect(calls.withLock { $0 } == 1)
     }
 

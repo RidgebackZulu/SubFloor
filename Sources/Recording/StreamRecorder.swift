@@ -170,7 +170,8 @@ public final class StreamRecorder: @unchecked Sendable {
         get { producer.withLock { $0.dataLimitOverride } }
         set { producer.withLock { $0.dataLimitOverride = newValue } }
     }
-    /// Tests: the clock the first-sample time is taken from.
+    /// Tests: the clock the first-sample time, and the time each pushed block is heard at (a snapshot's `endTime`),
+    /// are taken from.
     public var now: @Sendable () -> Date {
         get { producer.withLock { $0.now } }
         set { producer.withLock { $0.now = newValue } }
@@ -185,6 +186,9 @@ public final class StreamRecorder: @unchecked Sendable {
         var scratch: UnsafeMutableRawBufferPointer?
         var dataLimitOverride: Int?
         var now: @Sendable () -> Date = { Date() }
+        /// When the last block was pushed (`now` then): the time the ring's newest frame was heard, which a snapshot
+        /// carries as its `endTime`, so that it stays right with the radio stopped. Nil until the first push.
+        var heard: Date?
     }
 
     /// What kind of recording is open (or being opened). Read cheaply from any thread.
@@ -447,7 +451,8 @@ public final class StreamRecorder: @unchecked Sendable {
     }
 
     /// The newest frames, up to `lastSeconds`, never from before the last retune (`setContext`) or
-    /// `clearHistory`. nil when the recorder is not set up for IQ or has heard nothing since. Any thread:
+    /// `clearHistory`. nil when the recorder is not set up for IQ or has heard nothing since. Its `endTime` is when
+    /// the newest frame was pushed, not when it is read: right with the radio stopped. Any thread:
     /// it blocks `push` for one memcpy of what it takes, and converts after letting go.
     public func snapshot(lastSeconds: Double) -> IQSnapshot? {
         let (setup, plan) = producer.withLock { ($0.setup, $0.plan) }
@@ -462,11 +467,12 @@ public final class StreamRecorder: @unchecked Sendable {
         /// what the bytes mean first. `out` must be faulted in already: a fresh allocation's page faults
         /// would otherwise run with `push` blocked (tens of ms for 16 s of 2 MS/s).
         func copy(into out: UnsafeMutableRawBufferPointer) -> Int {
-            let (n, now, head) = producer.withLock { p -> (Int, @Sendable () -> Date, Int?) in
-                guard p.setup?.layout == layout, p.plan == plan else { return (0, p.now, nil) }
-                return (ring.copyNewest(into: out), p.now, ring.headFrames)
+            let (n, heard, head) = producer.withLock { p -> (Int, Date, Int?) in
+                guard p.setup?.layout == layout, p.plan == plan else { return (0, p.now(), nil) }
+                // When the newest frame was heard (the last push), not when it is read.
+                return (ring.copyNewest(into: out), p.heard ?? p.now(), ring.headFrames)
             }
-            end = now()
+            end = heard
             endFrame = head
             return n
         }
@@ -509,7 +515,8 @@ public final class StreamRecorder: @unchecked Sendable {
         guard let span = producer.withLock({ p -> (start: Int, end: Int, time: Date)? in
             guard p.setup?.layout == layout, p.plan == plan else { return nil }
             let end = ring.head
-            return (ring.rewind(bytes: min(wanted, plan.preRollBytes)), end, p.now())
+            // When the newest frame was heard (the last push), not when it is read.
+            return (ring.rewind(bytes: min(wanted, plan.preRollBytes)), end, p.heard ?? p.now())
         }), span.end > span.start else { return nil }
 
         let pieceBytes = min(chunkFrames * bpf, span.end - span.start)
@@ -556,6 +563,7 @@ public final class StreamRecorder: @unchecked Sendable {
             let scratch = p.scratch!
             converter.convert(samples, into: scratch)
             ring.push(UnsafeRawBufferPointer(rebasing: scratch[0..<bytes]))
+            p.heard = p.now()
         }
         if recording.load(ordering: .relaxed) { wake.signal() }
     }

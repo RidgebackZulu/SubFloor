@@ -993,11 +993,11 @@ struct SignalIDServiceTests {
         let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
         m.signalID.analysis = Self.silence(seen)
         let at = m.centerHz + 5_000
-        let reads = SignalIDService.lookBackStats.withLock { $0.reads }
+        let reads = m.signalID.lookBackStats.withLock { $0.reads }
         let id = try #require(await m.signalID.identify(atHz: at))
         #expect(id.label == SignalIdentifier.noSignalNote && id.note == SignalIdentifier.noSignalNote, "\(id.label)")
         // One read: its margin takes in how far the ring moved on since the first read.
-        #expect(SignalIDService.lookBackStats.withLock { $0.reads } == reads + 1)
+        #expect(m.signalID.lookBackStats.withLock { $0.reads } == reads + 1)
         let windows = seen.withLock { $0 }.dropFirst()
         #expect(windows.map { Int($0.seconds.rounded()) } == [13, 10, 7, 4, 1], "\(windows.map(\.seconds))")
         let ends = windows.compactMap { $0.endTime?.timeIntervalSince(end) }
@@ -1013,16 +1013,39 @@ struct SignalIDServiceTests {
         #expect(full.note == SignalIdentifier.noSignalNote, "\(full.note ?? "no note")")
     }
 
-    /// The radio stopped: the ring's IQ is read, and the analysis gets when it was heard, not now; the longer read
-    /// gets its own read's end time.
+    /// A real IQ recorder at 48 kS/s, its pre-roll `preRoll` s, fed `iq` in blocks of a second with its clock at `heard`
+    /// for the last of them (`heard` − 1 s before), then its clock the wall clock: what the reads say of when the IQ
+    /// was heard must come from the pushes, not from the reads.
+    nonisolated private static func recorder(_ iq: [Float], heard: Date, preRoll: Double = 20) -> StreamRecorder {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("SignalIDServiceTests-\(UUID().uuidString)")
+        let r = StreamRecorder(kind: .iq, rollsOnContextChange: true)
+        r.configure(StreamRecorder.Setup(sampleRate: 48_000, channels: 2, fileFormat: .wav, sampleFormat: .float32,
+                                         preRollSeconds: preRoll, memoryLimitBytes: 1 << 30, folder: dir))
+        let block = 2 * 48_000
+        var start = 0
+        while start < iq.count {
+            let end = min(start + block, iq.count)
+            r.now = { end == iq.count ? heard : heard.addingTimeInterval(-1) }
+            iq[start..<end].withUnsafeBufferPointer { r.push($0) }
+            start = end
+        }
+        r.now = { Date() }
+        return r
+    }
+
+    /// The radio stopped: the ring's IQ is read through the real recorder, and the analysis gets when it was heard (the
+    /// last push), not when it is read; the longer read, ending at the same newest frame, gets that time too. The
+    /// look-back's windows, placed by frame, are each stamped that many seconds before it.
     @Test func stoppedRadioUsesTheRing() async throws {
         guard let m = runningModel() else { return }
         defer { m.shutdown() }
         m.stop()
-        let heard = Date().addingTimeInterval(-600), longEnd = heard.addingTimeInterval(0.7)
-        let snap = Self.burst(seconds: 3.1, on: 0...3.1, offsetHz: 5_000, endTime: heard)
-        m.signalID.snapshotProvider = Self.provider(snap)
-        m.signalID.chunkProvider = Self.chunks(snap, endTime: longEnd)
+        let heard = Date().addingTimeInterval(-600)
+        let burst = Self.burst(seconds: 3.1, on: 0...3.1, offsetHz: 5_000, endTime: heard)
+        let recorder = Self.recorder(burst.samples, heard: heard)
+        defer { recorder.shutdown() }
+        m.signalID.snapshotProvider = { recorder.snapshot(lastSeconds: $0) }
+        m.signalID.chunkProvider = { recorder.snapshot(lastSeconds: $0, chunkFrames: $1, $2) }
         m.signalID.sourceKind = { .sdrplay }
         let ends = Locked<[Date?]>([])
         let inner = Self.stub()
@@ -1033,7 +1056,21 @@ struct SignalIDServiceTests {
             return id
         }
         #expect(await m.signalID.identify(atHz: m.centerHz + 5_000) != nil)
-        #expect(ends.withLock { $0 } == [heard, longEnd], "\(ends.withLock { $0 })")
+        #expect(ends.withLock { $0 } == [heard, heard], "\(ends.withLock { $0.map { $0?.timeIntervalSince(heard) } })")
+
+        // 17 s of silence heard up to `heard`: each window the look-back analyses ends 3, 6, … 15 s before it.
+        let silent = Self.recorder([Float](repeating: 0, count: 2 * 17 * 48_000), heard: heard)
+        defer { silent.shutdown() }
+        m.signalID.snapshotProvider = { silent.snapshot(lastSeconds: $0) }
+        m.signalID.chunkProvider = { silent.snapshot(lastSeconds: $0, chunkFrames: $1, $2) }
+        m.signalID.invalidateCache()
+        let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
+        m.signalID.analysis = Self.silence(seen)
+        let id = try #require(await m.signalID.identify(atHz: m.centerHz + 5_000))
+        #expect(id.note == SignalIdentifier.noSignalNote, "\(id.note ?? "no note")")
+        let windows = seen.withLock { $0 }.filter(\.longer)
+        let backs = windows.compactMap { $0.endTime?.timeIntervalSince(heard) }
+        #expect(backs.count == 5 && zip(backs, [-3.0, -6, -9, -12, -15]).allSatisfy { abs($0 - $1) < 1e-6 }, "\(backs)")
     }
 
     /// A 5 s ring: the look-back reads what it holds (less the 50 ms after the barrier) and says so; that is the whole
@@ -1410,10 +1447,10 @@ struct SignalIDServiceTests {
             m.signalID.invalidateCache()
             let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
             m.signalID.analysis = Self.silence(seen)
-            let before = SignalIDService.lookBackStats.withLock { $0 }
+            let before = m.signalID.lookBackStats.withLock { $0 }
             let at = m.centerHz + 5_000
             let id = try #require(await m.signalID.identify(atHz: at))
-            let after = SignalIDService.lookBackStats.withLock { $0 }
+            let after = m.signalID.lookBackStats.withLock { $0 }
             #expect(id.note == SignalIdentifier.noSignalNote, "\(rate): \(id.note ?? "no note")")
             let windows = seen.withLock { $0 }.filter(\.longer)
             let ends = windows.compactMap { $0.endTime?.timeIntervalSince(end) }
@@ -1622,12 +1659,12 @@ struct SignalIDServiceTests {
                     clock.withLock { $0 += cost }
                     return silence(a)
                 }
-                let before = SignalIDService.lookBackStats.withLock { $0.reads }
+                let before = m.signalID.lookBackStats.withLock { $0.reads }
                 let at = m.centerHz + 5_000
                 let id = try #require(await m.signalID.identify(atHz: at))
                 let label = "\(rate) S/s, \(cost) s an analysis"
                 #expect(id.note == SignalIdentifier.noSignalNote, "\(label): \(id.note ?? "no note")")
-                #expect(SignalIDService.lookBackStats.withLock { $0.reads } - before == reads, "\(label)")
+                #expect(m.signalID.lookBackStats.withLock { $0.reads } - before == reads, "\(label)")
                 let windows = seen.withLock { $0 }.filter(\.longer).map(\.seconds)
                 #expect(windows.count == 5 && zip(windows, [3.0, 3, 3, 3, 1]).allSatisfy { $0 >= $1 - 0.06 },
                         "\(label): \(windows)")
@@ -1704,14 +1741,65 @@ struct SignalIDServiceTests {
             m.signalID.invalidateCache()
             let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
             m.signalID.analysis = Self.silence(seen)
-            let before = SignalIDService.lookBackStats.withLock { $0.reads }
+            let before = m.signalID.lookBackStats.withLock { $0.reads }
             let at = m.centerHz + 5_000
             let id = try #require(await m.signalID.identify(atHz: at))
             #expect(id.note == note, "\(lag) s: \(id.note ?? "no note")")
-            #expect(SignalIDService.lookBackStats.withLock { $0.reads } - before == 1, "\(lag) s")
+            #expect(m.signalID.lookBackStats.withLock { $0.reads } - before == 1, "\(lag) s")
             let runs = seen.withLock { $0.count }
             _ = await m.signalID.identify(atHz: at)
             #expect((seen.withLock { $0.count } == runs) == kept, "\(lag) s: kept \(kept)")
+        }
+    }
+
+    /// A ring rebuilt after the first read (`StreamRecorder.configure` on a change of plan: its frames count from 0
+    /// again) can't be placed against the look-back's span: a probe, or a read, that ends before the ring was last seen
+    /// to end gives no look-back, said in the note, and nothing is kept (the next call reads again), never the newest
+    /// frames analysed as the windows before them.
+    @Test func aRebuiltRingHasNoLookBack() async throws {
+        guard let m = runningModel() else { return }
+        defer { m.shutdown() }
+        let rate = 48_000.0
+        for readDrops in [false, true] {
+            // 30 s in the ring at first; once the first pass has run, 2 s (seen by the probe, or only by the read).
+            let rebuilt = Locked(false)
+            @Sendable func end(probe: Bool) -> Int {
+                rebuilt.withLock { $0 } && !(probe && readDrops) ? Int(2 * rate) : Int(30 * rate)
+            }
+            m.signalID.snapshotProvider = { last in
+                let end = end(probe: last <= SignalIDService.probeSeconds)
+                let frames = min(end, Int((last * rate).rounded()))
+                return IQSnapshot(samples: [Float](repeating: 0, count: 2 * frames), sampleRate: rate, endTime: Date(),
+                                  endFrame: end)
+            }
+            m.signalID.chunkProvider = { last, chunkFrames, visit in
+                let end = end(probe: false)
+                let frames = min(end, Int((last * rate).rounded()))
+                let piece = [Float](repeating: 0, count: 2 * min(chunkFrames, frames))
+                var done = 0
+                while done < frames {
+                    let n = min(chunkFrames, frames - done)
+                    guard piece[0..<(2 * n)].withUnsafeBufferPointer(visit) else { return nil }
+                    done += n
+                }
+                return IQRead(frames: frames, sampleRate: rate, endTime: Date(), endFrame: end)
+            }
+            m.signalID.invalidateCache()
+            let seen = Locked<[(seconds: Double, endTime: Date?, longer: Bool)]>([])
+            let silence = Self.silence(seen)
+            m.signalID.analysis = { a in
+                if a.longer == nil { rebuilt.withLock { $0 = true } }
+                return silence(a)
+            }
+            let at = m.centerHz + 5_000
+            let id = try #require(await m.signalID.identify(atHz: at))
+            let label = readDrops ? "the read ends before the ring did" : "the probe ends before the ring did"
+            #expect(id.note == SignalIdentifier.noSignalNote + "; " + SignalIDService.lookBackFailedNote,
+                    "\(label): \(id.note ?? "no note")")
+            #expect(seen.withLock { $0.filter(\.longer).isEmpty }, "\(label): the newest frames were analysed as a window")
+            // Not kept: asked again, the point is read again.
+            _ = await m.signalID.identify(atHz: at)
+            #expect(seen.withLock { $0.filter { !$0.longer }.count } == 2, "\(label): kept")
         }
     }
 

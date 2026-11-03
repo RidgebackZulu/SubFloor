@@ -516,11 +516,14 @@ final class SignalIDService {
                 queue.finished(ticket)
                 return nil
             }
-            let request = Request(
+            var request = Request(
                 atHz: atHz, bandwidthHz: bandwidthHz, radiusHz: radiusHz, spectrum: model.spectrumSnapshot(),
                 longer: longerRead, modelCenterHz: model.centerHz, trueTime: sourceKind() == .sdrplay,
                 notAtFrequency: tuneFailedAt.map { now().timeIntervalSince($0) >= Self.notAtFrequencyGraceSeconds } ?? false,
                 comb: knownComb(), lookBackReads: lookBackReads)
+            #if DEBUG
+            request.lookBackStats = lookBackStats
+            #endif
             let provider = snapshotProvider, chunks = chunkProvider, analysis = self.analysis, barrier = tuning
             let finder = combFinder
             let task = Task.detached(executorPreference: executor, priority: .userInitiated) {
@@ -627,6 +630,10 @@ final class SignalIDService {
         var comb: KnownComb? = nil
         /// The most reads a look-back makes (`lookBackMaxReads`).
         var lookBackReads = SignalIDService.lookBackMaxReads
+        #if DEBUG
+        /// Where the look-back counts its reads (the service's `lookBackStats`; nil: nowhere).
+        var lookBackStats: LookBackStats? = nil
+        #endif
     }
 
     /// `run` (the tests' form).
@@ -785,9 +792,16 @@ final class SignalIDService {
     }
 
     #if DEBUG
-    /// Test hook: how many times a look-back's read was copied to be trimmed (never, when it is handed over), and the
-    /// most floats one of its reads reserved.
-    nonisolated static let lookBackStats = Mutex((copies: 0, reads: 0, mostFloats: 0))
+    /// Test hook: how many look-back reads this service made, how many times one was copied to be trimmed (never, when
+    /// it is handed over), and the most floats one reserved. The service's own, so suites running side by side in one
+    /// process never move each other's counts.
+    final class LookBackStats: Sendable {
+        private let counts = Mutex((copies: 0, reads: 0, mostFloats: 0))
+        func withLock<R>(_ body: (inout (copies: Int, reads: Int, mostFloats: Int)) -> R) -> R {
+            counts.withLock { body(&$0) }
+        }
+    }
+    @ObservationIgnored let lookBackStats = LookBackStats()
     #endif
 
     /// How a look-back went.
@@ -812,8 +826,9 @@ final class SignalIDService {
     ///
     /// The first window whose answer has an extent is the answer, recentred, saying how long nothing was there to
     /// identify; with none, "No signal": complete when its windows covered the span (`lookBackToleranceSeconds` short at
-    /// most), or all the ring held since the retune, which it says. `unavailable` after `lookBackReads` reads, or a read
-    /// that failed; `dropped` when the radio retuned or it was cancelled.
+    /// most), or all the ring held since the retune, which it says. `unavailable` after `lookBackReads` reads, a read
+    /// that failed, or a ring rebuilt meanwhile (a probe or read ending before the ring was last seen to end: its frames
+    /// count from 0 again, so they can't be placed; not kept); `dropped` when the radio retuned or it was cancelled.
     nonisolated static func lookBack(request: Request, state: TuneBarrier.State, firstEnd: Date, firstEndFrame: Int?,
                                      sampleRate: Double, comb: CaptureComb?, provider: SnapshotProvider,
                                      chunks: ChunkProvider, analysis: Analysis,
@@ -844,11 +859,15 @@ final class SignalIDService {
         var reads = 0
         pastReads: while let first = backs.first {
             guard reads < request.lookBackReads else { return .unavailable(lookBackStopped(after: reads)) }
-            // Where the ring ends now, just before the read.
+            // Where the ring ends now, just before the read. A ring that ends before where it was last seen to (or
+            // before the span's start) was rebuilt meanwhile (`StreamRecorder.configure`: its frames count from 0 again):
+            // its frames can't be placed against the span, so there is no look-back (not kept: the next asks again).
             if byFrames {
                 guard let probe = provider(probeSeconds), probe.sampleRate == sampleRate, let frame = probe.endFrame,
                       barrier.current == state else { return barrier.current == state ? .unavailable(lookBackFailedNote) : .dropped }
-                known = max(known, Double(frame) / sampleRate)
+                let now = Double(frame) / sampleRate
+                guard now >= known else { return .unavailable(lookBackFailedNote) }
+                known = now
             }
             // From the first window not yet analysed back as far as one read holds.
             let newer = end0 - first
@@ -870,11 +889,13 @@ final class SignalIDService {
                       let readEnd = position(segment.readEndFrame, segment.readEndTime) else {
                     return .unavailable(lookBackFailedNote)
                 }
+                // A read ending before the ring was last seen to end: the ring was rebuilt as it was read.
+                guard !byFrames || readEnd >= known else { return .unavailable(lookBackFailedNote) }
                 known = max(known, readEnd)
                 let readStart = end - segment.seconds
                 if segment.reachedStart { start = readStart }
                 #if DEBUG
-                lookBackStats.withLock { $0.reads += 1; $0.mostFloats = max($0.mostFloats, segment.reservedFloats) }
+                request.lookBackStats?.withLock { $0.reads += 1; $0.mostFloats = max($0.mostFloats, segment.reservedFloats) }
                 let base = iq.withUnsafeBufferPointer { $0.baseAddress }
                 #endif
                 while let back = backs.first {
@@ -894,7 +915,7 @@ final class SignalIDService {
                     let keep = min(iq.count / 2, Int((held * rate).rounded()))
                     iq.removeLast(iq.count - 2 * keep)
                     #if DEBUG
-                    if iq.withUnsafeBufferPointer({ $0.baseAddress }) != base { lookBackStats.withLock { $0.copies += 1 } }
+                    if iq.withUnsafeBufferPointer({ $0.baseAddress }) != base { request.lookBackStats?.withLock { $0.copies += 1 } }
                     #endif
                     guard !Task.isCancelled, barrier.current == state else { return .dropped }
                     let before = iq, seconds = Double(keep) / rate
@@ -1388,7 +1409,8 @@ final class SignalIDService {
     static let trialDecodeCutNote = "The trial decode was cut short by a retune"
 
     /// `identity` into the card; nil (no data, or a retune during the longer read) keeps any first answer, said
-    /// in its note when a longer read was running.
+    /// in its note when a longer read was running. Every fill ends a trial decode's `decoding` (its start sets it
+    /// itself, after the first answer's fill): the answer filled in is the decoded one, or the one that stands.
     private func fill(_ identity: SignalIdentity?, measuring: Bool) {
         guard var shown = card else { return }
         if identity == nil, shown.measuring, var first = shown.identity {
@@ -1398,6 +1420,7 @@ final class SignalIDService {
         }
         shown.pending = false
         shown.measuring = measuring
+        shown.decoding = false
         if let identity {
             shown.identity = identity
             let m = identity.measurement
