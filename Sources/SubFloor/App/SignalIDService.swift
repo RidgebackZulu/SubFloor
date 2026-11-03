@@ -1323,9 +1323,17 @@ final class SignalIDService {
 
     // MARK: Hover
 
-    /// The radius hover and card ask within at a zoom of `hzPerPoint` (nil: the identifier's default).
+    /// The widest radius hover and card ask within: a group is a few hundred Hz across, and at the widest zoom (a 10 MS/s
+    /// capture across 1500 points, 4 × 6.7 kHz a point) the 27 kHz radius would put every trace of a 54 kHz stretch
+    /// under the point. Measured in a release build on a 54 kHz stretch of 17 signals (`GroupAnswerTests.wideRadiusStaysFast`):
+    /// 156 ms at 27 kHz against the 150 ms target, 170 ms at 2 kHz, where the point takes in the nine-station group
+    /// instead (the group answer's own cost, ruled at 212 ms for 345 Hz): the cap bounds the traces taken in, not that.
+    static let maxRadiusHz = 2_000.0
+
+    /// The radius hover and card ask within at a zoom of `hzPerPoint` (nil: the identifier's default): `radiusPixels`
+    /// worth of Hz, `maxRadiusHz` at most.
     static func radiusHz(hzPerPoint: Double?) -> Double? {
-        hzPerPoint.flatMap { $0 > 0 && $0.isFinite ? radiusPixels * $0 : nil }
+        hzPerPoint.flatMap { $0 > 0 && $0.isFinite ? min(radiusPixels * $0, maxRadiusHz) : nil }
     }
 
     /// The pointer rests at `point` (view points) over `hz` (display Hz), the view showing `hzPerPoint` (nil: not

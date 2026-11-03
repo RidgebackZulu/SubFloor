@@ -926,6 +926,19 @@ struct SignalIDServiceTests {
         #expect(queues.withLock { $0 } == ["app.subfloor.signal-id"], "\(queues.withLock { $0 })")
     }
 
+    /// Hover's and the card's radius is `radiusPixels` worth of Hz at the zoom, `maxRadiusHz` at most (the widest zoom, a
+    /// 10 MS/s capture across 1500 points, would give 27 kHz and a first answer over 150 ms); nil without a zoom.
+    @Test func hoverRadiusFollowsTheZoomUpToACap() {
+        #expect(SignalIDService.radiusHz(hzPerPoint: nil) == nil)
+        #expect(SignalIDService.radiusHz(hzPerPoint: 0) == nil)
+        #expect(SignalIDService.radiusHz(hzPerPoint: -5) == nil)
+        #expect(SignalIDService.radiusHz(hzPerPoint: .infinity) == nil)
+        #expect(SignalIDService.radiusHz(hzPerPoint: 25) == 100)
+        #expect(SignalIDService.radiusHz(hzPerPoint: 500) == 2_000)
+        #expect(SignalIDService.radiusHz(hzPerPoint: 10_000_000 / 1_500) == SignalIDService.maxRadiusHz)
+        #expect(SignalIDService.maxRadiusHz == 2_000)
+    }
+
     // MARK: A silent moment isn't an empty frequency (Task 7)
 
     /// `seconds` of noise at 48 kS/s (unit power) with an RTTY 20 dB over it in 250 Hz, `offsetHz` from the centre, on

@@ -246,8 +246,23 @@ import Testing
         #expect(id.note == SignalIdentifier.cancelledNote, "\(Self.describe(id))")
     }
 
+    /// A 64 kS/s capture: the nine stations at its middle and, across ±27 kHz of it, a CW, an RTTY, a PSK31 or a carrier
+    /// every 6 kHz: what the widest zoom's radius takes in under the point.
+    static let wideRate = 64_000.0
+    static let wide: [Float] = {
+        let kinds: [SynthSpec] = [.cw(wpm: 20), .rtty(), .psk31, .carrier]
+        let far = stride(from: -27_000.0, through: 27_000, by: 6_000).filter { abs($0) > 2_000 }.enumerated().map { k, hz in
+            SignalSynth.Placed(kinds[k % kinds.count], offsetHz: hz, snrDb: 12, seed: UInt64(100 + k))
+        }
+        return SignalSynth.several(nineSpecs + far, sampleRate: wideRate, seconds: seconds, noiseSeed: 2)
+    }()
+
     /// The group's answer on a 3 s read (its longer read that same read) in a release build: ≤ 300 ms, the best of three
-    /// after one to warm.
+    /// after one to warm. And on `wide`, the median of five: at the widest zoom's own radius, a 10 MS/s capture across
+    /// about 1500 points (about 27 kHz, 4 × 6.7 kHz a point: every trace within it under the point), printed; and at
+    /// the 2 kHz the app caps hover's radius at (`SignalIDService.maxRadiusHz`), ≤ 300 ms. Measured in the final fix
+    /// round: 156 ms at 27 kHz (over the 150 ms target, so the cap), 170 ms at 2 kHz, where the point takes in the
+    /// nine-station group instead (the group answer's own cost, ruled at 212 ms for 345 Hz).
     @Test(.enabled(if: AnalogFamilyTests.optimised())) func wideRadiusStaysFast() {
         let clock = ContinuousClock()
         var id = SignalIdentity(measurement: SignalMeasurement())
@@ -256,6 +271,23 @@ import Testing
         print("wideRadiusStaysFast: \(elapsed)")
         #expect(id.signals.count == 9, "\(Self.describe(id))")
         #expect(elapsed <= .milliseconds(300), "the group's answer took \(elapsed)")
+
+        let radius = 4 * 10_000_000.0 / 1_500
+        _ = Self.identify(Self.wide, atOffset: 0, radiusHz: radius, rate: Self.wideRate)
+        let times = (0..<5).map { _ in
+            clock.measure { id = Self.identify(Self.wide, atOffset: 0, radiusHz: radius, rate: Self.wideRate) }
+        }.sorted()
+        print("wideRadiusStaysFast at \(Int(radius)) Hz: median \(times[2]), slowest \(times[4]); \(Self.describe(id))")
+        #expect(id.signals.count >= 9, "\(Self.describe(id))")
+
+        let capped = 2_000.0
+        _ = Self.identify(Self.wide, atOffset: 0, radiusHz: capped, rate: Self.wideRate)
+        let cappedTimes = (0..<5).map { _ in
+            clock.measure { id = Self.identify(Self.wide, atOffset: 0, radiusHz: capped, rate: Self.wideRate) }
+        }.sorted()
+        print("wideRadiusStaysFast at \(Int(capped)) Hz: median \(cappedTimes[2]), slowest \(cappedTimes[4]); \(Self.describe(id))")
+        #expect(id.signals.count == 9, "\(Self.describe(id))")
+        #expect(cappedTimes[2] <= .milliseconds(300), "the capped radius's answer took \(cappedTimes[2])")
     }
 
     /// No signal of a group is given a width it doesn't have.
