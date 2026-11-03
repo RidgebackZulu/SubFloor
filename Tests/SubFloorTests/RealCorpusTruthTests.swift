@@ -122,7 +122,13 @@ struct RealCorpusTruthTests {
         let points = manifest.points.filter { $0.truth == "FT8" && $0.how.hasPrefix("decoded") }
         let barrier = TuneBarrier()
         barrier.end(centerHz: centre)
-        var known: [SignalIDDecoding.BoxRead] = []
+        // The boxes read and the slots decoded, carried from point to point as the service does; and how many times
+        // the decoder ran.
+        var known: [SignalIDDecoding.BoxRead] = [], slots: [SignalIDDecoding.SlotDecodes] = []
+        let runs = Mutex(0)
+        var decoders = SignalIDDecoding.Decoders.standard
+        let standard = decoders.ft8
+        decoders.ft8 = { audio, slot in runs.withLock { $0 += 1 }; return standard(audio, slot) }
         var tried = 0, confirmed = 0, members = 0, right = 0, unverified = 0
         var wrong: [String] = []
         for point in points {
@@ -157,12 +163,14 @@ struct RealCorpusTruthTests {
             }
             tried += 1
             guard let made = SignalIDDecoding.attempt(for: identity, plan: plan, state: barrier.current, trueTime: true,
-                                                      known: known, chunks: read, barrier: barrier, cancelled: { false })
+                                                      known: known, slots: slots, chunks: read, barrier: barrier,
+                                                      decoders: decoders, cancelled: { false })
             else { continue }
             if let box = made.box {
                 known.removeAll { $0.dialHz == box.dialHz }
                 known.append(box)
             }
+            if let slot = made.slot { slots = SignalIDDecoding.keeping(slots, slot) }
             let named = SignalIDDecoding.applied(made, to: identity, centerHz: centre)
             guard let decodedSlot = made.slotStart?.timeIntervalSince(start) else { continue }
             // Slots 15 s apart alternate parity.
@@ -194,7 +202,7 @@ struct RealCorpusTruthTests {
         }
         print("ft8TrialAttribution: \(points.count) decoded points, \(tried) tried: \(confirmed) points' own traces and "
               + "\(members) members named by a decode (\(right) checked against a decoded point on them, \(unverified) with "
-              + "none there), \(known.count) slot decodes, \(wrong.count) wrong")
+              + "none there), \(runs.withLock { $0 }) decoder runs over \(known.count) boxes, \(wrong.count) wrong")
         for line in wrong { print("ft8TrialAttribution wrong: \(line)") }
         #expect(wrong.isEmpty)
     }

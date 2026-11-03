@@ -222,8 +222,9 @@ final class SignalIDQueue {
 /// try a private decode where one applies (FT8's latest complete slot; RTTY, PSK31): a queued job of its own in the same
 /// lane, after the answer is out (`firstAnswer`). A checked FT8 message names the signal it lies on at 1.0; readable
 /// text is evidence for RTTY or PSK31. Its decoders are its own: the decoder panel, its settings and the decode history
-/// never see it. An FT8 box's read and the slots decoded in it are kept (`boxReads`, forgotten on a retune): a scan
-/// decodes a slot once, while what the read says of each point's slot is settled (`SignalIDDecoding.settled`).
+/// never see it. An FT8 box's read (`boxReads`) and the slots decoded in it (`slotDecodes`, apart) are kept, forgotten
+/// on a retune: a scan decodes a slot once per box, and reads the box again only while what its read says of a
+/// point's slot is unsettled (`SignalIDDecoding.settled`).
 ///
 /// **Card.** A right click (`openCard`) identifies the signal there the same way, with a trial decode, and fills `card`
 /// in as it comes; the UI shows it as a popover at the click. A retune that drops its longer read or its trial decode
@@ -374,9 +375,10 @@ final class SignalIDService {
     }
 
     @ObservationIgnored private var cache: [CacheEntry] = []
-    /// The boxes an FT8 trial read: when their traces were on the air, and the slots decoded in them, for a scan's other
-    /// points.
+    /// The boxes an FT8 trial read (when their traces were on the air) and, apart, the slots decoded in them (a slot is
+    /// decoded once per box, whichever read of the box it is taken from), for a scan's other points.
     @ObservationIgnored private var boxReads: [SignalIDDecoding.BoxRead] = []
+    @ObservationIgnored private var slotDecodes: [SignalIDDecoding.SlotDecodes] = []
     /// The capture's comb as last found, for the tuning it was found in, and when.
     @ObservationIgnored private var combCache: (state: TuneBarrier.State, at: Date, comb: CombReading)?
     /// When the last tune failed (nil: it didn't), by `now`.
@@ -411,8 +413,9 @@ final class SignalIDService {
     /// `tryDecode` (the card's and agents', never hover's, and not with `longerRead` false): when a trial decode
     /// applies (`SignalIDDecoding.plan`), the answer is given to `firstAnswer` and then decoded, a queued job of its own
     /// in the same lane, and the answer returned is the decoded one (`SignalIDDecoding.applied`); nil when the radio
-    /// retuned or it was cancelled meanwhile. FT8 box reads and the slots decoded in them are kept (`boxReads`): another
-    /// point in the box uses them while their word on its slot is settled. `decoding` is called (on the main actor) as
+    /// retuned or it was cancelled meanwhile. FT8 box reads (`boxReads`) and the slots decoded in them (`slotDecodes`)
+    /// are kept: another point in the box uses the read while its word on the point's slot is settled, and the slot's
+    /// decodes whichever read it takes them from. `decoding` is called (on the main actor) as
     /// the decode starts, after that first answer.
     func identify(atHz: Double, bandwidthHz: Double? = nil, radiusHz: Double? = nil, longerRead: Bool = true,
                   priority: SignalIDPriority = .background, tryDecode: Bool = false,
@@ -453,12 +456,12 @@ final class SignalIDService {
                 queue.finished(ticket)
                 return nil
             }
-            let known = boxReads.filter { $0.state == state }
+            let known = boxReads.filter { $0.state == state }, slots = slotDecodes.filter { $0.state == state }
             let trueTime = sourceKind() == .sdrplay
             let chunks = chunkProvider, barrier = tuning, decoders = self.decoders
             let task = Task.detached(executorPreference: executor, priority: .userInitiated) {
                 SignalIDDecoding.attempt(for: answer, plan: plan, state: state, trueTime: trueTime, known: known,
-                                         chunks: chunks, barrier: barrier, decoders: decoders,
+                                         slots: slots, chunks: chunks, barrier: barrier, decoders: decoders,
                                          cancelled: { Task.isCancelled })
             }
             ticket.cancel = { task.cancel() }
@@ -470,8 +473,9 @@ final class SignalIDService {
                 continue
             }
             guard let made, state == tuning.current else { return nil }
-            // A box read (and any slot decoded in it) is kept though the caller has gone (another point in it uses it):
-            // the newest for its box, and none older by the ring's clock than the reuse allows.
+            // A box read, and a slot decoded, are kept though the caller has gone (another point in the box uses them):
+            // the newest read for its box, and none older by the ring's clock than the reuse allows; the slot apart
+            // from the read (`SignalIDDecoding.keeping`: one per box and slot, within reach of a read).
             if let box = made.box {
                 boxReads.removeAll {
                     $0.state != state || $0.dialHz == box.dialHz
@@ -479,6 +483,7 @@ final class SignalIDService {
                 }
                 boxReads.append(box)
             }
+            if let slot = made.slot { slotDecodes = SignalIDDecoding.keeping(slotDecodes, slot) }
             guard !Task.isCancelled else { return nil }
             return SignalIDDecoding.applied(made, to: answer, centerHz: state.centerHz)
         }
@@ -1414,6 +1419,7 @@ final class SignalIDService {
         cache.removeAll()
         combCache = nil
         boxReads.removeAll()
+        slotDecodes.removeAll()
         endHover()
     }
 }

@@ -29,11 +29,11 @@ struct TrialDecode: Sendable, Equatable {
 ///   (`OnAirMap`): when each trace under the point was on the air, over all of that read. The latest complete 15 s slot
 ///   in it that the point's own trace was on the air in (`onAir`: stations keep a parity, so most of the slot before
 ///   the one now on is other stations') is demodulated as USB to a 3 kHz box of 12 kHz audio (`ModemChannel`) and
-///   decoded (`FT8Modem.decode`). Only with a true time (the RSP's): the slots are placed by it. The box's read, its
-///   timing and every slot decoded in it are kept (`BoxRead`), so a scan decodes a slot once: a point in the box uses
-///   that read when what it says of the point's slot is settled (`settled`: a read made now would say the same), else
-///   reads again. A checked message names the trace it lies on, when that trace offers FT8 and was on the air in the
-///   slot (`applied`).
+///   decoded (`FT8Modem.decode`). Only with a true time (the RSP's): the slots are placed by it. The box's read and
+///   timing (`BoxRead`) and the slot's decodes (`SlotDecodes`, kept apart) are kept for the scan's other points: one
+///   uses the read when what it says of the point's slot is settled (`settled`), else reads again; and a slot is
+///   decoded once per box whichever read it is taken from. A checked message names the trace it lies on, when that
+///   trace offers FT8 and was on the air in the slot (`applied`).
 /// - **RTTY and PSK31** (`stream`): the newest `streamSeconds` around the signal, demodulated the same way, through an
 ///   RTTY decoder at the measured shift (the standard one it is: 170, 425 or 850 Hz) and each standard speed within
 ///   `rttyBaudSearch` of the measured one (45.45, 50, 75 Bd: a character's 1.5 stop bits can make its keying read 7/7.5
@@ -96,7 +96,9 @@ enum SignalIDDecoding {
     static let noTrueTimeNote = "No FT8 decode: the IQ has no true time to find its slots by"
     static let noOwnSlotNote = String(format: "No FT8 decode: it was on the air in no complete slot of the last %.0f s; named from its tones and slots",
                                       ft8RingSeconds)
-    /// The ring's read failed (it was overwritten or reconfigured as it was read, or held nothing): nothing was timed.
+    /// The ring gave nothing to read (not running, or cleared): nothing was timed.
+    static let ringEmptyNote = "No FT8 decode: the ring gave nothing to read; named from its tones and slots"
+    /// The ring's read failed after it had given its newest sample: it was overwritten or reconfigured as it was read.
     static let readFailedNote = "No FT8 decode: the ring's read failed (overwritten or reconfigured as it was read); named from its tones and slots"
     /// The note when the ring reached back only `seconds` (its pre-roll, or a retune since), and no complete slot the
     /// signal was on the air in.
@@ -183,16 +185,16 @@ enum SignalIDDecoding {
             })
     }
 
-    // MARK: The FT8 slot cache
+    // MARK: The FT8 box and slot caches
 
-    /// One box's read: when everything in it was on the air (`map`, over the channel the trial read), and the messages
-    /// of every slot decoded in it, kept for the scan's other points.
+    /// One box's read: when everything in it was on the air (`map`, over the channel the trial read), kept for the
+    /// scan's other points while its word on their slot is settled (`settled`). The newest read of a box replaces the
+    /// one before; the slots decoded in it are kept apart (`SlotDecodes`).
     struct BoxRead: Sendable, Equatable {
         var state: TuneBarrier.State
         /// The box's dial (display Hz): its audio is RF less this.
         var dialHz: Double
         var map: OnAirMap
-        var slots: [Date: [TrialDecode]] = [:]
 
         /// Whether a signal at `rfHz` was in this box's decoded band.
         func covers(_ rfHz: Double) -> Bool {
@@ -201,10 +203,39 @@ enum SignalIDDecoding {
         }
     }
 
+    /// One FT8 slot's messages as decoded in one box (a tuning, a dial and a slot start): a complete slot's audio
+    /// never changes, so it is decoded once per box however many reads of the box a scan makes (an unsettled read is
+    /// made again, but its slot's decodes are these). Kept apart from the box's read, which each fresh read replaces.
+    struct SlotDecodes: Sendable, Equatable {
+        var state: TuneBarrier.State
+        var dialHz: Double
+        var slotStart: Date
+        var decodes: [TrialDecode]
+
+        func matches(_ state: TuneBarrier.State, dialHz: Double, slotStart: Date) -> Bool {
+            self.state == state && self.dialHz == dialHz && self.slotStart == slotStart
+        }
+    }
+
+    /// A slot's decodes are kept while its start is within this of the newest slot decoded: as far back as a read
+    /// reaches, and a slot more (a settled box is reused up to `boxReuseSeconds` after a read). What is kept is bounded by
+    /// that and the boxes a tuning has.
+    static let slotKeepSeconds = ft8RingSeconds + FT8Modem.slotSeconds
+
+    /// `slots` with `new` kept in it: one entry per tuning, dial and slot (`new` replaces its like), none of another
+    /// tuning, and none starting more than `slotKeepSeconds` before `new`'s.
+    static func keeping(_ slots: [SlotDecodes], _ new: SlotDecodes) -> [SlotDecodes] {
+        slots.filter {
+            $0.state == new.state && !$0.matches(new.state, dialHz: new.dialHz, slotStart: new.slotStart)
+                && new.slotStart.timeIntervalSince($0.slotStart) <= slotKeepSeconds
+        } + [new]
+    }
+
     // MARK: Attempt
 
     /// What a trial made: its decodes (the FT8 slot's every message, or a stream's readable text), the box's read to keep
-    /// (nil when it made none), and a note when it couldn't try (no true time, no slot of its own in reach).
+    /// (nil when it made none), the slot it decoded to keep (nil when it decoded none, or took one kept already), and a
+    /// note when it couldn't try (no true time, no slot of its own in reach).
     struct Attempt: Sendable, Equatable {
         var decodes: [TrialDecode] = []
         /// The FT8 slot `decodes` are of: a trace is named by them only when it was on the air in it.
@@ -212,22 +243,24 @@ enum SignalIDDecoding {
         /// When the traces in the box were on the air: what says which were on in `slotStart`.
         var map: OnAirMap?
         var box: BoxRead?
+        var slot: SlotDecodes?
         var note: String?
     }
 
     /// The trial for `identity` (see the type's notes), made off the ring in the tuning `state` (`barrier` says when that
     /// changes): nil when cancelled or the radio retuned (the answer is dropped). `known`: boxes already read; a recent
     /// one in this tuning that covers the signal is used (`boxReuseSeconds`) when what it says of the signal's slot is
-    /// settled (`settled`), and its slots decoded.
+    /// settled (`settled`). `slots`: slots decoded already; the signal's slot is taken from them, in the box it is
+    /// decoded in, rather than decoded again.
     static func attempt(for identity: SignalIdentity, plan: Plan, state: TuneBarrier.State, trueTime: Bool,
-                        known: [BoxRead], chunks: SignalIDService.ChunkProvider, barrier: TuneBarrier,
-                        decoders: Decoders = .standard, cancelled: () -> Bool) -> Attempt? {
+                        known: [BoxRead], slots: [SlotDecodes] = [], chunks: SignalIDService.ChunkProvider,
+                        barrier: TuneBarrier, decoders: Decoders = .standard, cancelled: () -> Bool) -> Attempt? {
         guard !cancelled(), barrier.current == state else { return nil }
         switch plan {
         case .ft8(let targetHz):
             guard trueTime else { return Attempt(note: noTrueTimeNote) }
-            return ft8(targetHz: targetHz, own: identity, state: state, known: known, chunks: chunks, barrier: barrier,
-                       decoders: decoders, cancelled: cancelled)
+            return ft8(targetHz: targetHz, own: identity, state: state, known: known, slots: slots, chunks: chunks,
+                       barrier: barrier, decoders: decoders, cancelled: cancelled)
         case .stream(let streams, let centre):
             return stream(streams, centerHz: centre, state: state, chunks: chunks, barrier: barrier,
                           decoders: decoders, cancelled: cancelled)
@@ -239,13 +272,14 @@ enum SignalIDDecoding {
     /// history. (`attempt(for:plan:…)` is the service's, with its slot cache and tuning.)
     static func attempt(for identity: SignalIdentity, atHz: Double, centerHz: Double,
                         chunks: SignalIDService.ChunkProvider, trueTime: Bool = true,
-                        known: [BoxRead] = [], decoders: Decoders = .standard,
+                        known: [BoxRead] = [], slots: [SlotDecodes] = [], decoders: Decoders = .standard,
                         cancelled: () -> Bool) -> TrialDecode? {
         let barrier = TuneBarrier()
         barrier.end(centerHz: centerHz)
         guard let plan = plan(for: identity, centerHz: centerHz),
               let made = attempt(for: identity, plan: plan, state: barrier.current, trueTime: trueTime,
                                  known: known.map { var k = $0; k.state = barrier.current; return k },
+                                 slots: slots.map { var k = $0; k.state = barrier.current; return k },
                                  chunks: chunks, barrier: barrier, decoders: decoders, cancelled: cancelled)
         else { return nil }
         let named = applied(made, to: identity, centerHz: centerHz)
@@ -254,21 +288,27 @@ enum SignalIDDecoding {
     }
 
     /// The latest complete FT8 slot within `ft8RingSeconds` that `own` (the point's signal) was on the air in, decoded in
-    /// the box around `targetHz`: the box read, timed (`OnAirMap`), its slot chosen (`ownSlot`) and decoded; or, from a
+    /// the box around `targetHz`: the box read, timed (`OnAirMap`), its slot chosen (`ownSlot`) and decoded, unless that
+    /// slot was decoded in this box before (`slots`: its decodes are taken, and only the timing is new); or, from a
     /// recent read of it (`known`) whose word on that slot is settled (`settled`), the slot chosen by that read's timing
     /// and its decodes taken. The decode is kept once it is made, though the job was then cancelled (stopped for the
     /// owner: its retry uses it); a retune drops it.
     static func ft8(targetHz: Double, own: SignalIdentity, state: TuneBarrier.State, known: [BoxRead],
-                    chunks: SignalIDService.ChunkProvider, barrier: TuneBarrier, decoders: Decoders,
-                    cancelled: () -> Bool) -> Attempt? {
+                    slots: [SlotDecodes], chunks: SignalIDService.ChunkProvider, barrier: TuneBarrier,
+                    decoders: Decoders, cancelled: () -> Bool) -> Attempt? {
         // Where the ring ends now.
         guard let probe = chunks(SignalIDService.probeSeconds, SignalIDService.maxChunkFrames, { _ in true }),
               probe.sampleRate > 0 else {
-            return barrier.current == state ? Attempt(note: readFailedNote) : nil
+            return barrier.current == state ? Attempt(note: ringEmptyNote) : nil
         }
         guard !cancelled(), barrier.current == state else { return nil }
         let ownHz = state.centerHz + own.measurement.offsetHz
         let end = probe.endTime.timeIntervalSince1970
+        let dial = targetHz - boxCentreHz
+        /// The slot's decodes, when it was decoded in the box at `dialHz` before.
+        func decoded(_ slot: Date, in dialHz: Double) -> [TrialDecode]? {
+            slots.first { $0.matches(state, dialHz: dialHz, slotStart: slot) }?.decodes
+        }
         // A recent read of a box holding the signal, when what it says of the signal's slot can no longer change: that
         // slot, decoded already. A read whose word isn't settled (a station of the other parity may have come onto the
         // line since it ended) is read again, as is one the slot wasn't decoded in (its first point wasn't on then).
@@ -280,11 +320,12 @@ enum SignalIDDecoding {
                 switch verdict {
                 case .none(let note): return Attempt(map: box.map, note: note)
                 case .slot(let slot):
-                    if let decodes = box.slots[slot] { return Attempt(decodes: decodes, slotStart: slot, map: box.map) }
+                    if let decodes = decoded(slot, in: box.dialHz) {
+                        return Attempt(decodes: decodes, slotStart: slot, map: box.map)
+                    }
                 }
             }
         }
-        let dial = targetHz - boxCentreHz
         switch SignalIDService.channelRead(seconds: ft8RingSeconds, offsetHz: dial + boxCentreHz - state.centerHz,
                                            windowHz: channelHz, tuning: state, sampleRate: probe.sampleRate,
                                            chunks: chunks, barrier: barrier) {
@@ -294,13 +335,16 @@ enum SignalIDDecoding {
             guard !cancelled(), barrier.current == state else { return nil }
             let map = OnAirMap(iq: read.iq, sampleRate: read.sampleRate, centerOffsetHz: read.offsetHz,
                                halfSpanHz: channelHz / 2, readEnd: read.endTime)
-            var box = BoxRead(state: state, dialHz: dial, map: map)
+            let box = BoxRead(state: state, dialHz: dial, map: map)
             guard !cancelled(), barrier.current == state else { return nil }
             let slot: Date
             switch ownSlot(own, map: map, centerHz: state.centerHz) {
             case .none(let note): return Attempt(map: map, box: box, note: note)
             case .slot(let s): slot = s
             }
+            // Decoded in this box before (by an earlier read of it): a complete slot's audio is the same in every read,
+            // so its messages are too. Only the timing (the map) is this read's.
+            if let decodes = decoded(slot, in: dial) { return Attempt(decodes: decodes, slotStart: slot, map: map, box: box) }
             // The slot's 15 s of the read, from its start.
             let readStart = read.endTime.addingTimeInterval(-read.seconds)
             let early = slot.timeIntervalSince(readStart)
@@ -312,8 +356,8 @@ enum SignalIDDecoding {
             let decodes = ft8Decodes(audio, slot: slot, dialHz: dial, decoders: decoders)
             // Made: kept though cancelled meanwhile (the decode can't be stopped, and a retry would make it again).
             guard barrier.current == state else { return nil }
-            box.slots[slot] = decodes
-            return Attempt(decodes: decodes, slotStart: slot, map: map, box: box)
+            return Attempt(decodes: decodes, slotStart: slot, map: map, box: box,
+                           slot: SlotDecodes(state: state, dialHz: dial, slotStart: slot, decodes: decodes))
         }
     }
 
@@ -332,11 +376,14 @@ enum SignalIDDecoding {
         return .none(held < ft8RingSeconds - ringShortSeconds ? ringShortNote(held) : noOwnSlotNote)
     }
 
-    /// Whether `verdict`, what `map` says of a point's slot (`ownSlot`), is what a read made at `now` (UTC) would say:
+    /// Whether `verdict`, what `map` says of a point's slot (`ownSlot`), can no longer be made wrong by more read, so
+    /// a point may be named by it at `now` (UTC):
     /// - a slot: the map reaches past where the next slot's `heard` settles (`OnAir.heardSettlesAt`), so a station of
     ///   the other parity coming onto the line there (which makes it two stations', never named) was seen if it did.
     ///   `covers` is over the slot's whole transmission, and `heard` of the slot before is over what the map saw of it:
-    ///   neither changes with more read;
+    ///   neither changes with more read. The slot is the point's own: a read made at `now` could instead find a newer
+    ///   own slot complete since the map's read ended (the station's next transmission, up to `boxReuseSeconds` old),
+    ///   so a settled box can name the point from an older own message than a fresh read would, never a wrong one;
     /// - none: no slot has completed since the map's read ended (one could be the point's), so the map's verdict is over
     ///   every complete slot of the ring now.
     static func settled(_ verdict: OwnSlot, map: OnAirMap, now: Double) -> Bool {
