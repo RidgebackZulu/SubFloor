@@ -190,16 +190,7 @@ import Testing
             let capture = Self.capture(spec, readSeconds: seconds, endInTransmission: seconds - 0.2, rfHz: rfHz, seed: seed)
             let id = Self.identified(capture, rfHz: rfHz, endTime: capture.end)
             #expect(id.best?.name == name, "\(name) seed \(seed): \(IdentifyTests.describe(id))")
-            if name == "FT8" {
-                #expect(id.best?.evidence.contains { $0.contains("JS8") } == true)
-                // When it was on the air, by UTC, for a trial decode.
-                #expect(id.measurement.onAir.map { !$0.runs.isEmpty && $0.readEndUTC == capture.end?.timeIntervalSince1970 } == true)
-                // The quick first pass's too.
-                let quick = SignalIdentifier.identify(iq: capture.first, sampleRate: Self.rate,
-                                                      captureCenterHz: rfHz - Self.offsetHz, atHz: rfHz, bandwidthHz: nil,
-                                                      spectrumDb: nil, longer: nil, endTime: capture.end)
-                #expect(quick.measurement.onAir.map { !$0.runs.isEmpty } == true, "\(IdentifyTests.describe(quick))")
-            }
+            if name == "FT8" { #expect(id.best?.evidence.contains { $0.contains("JS8") } == true) }
             let other = name == "FT8" ? "FT4" : "FT8"
             #expect(!([id.best].compactMap { $0 } + id.alternatives).contains { $0.name == other && $0.confidence >= 0.7 })
         }

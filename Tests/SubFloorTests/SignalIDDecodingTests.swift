@@ -87,36 +87,32 @@ struct SignalIDDecodingTests {
         }
     }
 
-    /// FT8 stations (message, tone 0 in Hz above the capture centre) in the slot at `slotStart` and the one after, in
-    /// a ring of `seconds` ending at `ringEnd`.
-    nonisolated static func ft8Ring(_ stations: [(String, Double)], seconds: Double = 20,
+    /// FT8 stations (message, tone 0 in Hz above the capture centre, the slots it sends in: `slotStart` when none are
+    /// given) in a ring of `seconds` ending at `endTime`.
+    nonisolated static func ft8Ring(_ stations: [(String, Double, [Date])], seconds: Double = 20,
                                     endTime: Date = ringEnd) -> [Float] {
         let first = endTime.addingTimeInterval(-seconds)
         var audio = [Float](repeating: 0, count: Int(seconds * rate))
-        for slot in [slotStart.addingTimeInterval(-15), slotStart, slotStart.addingTimeInterval(15)] {
-            let at = Int((slot.timeIntervalSince(first) * rate).rounded())
-            for (message, hz) in stations {
-                guard let wave = FT8Encoder.audio(message: message, audioHz: hz, sampleRate: rate, amplitude: 0.1) else {
-                    continue
-                }
+        for (message, hz, slots) in stations {
+            guard let wave = FT8Encoder.audio(message: message, audioHz: hz, sampleRate: rate, amplitude: 0.1) else {
+                continue
+            }
+            for slot in slots.isEmpty ? [slotStart] : slots {
+                let at = Int((slot.timeIntervalSince(first) * rate).rounded())
                 for (i, x) in wave.enumerated() where at + i >= 0 && at + i < audio.count { audio[at + i] += x }
             }
         }
         return iq(audio: audio, shiftHz: 0)
     }
 
+    /// One station at 1000 Hz in `slotStart`, for the service's tests: what their FT8 answer (`ft8Analysis`) is.
+    nonisolated static let serviceRing = ft8Ring([("CQ K1ABC FN42", 1000, [])])
+
     /// A measured FT8 at `toneZeroHz` above `ft8Centre`, named on its tones (not yet proved).
-    /// It was on the air in the slot at `onIn` (nil: never), as a 16 s read ending at `readEnd` saw it.
-    nonisolated static func ft8Identity(toneZeroHz: Double, named: Bool = true, onIn: Date? = slotStart,
-                                        readEnd: Date = ringEnd) -> SignalIdentity {
-        var m = SignalMeasurement(offsetHz: toneZeroHz + 3.5 * FT8Encoder.toneSpacing, occupiedBandwidthHz: 50,
+    nonisolated static func ft8Identity(toneZeroHz: Double, named: Bool = true) -> SignalIdentity {
+        let m = SignalMeasurement(offsetHz: toneZeroHz + 3.5 * FT8Encoder.toneSpacing, occupiedBandwidthHz: 50,
                                   bandwidth6dBHz: 45, family: .fsk, familyConfidence: 0.8, symbolRate: 6.25,
                                   toneCount: 8, toneSpacingHz: 6.25, seconds: 16)
-        let end = readEnd.timeIntervalSince1970
-        m.onAir = OnAir(readStartUTC: end - 16, readEndUTC: end, runs: onIn.map { slot in
-            let start = slot.timeIntervalSince1970 + 0.5
-            return [start...min(end, start + 12.64)]
-        } ?? [])
         let match = ModeMatch(name: "FT8", confidence: named ? 0.82 : 0.65, evidence: ["its tones"])
         return named ? SignalIdentity(measurement: m, best: match) : SignalIdentity(measurement: m, alternatives: [match])
     }
@@ -130,7 +126,7 @@ struct SignalIDDecodingTests {
 
     /// The trial for `identity` through the service's own form, on `chunks`, in a tuning centred on `centerHz`.
     nonisolated static func trial(_ identity: SignalIdentity, centerHz: Double, chunks: SignalIDService.ChunkProvider,
-                                  trueTime: Bool = true, known: [SignalIDDecoding.SlotDecodes] = [],
+                                  trueTime: Bool = true, known: [SignalIDDecoding.BoxRead] = [],
                                   decoders: SignalIDDecoding.Decoders = .standard)
         -> (made: SignalIDDecoding.Attempt?, identity: SignalIdentity) {
         let barrier = TuneBarrier()
@@ -144,120 +140,139 @@ struct SignalIDDecodingTests {
 
     // MARK: FT8
 
-    /// A checked message names the FT8 it lies on at 1.0, its text kept; a message beside no trace names nothing, and a
-    /// trace with no message of its own keeps what it had.
+    /// A checked message names the FT8 it lies on at 1.0, its text kept, when that trace was on the air in the message's
+    /// slot as the trial's own 28 s read times it; a message beside no trace names nothing, and a trace with no message
+    /// of its own keeps what it had. The ring ends 12 s into the slot after the one decoded: the identification's 16 s
+    /// read would hold only 2 s of the decoded slot's transmissions, the trial's 28 s all of them.
     @Test func ft8DecodeConfirms() throws {
-        let ring = Self.ft8Ring([("CQ K1ABC FN42", 1000), ("G4XYZ K1ABC -12", 1200)])
-        let chunks = Self.chunks(ring)
+        let next = Self.slotStart.addingTimeInterval(15), end = Self.slotStart.addingTimeInterval(27)
+        let ring = Self.ft8Ring([
+            ("CQ K1ABC FN42", 1000, []), ("G4XYZ K1ABC -12", 1200, []),
+            // Near the box's edge, 1.3 kHz from its middle.
+            ("CQ VK2ABC QF56", 2400, []),
+            // On the air only in the slot now on (another parity).
+            ("CQ W1AW FN31", 1600, [next]),
+            // A line two stations share, one of each parity.
+            ("CQ DL1ABC JO62", 1400, [Self.slotStart]), ("CQ JA1XYZ PM95", 1400, [next]),
+        ], seconds: 30, endTime: end)
+        let chunks = Self.chunks(ring, endTime: end)
         let own = Self.ft8Identity(toneZeroHz: 1000)
         // A group under the point: the two stations, and a trace between them that is neither (likely FT8, inherited).
         var group = own
         var between = Self.ft8Identity(toneZeroHz: 1100, named: false)
         between.nameInherited = true
-        group.signals = [own, between, Self.ft8Identity(toneZeroHz: 1200)]
+        group.signals = [own, between, Self.ft8Identity(toneZeroHz: 1200), Self.ft8Identity(toneZeroHz: 2400)]
         group.groupSpanHz = 1000...1250
         group.captureCenterHz = Self.ft8Centre
-        // The one decode of the slot (a debug build takes some seconds over it); the rest use it, as a scan would.
+        // The one decode of the slot (a debug build takes some seconds over it); the rest use the box's read, as a scan
+        // would.
         let (made, named) = Self.trial(group, centerHz: Self.ft8Centre, chunks: chunks)
-        let slot = try #require(made?.slot)
-        #expect(made?.decodes.count == 2 && slot.slotStart == Self.slotStart && made?.slotStart == Self.slotStart)
+        let box = try #require(made?.box)
+        #expect(made?.slotStart == Self.slotStart && box.slots[Self.slotStart]?.count == 4, "\(made?.decodes ?? [])")
         #expect(named.best?.name == "FT8" && named.best?.confidence == 1)
         #expect(named.confirmedByDecode && named.decodedText == "CQ K1ABC FN42" && !named.needsLongerRead)
         #expect(named.signals[0].decodedText == "CQ K1ABC FN42" && named.signals[0].best?.confidence == 1)
+        // A member, timed over the trial's read: named with its own message.
         #expect(named.signals[2].decodedText == "G4XYZ K1ABC -12" && named.signals[2].best?.confidence == 1)
-        // Nothing decoded on the trace between them: it is as it was.
+        // One near the box's edge too (timed over the whole box).
+        #expect(named.signals[3].decodedText == "CQ VK2ABC QF56")
+        // Nothing on the trace between them: it is as it was.
         #expect(named.signals[1] == between)
-        #expect(named.label.hasPrefix("Several signals: FT8 ×2, unknown ×1") || named.label.hasPrefix("FT8 · 3 signals"),
-                "\(named.label)")
+        #expect(named.label.hasPrefix("FT8 · 4 signals"), "\(named.label)")
+        func tried(_ identity: SignalIdentity) -> (made: SignalIDDecoding.Attempt?, identity: SignalIdentity) {
+            Self.trial(identity, centerHz: Self.ft8Centre, chunks: chunks, known: [box])
+        }
 
         // The plain form: the decode at the signal.
         let decode = try #require(SignalIDDecoding.attempt(for: own, atHz: Self.ft8Centre + own.measurement.offsetHz,
-                                                           centerHz: Self.ft8Centre, chunks: chunks, known: [slot],
+                                                           centerHz: Self.ft8Centre, chunks: chunks, known: [box],
                                                            cancelled: { false }))
         #expect(decode.mode == "FT8" && decode.strength == .checked && decode.text == "CQ K1ABC FN42")
         #expect(abs(decode.rfHz - (Self.ft8Centre + own.measurement.offsetHz)) < 2)
 
-        // A trace beside the stations (its extent and a tone short of either) is never named by their messages.
-        let beside = Self.ft8Identity(toneZeroHz: 1100)
-        let (_, alone) = Self.trial(beside, centerHz: Self.ft8Centre, chunks: chunks, known: [slot])
-        #expect(alone.best?.confidence == 0.82 && alone.decodedText == nil && !alone.confirmedByDecode)
+        // A trace beside the stations (nothing on the air there) gets no decode of its own, and no one's message.
+        let alone = tried(Self.ft8Identity(toneZeroHz: 1100)).identity
+        #expect(alone.best?.confidence == 0.82 && alone.decodedText == nil && alone.note == SignalIDDecoding.noOwnSlotNote)
         // Its extent and a tone: a trace 30 Hz off a message (25 Hz half its width, and 6.25) is named by it; 40 Hz off,
         // not.
-        let (_, near) = Self.trial(Self.ft8Identity(toneZeroHz: 1030), centerHz: Self.ft8Centre, chunks: chunks,
-                                   known: [slot])
-        #expect(near.decodedText == "CQ K1ABC FN42" && near.best?.confidence == 1)
-        let (_, off) = Self.trial(Self.ft8Identity(toneZeroHz: 1040), centerHz: Self.ft8Centre, chunks: chunks,
-                                  known: [slot])
+        #expect(tried(Self.ft8Identity(toneZeroHz: 1030)).identity.decodedText == "CQ K1ABC FN42")
+        let off = tried(Self.ft8Identity(toneZeroHz: 1040)).identity
         #expect(off.decodedText == nil && off.best?.confidence == 0.82)
         // Nor a comb's line, though a message lies on it.
         var line = own
         line.comb = CombInfo(spacingHz: 1000, lineCount: 9)
-        let (_, comb) = Self.trial(line, centerHz: Self.ft8Centre, chunks: chunks, known: [slot])
+        let comb = tried(line).identity
         #expect(comb.decodedText == nil && comb.best?.confidence == 0.82)
-        // Stations keep a parity. One at a message's frequency on the air only in the slot now on (not the one decoded)
-        // is another station: alone, it gets no decode (no complete slot of its in reach); in a group, it keeps its own
-        // answer. And a member at a message's frequency that offers no FT8 is never named it.
-        let current = Self.slotStart.addingTimeInterval(15)
-        let (_, other) = Self.trial(Self.ft8Identity(toneZeroHz: 1200, onIn: current), centerHz: Self.ft8Centre,
-                                    chunks: chunks, known: [slot])
-        #expect(other.decodedText == nil && other.best?.confidence == 0.82 && other.note == SignalIDDecoding.noSlotNote)
-        // A line on in that slot and in the one now on is two stations, one of each parity: not said to be the message's.
-        // (Its read ends 5 s into the slot now on: 2.5 s past the clocks' 2 s, enough to hear it.)
-        let later = Self.slotStart.addingTimeInterval(20)
-        var both = Self.ft8Identity(toneZeroHz: 1000, readEnd: later)
-        let s0 = Self.slotStart.timeIntervalSince1970
-        both.measurement.onAir?.runs = [(s0 + 1)...(s0 + 13.1), (s0 + 15.5)...(s0 + 20)]
-        let (_, two) = Self.trial(both, centerHz: Self.ft8Centre, chunks: Self.chunks(ring, endTime: later), known: [slot])
-        #expect(two.decodedText == nil && two.note == SignalIDDecoding.noSlotNote)
+        // Stations keep a parity. One on the air only in the slot now on is another station: alone, no complete slot of
+        // its own is in the read; in a group, it keeps its own answer. A line on in both parities is two stations: never
+        // said to be the decoded slot's. And a member at a message's frequency that offers no FT8 is never named it.
+        let current = tried(Self.ft8Identity(toneZeroHz: 1600)).identity
+        #expect(current.decodedText == nil && current.best?.confidence == 0.82 && current.note == SignalIDDecoding.noOwnSlotNote)
+        let shared = tried(Self.ft8Identity(toneZeroHz: 1400)).identity
+        #expect(shared.decodedText == nil && shared.note == SignalIDDecoding.noOwnSlotNote)
         var psk = Self.ft8Identity(toneZeroHz: 1200)
         psk.measurement.family = .psk
         psk.best = ModeMatch(name: "PSK31 / PSK63", confidence: 0.8, evidence: [])
-        for neighbour in [Self.ft8Identity(toneZeroHz: 1200, onIn: current), psk] {
+        for neighbour in [Self.ft8Identity(toneZeroHz: 1600), Self.ft8Identity(toneZeroHz: 1400), psk] {
             var pair = own
             pair.signals = [own, neighbour]
             pair.captureCenterHz = Self.ft8Centre
-            let (_, two) = Self.trial(pair, centerHz: Self.ft8Centre, chunks: chunks, known: [slot])
+            let two = tried(pair).identity
             #expect(two.signals[0].decodedText == "CQ K1ABC FN42")
             #expect(two.signals[1] == neighbour, "\(neighbour.label)")
         }
+        // A message whose nearest trace may not be named is no one's: never moved to the next trace it lies on (the point,
+        // 25 Hz off). Here the PSK31 member 25 Hz above the point holds the message.
+        var probe = own
+        var close = psk
+        close.measurement.offsetHz = own.measurement.offsetHz + 25
+        probe.signals = [own, close]
+        probe.captureCenterHz = Self.ft8Centre
+        let theirs = TrialDecode(mode: "FT8", text: "K9ZZ W1AW RR73", strength: .checked,
+                                 rfHz: Self.ft8Centre + close.measurement.offsetHz)
+        var only = try #require(made)
+        only.decodes = [theirs]
+        let moved = SignalIDDecoding.applied(only, to: probe, centerHz: Self.ft8Centre)
+        #expect(moved.decodedText == nil && moved.signals.allSatisfy { $0.decodedText == nil })
         // Nor one wider than an FT8 can be, though a message lies inside it.
         var wide = own
         wide.measurement.occupiedBandwidthHz = 400
         wide.measurement.bandwidth6dBHz = 400
-        let (_, voice) = Self.trial(wide, centerHz: Self.ft8Centre, chunks: chunks, known: [slot])
+        let voice = tried(wide).identity
         #expect(voice.decodedText == nil && voice.best?.confidence == 0.82)
     }
 
-    /// With no complete slot within reach (a 10 s ring), no decode: the name from its tones and slots stands, and the
-    /// note says why.
+    /// With no complete slot within reach, no decode: the name from its tones and slots stands, and the note says what
+    /// limited it (a 10 s ring; a full 28 s read whose last slot of its own began just before it).
     @Test func ft8NoSlotInReachGoesWithout() {
         let calls = Shared(0)
         var decoders = SignalIDDecoding.Decoders.standard
         decoders.ft8 = { _, _ in calls.withLock { $0 += 1 }; return [] }
         let own = Self.ft8Identity(toneZeroHz: 1000)
         let (made, named) = Self.trial(own, centerHz: Self.ft8Centre,
-                                       chunks: Self.chunks(Self.ft8Ring([("CQ K1ABC FN42", 1000)], seconds: 10)),
+                                       chunks: Self.chunks(Self.ft8Ring([("CQ K1ABC FN42", 1000, [])], seconds: 10)),
                                        decoders: decoders)
         #expect(made?.decodes.isEmpty == true && calls.withLock { $0 } == 0)
         #expect(named.best == own.best && named.decodedText == nil)
-        #expect(named.note == SignalIDDecoding.noSlotNote)
+        #expect(named.note == SignalIDDecoding.ringShortNote(10), "\(named.note ?? "")")
         // Nor without a true time to place the slot by.
-        let (_, untimed) = Self.trial(own, centerHz: Self.ft8Centre, chunks: Self.chunks(Self.ft8Ring([])),
+        let (_, untimed) = Self.trial(own, centerHz: Self.ft8Centre, chunks: Self.chunks(Self.serviceRing),
                                       trueTime: false, decoders: decoders)
         #expect(untimed.note == SignalIDDecoding.noTrueTimeNote && calls.withLock { $0 } == 0)
-        // A full ring whose newest complete slot started more than `ft8RingSeconds` ago (28.9 s): out of reach.
+        // A full ring whose newest complete slot of its own started more than `ft8RingSeconds` ago (28.9 s): out of reach.
         let late = Self.slotStart.addingTimeInterval(28.9)
         let (_, far) = Self.trial(own, centerHz: Self.ft8Centre,
-                                  chunks: Self.chunks(Self.ft8Ring([], seconds: 31, endTime: late), endTime: late),
+                                  chunks: Self.chunks(Self.ft8Ring([("CQ K1ABC FN42", 1000, [])], seconds: 31, endTime: late),
+                                                      endTime: late),
                                   decoders: decoders)
-        #expect(far.note == SignalIDDecoding.noSlotNote && calls.withLock { $0 } == 0)
+        #expect(far.note == SignalIDDecoding.noOwnSlotNote && calls.withLock { $0 } == 0, "\(far.note ?? "")")
         // A message that is nothing once cleaned is no message.
         var blank = SignalIDDecoding.Decoders.standard
         blank.ft8 = { _, slotStart in
             [SlotDecode(mode: .ft8, slotStart: slotStart, frequencyHz: 1000, snrDb: 0, timeOffset: 0, message: "\u{7}\u{0}")]
         }
-        let (empty, _) = Self.trial(own, centerHz: Self.ft8Centre, chunks: Self.chunks(Self.ft8Ring([])), decoders: blank)
-        #expect(empty?.decodes.isEmpty == true && empty?.slot != nil)
+        let (empty, _) = Self.trial(own, centerHz: Self.ft8Centre, chunks: Self.chunks(Self.serviceRing), decoders: blank)
+        #expect(empty?.decodes.isEmpty == true && empty?.box?.slots[Self.slotStart] == [])
     }
 
     /// A slot decoded is kept though the job was stopped meanwhile (for the owner): its retry uses it. A retune drops it.
@@ -273,9 +288,9 @@ struct SignalIDDecodingTests {
         barrier.end(centerHz: Self.ft8Centre)
         let own = Self.ft8Identity(toneZeroHz: 1000)
         let made = SignalIDDecoding.attempt(for: own, plan: .ft8(targetHz: Self.ft8Centre + 1000), state: barrier.current,
-                                            trueTime: true, known: [], chunks: Self.chunks(Self.ft8Ring([])),
+                                            trueTime: true, known: [], chunks: Self.chunks(Self.serviceRing),
                                             barrier: barrier, decoders: decoders, cancelled: { stop.withLock { $0 } })
-        #expect(made?.slot?.decodes.first?.text == "CQ K1ABC FN42")
+        #expect(made?.box?.slots[Self.slotStart]?.first?.text == "CQ K1ABC FN42")
     }
 
     // MARK: RTTY and PSK31
@@ -387,8 +402,11 @@ struct SignalIDDecodingTests {
         wide.measurement.occupiedBandwidthHz = 90
         var group = wide
         group.signals = [wide, Self.ft8Identity(toneZeroHz: 1040)]   // centre 1061.875: overlaps the first
+        // Both on the air in the slot (the one station at 1000 Hz overlaps them).
+        let map = OnAirMap(iq: Self.serviceRing, sampleRate: Self.rate, centerOffsetHz: 0, halfSpanHz: 2000,
+                           readEnd: Self.ringEnd)
         let made = SignalIDDecoding.Attempt(decodes: [message("FIRST", at: 1050), message("SECOND", at: 1025),
-                                                      message("THIRD", at: 1010)], slotStart: Self.slotStart)
+                                                      message("THIRD", at: 1010)], slotStart: Self.slotStart, map: map)
         let named = SignalIDDecoding.applied(made, to: group, centerHz: Self.ft8Centre)
         // 1025 and 1010 lie on the first only (36.9 Hz and more from the second's centre: past its 25 and a tone), and
         // 1025 is the nearer: the first's. 1050 lies on both, nearer the second: the second's.
@@ -452,7 +470,7 @@ struct SignalIDDecodingTests {
     /// Hover never decodes; the card, given the same answer, does.
     @Test func hoverNeverDecodes() async throws {
         let calls = Shared(0)
-        guard let (m, _) = runningModel(ring: Self.ft8Ring([("CQ K1ABC FN42", 1000)]),
+        guard let (m, _) = runningModel(ring: Self.serviceRing,
                                         analysis: Self.ft8Analysis()) else { return }
         defer { m.shutdown() }
         let open = Shared(false)
@@ -485,7 +503,7 @@ struct SignalIDDecodingTests {
     /// A trial through the service leaves the decoder panel as it was: its settings, its box, its rows and the decode
     /// history (nothing written to its folder).
     @Test func decoderPanelUntouched() async throws {
-        guard let (m, dir) = runningModel(ring: Self.ft8Ring([("CQ K1ABC FN42", 1000)]),
+        guard let (m, dir) = runningModel(ring: Self.serviceRing,
                                           analysis: Self.ft8Analysis()) else { return }
         defer { m.shutdown() }
         let settings = m.modemSettings, box = m.modemBox
@@ -510,7 +528,7 @@ struct SignalIDDecodingTests {
 
     /// A retune while the decode runs drops the answer.
     @Test func retuneDropsTheDecode() async throws {
-        guard let (m, _) = runningModel(ring: Self.ft8Ring([]), analysis: Self.ft8Analysis()) else { return }
+        guard let (m, _) = runningModel(ring: Self.serviceRing, analysis: Self.ft8Analysis()) else { return }
         defer { m.shutdown() }
         let service = m.signalID
         let barrier = service.tuning
@@ -535,7 +553,7 @@ struct SignalIDDecodingTests {
     /// A slot decoded for a caller that went meanwhile (a closed card) is kept: the next point in it uses it.
     @Test func aGoneCallersSlotIsKept() async throws {
         let calls = Shared(0), open = Shared(false)
-        guard let (m, _) = runningModel(ring: Self.ft8Ring([]), analysis: Self.ft8Analysis()) else { return }
+        guard let (m, _) = runningModel(ring: Self.serviceRing, analysis: Self.ft8Analysis()) else { return }
         defer { m.shutdown() }
         m.signalID.decoders.ft8 = { _, _ in
             calls.withLock { $0 += 1 }
@@ -569,7 +587,9 @@ struct SignalIDDecodingTests {
             id.captureCenterHz = a.captureCenterHz
             return id
         }
-        guard let (m, _) = runningModel(ring: Self.ft8Ring([]), analysis: analysis) else { return }
+        let ring = Self.ft8Ring(members.indices.map { ("CQ K1ABC FN42", 600 + 300 * Double($0), []) }
+                                + [("CQ W1AW FN31", 6000, [])])
+        guard let (m, _) = runningModel(ring: ring, analysis: analysis) else { return }
         defer { m.shutdown() }
         m.signalID.decoders.ft8 = { _, _ in calls.withLock { $0 += 1 }; return [] }
         for member in members {

@@ -61,9 +61,6 @@ public struct SignalMeasurement: Codable, Sendable, Equatable {
     public var edgesUnderNoise: Bool
     /// How well its transmissions fit each slot mode's UTC slots (`SlotEvidence`); empty without a true time.
     public var slotFits: [SlotFit]
-    /// When it was on the air by UTC, from its trace (a narrow one's, with a true time); nil otherwise. A trial decode
-    /// of a slot names it only when it was on for that slot.
-    public var onAir: OnAir?
     /// The best of `slotFits`.
     public var slotFit: SlotFit? { slotFits.max { ($0.fit, $0.events) < ($1.fit, $1.events) } }
     /// Length of IQ analysed.
@@ -78,7 +75,7 @@ public struct SignalMeasurement: Codable, Sendable, Equatable {
                 fmDeviationHz: Double? = nil, cwWPM: Double? = nil, burstPeriodSeconds: Double? = nil,
                 burstDuty: Double? = nil, subcarriersHz: [Double] = [], seconds: Double = 0, notes: [String] = [],
                 audioEnvelope: EnvelopeKind? = nil, modulationPeriodSeconds: Double? = nil,
-                edgesUnderNoise: Bool = false, slotFits: [SlotFit] = [], onAir: OnAir? = nil) {
+                edgesUnderNoise: Bool = false, slotFits: [SlotFit] = []) {
         self.offsetHz = offsetHz
         self.occupiedBandwidthHz = occupiedBandwidthHz
         self.bandwidth6dBHz = bandwidth6dBHz
@@ -101,7 +98,6 @@ public struct SignalMeasurement: Codable, Sendable, Equatable {
         self.modulationPeriodSeconds = modulationPeriodSeconds
         self.edgesUnderNoise = edgesUnderNoise
         self.slotFits = slotFits
-        self.onAir = onAir
         self.seconds = seconds
         self.notes = notes
     }

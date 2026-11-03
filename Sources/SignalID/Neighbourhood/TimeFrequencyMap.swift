@@ -12,7 +12,7 @@ import Foundation
 /// that percentile's bias for noise (a bin's power in noise is exponential: its 20th percentile is −ln 0.8 of its mean), so
 /// a bin of noise averages 0 dB over rows and a level jump across the band leaves the rows alike. A low percentile
 /// because a crowded view is mostly signals: its median would be one of them, and they would read as noise.
-struct TimeFrequencyMap {
+struct TimeFrequencyMap: Equatable {
     /// Which of a row's bins, sorted, gives its noise level, and what that percentile is of noise's mean.
     static let noiseShare = 0.2
     static let noiseBias = -log(0.8)

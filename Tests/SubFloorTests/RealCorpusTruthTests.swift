@@ -122,7 +122,7 @@ struct RealCorpusTruthTests {
         let points = manifest.points.filter { $0.truth == "FT8" && $0.how.hasPrefix("decoded") }
         let barrier = TuneBarrier()
         barrier.end(centerHz: centre)
-        var known: [SignalIDDecoding.SlotDecodes] = []
+        var known: [SignalIDDecoding.BoxRead] = []
         var tried = 0, confirmed = 0, members = 0, right = 0, unverified = 0
         var wrong: [String] = []
         for point in points {
@@ -159,19 +159,26 @@ struct RealCorpusTruthTests {
             guard let made = SignalIDDecoding.attempt(for: identity, plan: plan, state: barrier.current, trueTime: true,
                                                       known: known, chunks: read, barrier: barrier, cancelled: { false })
             else { continue }
-            if let slot = made.slot { known.append(slot) }
+            if let box = made.box {
+                known.removeAll { $0.dialHz == box.dialHz }
+                known.append(box)
+            }
             let named = SignalIDDecoding.applied(made, to: identity, centerHz: centre)
             guard let decodedSlot = made.slotStart?.timeIntervalSince(start) else { continue }
             // Slots 15 s apart alternate parity.
             func otherParity(_ a: Double, _ b: Double) -> Bool { Int(((a - b) / 15).rounded()) % 2 != 0 }
             // Every trace named (the point's own, and any under it): against the decoded points on it.
-            for trace in [named] + named.signals where trace.decodedText != nil {
+            let traces: [SignalIdentity] = [named] + named.signals
+            for trace in traces where trace.decodedText != nil {
                 guard let text = trace.decodedText else { continue }
                 let isOwn = trace.measurement.offsetHz == named.measurement.offsetHz
                 if !isOwn { members += 1 } else if trace == named { confirmed += 1 } else { continue }
                 let hz = centre + trace.measurement.offsetHz
                 let reach = max(trace.measurement.occupiedBandwidthHz, trace.measurement.bandwidth6dBHz) / 2 + 6.25
-                let there = points.filter { abs(($0.parameters?["toneZeroHz"] ?? 0) + 3.5 * 6.25 - hz) <= reach }
+                let there = points.filter { p -> Bool in
+                    let toneZero: Double = p.parameters?["toneZeroHz"] ?? 0
+                    return abs(toneZero + 21.875 - hz) <= reach
+                }
                 let sameSlot = there.filter { $0.parameters?["slotSeconds"] == decodedSlot }
                 let label = String(format: "%.1f Hz at %.1f s (slot %.0f decoded)", hz, t, decodedSlot)
                 if sameSlot.contains(where: { $0.how.contains("\"\(text)\"") }) {

@@ -2,6 +2,7 @@ import Accelerate
 import DSPCore
 import Foundation
 import Modems
+import Recording
 import SignalID
 
 /// What a trial decode read: in the mode table's name (`mode`), its text (radio text: untrusted, `SignalIDDecoding.clean`),
@@ -24,13 +25,13 @@ struct TrialDecode: Sendable, Equatable {
 /// never for hover. Each runs privately on the IQ ring's samples, with decoder instances of its own: it never sees the
 /// decoder panel, its settings or the decode history, and nothing it reads reaches them.
 ///
-/// - **FT8** (`ft8`): the latest complete 15 s slot the ring holds within `ft8RingSeconds`, read as a channel around the
-///   signal (or its group) and demodulated as USB to a 3 kHz box of 12 kHz audio (`ModemChannel`), and decoded
-///   (`FT8Modem.decode`). Only with a true time (the RSP's): the slot is placed by it, and it is the latest complete one
-///   the point's own trace was on the air in (`OnAir.covers`): stations keep a parity, so the slot before the one now
-///   on is mostly other stations'. Every message in the box is kept (`SlotDecodes`, per slot start and box), so a scan
-///   decodes a slot once. A checked message names the trace it lies on, when that trace offers FT8 and was on the air in
-///   the slot (`applied`).
+/// - **FT8** (`ft8`): `ft8RingSeconds` of the ring read as a channel around the signal (or its group), and timed
+///   (`OnAirMap`): when each trace under the point was on the air, over all of that read. The latest complete 15 s slot
+///   in it that the point's own trace was on the air in (`onAir`: stations keep a parity, so most of the slot before
+///   the one now on is other stations') is demodulated as USB to a 3 kHz box of 12 kHz audio (`ModemChannel`) and
+///   decoded (`FT8Modem.decode`). Only with a true time (the RSP's): the slots are placed by it. The box's read, its
+///   timing and every slot decoded in it are kept (`BoxRead`), so a scan decodes a slot once. A checked message names
+///   the trace it lies on, when that trace offers FT8 and was on the air in the slot (`applied`).
 /// - **RTTY and PSK31** (`stream`): the newest `streamSeconds` around the signal, demodulated the same way, through an
 ///   RTTY decoder at the measured shift (the standard one it is: 170, 425 or 850 Hz) and each standard speed within
 ///   `rttyBaudSearch` of the measured one (45.45, 50, 75 Bd: a character's 1.5 stop bits can make its keying read 7/7.5
@@ -67,13 +68,13 @@ enum SignalIDDecoding {
     static let demodulatePieceFrames = 1 << 14
     /// The audio's rate (the decoders').
     static let audioRate = ModemChannel.outputRate
-    /// A slot read reaches this far past the slot at either end (the ring moves on between the probe and the read).
-    static let slotMarginSeconds = 0.25
     /// A slot read that starts this much after the slot is still decoded, its start silence filled in (a transmission
     /// starts 0.5 s in).
     static let slotLateSeconds = 0.3
-    /// The decode cache keeps a slot's messages this long after the slot ended.
-    static let slotKeepSeconds = 60.0
+    /// A box's read (`BoxRead`) is used again for this long after it ended, by the ring's clock: a scan's other points.
+    static let boxReuseSeconds = 5.0
+    /// The ring read short of `ft8RingSeconds` by more than this held less than it.
+    static let ringShortSeconds = 0.5
     /// RTTY's standard speeds and shifts; a speed is tried within `rttyBaudSearch` of the measured one (a character's
     /// stop bits can make it read 7 % low), a shift taken within `rttyShiftTolerance`.
     static let rttyBauds = [45.45, 50, 75]
@@ -87,7 +88,12 @@ enum SignalIDDecoding {
     static let ft8Name = "FT8", rttyName = "RTTY", pskName = "PSK31 / PSK63"
 
     static let noTrueTimeNote = "No FT8 decode: the IQ has no true time to find its slots by"
-    static let noSlotNote = "No FT8 decode: no complete slot it was on the air in is in reach of the ring; named from its tones and slots"
+    static let noOwnSlotNote = "No FT8 decode: it was on the air in no complete slot of the last 28 s; named from its tones and slots"
+    /// The note when the ring held only `seconds`, and no complete slot the signal was on the air in.
+    static func ringShortNote(_ seconds: Double) -> String {
+        String(format: "No FT8 decode: the ring holds %.0f s, and no complete slot it was on the air in; named from its tones and slots",
+               seconds)
+    }
 
     // MARK: Plans
 
@@ -169,13 +175,14 @@ enum SignalIDDecoding {
 
     // MARK: The FT8 slot cache
 
-    /// One FT8 slot's messages in one box: every checked message there, kept for the scan's other points.
-    struct SlotDecodes: Sendable, Equatable {
+    /// One box's read: when everything in it was on the air (`map`, over the channel the trial read), and the messages
+    /// of every slot decoded in it, kept for the scan's other points.
+    struct BoxRead: Sendable, Equatable {
         var state: TuneBarrier.State
-        var slotStart: Date
         /// The box's dial (display Hz): its audio is RF less this.
         var dialHz: Double
-        var decodes: [TrialDecode]
+        var map: OnAirMap
+        var slots: [Date: [TrialDecode]] = [:]
 
         /// Whether a signal at `rfHz` was in this box's decoded band.
         func covers(_ rfHz: Double) -> Bool {
@@ -186,21 +193,23 @@ enum SignalIDDecoding {
 
     // MARK: Attempt
 
-    /// What a trial made: its decodes (the FT8 slot's every message, or a stream's readable text), the slot it decoded
-    /// to keep (nil when it reused one, or made none), and a note when it couldn't try (no true time, no slot in reach).
+    /// What a trial made: its decodes (the FT8 slot's every message, or a stream's readable text), the box's read to keep
+    /// (nil when it made none), and a note when it couldn't try (no true time, no slot of its own in reach).
     struct Attempt: Sendable, Equatable {
         var decodes: [TrialDecode] = []
         /// The FT8 slot `decodes` are of: a trace is named by them only when it was on the air in it.
         var slotStart: Date?
-        var slot: SlotDecodes?
+        /// When the traces in the box were on the air: what says which were on in `slotStart`.
+        var map: OnAirMap?
+        var box: BoxRead?
         var note: String?
     }
 
     /// The trial for `identity` (see the type's notes), made off the ring in the tuning `state` (`barrier` says when that
-    /// changes): nil when cancelled or the radio retuned (the answer is dropped). `known`: slots already decoded; one
-    /// for the same slot whose box covers the signal is used as it is.
+    /// changes): nil when cancelled or the radio retuned (the answer is dropped). `known`: boxes already read; a recent
+    /// one in this tuning that covers the signal is used (`boxReuseSeconds`), and its slots decoded.
     static func attempt(for identity: SignalIdentity, plan: Plan, state: TuneBarrier.State, trueTime: Bool,
-                        known: [SlotDecodes], chunks: SignalIDService.ChunkProvider, barrier: TuneBarrier,
+                        known: [BoxRead], chunks: SignalIDService.ChunkProvider, barrier: TuneBarrier,
                         decoders: Decoders = .standard, cancelled: () -> Bool) -> Attempt? {
         guard !cancelled(), barrier.current == state else { return nil }
         switch plan {
@@ -219,7 +228,7 @@ enum SignalIDDecoding {
     /// history. (`attempt(for:plan:…)` is the service's, with its slot cache and tuning.)
     static func attempt(for identity: SignalIdentity, atHz: Double, centerHz: Double,
                         chunks: SignalIDService.ChunkProvider, trueTime: Bool = true,
-                        known: [SlotDecodes] = [], decoders: Decoders = .standard,
+                        known: [BoxRead] = [], decoders: Decoders = .standard,
                         cancelled: () -> Bool) -> TrialDecode? {
         let barrier = TuneBarrier()
         barrier.end(centerHz: centerHz)
@@ -234,64 +243,91 @@ enum SignalIDDecoding {
     }
 
     /// The latest complete FT8 slot within `ft8RingSeconds` that `own` (the point's signal) was on the air in, decoded in
-    /// the box around `targetHz` (or one decoded already that covers `own`). The decode is kept once it is made, though
-    /// the job was then cancelled (stopped for the owner: its retry uses it); a retune drops it.
-    static func ft8(targetHz: Double, own: SignalIdentity, state: TuneBarrier.State, known: [SlotDecodes],
+    /// the box around `targetHz`: the box read, timed (`OnAirMap`), its slot chosen (`ownSlot`) and decoded; or, from a
+    /// recent read of it (`known`), the slot chosen by that read's timing and its decodes taken. The decode is kept once it is made, though the job
+    /// was then cancelled (stopped for the owner: its retry uses it); a retune drops it.
+    static func ft8(targetHz: Double, own: SignalIdentity, state: TuneBarrier.State, known: [BoxRead],
                     chunks: SignalIDService.ChunkProvider, barrier: TuneBarrier, decoders: Decoders,
                     cancelled: () -> Bool) -> Attempt? {
         // Where the ring ends now.
         guard let probe = chunks(SignalIDService.probeSeconds, SignalIDService.maxChunkFrames, { _ in true }),
               probe.sampleRate > 0 else {
-            return barrier.current == state ? Attempt(note: noSlotNote) : nil
+            return barrier.current == state ? Attempt(note: noOwnSlotNote) : nil
         }
         guard !cancelled(), barrier.current == state else { return nil }
-        let slotSeconds = FT8Modem.slotSeconds
         let ownHz = state.centerHz + own.measurement.offsetHz
-        // The complete slots in reach, newest first: the first `own` was on the air in.
-        var slotStart = SlotRecorder.slotStart(for: probe.endTime.addingTimeInterval(-slotSeconds), slotSeconds: slotSeconds)
-        while !onAir(own, in: slotStart) {
-            slotStart = slotStart.addingTimeInterval(-slotSeconds)
-            guard probe.endTime.timeIntervalSince(slotStart) + slotMarginSeconds <= ft8RingSeconds else {
-                return Attempt(note: noSlotNote)
+        let end = probe.endTime.timeIntervalSince1970
+        // A recent read of a box holding the signal, and the slot it was on in there, decoded already.
+        if let box = known.first(where: {
+            $0.state == state && $0.covers(ownHz) && end - $0.map.readEndUTC <= boxReuseSeconds
+        }) {
+            switch ownSlot(own, map: box.map, centerHz: state.centerHz) {
+            case .none(let note): return Attempt(map: box.map, note: note)
+            case .slot(let slot):
+                if let decodes = box.slots[slot] { return Attempt(decodes: decodes, slotStart: slot, map: box.map) }
+                // Not decoded in it yet (its first point wasn't on then): read afresh.
             }
         }
-        if let hit = known.first(where: { $0.state == state && $0.slotStart == slotStart && $0.covers(ownHz) }) {
-            return Attempt(decodes: hit.decodes, slotStart: slotStart)
-        }
-        let back = probe.endTime.timeIntervalSince(slotStart) + slotMarginSeconds
-        guard back <= ft8RingSeconds else { return Attempt(note: noSlotNote) }
         let dial = targetHz - boxCentreHz
-        let offset = dial + boxCentreHz - state.centerHz
-        switch SignalIDService.channelRead(seconds: back, offsetHz: offset, windowHz: channelHz, tuning: state,
-                                           sampleRate: probe.sampleRate, chunks: chunks, barrier: barrier,
-                                           feedSeconds: slotSeconds + 2 * slotMarginSeconds) {
+        switch SignalIDService.channelRead(seconds: ft8RingSeconds, offsetHz: dial + boxCentreHz - state.centerHz,
+                                           windowHz: channelHz, tuning: state, sampleRate: probe.sampleRate,
+                                           chunks: chunks, barrier: barrier) {
         case .dropped: return nil
-        case .failed: return Attempt(note: noSlotNote)
+        case .failed: return Attempt(note: noOwnSlotNote)
         case .read(let read):
             guard !cancelled(), barrier.current == state else { return nil }
-            // The read's first sample against the slot's start: what is before it dropped, a late start filled in.
+            let map = OnAirMap(iq: read.iq, sampleRate: read.sampleRate, centerOffsetHz: read.offsetHz,
+                               halfSpanHz: channelHz / 2, readEnd: read.endTime)
+            var box = BoxRead(state: state, dialHz: dial, map: map)
+            guard !cancelled(), barrier.current == state else { return nil }
+            let slot: Date
+            switch ownSlot(own, map: map, centerHz: state.centerHz) {
+            case .none(let note): return Attempt(map: map, box: box, note: note)
+            case .slot(let s): slot = s
+            }
+            // The slot's 15 s of the read, from its start.
             let readStart = read.endTime.addingTimeInterval(-read.seconds)
-            let early = slotStart.timeIntervalSince(readStart)
-            // It must start by `slotLateSeconds` into the slot (a ring holding less than the slot starts later); it ends
-            // past the slot's end, which the ring held when probed.
-            guard early >= -slotLateSeconds else { return Attempt(note: noSlotNote) }
+            let early = slot.timeIntervalSince(readStart)
             let drop = min(read.iq.count / 2, max(0, Int((early * read.sampleRate).rounded())))
             var audio = [Float](repeating: 0, count: max(0, Int((-early * audioRate).rounded())))
-            audio += demodulate(read.iq, fromFrame: drop, sampleRate: read.sampleRate,
-                                dialOffsetHz: dial - (state.centerHz + read.offsetHz))
-            let length = Int(slotSeconds * audioRate)
-            if audio.count > length { audio.removeLast(audio.count - length) }
-            audio += [Float](repeating: 0, count: length - audio.count)
+            audio += demodulate(read.iq, fromFrame: drop, frames: Int(FT8Modem.slotSeconds * read.sampleRate),
+                                sampleRate: read.sampleRate, dialOffsetHz: dial - (state.centerHz + read.offsetHz))
             guard !cancelled(), barrier.current == state else { return nil }
-            let decodes = decoders.ft8(audio, slotStart).map {
-                TrialDecode(mode: ft8Name, text: clean($0.message), strength: .checked,
-                            rfHz: dial + $0.frequencyHz + 3.5 * FT8Encoder.toneSpacing)
-            }.filter { !$0.text.isEmpty }
+            let decodes = ft8Decodes(audio, slot: slot, dialHz: dial, decoders: decoders)
             // Made: kept though cancelled meanwhile (the decode can't be stopped, and a retry would make it again).
             guard barrier.current == state else { return nil }
-            let slot = SlotDecodes(state: state, slotStart: slotStart, dialHz: dial, decodes: decodes)
-            return Attempt(decodes: decodes, slotStart: slotStart, slot: slot)
+            box.slots[slot] = decodes
+            return Attempt(decodes: decodes, slotStart: slot, map: map, box: box)
         }
+    }
+
+    /// Which slot `own` is decoded in, by `map`: the latest complete one in it that `own` was on the air in (`onAir`).
+    enum OwnSlot { case slot(Date), none(String) }
+
+    static func ownSlot(_ own: SignalIdentity, map: OnAirMap, centerHz: Double) -> OwnSlot {
+        let air = band(own).flatMap { map.onAir($0) }
+        let slotSeconds = FT8Modem.slotSeconds
+        var slot = SlotRecorder.slotStart(for: Date(timeIntervalSince1970: map.readEndUTC - slotSeconds),
+                                          slotSeconds: slotSeconds)
+        // Complete slots wholly in the read (or starting `slotLateSeconds` before it), newest first.
+        while slot.timeIntervalSince1970 >= map.readStartUTC - slotLateSeconds {
+            if let air, onAir(air, in: slot) { return .slot(slot) }
+            slot = slot.addingTimeInterval(-slotSeconds)
+        }
+        let held = map.readEndUTC - map.readStartUTC
+        return .none(held < ft8RingSeconds - ringShortSeconds ? ringShortNote(held) : noOwnSlotNote)
+    }
+
+    /// One slot's 12 kHz audio (cut or filled to 15 s) through the FT8 decoder, its messages cleaned.
+    static func ft8Decodes(_ audio: [Float], slot: Date, dialHz: Double, decoders: Decoders) -> [TrialDecode] {
+        var audio = audio
+        let length = Int(FT8Modem.slotSeconds * audioRate)
+        if audio.count > length { audio.removeLast(audio.count - length) }
+        audio += [Float](repeating: 0, count: length - audio.count)
+        return decoders.ft8(audio, slot).map {
+            TrialDecode(mode: ft8Name, text: clean($0.message), strength: .checked,
+                        rfHz: dialHz + $0.frequencyHz + 3.5 * FT8Encoder.toneSpacing)
+        }.filter { !$0.text.isEmpty }
     }
 
     /// The newest `streamSeconds` of the signal at `centerHz` through each of `streams`' decoders: the text that reads
@@ -329,11 +365,12 @@ enum SignalIDDecoding {
         }
     }
 
-    /// Interleaved IQ at `sampleRate` (from its frame `fromFrame` on) as 12 kHz USB audio of the 3 kHz box whose dial is
+    /// Interleaved IQ at `sampleRate` (from its frame `fromFrame` on, `frames` of it at most) as 12 kHz USB audio of the 3 kHz box whose dial is
     /// `dialOffsetHz` from its centre: a `ModemChannel` of its own.
-    static func demodulate(_ iq: [Float], fromFrame: Int = 0, sampleRate: Double, dialOffsetHz: Double) -> [Float] {
+    static func demodulate(_ iq: [Float], fromFrame: Int = 0, frames most: Int = .max, sampleRate: Double,
+                           dialOffsetHz: Double) -> [Float] {
         let channel = ModemChannel(inputRate: sampleRate, dialOffsetHz: dialOffsetHz)
-        let frames = max(0, iq.count / 2 - fromFrame)
+        let frames = max(0, min(most, iq.count / 2 - fromFrame))
         var audio: [Float] = []
         audio.reserveCapacity(Int(Double(frames) / sampleRate * audioRate) + 64)
         iq.withUnsafeBufferPointer { raw in
@@ -375,13 +412,18 @@ enum SignalIDDecoding {
         // The signals a message may lie on: those under the point (the point's own among them), else the point's own; only
         // one that offers FT8 and was on the air in the message's slot.
         let traces = out.signals.isEmpty ? [out] : out.signals
-        let eligible = made.slotStart.map { slot in traces.map { offersFT8($0) && onAir($0, in: slot) } }
-            ?? traces.map { _ in false }
+        let eligible = traces.map { trace -> Bool in
+            guard let slot = made.slotStart, let map = made.map, offersFT8(trace),
+                  let air = band(trace).flatMap({ map.onAir($0) }) else { return false }
+            return onAir(air, in: slot)
+        }
         var claimed: [Int: TrialDecode] = [:]
         for d in made.decodes where d.strength == .checked && d.mode == ft8Name {
-            // The one it lies on, the nearest; and on that one, the nearest message.
-            guard let k = traces.indices.filter({ eligible[$0] && lies(d, on: traces[$0], centerHz: centerHz) })
-                .min(by: { distance(d, traces[$0], centerHz) < distance(d, traces[$1], centerHz) }) else { continue }
+            // The nearest it lies on is its trace (when that one may be named; never the next one over); and on that
+            // one, the nearest message.
+            guard let k = traces.indices.filter({ lies(d, on: traces[$0], centerHz: centerHz) })
+                .min(by: { distance(d, traces[$0], centerHz) < distance(d, traces[$1], centerHz) }),
+                  eligible[k] else { continue }
             if let other = claimed[k], distance(other, traces[k], centerHz) <= distance(d, traces[k], centerHz) { continue }
             claimed[k] = d
         }
@@ -402,11 +444,17 @@ enum SignalIDDecoding {
         return out
     }
 
-    /// Whether `s`'s trace was on the air for the transmission of the FT8 slot starting at `slotStart` (`OnAir.covers`),
-    /// and in neither slot beside it as far as its read saw (`OnAir.heard`): stations keep a parity, so a line on in both
-    /// is two stations, and a message of one slot isn't said to be its.
-    static func onAir(_ s: SignalIdentity, in slotStart: Date) -> Bool {
-        guard let air = s.measurement.onAir else { return false }
+    /// The band a trace's timing is read over: its extent (relative to the capture centre).
+    static func band(_ s: SignalIdentity) -> ClosedRange<Double>? {
+        let m = s.measurement
+        let half = max(m.occupiedBandwidthHz, m.bandwidth6dBHz) / 2
+        return half > 0 ? (m.offsetHz - half)...(m.offsetHz + half) : nil
+    }
+
+    /// Whether a trace on the air at `air` was on for the transmission of the FT8 slot starting at `slotStart`
+    /// (`OnAir.covers`), and in neither slot beside it as far as the read saw (`OnAir.heard`): stations keep a parity,
+    /// so a line on in both is two stations, and a message of one slot isn't said to be its.
+    static func onAir(_ air: OnAir, in slotStart: Date) -> Bool {
         func transmission(_ slot: Date) -> ClosedRange<Double> {
             let start = slot.timeIntervalSince1970 + FT8Encoder.startSeconds
             return start...(start + Double(FT8Encoder.toneCount) * FT8Encoder.symbolSeconds)

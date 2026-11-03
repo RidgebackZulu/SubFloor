@@ -1,3 +1,5 @@
+import Accelerate
+import DSPCore
 import Foundation
 
 /// How well a signal's transmissions fit one slot grid: `fit` (0…1) for slots `periodSeconds` long, each holding a
@@ -57,6 +59,39 @@ public struct OnAir: Codable, Sendable, Equatable {
         guard upper > lower else { return false }
         let on = runs.reduce(0.0) { $0 + max(0, min(upper, $1.upperBound) - max(lower, $1.lowerBound)) }
         return on >= Self.heardSeconds
+    }
+}
+
+/// A read's picture of frequency against time (`TimeFrequencyMap`, as the identifier times a narrow trace:
+/// `mapBinHz` bins, `mapHopSeconds` apart, each moment against its own noise), kept to say when any band of it was on the
+/// air (`onAir`). A trial decode makes one over the channel it reads, so the traces it may name are timed over all of
+/// it, not over the identification's shorter read.
+public struct OnAirMap: Sendable, Equatable {
+    let map: TimeFrequencyMap
+    public let readStartUTC: Double
+    public let readEndUTC: Double
+
+    /// Over `iq` (interleaved, at `sampleRate`, its 0 Hz `centerOffsetHz` from the capture centre, ±`halfSpanHz` of
+    /// that), its last sample on the air at `readEnd`.
+    public init(iq: [Float], sampleRate: Double, centerOffsetHz: Double, halfSpanHz: Double, readEnd: Date) {
+        let z = iq.withUnsafeBufferPointer { raw in
+            raw.withMemoryRebound(to: DSPComplex.self) { Array($0.prefix(raw.count / 2)) }
+        }
+        map = TimeFrequencyMap.build(z, rate: sampleRate, centerOffsetHz: centerOffsetHz,
+                                     binHz: SignalIdentifier.mapBinHz, hopSeconds: SignalIdentifier.mapHopSeconds,
+                                     halfSpanHz: halfSpanHz)
+        readEndUTC = readEnd.timeIntervalSince1970
+        readStartUTC = readEndUTC - (sampleRate > 0 ? Double(iq.count / 2) / sampleRate : 0)
+    }
+
+    /// When the band `bandHz` (relative to the capture centre) was on the air (`TraceFinder.onTimes`); nil when the map
+    /// doesn't hold it.
+    public func onAir(_ bandHz: ClosedRange<Double>) -> OnAir? {
+        let low = max(0, map.bin(bandHz.lowerBound)), high = min(map.bins - 1, map.bin(bandHz.upperBound))
+        guard map.rows > 0, low <= high else { return nil }
+        let onTimes = TraceFinder.onTimes(low...high, map: map, quiet: 1)
+        return SlotEvidence.onAir(onTimes: onTimes, readEnd: Date(timeIntervalSince1970: readEndUTC),
+                                  readSeconds: readEndUTC - readStartUTC)
     }
 }
 

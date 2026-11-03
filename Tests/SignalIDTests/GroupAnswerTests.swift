@@ -320,16 +320,6 @@ extension GroupAnswerTests {
 
     /// Each rule alone turns away the trace it is for: a key's starts and stops of its own, FT4's width, a start further
     /// off than clocks are, and with a true time a transmission that doesn't fit the slots.
-    /// One not measured carries its line's on-times by UTC (`onAir`), with a true time.
-    @Test func anUnmeasuredLineSaysWhenItWasOn() {
-        let end = Date(timeIntervalSince1970: SignalSynth.slotEpoch + 3)
-        let timed = SignalIdentifier.unmeasured(Self.line(300, width: 56, on: [0.6...3.0]), seconds: 3, captureCenterHz: 0,
-                                                from: nil, endTime: end)
-        #expect(timed.measurement.onAir?.runs == [(SignalSynth.slotEpoch + 0.6)...(SignalSynth.slotEpoch + 3)])
-        #expect(SignalIdentifier.unmeasured(Self.line(300, width: 56, on: [0.6...3.0]), seconds: 3, captureCenterHz: 0,
-                                            from: nil).measurement.onAir == nil)
-    }
-
     @Test func onlyTheSameSlotAndWidthInherit() {
         let ft8 = ModeTable.row("FT8")!
         let model = Self.line(0, width: 56, on: [0.6...3.0])
