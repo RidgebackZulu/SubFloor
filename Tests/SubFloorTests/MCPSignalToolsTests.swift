@@ -140,6 +140,29 @@ struct MCPSignalToolsTests {
         #expect(!text.isError, "\(text.content)")
     }
 
+    /// An agent may give the point's radius: `radius_hz` reaches the identifier (nil without it: its default, suited to
+    /// narrow signals), clamped to 1–5000 Hz as `bandwidth_hz` is to its range, and must be a number.
+    @Test func identifySignalTakesARadius() async {
+        guard let (m, tools) = runningModel() else { return }
+        defer { m.shutdown() }
+        let radii = Shared<[Double?]>([])
+        let inner = Self.rtty()
+        m.signalID.analysis = { a in
+            radii.withLock { $0.append(a.pointRadiusHz) }
+            return inner(a)
+        }
+        let hz = m.centerHz + 5_000
+        for given in [nil, 400, 9_000, 0.5] as [Double?] {
+            var args: [String: JSONValue] = ["frequency": .number(hz)]
+            if let given { args["radius_hz"] = .number(given) }
+            let r = await call(tools, "identify_signal", args)
+            #expect(!r.isError, "\(String(describing: given)): \(r.content)")
+        }
+        #expect(radii.withLock { $0 } == [nil, 400, 5_000, 1], "\(radii.withLock { $0 })")
+        let bad = await call(tools, "identify_signal", ["frequency": .number(hz), "radius_hz": .string("wide")])
+        #expect(bad.isError && bad.content.contains("radius_hz must be a number"), "\(bad.content)")
+    }
+
     @Test func identifySignalRefusesWhatItCannotRead() async {
         let stopped = makeModel()
         let tools = SubFloorTools(model: stopped)
@@ -866,6 +889,36 @@ struct MCPSignalToolsTests {
         #expect(one.structured?["truncated"]?.bool == true)
     }
 
+    /// A stepped scan that dwells names a group at a step: its row's `tune` is where the station is at that step (from
+    /// the answer's own capture centre), not that far from the tuning the scan put back afterwards (I2).
+    @Test func aSteppedScanGroupRowIsTunedWhereItWasRead() async {
+        guard let (m, tools) = runningModel() else { return }
+        defer { m.shutdown() }
+        m.tune(to: 7_150_000)
+        let before = Tuning(m)
+        let span = m.sampleRate, from = 6_000_000.0
+        // The group in the second piece, its stations 5 kHz apart (the spectrum's bins tell them apart); an RTTY in the third.
+        let base = from + 1.3 * span
+        let group = (0..<6).map { base + Double($0) * 5_000 }
+        let other = from + 2.2 * span
+        m.signalID.analysis = Self.ft8Group(group)
+        tools.scanSpectrum = { Self.spectrum(of: m, lines: group + [other]) }
+        let r = await call(tools, "identify_signals", ["from_hz": .number(from), "to_hz": .number(from + 2.5 * span),
+                                                       "dwell_seconds": .number(15)])
+        #expect(!r.isError, "\(r.content)")
+        #expect(r.structured?["restored"]?.bool == true && Tuning(m) == before)
+        let rows = r.structured?["signals"]?.array ?? []
+        let row = rows.first { $0["count"] != nil }
+        #expect(row?["count"]?.double == 6, "\(rows.map { $0["identity"]?["label"]?.string ?? "" })")
+        let lower = row?["from_hz"]?.double ?? 0, upper = row?["to_hz"]?.double ?? 0
+        #expect(abs(lower - (base - 25)) <= 1 && abs(upper - (group.last! + 25)) <= 1, "\(lower)–\(upper)")
+        // The station's dial puts its passband over the group: inside the span, less the passband and its offset.
+        let tune = row?["identity"]?["tune"]
+        let dial = tune?["frequency"]?.double ?? 0, passband = tune?["bandwidth_hz"]?.double ?? 0
+        #expect(dial >= lower - passband - 200 && dial <= upper, "dial \(dial), span \(lower)–\(upper), passband \(passband)")
+        #expect(rows.contains { $0["identity"]?["name"]?.string == "RTTY" })
+    }
+
     /// An interference comb's lines are listed with interference true, and don't count towards max_signals.
     @Test func scanFlagsComb() async {
         guard let (m, tools) = runningModel() else { return }
@@ -1129,6 +1182,7 @@ struct MCPSignalToolsTests {
         // Frequencies take a number or a string (as `tune` does); counts are integers, the rest numbers.
         #expect(one.inputSchema["properties"]?["frequency"]?["anyOf"]?.array?.count == 2)
         #expect(one.inputSchema["properties"]?["bandwidth_hz"]?["type"]?.string == "number")
+        #expect(one.inputSchema["properties"]?["radius_hz"]?["type"]?.string == "number")
         #expect(many.inputSchema["properties"]?["from_hz"]?["anyOf"]?.array?.count == 2)
         #expect(many.inputSchema["properties"]?["to_hz"]?["anyOf"]?.array?.count == 2)
         #expect(many.inputSchema["properties"]?["min_snr_db"]?["type"]?.string == "number")

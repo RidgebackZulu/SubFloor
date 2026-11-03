@@ -142,6 +142,7 @@ What kind of signal is at a frequency. Read-only: it never retunes.
 |---|---|---|
 | `frequency` **(required)** | number or string | Display Hz, or a string like `"7.074 MHz"`. Inside the capture. |
 | `bandwidth_hz` | number | The signal's width in Hz, if you know it. |
+| `radius_hz` | number | How far either side of `frequency` the signals under the point are taken from, 1–5000 Hz. Default 60, suited to narrow signals; a few hundred takes in a whole FT8 group (`signals`), as the owner's view does. |
 
 Returns `{hz, label, family, name, confidence, family_confidence, parameters, alternatives, evidence, tune,
 confirmed_by_decode, needs_longer_read, note, decoded?, interference?, name_inherited?, likely?, count?, signals?,

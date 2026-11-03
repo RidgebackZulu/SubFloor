@@ -95,7 +95,9 @@ shift, tones, keying) and matched against a table of known modes and the band pl
 `identify_signals` (inside the capture, or with `dwell_seconds`) make the trial decode.
 
 To ask about any frequency in the capture, not just a cursor: `identify_signal {frequency}`. It never retunes. If
-the frequency is outside the capture, `tune` there first (or use `identify_signals`, which steps for you).
+the frequency is outside the capture, `tune` there first (or use `identify_signals`, which steps for you). Its
+`radius_hz` (1–5000, default 60) is how far either side of the frequency the signals under the point are taken
+from: the default suits a narrow signal; a few hundred Hz takes in a whole FT8 group, as the owner's view does.
 
 Then check the identification the way a person would: is it plausible for the **frequency** (what is allocated or
 scheduled there: a broadcast band, a ham band's digital segment, a known utility or number station; search the web
