@@ -222,8 +222,8 @@ final class SignalIDQueue {
 /// try a private decode where one applies (FT8's latest complete slot; RTTY, PSK31): a queued job of its own in the same
 /// lane, after the answer is out (`firstAnswer`). A checked FT8 message names the signal it lies on at 1.0; readable
 /// text is evidence for RTTY or PSK31. Its decoders are its own: the decoder panel, its settings and the decode history
-/// never see it. An FT8 slot's messages are kept per slot and box (`boxReads`, forgotten on a retune): a scan decodes
-/// a slot once.
+/// never see it. An FT8 box's read and the slots decoded in it are kept (`boxReads`, forgotten on a retune): a scan
+/// decodes a slot once, while what the read says of each point's slot is settled (`SignalIDDecoding.settled`).
 ///
 /// **Card.** A right click (`openCard`) identifies the signal there the same way, with a trial decode, and fills `card`
 /// in as it comes; the UI shows it as a popover at the click. A retune that drops its longer read or its trial decode
@@ -411,8 +411,9 @@ final class SignalIDService {
     /// `tryDecode` (the card's and agents', never hover's, and not with `longerRead` false): when a trial decode
     /// applies (`SignalIDDecoding.plan`), the answer is given to `firstAnswer` and then decoded, a queued job of its own
     /// in the same lane, and the answer returned is the decoded one (`SignalIDDecoding.applied`); nil when the radio
-    /// retuned or it was cancelled meanwhile. FT8 slots decoded are kept (`boxReads`): another point in the same slot
-    /// and box uses them. `decoding` is called (on the main actor) as the decode starts, after that first answer.
+    /// retuned or it was cancelled meanwhile. FT8 box reads and the slots decoded in them are kept (`boxReads`): another
+    /// point in the box uses them while their word on its slot is settled. `decoding` is called (on the main actor) as
+    /// the decode starts, after that first answer.
     func identify(atHz: Double, bandwidthHz: Double? = nil, radiusHz: Double? = nil, longerRead: Bool = true,
                   priority: SignalIDPriority = .background, tryDecode: Bool = false,
                   firstAnswer: (@MainActor (SignalIdentity) -> Void)? = nil,

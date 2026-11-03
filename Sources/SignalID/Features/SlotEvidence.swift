@@ -54,11 +54,17 @@ public struct OnAir: Codable, Sendable, Equatable {
     /// middle as the read saw it (`span` less the clock's tolerance at each end, so a neighbouring slot's transmission
     /// on a clock that far off isn't taken for one in it).
     public func heard(during span: ClosedRange<Double>) -> Bool {
-        let tolerance = SlotEvidence.clockToleranceSeconds
-        let lower = max(span.lowerBound + tolerance, readStartUTC), upper = min(span.upperBound - tolerance, readEndUTC)
+        let lower = max(span.lowerBound + SlotEvidence.clockToleranceSeconds, readStartUTC)
+        let upper = min(Self.heardSettlesAt(span), readEndUTC)
         guard upper > lower else { return false }
         let on = runs.reduce(0.0) { $0 + max(0, min(upper, $1.upperBound) - max(lower, $1.lowerBound)) }
         return on >= Self.heardSeconds
+    }
+
+    /// The UTC a read must reach for `heard(during: span)` to be settled: the end of the middle it judges. Read that
+    /// far, the verdict can't change with more read.
+    public static func heardSettlesAt(_ span: ClosedRange<Double>) -> Double {
+        span.upperBound - SlotEvidence.clockToleranceSeconds
     }
 }
 
