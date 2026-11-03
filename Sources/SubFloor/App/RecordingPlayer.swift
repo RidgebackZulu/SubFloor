@@ -21,7 +21,11 @@ final class RecordingPlayer {
     /// One of `jumpSizes`.
     var jump: Double = 1
     /// 0...1, the main volume knob: `AppModel` sets it when the knob moves.
-    var volume: Float = 0.5 { didSet { if graph != nil { engine.mainMixerNode.outputVolume = volume } } }
+    var volume: Float = 0.5 { didSet { if graph != nil { engine.mainMixerNode.outputVolume = speakerVolume } } }
+    /// What the mixer plays at: the knob's volume, or none under `swift test` unless it renders offline.
+    private var speakerVolume: Float {
+        AudioOutput.speakersSilenced && !engine.isInManualRenderingMode ? 0 : volume
+    }
     /// The user's noise-reduction setting, from `AppModel`. It applies only where the loaded recording's mode
     /// allows (`noiseReductionAvailable`).
     var noiseReduction = NoiseReductionSettings() { didSet { pushNoiseReduction() } }
@@ -160,6 +164,7 @@ final class RecordingPlayer {
         }
         do {
             // Before the node plays: a player node started in an engine that is not running throws.
+            engine.mainMixerNode.outputVolume = speakerVolume
             if !engine.isRunning { try engine.start() }
         } catch {
             loadError = Self.cannotPlay
@@ -221,7 +226,7 @@ final class RecordingPlayer {
         for node in [player, converter, effect] { engine.attach(node) }
         engine.connect(converter, to: effect, format: NoiseReductionAudioUnit.format)
         engine.connect(effect, to: engine.mainMixerNode, format: NoiseReductionAudioUnit.format)
-        engine.mainMixerNode.outputVolume = volume
+        engine.mainMixerNode.outputVolume = speakerVolume
         // The engine stops itself when the output device changes (or goes away), and says so here.
         configurationObserver = NotificationObserver(name: .AVAudioEngineConfigurationChange, object: engine) { [weak self] in
             guard let self, !self.engine.isRunning else { return }
