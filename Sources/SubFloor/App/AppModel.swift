@@ -79,6 +79,10 @@ private struct SessionState: Codable {
     var transcription: TranscriptionSettings?
     /// An agent's Auto time limit (`AppModel.autoRecordOffAt`).
     var autoRecordOffAt: Date?
+    /// The scheduler's master switch; nil (a session from before the scheduler, or a first launch) is off.
+    var schedulerOn: Bool?
+    /// The last time the scheduler was known running (stamped once a minute), for windows missed while it wasn't.
+    var schedulerAlive: Date?
 }
 
 @MainActor @Observable
@@ -283,6 +287,8 @@ final class AppModel {
     /// Called (on the main actor) when the low-disk check ends a schedule's recording: the scheduler ends the
     /// run with `.lowDisk`. `scheduleRecording` is already nil by then.
     @ObservationIgnored var onLowDiskStop: (() -> Void)?
+    /// Called (on the main actor) with the lines each log write put on disk: the scheduler counts its run's files.
+    @ObservationIgnored var onLogged: (([RecordingLogEntry]) -> Void)?
 
     /// `paused`: Auto is on but a manual audio recording owns the recorder; the trigger resumes after it.
     /// `scheduled`: a schedule's run is recording with the trigger (`scheduleRecording`).
@@ -488,6 +494,8 @@ final class AppModel {
     let engine = DSPEngine()
     /// Signal ID: names the signal at a frequency from the IQ ring, and where the pointer rests.
     let signalID = SignalIDService()
+    /// Timed recordings: broadcasts and watches, run once a second against the clock.
+    let scheduler: Scheduler
     private var sdrplay: SDRplayDevice?
     /// Tests: a stand-in RSP, used as an open device whenever the RSP is chosen. Gone once it is "removed"
     /// (`simulateDeviceRemovedForTesting`), for the rest of the model's life.
@@ -508,7 +516,7 @@ final class AppModel {
     /// init below, points the library at its own folder (or none) rather than at the owner's recordings.
     convenience init() {
         self.init(bookmarkStore: BookmarkStore(url: BookmarkStore.defaultURL), defaults: .standard,
-                  apiKeyStore: KeychainAPIKeyStore())
+                  apiKeyStore: KeychainAPIKeyStore(), scheduleStore: ScheduleStore(url: ScheduleStore.defaultURL))
         startLibrary()
     }
 
@@ -516,14 +524,21 @@ final class AppModel {
     /// opens the real RSP, except with a `fakeRSP`: such a model never opens a real one (the open fails), even
     /// after the fake is gone.
     /// `fakeRSP`: a stand-in RSP for tests; choosing the RSP uses it as an open device (named "Test RSP").
+    /// `scheduleStore`: nil keeps `schedules.json` beside the bookmarks file. `makeScheduler`: tests build the
+    /// scheduler (its clock, timing and zone) on that store; nil makes the app's.
     init(bookmarkStore: BookmarkStore, defaults: UserDefaults,
          apiKeyStore: any APIKeyStore = MemoryAPIKeyStore(),
          transcribe: @escaping TranscribeFunction = OpenRouterTranscriber.liveTranscribe,
          openRSP: (@Sendable () throws -> SDRplayDevice)? = nil,
          rspOpenTimeout: Duration = .seconds(10),
          decodeHistoryFolder: URL? = nil,
-         fakeRSP: SyntheticSource? = nil) {
+         fakeRSP: SyntheticSource? = nil,
+         scheduleStore: ScheduleStore? = nil,
+         makeScheduler: ((ScheduleStore) -> Scheduler)? = nil) {
         self.fakeRSP = fakeRSP
+        let schedules = scheduleStore
+            ?? ScheduleStore(url: bookmarkStore.url.deletingLastPathComponent().appendingPathComponent("schedules.json"))
+        scheduler = makeScheduler?(schedules) ?? Scheduler(store: schedules)
         self.bookmarkStore = bookmarkStore
         self.defaults = defaults
         self.apiKeyStore = apiKeyStore
@@ -577,6 +592,7 @@ final class AppModel {
         RunLoop.main.add(timer, forMode: .common)
         statsTimer = timer
         signalID.attach(to: self, recorder: engine.iqRecorder)
+        scheduler.attach(to: self)
     }
 
     // MARK: Derived
@@ -749,6 +765,7 @@ final class AppModel {
     /// Orderly shutdown (app quit): stop the engine, release the RSP, persist the session. Idempotent.
     func shutdown() {
         isShutDown = true
+        scheduler.shutdown()
         player.unload()
         engine.stop()
         isRunning = false
@@ -1493,6 +1510,7 @@ final class AppModel {
             try recordingLog.append(entries)
             logWriteFailed = false
             library.didLog(entries)   // only what is on disk
+            onLogged?(entries)
             queueFinishedRecordings(entries)
         } catch {
             guard !logWriteFailed else { return }
@@ -1686,7 +1704,8 @@ final class AppModel {
     /// up on anything else (the open failed, the demo runs) or is not on the RSP within `timeout`; then the source
     /// chosen and the running state are put back as they were. An open in flight is waited for past `timeout`: it
     /// ends by itself within `rspOpenTimeout` (opened, failed, or stalled with the demo running), and an answer
-    /// arriving after this returned would otherwise change the radio behind the caller's back.
+    /// arriving after this returned would otherwise change the radio behind the caller's back. Quitting or a cancelled
+    /// task gives up at once, as a failure does.
     func startRSPForSchedule(timeout: Duration) async -> Bool {
         if isRunning && sourceKind == .sdrplay { return true }
         let source = preferredSource, wasRunning = isRunning
@@ -1695,6 +1714,7 @@ final class AppModel {
         let deadline = ContinuousClock.now + timeout
         while true {
             if isRunning && sourceKind == .sdrplay { return true }
+            if isShutDown || Task.isCancelled { break }
             if rspOpenFailed || (isRunning && sourceKind == .synthetic) { break }
             if ContinuousClock.now >= deadline && rspConnection != .opening { break }
             try? await Task.sleep(for: .milliseconds(50))
@@ -1907,7 +1927,7 @@ final class AppModel {
     }
 
     /// Mid-run (`sessionRadioOverride`), the radio part is the owner's saved radio rather than the run's.
-    private func saveSessionIfChanged() {
+    func saveSessionIfChanged() {
         let radio = sessionRadioOverride ?? saveRadio()
         var upconverter = upconverter
         upconverter.enabled = radio.upconverter
@@ -1919,7 +1939,8 @@ final class AppModel {
                                  modemBox: nil, modemSettings: modem.settings, recording: recording,
                                  autoRecord: radio.autoRecord, squelchEnabled: radio.squelchEnabled, squelchDb: radio.squelchDb,
                                  noiseReduction: noiseReduction, skipSilence: skipSilence,
-                                 transcription: transcriptionSettings, autoRecordOffAt: radio.autoRecordOffAt)
+                                 transcription: transcriptionSettings, autoRecordOffAt: radio.autoRecordOffAt,
+                                 schedulerOn: scheduler.isOn, schedulerAlive: scheduler.aliveStamp)
         guard let data = try? JSONEncoder().encode(state), data != lastSavedSession else { return }
         defaults.set(data, forKey: "session")
         lastSavedSession = data
@@ -1940,6 +1961,7 @@ final class AppModel {
         if let on = s.autoRecord { autoRecordEnabled = on }
         if let on = s.skipSilence { skipSilence = on }
         if let t = s.transcription { transcriptionSettings = t }
+        scheduler.restoreSession(on: s.schedulerOn ?? false, alive: s.schedulerAlive)
         // With the rest restored: it saves the session, which must be whole by then.
         if let nr = s.noiseReduction { noiseReduction = nr }
         // An agent's Auto limit after Auto itself, whose change clears it, and after the rest, since setting it
