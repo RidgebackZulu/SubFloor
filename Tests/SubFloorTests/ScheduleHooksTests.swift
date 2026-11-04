@@ -30,7 +30,7 @@ struct ScheduleHooksTests {
     }
 
     private func makeModel(fakeRSP: Bool = true, defaults: UserDefaults? = nil, dir: URL? = nil,
-                           openRSP: @escaping @Sendable () throws -> SDRplayDevice = { throw SDRplayError.noDevice })
+                           openRSP: (@Sendable () throws -> SDRplayDevice)? = { throw SDRplayError.noDevice })
         -> (AppModel, URL) {
         let dir = dir ?? tempDir()
         let m = AppModel(bookmarkStore: BookmarkStore(url: dir.appendingPathComponent("bookmarks.json")),
@@ -296,6 +296,137 @@ struct ScheduleHooksTests {
         #expect(PlayerPanel.title(r) == "Voice of Korea · 9.435 MHz AM")
         #expect(DayTimelineView.hoverText(r) == plain.replacingOccurrences(of: "9.435 MHz AM", with: "Voice of Korea · 9.435 MHz AM"))
         #expect(SubFloorTools.recordingJSON(r, nil)["schedule"]?.string == "Voice of Korea")
+    }
+
+    @Test func startRSPForScheduleWaitsForAnOpenInFlight() async throws {
+        // Preferred RSP, stopped, and an open slower than the wait: the open is waited for, so its late failure
+        // cannot start the radio after the run gave up.
+        let (m, _) = makeModel(fakeRSP: false, openRSP: {
+            Thread.sleep(forTimeInterval: 0.6)
+            throw SDRplayError.noDevice
+        })
+        defer { m.shutdown() }
+        #expect(m.preferredSource == .sdrplay && !m.isRunning)
+        #expect(await m.startRSPForSchedule(timeout: .milliseconds(100)) == false)
+        #expect(m.rspConnection != .opening)
+        #expect(m.rspOpenFailed)
+        try await Task.sleep(for: .milliseconds(500))
+        #expect(!m.isRunning)
+        #expect(m.preferredSource == .sdrplay)
+
+        // An open that stalls past `rspOpenTimeout` (2 s here): the demo runs, the wait gives up and stops the radio,
+        // and the open's answer when it comes leaves it stopped.
+        let (stalled, _) = makeModel(fakeRSP: false, openRSP: {
+            Thread.sleep(forTimeInterval: 3)
+            throw SDRplayError.noDevice
+        })
+        defer { stalled.shutdown() }
+        #expect(await stalled.startRSPForSchedule(timeout: .milliseconds(100)) == false)
+        #expect(stalled.rspConnection == .stalled)
+        #expect(!stalled.isRunning)
+        for _ in 0..<60 where stalled.rspConnection != .idle { try await Task.sleep(for: .milliseconds(50)) }
+        #expect(stalled.rspConnection == .idle)   // the open answered
+        #expect(!stalled.isRunning)
+    }
+
+    @Test func aFullRestoreAfterALostRSPEndsSafely() async throws {
+        // No openRSP given: a model with a fake RSP must still never open the real one.
+        let (m, _) = makeModel(openRSP: nil)
+        defer { m.shutdown() }
+        m.squelchEnabled = true
+        m.autoRecordEnabled = true
+        guard runningRSP(m) != nil else { return }
+        let saved = m.saveRadio()
+        m.sessionRadioOverride = saved
+        m.scheduleRecording = AppModel.ScheduleRecording(tag: Self.tag, timing: Self.timing)
+        m.simulateDeviceRemovedForTesting()
+        m.scheduleRecording = nil
+        #expect(m.banner?.message == "RSP1B disconnected.")
+        m.banner = nil   // dismissed, so the open's own banner shows
+        m.restoreRadio(saved, full: true)
+        for _ in 0..<100 where m.rspConnection == .opening { try await Task.sleep(for: .milliseconds(50)) }
+        #expect(m.rspOpenFailed)
+        #expect(m.banner?.message == "No RSP found — demo signal. \(SDRplayError.noDevice)")   // the stand-in open, not the RSP's
+        #expect(m.sourceKind != .sdrplay)
+        #expect(m.engine.autoRecorder.config.enabled == false)   // the demo is never recorded
+        #expect(!m.isAutoRecording)
+        #expect(m.sessionRadioOverride == nil)
+    }
+
+    /// An auto session at the head with everything so far committed, written to a file, without a poll.
+    private func recordUnseen(_ recorder: StreamRecorder) -> Bool {
+        func spin(_ done: () -> Bool) -> Bool {
+            let end = Date().addingTimeInterval(5)
+            while !done() {
+                if Date() >= end { return false }
+                Thread.sleep(forTimeInterval: 0.005)
+            }
+            return true
+        }
+        let first = recorder.headFrame
+        recorder.start(fromFrame: first)
+        guard spin({ recorder.headFrame > first + 2_400 }) else { return false }
+        recorder.commit(throughFrame: recorder.headFrame)
+        return spin { recorder.status.framesWritten > 0 && recorder.status.url != nil }
+    }
+
+    @Test func aRecordingIsLabelledByTheScheduleItOpenedUnder() throws {
+        let (m, _) = makeModel()
+        defer { m.shutdown() }
+        guard runningRSP(m) != nil else { return }
+        let recorder = m.engine.audioRecorder
+        func labels(_ file: String, on day: Date) throws -> [String] {
+            try m.recordingLog.entries(forUTCDay: day).compactMap {
+                if case .scheduled(file, _, let name) = $0 { name } else { nil }
+            }
+        }
+        // Opened during the run, first seen as the run ends: labelled.
+        m.scheduleRecording = AppModel.ScheduleRecording(tag: Self.tag, timing: Self.timing)
+        #expect(recordUnseen(recorder))
+        let during = try #require(recorder.status.url).lastPathComponent
+        m.scheduleRecording = nil
+        #expect(try labels(during, on: try #require(recorder.status.startedAt)) == ["Voice of Korea"])
+        recorder.stop(wait: true)
+        m.refreshRecordingStatus()
+        // Opened before a run, first seen as it starts: not labelled.
+        #expect(recordUnseen(recorder))
+        let before = try #require(recorder.status.url).lastPathComponent
+        #expect(before != during)
+        m.scheduleRecording = AppModel.ScheduleRecording(tag: Self.tag, timing: Self.timing)
+        #expect(try labels(before, on: try #require(recorder.status.startedAt)) == [])
+        recorder.stop(wait: true)
+        m.scheduleRecording = nil
+    }
+
+    @Test func aRestoreAfterALowDiskStopKeepsAutoOff() {
+        let (m, _) = makeModel()
+        defer { m.shutdown() }
+        var free: Int64 = 50_000_000
+        m.freeSpaceProbe = { _ in free }
+        m.autoRecordEnabled = true   // the owner's
+        let saved = m.saveRadio()
+        m.scheduleRecording = AppModel.ScheduleRecording(tag: Self.tag, timing: Self.timing)
+        m.checkRecordingsDiskSpace()
+        #expect(!m.autoRecordEnabled && m.scheduleRecording == nil)
+        m.restoreRadio(saved, full: false)
+        #expect(!m.autoRecordEnabled)
+        m.restoreRadio(saved, full: true)
+        #expect(!m.autoRecordEnabled)
+        free = 600_000_000
+        m.restoreRadio(saved, full: false)
+        #expect(m.autoRecordEnabled)   // with room again, the owner's Auto comes back
+    }
+
+    @Test func restoreClearsTheSessionOverride() {
+        let (m, _) = makeModel()
+        defer { m.shutdown() }
+        let saved = m.saveRadio()
+        m.sessionRadioOverride = saved
+        m.restoreRadio(saved, full: false)
+        #expect(m.sessionRadioOverride == nil)
+        m.sessionRadioOverride = saved
+        m.restoreRadio(saved, full: true)
+        #expect(m.sessionRadioOverride == nil)
     }
 
     @Test func lowDiskEndsAScheduledRecording() {

@@ -271,6 +271,8 @@ final class AppModel {
     /// auto recording that opens gets a `.scheduled` log line, and `autoRecordState` is `.scheduled`. The same
     /// guards as Auto's apply: the radio running on a real source with the squelch on, and the disk check.
     var scheduleRecording: ScheduleRecording? {
+        // A recording that opened before the change is seen (and labelled, or not) against the old value.
+        willSet { if newValue != scheduleRecording { refreshRecordingStatus() } }
         didSet {
             guard scheduleRecording != oldValue else { return }
             if oldValue == nil { lastDiskCheck = nil }   // check the disk at the next refresh
@@ -510,12 +512,14 @@ final class AppModel {
         startLibrary()
     }
 
-    /// `openRSP`, `rspOpenTimeout` and `transcribe`: tests replace the device, the wait and the transcription.
+    /// `openRSP`, `rspOpenTimeout` and `transcribe`: tests replace the device, the wait and the transcription. nil
+    /// opens the real RSP, except with a `fakeRSP`: such a model never opens a real one (the open fails), even
+    /// after the fake is gone.
     /// `fakeRSP`: a stand-in RSP for tests; choosing the RSP uses it as an open device (named "Test RSP").
     init(bookmarkStore: BookmarkStore, defaults: UserDefaults,
          apiKeyStore: any APIKeyStore = MemoryAPIKeyStore(),
          transcribe: @escaping TranscribeFunction = OpenRouterTranscriber.liveTranscribe,
-         openRSP: @escaping @Sendable () throws -> SDRplayDevice = { try SDRplayDevice.open() },
+         openRSP: (@Sendable () throws -> SDRplayDevice)? = nil,
          rspOpenTimeout: Duration = .seconds(10),
          decodeHistoryFolder: URL? = nil,
          fakeRSP: SyntheticSource? = nil) {
@@ -524,7 +528,9 @@ final class AppModel {
         self.defaults = defaults
         self.apiKeyStore = apiKeyStore
         apiKey = apiKeyStore.load()
-        self.openRSP = openRSP
+        let noRealOpen: @Sendable () throws -> SDRplayDevice = { throw SDRplayError.noDevice }
+        let realOpen: @Sendable () throws -> SDRplayDevice = { try SDRplayDevice.open() }
+        self.openRSP = openRSP ?? (fakeRSP != nil ? noRealOpen : realOpen)
         self.rspOpenTimeout = rspOpenTimeout
         decodeHistory = DecodeHistory(folder: decodeHistoryFolder ?? DecodeHistory.defaultFolder)
         library = RecordingsLibrary(folder: RecordingSettings().folder)   // the folder `restoreSession` may replace
@@ -826,8 +832,9 @@ final class AppModel {
         rspConnection = .idle
         switch result {
         case .success(let device):
-            // Not wanted any more (another source chosen, or quitting): release it at once.
-            guard !isShutDown, preferredSource == .sdrplay, sdrplay == nil else {
+            // Not wanted any more (another source chosen, quitting, or, after a stall, the radio stopped since:
+            // it must not start on its own, after a scheduled run gave up on it say): release it at once.
+            guard !isShutDown, preferredSource == .sdrplay, sdrplay == nil, !wasStalled || isRunning else {
                 device.close()
                 return
             }
@@ -923,12 +930,14 @@ final class AppModel {
         show(Banner(kind: .error, message: removed ? "RSP1B disconnected." : "RSP1B reported a failure.", action: .retry))
     }
 
+    #if DEBUG
     /// Test seam: the open RSP (real or fake) is removed, as `handle(.deviceRemoved)` would see it. A fake RSP is
     /// gone for the rest of the model's life, so a restart cannot use it.
     func simulateDeviceRemovedForTesting() {
         fakeRSP = nil
         lostRSP(removed: true)
     }
+    #endif
 
     // MARK: Tuning
 
@@ -1639,7 +1648,11 @@ final class AppModel {
     /// Puts back what `saveRadio` saved, and unmutes. `full` false: only the squelch, Auto (and its limit), HamItUp
     /// and the mute (a run the owner stopped: the tuning, mode, source and running are theirs). HamItUp goes back
     /// before the tuning, so the saved display frequencies mean what they meant.
+    ///
+    /// Auto stays off while less than `autoOffDiskBytes` is free (the check would only turn it off again), and
+    /// `sessionRadioOverride` is cleared: the session is the live radio again.
     func restoreRadio(_ s: SavedRadio, full: Bool) {
+        defer { sessionRadioOverride = nil }
         if full, s.source != preferredSource, s.source != .file || fileSource != nil { useSource(s.source) }
         setUpconverter(s.upconverter)
         if full {
@@ -1656,7 +1669,8 @@ final class AppModel {
         squelchEnabled = s.squelchEnabled
         squelchDb = s.squelchDb
         // Auto before its limit: a change of Auto clears the limit. A limit that has passed meanwhile ends Auto.
-        autoRecordEnabled = s.autoRecord
+        let diskFull = freeSpaceProbe(recording.folder).map { $0 < Self.autoOffDiskBytes } ?? false
+        autoRecordEnabled = s.autoRecord && !diskFull
         if s.autoRecord, let offAt = s.autoRecordOffAt, offAt <= Date() { autoRecordEnabled = false }
         autoRecordOffAt = autoRecordEnabled ? s.autoRecordOffAt : nil
         scheduleMuted = false
@@ -1670,7 +1684,9 @@ final class AppModel {
 
     /// Starts the radio on the RSP (switching from Demo or a file). True once it runs on the RSP. False if it ended
     /// up on anything else (the open failed, the demo runs) or is not on the RSP within `timeout`; then the source
-    /// chosen and the running state are put back as they were.
+    /// chosen and the running state are put back as they were. An open in flight is waited for past `timeout`: it
+    /// ends by itself within `rspOpenTimeout` (opened, failed, or stalled with the demo running), and an answer
+    /// arriving after this returned would otherwise change the radio behind the caller's back.
     func startRSPForSchedule(timeout: Duration) async -> Bool {
         if isRunning && sourceKind == .sdrplay { return true }
         let source = preferredSource, wasRunning = isRunning
@@ -1679,7 +1695,8 @@ final class AppModel {
         let deadline = ContinuousClock.now + timeout
         while true {
             if isRunning && sourceKind == .sdrplay { return true }
-            if rspOpenFailed || (isRunning && sourceKind == .synthetic) || ContinuousClock.now >= deadline { break }
+            if rspOpenFailed || (isRunning && sourceKind == .synthetic) { break }
+            if ContinuousClock.now >= deadline && rspConnection != .opening { break }
             try? await Task.sleep(for: .milliseconds(50))
         }
         if source != preferredSource, source != .file || fileSource != nil { useSource(source) }
