@@ -16,6 +16,64 @@ private func sample(_ file: String, text: String = "hello there") -> StoredTrans
 }
 
 @Suite struct TranscriptStoreTests {
+    @Test func version1StillReads() throws {
+        let folder = try makeFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        // A sidecar as version 1 wrote it: none of the language or translation keys.
+        var old = sample("old.wav")
+        old.version = 1
+        try TranscriptStore.write(old, in: folder)
+        let text = try String(contentsOf: TranscriptStore.url(for: "old.wav", in: folder), encoding: .utf8)
+        #expect(text.contains("\"version\" : 1"))
+        #expect(!text.contains("spokenLanguage") && !text.contains("translation"))
+        let read = try #require(TranscriptStore.readAll(in: folder)["old.wav"])
+        #expect(read == old)
+        #expect(read.spokenLanguage == nil && read.translation == nil && read.translationNote == nil)
+        #expect(read.isEnglish)
+        #expect(read.englishChunks == read.chunks)
+    }
+
+    @Test func version2RoundTrips() throws {
+        let folder = try makeFolder()
+        defer { try? FileManager.default.removeItem(at: folder) }
+        var t = sample("ko.wav", text: "안녕하세요")
+        t.spokenLanguage = "korean"
+        t.translation = TranscriptTranslation(model: "m/t", segments: [.init(start: 1, end: 2.5, text: "Hello")], costUSD: 0.0002)
+        t.translationNote = "kept"
+        try TranscriptStore.write(t, in: folder)
+        let read = try #require(TranscriptStore.readAll(in: folder)["ko.wav"])
+        #expect(read == t)
+        #expect(read.version == 2)
+        #expect(!read.isEnglish)
+        #expect(read.translation?.text == "Hello")
+        let english = read.englishChunks
+        #expect(english.count == 1 && english[0].offsetSeconds == 0)
+        #expect(english[0].response.language == "en")
+        #expect(english[0].response.text == "Hello")
+        #expect(english[0].response.segments == [.init(start: 1, end: 2.5, text: "Hello")])
+    }
+
+    @Test func englishIsRecognisedWhateverTheSpelling() {
+        var t = sample("a.wav")
+        for name in [nil, "en", "EN", "eng", "English", "english"] {
+            t.spokenLanguage = name
+            #expect(t.isEnglish, "\(name ?? "nil")")
+        }
+        t.spokenLanguage = "korean"
+        #expect(!t.isEnglish)
+    }
+
+    @Test func spokenLanguageIsTheFirstNonEmptyReport() {
+        func chunk(_ lang: String?) -> TranscriptChunk {
+            TranscriptChunk(offsetSeconds: 0, response: WhisperResponse(text: "x", language: lang))
+        }
+        var t = sample("a.wav")
+        t.chunks = [chunk(nil), chunk(""), chunk("korean"), chunk("english")]
+        #expect(t.reportedLanguage == "korean")
+        t.chunks = [chunk(nil)]
+        #expect(t.reportedLanguage == nil)
+    }
+
     @Test func writeThenReadAll() throws {
         let folder = try makeFolder()
         defer { try? FileManager.default.removeItem(at: folder) }

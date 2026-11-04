@@ -38,6 +38,18 @@ struct TranscriptionSettingsTests {
         #expect(again.transcriptionSettings.enabledSince == stamped)
     }
 
+    @Test func oldSettingsDecodeWithTranslateOn() throws {
+        let old = Data(#"{"enabled":false,"model":"other/whisper","language":"ko"}"#.utf8)
+        let s = try JSONDecoder().decode(TranscriptionSettings.self, from: old)
+        #expect(s.translate)
+        #expect(s.translationModel == OpenRouterTranslator.defaultModel)
+        #expect(!s.enabled && s.model == "other/whisper" && s.language == "ko")   // what was saved is kept
+        var changed = TranscriptionSettings(enabledSince: nil)
+        changed.translate = false
+        changed.translationModel = "x/y"
+        #expect(try JSONDecoder().decode(TranscriptionSettings.self, from: JSONEncoder().encode(changed)) == changed)
+    }
+
     @Test func oldSessionDecodes() throws {
         let defaults = UserDefaults(suiteName: UUID().uuidString)!
         let (m, dir) = makeModel(defaults: defaults)

@@ -249,6 +249,10 @@ public struct RecordingsCatalog: Equatable, Sendable {
         (popsByDay[Self.dayNumber(day)] ?? []).sorted { ($0.at, $0.frequencyHz, $0.mode, $0.seconds) < ($1.at, $1.frequencyHz, $1.mode, $1.seconds) }
     }
 
+    /// The schedule `file` was recorded for, from its `scheduled` log line, whether or not the folder listing
+    /// has the file yet (a recording that has just ended may not be listed for a moment).
+    public func scheduleName(of file: String) -> String? { scheduleNames[file] }
+
     public func recording(_ file: String) -> CatalogRecording? {
         if let live, live.file == file { return liveRecording(live) }
         guard let name = names[file] else { return nil }

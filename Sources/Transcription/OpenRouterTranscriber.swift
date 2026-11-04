@@ -51,8 +51,39 @@ public enum TranscriptionError: Error, Equatable, Sendable {
     }
 }
 
+/// One translated phrase, with the times of the Whisper segment it translates (seconds into the recording).
+public struct TranslatedSegment: Codable, Equatable, Sendable {
+    public var start: Double
+    public var end: Double
+    public var text: String
+
+    public init(start: Double, end: Double, text: String) {
+        self.start = start
+        self.end = end
+        self.text = text
+    }
+}
+
+/// An English translation of a transcript, segment by segment.
+public struct TranscriptTranslation: Codable, Equatable, Sendable {
+    public var model: String
+    public var segments: [TranslatedSegment]
+    /// Dollars billed for the translation, or nil when OpenRouter reported none.
+    public var costUSD: Double?
+
+    public init(model: String, segments: [TranslatedSegment], costUSD: Double?) {
+        self.model = model
+        self.segments = segments
+        self.costUSD = costUSD
+    }
+
+    /// The segments joined with spaces.
+    public var text: String { segments.map(\.text).joined(separator: " ") }
+}
+
 /// What is saved beside a recording: every reply, whole, plus enough to re-classify it later.
 /// A recording that was labelled without being sent has `note` set and no chunks.
+/// Version 2 adds `spokenLanguage`, `translation` and `translationNote`; version 1 sidecars still read.
 public struct StoredTranscript: Codable, Equatable, Sendable {
     public var version: Int
     public var file: String
@@ -66,9 +97,16 @@ public struct StoredTranscript: Codable, Equatable, Sendable {
     /// "silent" or "too short" when labelled without sending; otherwise nil.
     public var note: String?
     public var chunks: [TranscriptChunk]
+    /// The language Whisper reported, as it spelled it (e.g. "korean"); nil when none was reported.
+    public var spokenLanguage: String?
+    /// The English translation, when the spoken language wasn't English and one was made.
+    public var translation: TranscriptTranslation?
+    /// Why there is no translation when one was wanted, e.g. "Couldn't translate: the reply wasn't a translation."
+    public var translationNote: String?
 
-    public init(version: Int = 1, file: String, model: String, language: String?, createdAt: Date,
-                durationSeconds: Double, costUSD: Double?, note: String?, chunks: [TranscriptChunk]) {
+    public init(version: Int = 2, file: String, model: String, language: String?, createdAt: Date,
+                durationSeconds: Double, costUSD: Double?, note: String?, chunks: [TranscriptChunk],
+                spokenLanguage: String? = nil, translation: TranscriptTranslation? = nil, translationNote: String? = nil) {
         self.version = version
         self.file = file
         self.model = model
@@ -78,6 +116,29 @@ public struct StoredTranscript: Codable, Equatable, Sendable {
         self.costUSD = costUSD
         self.note = note
         self.chunks = chunks
+        self.spokenLanguage = spokenLanguage
+        self.translation = translation
+        self.translationNote = translationNote
+    }
+
+    /// True when the speech was English or no language was reported: nothing to translate.
+    public var isEnglish: Bool {
+        guard let spokenLanguage else { return true }
+        return ["en", "eng", "english"].contains(spokenLanguage.lowercased())
+    }
+
+    /// The first non-empty language the replies report: what `spokenLanguage` is set from.
+    public var reportedLanguage: String? {
+        chunks.lazy.compactMap(\.response.language).first { !$0.isEmpty }
+    }
+
+    /// The transcript as English chunks for display and search: the translation (one chunk at offset 0 whose
+    /// segments carry the absolute times) when there is one, else `chunks`.
+    public var englishChunks: [TranscriptChunk] {
+        guard let translation else { return chunks }
+        let segments = translation.segments.map { WhisperResponse.Segment(start: $0.start, end: $0.end, text: $0.text) }
+        return [TranscriptChunk(offsetSeconds: 0, response: WhisperResponse(
+            text: translation.text, language: "en", duration: durationSeconds, segments: segments))]
     }
 }
 
@@ -170,8 +231,9 @@ public struct OpenRouterTranscriber: Sendable {
     /// labelled without a request.
     public func transcribe(file: String, audio: PreparedAudio, now: Date) async throws -> StoredTranscript {
         func stored(note: String?, seconds: Double, cost: Double?, chunks: [TranscriptChunk]) -> StoredTranscript {
-            StoredTranscript(version: 1, file: file, model: model, language: language, createdAt: now,
-                             durationSeconds: seconds, costUSD: cost, note: note, chunks: chunks)
+            StoredTranscript(file: file, model: model, language: language, createdAt: now, durationSeconds: seconds,
+                             costUSD: cost, note: note, chunks: chunks,
+                             spokenLanguage: chunks.lazy.compactMap(\.response.language).first { !$0.isEmpty })
         }
         switch audio {
         case .silent:

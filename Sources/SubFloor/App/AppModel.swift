@@ -578,6 +578,9 @@ final class AppModel {
         transcription.settings = transcriptionSettings
         transcription.apiKey = apiKey
         transcription.isTranscribed = { [library] file in library.transcripts.contains(file) }
+        // The `.scheduled` log line is written when the recording opens and the file is queued when it ends, so
+        // the catalog knows its schedule by then (asked by file name: the listing may not have the file yet).
+        transcription.autoDetect = { [library] file in library.catalog.scheduleName(of: file) != nil }
         transcription.onTranscript = { [library] t, folder in library.didTranscribe(t, folder: folder) }
         library.onError = { [weak self] message in self?.show(Banner(kind: .error, message: message)) }
         library.onChange = { [weak self] in

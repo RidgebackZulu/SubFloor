@@ -19,6 +19,29 @@ private func spoken(_ file: String, _ text: String) -> StoredTranscript {
 }
 
 @Suite struct TranscriptIndexTests {
+    @Test func searchFindsBothTexts() {
+        var t = spoken("ko.wav", "안녕하세요 여러분 weather")
+        t.spokenLanguage = "korean"
+        t.translation = TranscriptTranslation(model: "m", segments: [.init(start: 0, end: 5, text: "Hello everyone, rainfall today")], costUSD: nil)
+        var index = TranscriptIndex()
+        index.set(t)
+        #expect(index.matches("ko.wav", terms: TranscriptSearch.terms("안녕하세요")))
+        #expect(index.matches("ko.wav", terms: TranscriptSearch.terms("rainfall hello")))
+        #expect(index.matches("ko.wav", terms: TranscriptSearch.terms("weather 여러분 everyone")))
+        #expect(!index.matches("ko.wav", terms: TranscriptSearch.terms("snow")))
+        let summary = index.summary("ko.wav")
+        #expect(summary?.spokenLanguage == "korean")
+        #expect(summary?.english == "Hello everyone, rainfall today")
+        #expect(summary?.text.contains("rainfall") == false)   // the original's text stays the original's
+    }
+
+    @Test func anUntranslatedTranscriptHasNoEnglish() {
+        var index = TranscriptIndex()
+        index.set(spoken("a.wav", "hello there"))
+        #expect(index.summary("a.wav")?.english == nil)
+        #expect(index.summary("a.wav")?.spokenLanguage == nil)
+    }
+
     @Test func indexClassifiesOnLoad() throws {
         let index = TranscriptIndex(["voice.wav": try stored("voice.wav", fixture: "voice-clip-32s")])
         let summary = try #require(index.summary("voice.wav"))

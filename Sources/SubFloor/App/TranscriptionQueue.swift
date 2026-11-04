@@ -7,6 +7,10 @@ import Transcription
 /// The app's is `OpenRouterTranscriber.liveTranscribe`; tests script one so nothing reaches the network.
 typealias TranscribeFunction = @Sendable (_ file: String, _ url: URL, _ model: String, _ language: String?, _ apiKey: String) async throws -> StoredTranscript
 
+/// Translates a transcript into English: the transcript, the translation model, the API key.
+/// The app's is `OpenRouterTranslator.liveTranslate`; tests script one.
+typealias TranslateFunction = @Sendable (_ t: StoredTranscript, _ model: String, _ apiKey: String) async throws -> TranscriptTranslation
+
 /// Where a recording the queue knows about stands. A transcribed recording has no state: it is in the index.
 enum TranscriptionJobState: Equatable {
     /// Waiting for a slot, for a retry delay to pass, or for a key OpenRouter accepts.
@@ -58,6 +62,9 @@ final class TranscriptionQueue {
     /// Whether the current folder's index already has a transcript for a file; such a file is not queued
     /// again (except by `retry`). Set by `AppModel` to read the library's index.
     @ObservationIgnored var isTranscribed: (String) -> Bool = { _ in false }
+    /// Files sent with the language left to auto-detect, whatever the setting (`AppModel`: scheduled recordings).
+    /// A file sent with no language is also translated, when `settings.translate` is on and it isn't English.
+    @ObservationIgnored var autoDetect: (String) -> Bool = { _ in false }
 
     /// A recording to transcribe, and the folder it was in when it was queued: its sidecar goes there even if
     /// the folder setting changes meanwhile.
@@ -75,6 +82,7 @@ final class TranscriptionQueue {
     }
 
     @ObservationIgnored private let transcribe: TranscribeFunction
+    @ObservationIgnored private let translate: TranslateFunction
     @ObservationIgnored private let sleep: @Sendable (Duration) async throws -> Void
     /// Waiting for a slot, front first.
     @ObservationIgnored private var pending: [Job] = []
@@ -87,8 +95,10 @@ final class TranscriptionQueue {
 
     /// `sleep` waits out the retry delays; tests pass one that returns at once.
     init(transcribe: @escaping TranscribeFunction = OpenRouterTranscriber.liveTranscribe,
+         translate: @escaping TranslateFunction = OpenRouterTranslator.liveTranslate,
          sleep: @escaping @Sendable (Duration) async throws -> Void = { try await Task.sleep(for: $0) }) {
         self.transcribe = transcribe
+        self.translate = translate
         self.sleep = sleep
     }
 
@@ -204,7 +214,11 @@ final class TranscriptionQueue {
         let settings = self.settings
         let url = job.folder.appendingPathComponent(job.file)
         do {
-            let t = try await transcribe(job.file, url, settings.model, settings.language, key)
+            // A scheduled recording, or a setting of auto-detect, sends no language: that is what translates.
+            let language = autoDetect(job.file) ? nil : settings.language
+            var t = try await transcribe(job.file, url, settings.model, language, key)
+            if t.spokenLanguage == nil { t.spokenLanguage = t.reportedLanguage }
+            if language == nil, settings.translate { await translated(&t, settings: settings, key: key) }
             let folder = job.folder
             let saved = await Task.detached(priority: .utility) { () -> String? in
                 do { try TranscriptStore.write(t, in: folder); return nil } catch { return error.localizedDescription }
@@ -232,6 +246,26 @@ final class TranscriptionQueue {
         }
         inFlight -= 1
         pump()
+    }
+
+    /// Translates `t` into English when it has speech that isn't English. One attempt: a reply that isn't a
+    /// translation, or any failure, leaves `t` as it is with a note, and the cost of a translation is added.
+    private func translated(_ t: inout StoredTranscript, settings: TranscriptionSettings, key: String) async {
+        guard !t.isEnglish, t.note == nil, t.chunks.contains(where: { !($0.response.segments ?? []).isEmpty }) else { return }
+        do {
+            let translation = try await translate(t, settings.translationModel, key)
+            t.translation = translation
+            if let cost = translation.costUSD { t.costUSD = (t.costUSD ?? 0) + cost }
+        } catch is CancellationError {
+            return
+        } catch TranslationError.malformed {
+            t.translationNote = "Couldn't translate: the reply wasn't a translation."
+        } catch TranslationError.http(let status, let message) {
+            let reason = message.flatMap { $0.isEmpty ? nil : String($0.prefix(120)) } ?? "HTTP \(status)"
+            t.translationNote = "Couldn't translate: \(reason)"
+        } catch {
+            t.translationNote = "Couldn't translate: \(String(error.localizedDescription.prefix(120)))"
+        }
     }
 
     /// Records how a job ended (no state once its transcript is saved, `.failed` otherwise) and counts it
