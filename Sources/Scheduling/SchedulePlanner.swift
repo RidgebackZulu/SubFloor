@@ -183,6 +183,9 @@ public enum ScheduleButtonState: Equatable, Sendable {
     case off(waiting: Int)
     case later([TickerItem])
     case soon(TickerItem, secondsLeft: Int)
+    /// A broadcast's run that isn't recording: taking the radio, measuring the floor, or with the squelch shut.
+    case quiet(TickerItem, until: Date)
+    /// Only once the recorder records.
     case recording(TickerItem, elapsed: Int, marginDb: Float, until: Date)
     case watching(TickerItem, caught: Int, until: Date)
 }
@@ -216,6 +219,8 @@ public enum TickerText {
             let seconds = max(0, secondsLeft)
             return "in \(seconds / 60):" + String(format: "%02d", seconds % 60)
                 + " · \(describe(item, withMode: true)) · click to start now"
+        case .quiet(let item, let until):
+            return [describe(item, withMode: true), "quiet now", "until \(clock(until, zone))"].joined(separator: separator)
         case .recording(let item, _, let marginDb, let until):
             return [describe(item, withMode: true), "until \(clock(until, zone))",
                     "squelch \(number(Double(marginDb))) dB over the noise"].joined(separator: separator)

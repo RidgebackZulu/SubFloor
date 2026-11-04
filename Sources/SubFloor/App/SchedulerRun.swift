@@ -314,6 +314,12 @@ final class BroadcastRun {
         }
     }
 
+    /// The recorder is writing a schedule's (auto) recording.
+    func recorderRecords(_ m: AppModel) -> Bool {
+        let status = m.engine.audioRecorder.status
+        return status.isRecording && status.isAuto
+    }
+
     /// Seconds recorded so far: the files whose length is logged, and the latest one (being written, or closed and
     /// not logged yet) if it is this run's.
     func elapsed(_ m: AppModel) -> Double {

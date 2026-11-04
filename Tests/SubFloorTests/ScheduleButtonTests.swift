@@ -45,6 +45,16 @@ struct ScheduleButtonTests {
         #expect(long.leftLabel == "1:02:05")
     }
 
+    @Test func aBroadcastNotRecordingYetLooksCalm() {
+        let m = ScheduleButtonModel(state: .quiet(item, until: start), zone: utc)
+        #expect(m.look == .later)   // the calm "on" look, not red
+        #expect(m.leftLabel == "Schedule")
+        #expect(m.leftAction == .stopRun)
+        #expect(m.tickerAction == .none)
+        #expect(m.tickerText.hasPrefix("Voice of Korea · 9435 kHz AM · quiet now"))
+        #expect(m.accessibilityLabel == "Scheduled broadcast, quiet now: click to stop it")
+    }
+
     @Test func watchingShowsTheEye() {
         let watch = TickerItem(name: "pirates", start: start, lowHz: 6_900_000, highHz: 7_000_000)
         let m = ScheduleButtonModel(state: .watching(watch, caught: 2, until: start), zone: utc)

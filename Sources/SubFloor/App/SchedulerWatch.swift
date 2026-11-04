@@ -157,8 +157,7 @@ extension BroadcastRun {
         let giveUp = ContinuousClock.now + .seconds(auto.startAfter + Self.squelchWaitSeconds)
         var opened = false
         while proceed(m) {
-            let status = m.engine.audioRecorder.status
-            if status.isRecording && status.isAuto {
+            if recorderRecords(m) {
                 opened = true
                 phase = .recording
             } else if opened || ContinuousClock.now >= giveUp {

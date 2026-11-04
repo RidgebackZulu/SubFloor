@@ -135,7 +135,10 @@ final class Scheduler {
     func attach(to model: AppModel) {
         self.model = model
         model.onLowDiskStop = { [weak self] in self?.endRun(.lowDisk) }
-        model.onLogged = { [weak self] entries in self?.currentRun?.logged(entries) }
+        model.onLogged = { [weak self] entries in
+            self?.currentRun?.logged(entries)
+            self?.refreshButton()   // a recording opened or closed: red, or calm again, at once
+        }
         switch loadResult {
         case .recoveredFromCorrupt:
             model.show(Banner(kind: .warning, message: "The schedules file was unreadable. It was backed up as \(store.lastBackupURL?.lastPathComponent ?? "schedules.corrupt-<timestamp>.json") and the default watch was restored."))
@@ -158,10 +161,13 @@ final class Scheduler {
     }
 
     /// App quit: the timer and a run in progress stop where they are (the session already holds the owner's radio).
-    /// A run cut short logs what it has recorded so far, and the store is saved.
+    /// A run cut short logs what it has recorded so far, and the store is saved. The alive stamp is moved to now and
+    /// saved, so the next launch doesn't log a window that ran until the quit as missed.
     func shutdown() {
         guard !isShutDown else { return }
         isShutDown = true
+        aliveStamp = now()
+        model?.saveSessionIfChanged()
         if let run = currentRun, let model, let outcome = run.outcomeAtQuit(model, now: now()) {
             record(outcome, for: run.schedule.id, at: now())
             lastOutcome = outcome
@@ -428,6 +434,9 @@ final class Scheduler {
         } else if let run = currentRun, let model {
             if run.schedule.kind == .watch, run.phase != .recording {
                 state = .watching(Self.item(run.schedule, run.window), caught: run.files.count, until: run.window.end)
+            } else if run.schedule.kind == .broadcast, run.phase != .recording || !run.recorderRecords(model) {
+                // Red only once the recorder records: not while the radio is taken, the floor measured, or the squelch shut.
+                state = .quiet(Self.item(run.schedule, run.window, frequencyHz: run.frequencyHz), until: run.window.end)
             } else {
                 state = .recording(Self.item(run.schedule, run.window, frequencyHz: run.frequencyHz, mode: run.stationMode),
                                    elapsed: Int(run.elapsed(model)), marginDb: run.schedule.squelchMarginDb,

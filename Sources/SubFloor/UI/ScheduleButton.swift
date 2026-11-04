@@ -41,6 +41,9 @@ struct ScheduleButtonModel: Equatable {
         case .soon:
             look = .soon; leftLabel = "Schedule"; leftAction = .turnOff; tickerAction = .startEarly
             accessibilityLabel = "Scheduler on: click to turn it off"
+        case .quiet:
+            look = .later; leftLabel = "Schedule"; leftAction = .stopRun; tickerAction = .none
+            accessibilityLabel = "Scheduled broadcast, quiet now: click to stop it"
         case .recording(_, let elapsed, _, _):
             look = .recording; leftLabel = RecordingFormat.elapsed(Double(elapsed)); leftAction = .stopRun; tickerAction = .none
             accessibilityLabel = "Recording on schedule, \(Self.spoken(elapsed)): click to stop this recording"

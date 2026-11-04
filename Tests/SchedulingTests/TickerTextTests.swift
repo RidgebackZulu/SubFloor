@@ -35,6 +35,7 @@ private func at(_ hhmm: String) -> Date {
         #expect(text(.watching(pirates, caught: 0, until: at("02:00"))).contains("none caught yet"))
         #expect(text(.recording(piratesStation, elapsed: 5, marginDb: 8, until: at("02:00"))) ==
                 "Pirates · 6925 kHz USB · until 02:00 · squelch 8 dB over the noise")
+        #expect(text(.quiet(korea, until: at("21:30"))) == "Voice of Korea · 9435 kHz AM · quiet now · until 21:30")
     }
 
     @Test func fractionalKilohertzShowsOneDecimal() {

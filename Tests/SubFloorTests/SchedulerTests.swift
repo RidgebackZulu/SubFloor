@@ -253,9 +253,33 @@ struct SchedulerTests {
         guard try await startAndRecord(m, s) else { return }
         // Long enough for a file to open if the squelch let anything through.
         await wait(upTo: 3) { false }
+        await m.scheduler.tick()
+        // Armed but the squelch shut: the calm look naming the broadcast, not the red Recording one.
+        guard case .quiet(let item, _) = m.scheduler.buttonState else {
+            Issue.record("button \(m.scheduler.buttonState)")
+            return
+        }
+        #expect(item.name == s.name && item.frequencyHz == 9_990_000)
         await endWindow(m, s, clock)
         #expect(lastRun(m, s) == .nothingHeard(watch: false))
         #expect(try labelled(m, s).isEmpty)
+    }
+
+    @Test func theButtonIsRedOnlyOnceTheRecorderRecords() async throws {
+        let (m, clock) = makeModel()
+        defer { m.shutdown() }
+        guard canRun(m) else { return }
+        let s = broadcast([10_000_000], clock: clock)
+        try m.scheduler.add(s)
+        m.scheduler.isOn = true
+        await m.scheduler.tick()
+        #expect(await wait(upTo: 40) { m.scheduler.currentRun?.phase == .measuring })
+        await m.scheduler.tick()
+        if case .quiet = m.scheduler.buttonState {} else { Issue.record("measuring: \(m.scheduler.buttonState)") }
+        #expect(await wait(upTo: 40) { m.engine.audioRecorder.status.isRecording && m.engine.audioRecorder.status.isAuto })
+        await m.scheduler.tick()
+        if case .recording = m.scheduler.buttonState {} else { Issue.record("recording: \(m.scheduler.buttonState)") }
+        await endWindow(m, s, clock)
     }
 
     @Test func signalMakesOneLabelledFile() async throws {
@@ -657,12 +681,15 @@ struct SchedulerTests {
     }
 
     @Test func quitMidRunLogsWhatWasRecorded() async throws {
-        let (m, clock) = makeModel()
+        let defaults = UserDefaults(suiteName: UUID().uuidString)!
+        let dir = tempDir()
+        let (m, clock) = makeModel(defaults: defaults, dir: dir)
         defer { m.shutdown() }
         guard canRun(m) else { return }
         let s = broadcast([10_000_000], clock: clock)
         guard try await startAndRecord(m, s) else { return }
         #expect(await wait(upTo: 15) { m.scheduler.currentRun?.files.count == 1 })
+        clock.now = clock.now.addingTimeInterval(30)   // quit before the next once-a-minute alive stamp
         m.shutdown()
         guard case .recorded(_, let files)? = lastRun(m, s) else {
             Issue.record("lastRun \(String(describing: lastRun(m, s)))")
@@ -674,6 +701,15 @@ struct SchedulerTests {
         #expect(stored?.lastRun?.outcome == lastRun(m, s))
         await wait(upTo: 0.5) { false }
         #expect(!m.isRunning)
+
+        // Relaunched after the window: what was logged at quit stands, not "Missed: SubFloor wasn't running".
+        let logged = lastRun(m, s)
+        clock.now = window(s, clock).end.addingTimeInterval(60)
+        let (again, _) = makeModel(defaults: defaults, dir: dir, clock: clock)
+        defer { again.shutdown() }
+        #expect(again.scheduler.isOn)
+        await again.scheduler.tick()
+        #expect(again.scheduler.schedules.first { $0.id == s.id }?.lastRun?.outcome == logged)
     }
 
     @Test func quitMidTeardownDoesNotRestartTheRadio() async throws {
@@ -702,6 +738,8 @@ struct SchedulerTests {
         guard canRun(m) else { return }
         let s = broadcast([10_000_000], clock: clock)
         guard try await startAndRecord(m, s) else { return }
+        #expect(await wait(upTo: 15) { m.scheduler.currentRun?.files.count == 1 })
+        let file = try #require(m.scheduler.currentRun?.files.first)
         clock.now = clock.now.addingTimeInterval(120)
         m.simulateDeviceRemovedForTesting()
         await m.scheduler.tick()
@@ -710,6 +748,11 @@ struct SchedulerTests {
         #expect(!m.isRunning)   // not restarted, on Demo or anything
         #expect(!m.scheduleMuted)
         #expect(m.scheduleRecording == nil)
+        // The file so far is kept, and labelled with the schedule.
+        #expect(FileManager.default.fileExists(atPath: m.library.url(for: file).path))
+        #expect(m.library.catalog.scheduleName(of: file) == s.name)
+        #expect(m.library.catalog.recording(file)?.scheduleName == s.name)
+        #expect(try labelled(m, s).contains { $0.file == file })
     }
 
     @Test func lowDiskEndsTheRun() async throws {
