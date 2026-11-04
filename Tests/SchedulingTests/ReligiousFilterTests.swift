@@ -21,3 +21,29 @@ func secularStationsPass(_ name: String) { #expect(!ReligiousFilter.bundled.isRe
     #expect(!filter.isReligious("Christmas Radio Christ"))     // allowlist wins over keyword
     #expect(filter.isReligious("CHRÍST Radio"))                // case and diacritics are folded
 }
+
+@Test(arguments: ["Radio YHWH", "Pescador Preacher", "WMLK Bethel, PA", "WBCQ World's Last Chance", "Radio Maria",
+                  "Assemblies of Yahweh", "Iglesia Ni Cristo", "Igreja Universal", "Muslim World Voice", "Allah Akbar Radio",
+                  "Radio Cristiana", "Rádio Cristã"])
+func religiousStationsFromTheB26ReviewAreCaught(_ name: String) { #expect(ReligiousFilter.bundled.isReligious(name)) }
+
+@Test(arguments: ["WBCQ The Planet", "WRMI Radio Miami", "Radio Cristóbal"])
+func theAllowlistOnlyCancelsKeywordHits(_ name: String) { #expect(!ReligiousFilter.bundled.isReligious(name)) }
+
+@Test func theAllowlistDoesNotOverrideTheDenylist() {
+    let filter = ReligiousFilter(denylist: ["Last Chance"], keywords: ["Christ"], allowlist: ["WBCQ"])
+    #expect(filter.isReligious("WBCQ World's Last Chance"))   // denylist first
+    #expect(!filter.isReligious("WBCQ Christmas Show"))        // the allowlist cancels a keyword hit
+}
+
+@Test func theBundledNorthAmericaTimetableHasNoReligiousStation() {
+    let t = Timetable(data: Timetable.bundledData(), season: EiBiSeason(year: 2026, half: .b))
+    let names = Set(t.broadcasts.map(\.station))
+    for banned in ["Radio YHWH", "Pescador Preacher", "WMLK Bethel, PA", "WBCQ World's Last Chance"] {
+        #expect(!names.contains(banned), "\(banned)")
+    }
+    let fold = { (s: String) in s.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: nil) }
+    for name in names {
+        #expect(!ReligiousFilter.bundled.denylist.contains { fold(name).contains(fold($0)) }, "\(name)")
+    }
+}

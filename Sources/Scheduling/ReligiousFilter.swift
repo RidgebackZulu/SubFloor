@@ -7,7 +7,8 @@ public struct ReligiousFilter: Sendable, Decodable {
     public var denylist: [String]
     /// Matched at the start of any word in a station's name ("Christ" matches "Christian").
     public var keywords: [String]
-    /// A name containing any of these is never religious, whatever else it contains.
+    /// A name containing any of these is not religious by a keyword alone ("Sound of Hope"); a denylist entry still
+    /// catches it ("WBCQ World's Last Chance").
     public var allowlist: [String]
 
     public init(denylist: [String], keywords: [String], allowlist: [String]) {
@@ -25,12 +26,13 @@ public struct ReligiousFilter: Sendable, Decodable {
         return filter
     }()
 
-    /// True when `station` is religious. The allowlist wins. A denylist entry matches as a substring. A keyword
-    /// matches the start of a word ("Christ" matches "Christian"). Matching is case- and diacritic-insensitive.
+    /// True when `station` is religious. A denylist entry matches as a substring, and is checked first. A keyword
+    /// matches the start of a word ("Christ" matches "Christian"), unless the name contains an allowlist entry (which
+    /// only cancels keyword hits). Matching is case- and diacritic-insensitive.
     public func isReligious(_ station: String) -> Bool {
         let name = Self.fold(station)
-        if allowlist.contains(where: { name.contains(Self.fold($0)) }) { return false }
         if denylist.contains(where: { name.contains(Self.fold($0)) }) { return true }
+        if allowlist.contains(where: { name.contains(Self.fold($0)) }) { return false }
         let words = name.split { !($0.isLetter || $0.isNumber) }
         let stems = keywords.map(Self.fold)
         return words.contains { word in stems.contains { word.hasPrefix($0) } }

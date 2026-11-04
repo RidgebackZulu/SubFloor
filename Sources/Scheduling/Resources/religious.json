@@ -1,6 +1,6 @@
 {
-  "reviewed": "2026-11-03 (season B26)",
-  "notes": "Keywords \"Cathol\", \"Catol\" and \"Cattol\" added beyond the spec's list (coordinator rulings) so French, Spanish, Portuguese and Italian Catholic stations are caught.",
+  "reviewed": "2026-11-04 (season B26, North America rows)",
+  "notes": "Keywords \"Cathol\", \"Catol\" and \"Cattol\" added beyond the spec's list (coordinator rulings) so French, Spanish, Portuguese and Italian Catholic stations are caught. 2026-11-04 final review: the denylist is checked first and the allowlist only cancels keyword hits; denylist adds \"World's Last Chance\", \"WMLK\", \"Radio YHWH\", \"Radio Maria\"; keywords add \"YHWH\", \"Yahweh\", \"Preach\", \"Iglesia\", \"Igreja\", \"Muslim\", \"Allah\", \"Cristian\", \"Cristã\" (not a bare \"Cristo\", which would catch \"Cristóbal\").",
   "denylist": [
     "Trans World Radio",
     "Adventist World Radio",
@@ -21,7 +21,11 @@
     "Voice of Hope",
     "WWCR",
     "WTWW",
-    "WINB"
+    "WINB",
+    "World's Last Chance",
+    "WMLK",
+    "Radio YHWH",
+    "Radio Maria"
   ],
   "keywords": [
     "Bible",
@@ -40,7 +44,16 @@
     "Cattol",
     "Islam",
     "Quran",
-    "Hope"
+    "Hope",
+    "YHWH",
+    "Yahweh",
+    "Preach",
+    "Iglesia",
+    "Igreja",
+    "Muslim",
+    "Allah",
+    "Cristian",
+    "Cristã"
   ],
   "allowlist": [
     "WRMI",
