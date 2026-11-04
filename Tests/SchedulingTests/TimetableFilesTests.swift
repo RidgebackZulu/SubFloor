@@ -173,6 +173,53 @@ private let good = Timetable.bundledData()
         #expect(rec.requests.count == 2)
     }
 
+    @Test func corruptCacheFallsBackToTheBundledFile() throws {
+        let folder = tempFolder()
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try Data("garbage".utf8).write(to: folder.appendingPathComponent("sked-b26.csv"))
+        let meta = TimetableMeta(season: "b26", etag: nil, lastModified: nil, checkedAt: nov3, fetchedAt: nov3)
+        let encoder = JSONEncoder(); encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(meta).write(to: folder.appendingPathComponent("meta.json"))
+        let files = TimetableFiles(folder: folder, fetch: stub(Recorder()) { _ in (Data(), 500, [:]) })
+        #expect(files.meta == meta)
+        let t = files.load()
+        #expect(!t.broadcasts.isEmpty)
+        #expect(t.broadcasts.count == Timetable(data: good, season: t.season).broadcasts.count)
+    }
+
+    @Test func fallbackNeverReplacesANewerCache() async throws {
+        let rec = Recorder()
+        let folder = tempFolder()
+        let seed = TimetableFiles(folder: folder, fetch: stub(rec) { _ in (good, 200, [:]) })
+        _ = await seed.updateIfDue(now: utc(2027, 3, 29))
+        #expect(seed.meta?.season == "a27")
+        let later = utc(2027, 4, 10)
+        let files = TimetableFiles(folder: folder, fetch: stub(rec) { r in
+            r.url?.lastPathComponent == "sked-a27.csv" ? (Data(), 404, [:]) : (good, 200, [:])
+        })
+        #expect(await files.updateIfDue(now: later) == nil)
+        #expect(files.meta?.season == "a27" && files.meta?.checkedAt == later)
+        #expect(FileManager.default.fileExists(atPath: folder.appendingPathComponent("sked-a27.csv").path))
+        #expect(!FileManager.default.fileExists(atPath: folder.appendingPathComponent("sked-b26.csv").path))
+    }
+
+    @Test func failedMetaWriteKeepsThePreviousFiles() async throws {
+        let rec = Recorder()
+        let folder = tempFolder()
+        let seed = TimetableFiles(folder: folder, fetch: stub(rec) { _ in (good, 200, [:]) })
+        _ = await seed.updateIfDue(now: utc(2027, 3, 27))
+        let files = TimetableFiles(folder: folder, fetch: stub(rec) { _ in (good, 200, [:]) })
+        let before = try #require(files.meta)
+        // Occupy the meta path with a directory so the write fails.
+        let metaURL = folder.appendingPathComponent("meta.json")
+        try FileManager.default.removeItem(at: metaURL)
+        try FileManager.default.createDirectory(at: metaURL, withIntermediateDirectories: false)
+        #expect(await files.updateIfDue(now: utc(2027, 3, 29)) == nil)
+        #expect(files.meta == before)
+        #expect(FileManager.default.fileExists(atPath: folder.appendingPathComponent("sked-b26.csv").path))
+        #expect(!FileManager.default.fileExists(atPath: folder.appendingPathComponent("sked-a27.csv").path))
+    }
+
     @Test func plistAllowsHTTPForEiBiOnly() throws {
         let root = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
         let data = try Data(contentsOf: root.appendingPathComponent("Sources/SubFloor/Info.plist"))

@@ -65,7 +65,7 @@ public final class TimetableFiles: @unchecked Sendable {
     /// The cached file if there is one, else the bundled one.
     public func load() -> Timetable {
         if let meta, let season = Self.season(named: meta.season),
-           let data = try? Data(contentsOf: cacheURL(meta.season)) {
+           let data = try? Data(contentsOf: cacheURL(meta.season)), EiBi.parse(data).rows.count >= Self.minimumRows {
             return Timetable(data: data, season: season)
         }
         let (data, season) = bundledFile()
@@ -108,7 +108,9 @@ public final class TimetableFiles: @unchecked Sendable {
                 if seasons.count == 1 { seasons.append(season.previous) }
             case 200:
                 let rows = EiBi.parse(body).rows.count
-                guard rows >= Self.minimumRows, rows * 2 >= replacedRows else {
+                // Never go back a season (the 404 fallback could otherwise replace a newer cache with an older file).
+                let older = cached.flatMap { Self.season(named: $0.0.season) }.map { season.startsAt < $0.startsAt } ?? false
+                guard rows >= Self.minimumRows, rows * 2 >= replacedRows, !older else {
                     stamp(old, season: cached?.0.season ?? bundledSeason.name, now: now)
                     return nil
                 }
@@ -148,25 +150,38 @@ public final class TimetableFiles: @unchecked Sendable {
     private func stamp(_ old: TimetableMeta?, season: String, now: Date) {
         var meta = old ?? TimetableMeta(season: season, etag: nil, lastModified: nil, checkedAt: now, fetchedAt: nil)
         meta.checkedAt = now
-        writeMeta(meta)
+        stamp(meta)
     }
 
+    /// Writes the CSV, then the meta. On a failure the previous files and the in-memory meta stay as they were
+    /// (a CSV written for a new season is removed again).
     private func store(_ csv: Data, meta: TimetableMeta) -> Bool {
+        let url = cacheURL(meta.season)
+        let hadFile = FileManager.default.fileExists(atPath: url.path)
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            try csv.write(to: cacheURL(meta.season), options: .atomic)
-        } catch { return false }
-        writeMeta(meta)
-        return true
+            try csv.write(to: url, options: .atomic)
+            try writeMeta(meta)
+            return true
+        } catch {
+            if !hadFile { try? FileManager.default.removeItem(at: url) }
+            return false
+        }
     }
 
-    private func writeMeta(_ meta: TimetableMeta) {
+    /// A stamp that can't be saved still counts in memory for this launch.
+    private func stamp(_ meta: TimetableMeta) {
+        lock.withLock { storedMeta = meta }
+        try? writeMeta(meta, remember: false)
+    }
+
+    private func writeMeta(_ meta: TimetableMeta, remember: Bool = true) throws {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        lock.withLock { storedMeta = meta }
-        guard let data = try? encoder.encode(meta) else { return }
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        try? data.write(to: folder.appendingPathComponent("meta.json"), options: .atomic)
+        let data = try encoder.encode(meta)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        try data.write(to: folder.appendingPathComponent("meta.json"), options: .atomic)
+        if remember { lock.withLock { storedMeta = meta } }
     }
 }
