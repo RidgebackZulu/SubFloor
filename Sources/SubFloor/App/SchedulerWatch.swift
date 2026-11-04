@@ -112,18 +112,20 @@ extension BroadcastRun {
         return true
     }
 
-    /// The floor in `mode` at its default bandwidth; a spot with no quiet place near it keeps the floor it had.
+    /// The floor in `mode` at its default bandwidth, with the VFO on `hz` (where the measurement puts it back); a spot
+    /// with no quiet place near it keeps the floor it had. False when the run ended meanwhile, or the owner changed
+    /// the radio (which ends it).
     private func measureFloor(_ m: AppModel, in mode: DemodMode, near hz: Double, timing: Scheduler.Timing) async -> Bool {
         guard proceed(m) else { return false }
         m.setMode(mode)
         m.setBandwidth(mode.defaultBandwidth)
+        m.setVFO(hz)
         note(m)
         movingVFO = true
         let floor = await m.measureNoiseFloor(near: hz, spots: 2, spotSeconds: timing.spotSeconds)
         movingVFO = false
-        guard live else { return false }
+        guard proceed(m) else { return false }
         if let floor { modeFloors[mode] = floor }
-        note(m)
         return true
     }
 

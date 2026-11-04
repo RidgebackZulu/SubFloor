@@ -1579,9 +1579,11 @@ final class AppModel {
 
     // MARK: Auto-record
 
-    /// Turns Auto on or off. On with the squelch off, it says so and waits for the squelch.
+    /// The owner turns Auto on or off (the button or the menu). On with the squelch off, it says so and waits for the
+    /// squelch. During a schedule's run it is an owner change: the run ends and the owner's new Auto stays.
     func toggleAutoRecord() {
         autoRecordEnabled.toggle()
+        scheduler.ownerChangedAuto()
         if autoRecordEnabled && !squelchEnabled {
             show(Banner(kind: .info, message: "Auto-record needs the squelch on."))
         }
@@ -1667,8 +1669,8 @@ final class AppModel {
                    running: isRunning)
     }
 
-    /// Puts back what `saveRadio` saved, and unmutes. `full` false: only the squelch, Auto (and its limit), HamItUp
-    /// and the mute (a run the owner stopped: the tuning, mode, source and running are theirs). HamItUp goes back
+    /// Puts back what `saveRadio` saved, and unmutes. `full` false: only the squelch, Auto (and its limit) and the mute
+    /// (a run the owner stopped: the tuning, HamItUp included, mode, source and running are theirs). HamItUp goes back
     /// before the tuning, so the saved display frequencies mean what they meant.
     ///
     /// Auto stays off while less than `autoOffDiskBytes` is free (the check would only turn it off again), and
@@ -1676,8 +1678,8 @@ final class AppModel {
     func restoreRadio(_ s: SavedRadio, full: Bool) {
         defer { sessionRadioOverride = nil }
         if full, s.source != preferredSource, s.source != .file || fileSource != nil { useSource(s.source) }
-        setUpconverter(s.upconverter)
         if full {
+            setUpconverter(s.upconverter)
             if sourceKind == .file {
                 setVFO(s.vfoHz)
             } else {

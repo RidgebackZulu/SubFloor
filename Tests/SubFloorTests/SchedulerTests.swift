@@ -458,8 +458,43 @@ struct SchedulerTests {
         #expect(lastRun(m, s) == .stoppedByYou)
         #expect(m.vfoHz == 10_020_000)   // stays where the owner put it
         #expect(m.isRunning && m.sourceKind == .sdrplay && m.mode == .am)
+        #expect(m.upconverter.enabled)   // HamItUp is part of the tuning the owner took over
         #expect(!m.scheduleMuted)
         clock.now = clock.now.addingTimeInterval(5)
+        await m.scheduler.tick()
+        #expect(m.scheduler.running == nil)   // not taken back
+    }
+
+    @Test func ownerRetuneDuringTheFloorStopsTheRun() async throws {
+        let (m, clock) = makeModel()
+        defer { m.shutdown() }
+        guard canRun(m) else { return }
+        let s = broadcast([10_000_000], clock: clock)
+        try m.scheduler.add(s)
+        m.scheduler.isOn = true
+        await m.scheduler.tick()
+        #expect(await wait(upTo: 40) { m.scheduler.currentRun?.movingVFO == true })
+        m.tune(to: 10_250_000)   // moves the centre too
+        let vfo = m.vfoHz, centre = m.centerHz
+        // Seen by the run itself, with no tick.
+        #expect(await wait(upTo: 15) { m.scheduler.running == nil })
+        #expect(lastRun(m, s) == .stoppedByYou)
+        #expect(m.vfoHz == vfo && m.centerHz == centre)   // the measurement didn't put its VFO back over them
+        #expect(m.scheduleRecording == nil)
+    }
+
+    @Test func ownerAutoToggleDuringARunStopsItAndKeepsTheirAuto() async throws {
+        let (m, clock) = makeModel()
+        defer { m.shutdown() }
+        guard canRun(m) else { return }
+        m.autoRecordEnabled = false
+        let s = broadcast([10_000_000], clock: clock)
+        guard try await startAndRecord(m, s) else { return }
+        m.toggleAutoRecord()   // the Auto button (or the menu item)
+        #expect(await wait(upTo: 15) { m.scheduler.running == nil })
+        #expect(lastRun(m, s) == .stoppedByYou)
+        #expect(m.autoRecordEnabled)   // the owner's new Auto, not the one saved at the start
+        #expect(m.sessionRadioOverride == nil)
         await m.scheduler.tick()
         #expect(m.scheduler.running == nil)   // not taken back
     }

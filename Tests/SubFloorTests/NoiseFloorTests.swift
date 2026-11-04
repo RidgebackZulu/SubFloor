@@ -147,6 +147,41 @@ struct NoiseFloorTests {
         #expect(m.vfoHz == 10_900_000)
     }
 
+    /// Starts a measurement near 10 MHz and waits until it has moved the VFO onto a spot.
+    private func measuring(_ m: AppModel) async -> Task<Float?, Never> {
+        m.setVFO(10_000_000)
+        let task = Task { await m.measureNoiseFloor(near: 10_000_000, spotSeconds: 2) }
+        for _ in 0..<200 where m.vfoHz == 10_000_000 { try? await Task.sleep(for: .milliseconds(10)) }
+        return task
+    }
+
+    @Test func anOwnersRetuneStopsTheMeasurementAndIsKept() async {
+        guard let m = await runningModel() else { return }
+        defer { m.shutdown() }
+        let task = await measuring(m)
+        #expect(m.vfoHz != 10_000_000)   // on a quiet spot
+        m.setVFO(10_100_000)   // within the capture: only the VFO moves
+        #expect(await task.value == nil)
+        #expect(m.vfoHz == 10_100_000)
+
+        let again = await measuring(m)
+        m.tune(to: 10_600_000)   // the centre moves
+        let vfo = m.vfoHz, centre = m.centerHz
+        #expect(await again.value == nil)
+        #expect(m.vfoHz == vfo && m.centerHz == centre)
+    }
+
+    @Test func aCancelledMeasurementLeavesTheVFO() async {
+        guard let m = await runningModel() else { return }
+        defer { m.shutdown() }
+        let task = await measuring(m)
+        let spot = m.vfoHz
+        #expect(spot != 10_000_000)
+        task.cancel()
+        #expect(await task.value == nil)
+        #expect(m.vfoHz == spot)
+    }
+
     @Test func noFloorWhenNoSpotExists() async {
         guard let m = await runningModel() else { return }
         defer { m.shutdown() }

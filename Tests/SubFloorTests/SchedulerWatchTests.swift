@@ -361,6 +361,24 @@ struct SchedulerWatchTests {
         #expect(m.mode == .usb)
     }
 
+    @Test func ownerRetuneWhileTheWatchMeasuresItsFloorStopsTheWatch() async throws {
+        let (m, clock, _) = makeModel(signals: [])
+        defer { m.shutdown() }
+        guard canRun(m) else { return }
+        let s = watch(clock: clock)
+        try m.scheduler.add(s)
+        m.scheduler.isOn = true
+        await m.scheduler.tick()
+        // Moving the VFO onto a quiet spot, away from the span's middle.
+        #expect(await wait(upTo: 40) {
+            m.scheduler.currentRun?.movingVFO == true && abs(m.vfoHz - 6_950_000) > 1
+        })
+        m.setVFO(6_990_000)
+        #expect(await wait(upTo: 10) { m.scheduler.running == nil })
+        #expect(lastRun(m, s) == .stoppedByYou)
+        #expect(m.vfoHz == 6_990_000)   // not put back on the middle
+    }
+
     // MARK: Overlaps
 
     @Test func broadcastPreemptsAndTheWatchResumes() async throws {

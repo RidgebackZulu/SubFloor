@@ -192,6 +192,7 @@ struct ScheduleHooksTests {
         m.setMode(.lsb)
         m.squelchDb = -95
         let saved = m.saveRadio()   // squelch off, Auto off, HamItUp off
+        #expect(!saved.upconverter)
 
         // The run, then the owner takes over mid-way.
         m.useSource(.synthetic)
@@ -209,9 +210,9 @@ struct ScheduleHooksTests {
         #expect(m.squelchDb == -95)
         #expect(!m.autoRecordEnabled)
         #expect(m.autoRecordOffAt == nil)
-        #expect(!m.upconverter.enabled)
         #expect(!m.scheduleMuted)
-        // The owner's tuning, mode, source and running stay as they left them.
+        // The owner's tuning (HamItUp included), mode, source and running stay as they left them.
+        #expect(m.upconverter.enabled)
         #expect(m.vfoHz == vfo)
         #expect(m.centerHz == centre)
         #expect(m.mode == .am)

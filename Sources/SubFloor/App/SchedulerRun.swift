@@ -21,7 +21,8 @@ final class BroadcastRun {
         /// The owner ended the run without touching the radio: the ticker's stop, the switch off, or the running
         /// schedule deleted, switched off or retuned.
         case stoppedByYou
-        /// The owner changed the radio mid-run: retuned, changed mode or bandwidth, recorded, or stopped it.
+        /// The owner changed the radio mid-run: retuned, changed mode or bandwidth, turned Auto on or off, recorded, or
+        /// stopped it.
         case ownerChangedRadio
         /// A watch making way for a broadcast: no outcome, and its window may start again.
         case preempted
@@ -41,10 +42,12 @@ final class BroadcastRun {
         var mode: DemodMode
         var bandwidthHz: Double
 
-        /// `tuning` false: the VFO and centre aren't compared (a floor measurement is moving the VFO).
+        /// `tuning` false: the VFO isn't compared (a floor measurement is moving it). The centre always is: quiet spots
+        /// lie inside the capture's usable part, so the run's own measurement never moves it.
         func matches(_ m: AppModel, tuning: Bool) -> Bool {
-            let tuned = abs(m.vfoHz - vfoHz) < 0.5 && abs(m.centerHz - centerHz) < 0.5
-            return (!tuning || tuned) && m.mode == mode && abs(m.bandwidthHz - bandwidthHz) < 0.5
+            let tuned = abs(m.vfoHz - vfoHz) < 0.5
+            return (!tuning || tuned) && abs(m.centerHz - centerHz) < 0.5 && m.mode == mode
+                && abs(m.bandwidthHz - bandwidthHz) < 0.5
         }
     }
 
@@ -75,7 +78,8 @@ final class BroadcastRun {
     private var secondsByFile: [String: Double] = [:]
     private var rspLostBefore: Date?
     private var expected: Expected?
-    /// A floor measurement is in flight: it moves the VFO, so only the mode and bandwidth are compared meanwhile.
+    /// A floor measurement is in flight: it moves the VFO, so only the centre, mode and bandwidth are compared
+    /// meanwhile. It puts the VFO back where it was noted, unless someone else moved the VFO or the centre.
     var movingVFO = false
     /// Set once the radio runs on the RSP for the run: from then on a stopped radio or a manual recording is the
     /// owner's doing.
@@ -163,13 +167,14 @@ final class BroadcastRun {
         for hz in frequencies {
             guard proceed(m) else { return }
             tune(m, to: hz)
+            note(m)
             movingVFO = true
             let floor = await m.measureNoiseFloor(near: hz, spots: frequencies.count > 1 ? 2 : 3,
                                                   spotSeconds: timing.spotSeconds)
             movingVFO = false
-            guard live else { return }
+            // The measurement puts the VFO back on `hz`; anything else is the owner's change, which ends the run.
+            guard proceed(m) else { return }
             if let floor { floors[hz] = floor }
-            note(m)   // the measurement puts the VFO back on `hz`
         }
 
         var chosen = frequencies[0]
@@ -250,6 +255,16 @@ final class BroadcastRun {
     }
 
     // MARK: During the run
+
+    /// The owner turned Auto on or off mid-run: the restore puts back their new Auto (with no agent's limit), and a
+    /// quit meanwhile saves it.
+    func ownerSetAuto(_ on: Bool, _ m: AppModel) {
+        guard var s = saved else { return }
+        s.autoRecord = on
+        s.autoRecordOffAt = nil
+        saved = s
+        m.sessionRadioOverride = s
+    }
 
     /// Why the run must end now, if it must: the RSP was lost, or the owner retuned, changed mode, stopped the radio
     /// or started a recording of their own.

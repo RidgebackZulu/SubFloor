@@ -401,6 +401,14 @@ final class Scheduler {
     /// The left part clicked during a run: ends this run only.
     func stopRun() { endRun(.stoppedByYou) }
 
+    /// The owner turned Auto on or off (`AppModel.toggleAutoRecord`) during a run: an owner change, so the run ends as
+    /// `.ownerChangedRadio` and its restore keeps the owner's new Auto.
+    func ownerChangedAuto() {
+        guard let run = currentRun, run.endReason == nil, let model else { return }
+        run.ownerSetAuto(model.autoRecordEnabled, model)
+        endRun(.ownerChangedRadio)
+    }
+
     // MARK: What the owner sees
 
     /// "SubFloor is recording a scheduled broadcast until 21:30" / "SubFloor is on a pirate watch until 02:00"; nil when idle.

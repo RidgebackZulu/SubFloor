@@ -37,35 +37,51 @@ enum QuietSpots {
 }
 
 extension AppModel {
-    /// Reads the channel level (`signalDb`) for `spotSeconds` on each quiet spot near `hz`, in the current mode and
-    /// bandwidth, with the squelch not gating. Returns the median, and puts the VFO back on `hz`. Nil when no spot is
-    /// found or the radio stops.
+    /// Reads the channel level (`signalDb`) for `spotSeconds` on each quiet spot within `radiusHz` of `hz`, in the
+    /// current mode and bandwidth, with the squelch not gating. Returns the median, and puts the VFO back on `hz`. Nil
+    /// when no spot is found or the radio stops.
+    ///
+    /// It stops (nil) as soon as someone else moves the VFO off the spot it set or moves the centre, and then leaves
+    /// the VFO alone, so an owner's retune is never undone; a cancelled task stops the same way.
     ///
     /// The level is measured before the squelch gate (Receiver.process), so the squelch is left alone. The level is
     /// read from the engine's stats: `signalDb` here is a 5 Hz copy that moves only in half-dB steps.
-    func measureNoiseFloor(near hz: Double, spots: Int = 3, spotSeconds: Double = 3) async -> Float? {
+    func measureNoiseFloor(near hz: Double, spots: Int = 3, spotSeconds: Double = 3,
+                           radiusHz: Double = 50_000) async -> Float? {
+        let start = (vfo: vfoHz, centre: centerHz)   // waiting for a frame, the owner may retune
         guard isRunning, let snapshot = await currentSpectrumSnapshot() else { return nil }
-        let picks = QuietSpots.pick(snapshot, around: hz, bandwidthHz: bandwidthHz, count: spots)
-        guard !picks.isEmpty else { return nil }
+        let picks = QuietSpots.pick(snapshot, around: hz, radiusHz: radiusHz, bandwidthHz: bandwidthHz, count: spots)
+        return await readFloor(on: picks, returningTo: hz, spotSeconds: spotSeconds, from: start)
+    }
+
+    /// The median of the channel level read on each of `spots` (after half of `spotSeconds` to settle), then the VFO
+    /// back on `hz`; see `measureNoiseFloor` for when it stops. `start` is the radio as the measurement began.
+    private func readFloor(on spots: [Double], returningTo hz: Double, spotSeconds: Double,
+                           from start: (vfo: Double, centre: Double)) async -> Float? {
+        guard !spots.isEmpty else { return nil }
+        let centre = start.centre
+        var vfo = start.vfo   // where this measurement last put the VFO
+        func undisturbed() -> Bool { isRunning && !Task.isCancelled && vfoHz == vfo && centerHz == centre }
         var medians: [Float] = []
         var completed = true
-        for spot in picks {
-            guard isRunning, !Task.isCancelled else { completed = false; break }
-            setVFO(spot)
+        for spot in spots {
+            guard undisturbed() else { completed = false; break }
+            setVFO(spot)   // inside the usable part (`QuietSpots`): the centre stays
+            vfo = vfoHz
             // The AGC and the channel filter settle first.
             try? await Task.sleep(for: .seconds(spotSeconds / 2))
             var reads: [Float] = []
             let readEnd = Date().addingTimeInterval(spotSeconds / 2)
             repeat {
-                guard isRunning, !Task.isCancelled else { completed = false; break }
+                guard undisturbed() else { break }
                 reads.append(engine.stats.withLock { $0.signalDb })
                 try? await Task.sleep(for: .milliseconds(100))
             } while Date() < readEnd
-            guard completed else { break }
+            guard undisturbed(), !reads.isEmpty else { completed = false; break }
             medians.append(Self.median(reads))
         }
-        if isRunning { setVFO(hz) }
-        guard completed, !medians.isEmpty else { return nil }
+        if undisturbed() { setVFO(hz) }
+        guard completed else { return nil }
         return Self.median(medians)
     }
 
