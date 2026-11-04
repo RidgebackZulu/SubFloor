@@ -1,0 +1,55 @@
+kHz:75;Time(UTC):93;Days:59;ITU:49;Station:201;Lng:49;Target:62;Remarks:135;P:35;Start:60;Stop:60;
+6000;0000-0100;Tu-Fr;CUB;Radio Habana Cuba;S;ENA;q;4;;[0125]
+6000;0200-0230;;CUB;Radio Habana Cuba;CR;ENA;q;1;;[0926]
+6000;0230-0330;;CUB;Radio Habana Cuba;E;ENA;q;1;;[0826]
+6000;0330-0400;;CUB;Radio Habana Cuba;CR;ENA;q;1;;[0826]
+4840;0100-1300;;USA;WWCR 3 Nashville, TN;E;NAm;n;2;;
+5890;0300-0500;Tu-Sa;USA;WWCR 4 Nashville, TN;E;NAm;n;2;;
+5010;0100-0200;;USA;WRMI Radio Miami Int.;E;Car;o;1;;
+5010;2300-2400;;USA;WRMI Radio Miami Int.;E;Car;o;1;;
+5050;0100-0500;;USA;WRMI Radio Miami Int.;E;CAm;o;2;;
+1060;1200-2200;;MEX;Radio Educación;S;CAm;e;1;;
+1060;2200-1200;;MEX;Radio Educación;S;CAm;e;1;;[1124]
+800;1000-1130;;USA;Trans World Radio;S;Car;/BES;1;;
+800;2330-2400;;USA;Trans World Radio;E;Car;/BES;1;;
+6155;2200-2230;;CVA;Radio Vaticana;M;FE;;0;;
+7250;0810-0920;Su;CVA;Radio Vaticana;RO;EEu;;2;;
+3325;1000-1100;;INS;Voice of Indonesia;E;INS;p;8;;[0925]
+5950;2330-2400;29Oct;F;Mystery for Joy;E;ENA;/USA-o;6;2910;2910
+1860;0000-0830;Su;USA;WA0RCR Gateway Newsltr.;E;NAm;wz;5;;
+1860;0000-0930;Su;USA;WA0RCR Gateway Newsltr.;E;NAm;wz;4;;
+4271;2200-1000;;CAN;CFH Halifax Radio;-TY;NAm;hx;1;;
+3265.1;0000-0100;Sa;USA;WBCQ The Planet;E;NAm;q;1;;[1026]
+60;0000-2400;;G;MSF Time from NPL;-TS;Eu;an;1;;[1123]
+60;0000-2400;;G;MSF Time from NPL;-TS;Eu;an;1;;[1123]
+77.5;0000-2400;;D;DCF77 Mainflingen;-TS;Eu;mf;1;;[1123]
+1860;0000-0830;Su;USA;WA0RCR Gateway Newsltr.;E;NAm;wz;5;;
+5000;0100-0200;;USA;Test Daily;E;NAm;x;1;;
+5010;0100-0200;Mo-Fr;USA;Test Weekdays;E;NAm;x;1;;
+5020;0100-0200;Sa-Mo;USA;Test Wrap;E;NAm;x;1;;
+5030;0100-0200;1245;USA;Test Digits;E;NAm;x;1;;
+5040;0100-0200;1.Sa;USA;Test FirstSat;E;NAm;x;1;;
+5050;0100-0200;Last7;USA;Test LastSun;E;NAm;x;1;;
+5060;0100-0200;altFr;USA;Test Alternate;E;NAm;x;1;;
+5070;0100-0200;15Sep;USA;Test OneDay;E;NAm;x;1;;
+5080;0100-0200;irr;USA;Test Irregular;E;NAm;x;1;;
+5090;0100-0200;Mo-Fr irr;USA;Test WeekdaysIrr;E;NAm;x;1;;
+5095;0100-0200;USB;USA;Test Sideband;E;NAm;x;1;;
+5100;2330-0030;;USA;Test Midnight;E;NAm;x;1;;
+5110;0000-2400;;USA;Test AllDay;E;NAm;x;1;;
+5200;0300-0400;;USA;Test Inactive;E;NAm;x;8;;
+5210;0300-0400;;USA;Test Utility;E;NAm;x;91;;
+5220;0300-0400;;USA;Test SummerOnly;E;NAm;x;5;;
+5230;0300-0400;;USA;Test WinterOnly;E;NAm;x;4;;
+5240;0300-0400;;USA;Test Dated;E;NAm;x;6;0111;3101
+9550;0230-0330;;USA;Test Merge;E;CAm;x;1;;
+5970.4;0230-0330;;USA;Test Merge;E;CAm;x;1;;
+7300;0230-0330;;USA;Test Merge;E;CAm;x;1;;
+6000;0400-0500;;B;Rádio Nacional;P;CAm;x;1;;
+7200;0600-0700;;G;Test Europe;G;Eu;x;1;;
+5300;0700-0800;;USA;Test Two Targets;E;Eu,NAm;x;1;;
+5400;0100-0200;;USA;Short row
+abc;0100-0200;;USA;Test BadFreq;E;NAm;x;1;;
+5410;2500-2600;;USA;Test BadTime;E;NAm;x;1;;
+5420;0100-0200;Xx;USA;Test BadDays;E;NAm;x;1;;
+5430;0100-0200;;USA;;E;NAm;x;1;;
