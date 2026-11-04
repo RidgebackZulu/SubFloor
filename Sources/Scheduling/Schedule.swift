@@ -63,6 +63,23 @@ public enum RunOutcome: Codable, Hashable, Sendable {
     case overlapped(with: String)
     case rspLost(afterSeconds: Double)
     case lowDisk
+
+    /// The row's text. Minutes round to the nearest whole minute, at least 1.
+    public var text: String {
+        func minutes(_ seconds: Double) -> Int { max(1, Int((seconds / 60).rounded())) }
+        switch self {
+        case .recorded(let seconds, let files):
+            return files > 1 ? "Recorded \(files) transmissions, \(minutes(seconds)) min" : "Recorded \(minutes(seconds)) min"
+        case .nothingHeard(let watch): return watch ? "Nothing heard: no voice came on" : "Nothing heard: the squelch never opened"
+        case .missedNoRSP: return "Missed: the RSP wasn't connected"
+        case .missedNotRunning: return "Missed: SubFloor wasn't running"
+        case .missedAsleep: return "Missed: the Mac was asleep"
+        case .stoppedByYou: return "Stopped by you"
+        case .overlapped(let name): return "Overlapped with \(name)"
+        case .rspLost(let seconds): return "The RSP disconnected after \(minutes(seconds)) min"
+        case .lowDisk: return "Stopped: less than 100 MB free"
+        }
+    }
 }
 
 public struct LastRun: Codable, Hashable, Sendable {
