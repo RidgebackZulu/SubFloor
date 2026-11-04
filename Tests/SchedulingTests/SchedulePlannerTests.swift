@@ -111,6 +111,16 @@ private func tick(_ schedules: [Schedule], on: Bool = true, now: String, lastTic
                      settled: [key]).isEmpty)
     }
 
+    @Test func editingTheRunningScheduleIsNotAnOverlapWithItself() {
+        let b = make("Voice of Korea", hour: 21)
+        let running = run(b, at: utc("2026-11-03T20:58:00Z"))
+        var moved = b
+        moved.start = .init(hour: 21, minute: 10)      // the owner moves its start during the run
+        moved.durationMinutes = 90
+        let actions = tick([moved], now: "2026-11-03T21:15:00Z", lastTick: "2026-11-03T21:14:59Z", running: running)
+        #expect(!actions.contains { if case .log = $0 { true } else { false } }, "\(actions)")
+    }
+
     @Test func overlappedBroadcastDoesNotStartWhenTheRunningOneEnds() {
         let a = make("Voice of Korea", hour: 21)                 // 20:59 – 22:02
         let b = make("Radio Habana Cuba", hour: 21, minute: 30, created: "2026-11-02T00:00:00Z")

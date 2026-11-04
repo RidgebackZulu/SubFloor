@@ -16,3 +16,10 @@ import Testing
     #expect(RunOutcome.rspLost(afterSeconds: 12 * 60).text == "The RSP disconnected after 12 min")
     #expect(RunOutcome.lowDisk.text == "Stopped: less than 100 MB free")
 }
+
+@Test func hugeOrOddLengthsDoNotTrap() {
+    #expect(RunOutcome.recorded(seconds: 1e300, files: 1).text == "Recorded 1000000 min")
+    #expect(RunOutcome.recorded(seconds: .infinity, files: 2).text == "Recorded 2 transmissions, 1000000 min")
+    #expect(RunOutcome.rspLost(afterSeconds: .nan).text == "The RSP disconnected after 1 min")
+    #expect(RunOutcome.rspLost(afterSeconds: -1e300).text == "The RSP disconnected after 1 min")
+}

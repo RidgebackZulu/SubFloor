@@ -116,6 +116,8 @@ public enum SchedulePlanner {
 
         if let current = holder {
             let name = schedules.first { $0.id == current.scheduleID }?.name
+            // The running schedule's own other window (its start or length edited mid-run) is no rival.
+            candidates.removeAll { $0.schedule.id == current.scheduleID }
             if current.kind == .watch, let winner = candidates.first, winner.schedule.kind == .broadcast {
                 actions.append(.preempt(running: current.scheduleID, by: winner.schedule.id, window: winner.window))
                 overlapped(candidates.dropFirst(), by: .broadcast, window: winner.window, name: winner.schedule.name)

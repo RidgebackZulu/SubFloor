@@ -64,9 +64,13 @@ public enum RunOutcome: Codable, Hashable, Sendable {
     case rspLost(afterSeconds: Double)
     case lowDisk
 
-    /// The row's text. Minutes round to the nearest whole minute, at least 1.
+    /// The row's text. Minutes round to the nearest whole minute, 1 to 1,000,000 (clamped before `Int()`, which traps
+    /// outside its range; NaN reads as 1).
     public var text: String {
-        func minutes(_ seconds: Double) -> Int { max(1, Int((seconds / 60).rounded())) }
+        func minutes(_ seconds: Double) -> Int {
+            let m = (seconds / 60).rounded()
+            return m.isNaN ? 1 : Int(min(max(m, 1), 1_000_000))
+        }
         switch self {
         case .recorded(let seconds, let files):
             return files > 1 ? "Recorded \(files) transmissions, \(minutes(seconds)) min" : "Recorded \(minutes(seconds)) min"
