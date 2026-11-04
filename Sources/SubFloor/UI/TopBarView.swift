@@ -57,6 +57,7 @@ struct TopBarView: View {
             NoiseReductionButton(settings: Bindable(model).noiseReduction, available: model.noiseReductionAvailable)
 
             RecordCluster()
+            ScheduleButton()
 
             Button { model.addBookmark() } label: { Image(systemName: "star") }
                 .help("Bookmark this frequency (⌘D)")
