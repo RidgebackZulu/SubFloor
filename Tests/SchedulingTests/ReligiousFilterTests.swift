@@ -6,7 +6,7 @@ import Foundation
                   "Follow the Bible", "Hope Radio", "Brother Stair", "Voz Missionaria", "Mystery for Joy", "Hope of Israel",
                   "Evang. Missionsgemeinden", "HCJB", "Family Radio", "KNLS", "Voice of Hope", "WWCR", "WTWW", "WINB",
                   "Gospel for Asia", "Christian Vision", "Radio Faith", "Missionswerk", "Église catholique", "Islamic Republic Radio Quran",
-                  "Jesus Saves", "Church of God", "World Harvest Hope"])
+                  "Jesus Saves", "Church of God", "World Harvest Hope", "Rádio Católica", "Radio Cattolica"])
 func religiousStationsAreCaught(_ name: String) { #expect(ReligiousFilter.bundled.isReligious(name)) }
 
 @Test(arguments: ["WRMI", "WRMI Okeechobee", "WBCQ", "Sound of Hope", "Hopen Island Meteo", "Voice of Korea", "Radio Habana Cuba",

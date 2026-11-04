@@ -1,6 +1,6 @@
 {
   "reviewed": "2026-11-03 (season B26)",
-  "notes": "Keyword \"Cathol\" added beyond the spec's list (coordinator ruling) so French catholique is caught.",
+  "notes": "Keywords \"Cathol\", \"Catol\" and \"Cattol\" added beyond the spec's list (coordinator rulings) so French, Spanish, Portuguese and Italian Catholic stations are caught.",
   "denylist": [
     "Trans World Radio",
     "Adventist World Radio",
@@ -36,6 +36,8 @@
     "Church",
     "Catholic",
     "Cathol",
+    "Catol",
+    "Cattol",
     "Islam",
     "Quran",
     "Hope"
