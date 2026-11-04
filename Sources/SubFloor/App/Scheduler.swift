@@ -407,6 +407,12 @@ final class Scheduler {
     /// The left part clicked during a run: ends this run only.
     func stopRun() { endRun(.stoppedByYou) }
 
+    /// The owner's Auto as it was before the run paused it; nil when no run holds the radio.
+    var ownersAutoDuringRun: Bool? {
+        guard let run = currentRun, run.endReason == nil else { return nil }
+        return run.saved?.autoRecord
+    }
+
     /// The owner turned Auto on or off (`AppModel.toggleAutoRecord`) during a run: an owner change, so the run ends as
     /// `.ownerChangedRadio` and its restore keeps the owner's new Auto.
     func ownerChangedAuto() {
