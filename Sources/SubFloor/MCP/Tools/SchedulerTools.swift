@@ -19,9 +19,9 @@ extension SubFloorTools {
             "frequencies": .object([
                 "type": .string("array"),
                 "items": .object(["anyOf": .array([.object(["type": .string("number")]), .object(["type": .string("string")])])]),
-                "description": .string("A broadcast's 1 to 8 frequencies: kHz numbers, or strings like \"9435\" (kHz) or \"9.435 MHz\"."),
+                "description": .string("A broadcast's 1 to 8 frequencies: kHz numbers (100 or more), or strings like \"9435\" (kHz) or \"9.435 MHz\"."),
             ]),
-            "low": .frequencySchema("A watch's band, low edge: kHz, or a string like \"6.85 MHz\"."),
+            "low": .frequencySchema("A watch's band, low edge: kHz (100 or more), or a string like \"6.85 MHz\"."),
             "high": .frequencySchema("A watch's band, high edge: kHz (10 to 400 kHz above low)."),
             "mode": .enumSchema(ScheduleMode.allCases.map(\.rawValue), "Default am for a broadcast, auto (USB or AM, as heard) for a watch."),
             "start": .schema("string", "Start time \"HH:MM\" (24 h) in time_zone."),
@@ -31,15 +31,16 @@ extension SubFloorTools {
                 "description": .string("Days it runs, of mo, tu, we, th, fr, sa, su, or [\"daily\"]. Give days or date."),
             ]),
             "date": .schema("string", "One date \"YYYY-MM-DD\" in time_zone: it runs once. Give days or date."),
-            "time_zone": .schema("string", "An IANA zone such as \"UTC\" or \"Europe/London\" (default the owner's)."),
+            "time_zone": .schema("string", "\"UTC\" or an IANA zone such as \"Europe/London\" (default the owner's)."),
             "squelch_margin_db": .schema("number", "How far over the noise the squelch sits, 3 to 30 dB (default 8)."),
         ]
         let scheduleShape = """
             A schedule is {id, kind, name, frequencies_khz, low_khz, high_khz, mode, start ("HH:MM"), \
             duration_minutes, time_zone, days (array, or null for a one-off), date ("YYYY-MM-DD" or null), enabled, \
             squelch_margin_db, added_by (the agent that added it; null for the owner's), source (you, agent or \
-            timetable), next_run (its next scheduled start, ISO 8601 UTC, or null when disabled or none is left; a \
-            broadcast takes the radio a minute earlier), last_run ({outcome, at} or null)}.
+            timetable), next_run (the scheduled start of its next window to open, ISO 8601 UTC, passing over one \
+            already under way; null when disabled or none is left; a broadcast takes the radio a minute earlier), \
+            last_run ({outcome, at} or null)}.
             """
         return [
             SubFloorTool("list_schedules", title: "List schedules", readOnly: true, locksRadio: false, description: described("""
@@ -125,11 +126,21 @@ extension SubFloorTools {
         s.kind == .broadcast ? w.start.addingTimeInterval(ScheduleClock.broadcastLead) : w.start
     }
 
-    /// The scheduled start of `s`'s next run (or the one under way), or nil when disabled or none is left.
-    func nextStart(_ s: Schedule) -> Date? {
-        guard s.enabled, let w = ScheduleClock.nextWindow(of: s, after: model.scheduler.now()) else { return nil }
-        return Self.scheduledStart(s, w)
+    /// `s`'s next window that opens after now, or nil when disabled or none is left. A window already under way
+    /// (running, paused for a broadcast, stopped by the owner or turned away) is passed over.
+    private func upcomingWindow(_ s: Schedule) -> DateInterval? {
+        guard s.enabled else { return nil }
+        let now = model.scheduler.now()
+        var after = now
+        while let w = ScheduleClock.nextWindow(of: s, after: after) {
+            if w.start > now { return w }
+            after = w.end
+        }
+        return nil
     }
+
+    /// The scheduled start of `s`'s next run (`upcomingWindow`).
+    func nextStart(_ s: Schedule) -> Date? { upcomingWindow(s).map { Self.scheduledStart(s, $0) } }
 
     func scheduleJSON(_ s: Schedule) -> JSONValue {
         var date: JSONValue = .null
@@ -147,12 +158,12 @@ extension SubFloorTools {
         ])
     }
 
-    /// `get_status`'s `scheduler`: the switch, the next run (not the one running) and the run in progress.
+    /// `get_status`'s `scheduler`: the switch, the next window to open (`upcomingWindow`) and the run in progress.
     var schedulerStatusJSON: JSONValue {
         let sched = model.scheduler
         var next: JSONValue = .null
-        let upcoming = SchedulePlanner.next(sched.schedules, after: sched.now())
-            .first { $0.0.id != sched.running?.scheduleID || $0.1 != sched.running?.window }
+        let upcoming = sched.schedules.compactMap { s in upcomingWindow(s).map { (s, $0) } }
+            .min { ($0.1.start, $0.0.created) < ($1.1.start, $1.0.created) }
         if let (s, w) = upcoming {
             var fields: [String: JSONValue] = ["name": .string(s.name), "starts": .time(Self.scheduledStart(s, w))]
             if s.kind == .broadcast {
@@ -165,8 +176,10 @@ extension SubFloorTools {
             next = .object(fields)
         }
         var running: JSONValue = .null
-        if let r = sched.running, let s = sched.schedules.first(where: { $0.id == r.scheduleID }) {
-            running = .object(["name": .string(s.name), "kind": .string(r.kind.rawValue), "until": .time(r.window.end)])
+        if let r = sched.running {
+            // A deleted schedule's run is still giving the radio back: its own copy names it.
+            let name = sched.schedules.first { $0.id == r.scheduleID }?.name ?? sched.currentRun?.schedule.name ?? ""
+            running = .object(["name": .string(name), "kind": .string(r.kind.rawValue), "until": .time(r.window.end)])
         }
         return .object(["on": .bool(sched.isOn), "next": next, "running": running])
     }
@@ -306,7 +319,12 @@ extension SubFloorTools {
             s.start = t
         }
         if let minutes = try args.int("duration_minutes") { s.durationMinutes = minutes }
-        if let zone = try args.string("time_zone") { s.timeZone = zone }
+        if let zone = try args.string("time_zone") {
+            guard zone == "UTC" || TimeZone.knownTimeZoneIdentifiers.contains(zone) else {
+                throw ToolError("Unknown time zone \(zone): use an IANA name like America/Chicago.")
+            }
+            s.timeZone = zone
+        }
         if args.has("days") && args.has("date") { throw ToolError("Give days or date, not both.") }
         if args.has("days") { s.days = try Self.days(args) }
         if let text = try args.string("date") {
@@ -316,13 +334,20 @@ extension SubFloorTools {
         if let margin = try args.double("squelch_margin_db", in: 3...30) { s.squelchMarginDb = Float(margin) }
     }
 
+    static let kHzHint = "Frequencies are in kHz: 9435 means 9435 kHz (9.435 MHz)."
+
     /// kHz from a number, or a string: bare digits are kHz, otherwise `FrequencyParser` (e.g. "9.435 MHz"). As Hz.
+    /// A bare number under 100 is refused: it is almost certainly MHz.
     private static func parseKHz(_ value: JSONValue, _ key: String) throws -> Double {
+        func bare(_ n: Double) throws -> Double {
+            guard n >= 100 else { throw ToolError(kHzHint) }
+            return (n * 1000).rounded()
+        }
         switch value {
-        case .number(let n) where n.isFinite: return (n * 1000).rounded()
+        case .number(let n) where n.isFinite: return try bare(n)
         case .string(let s):
             let t = s.trimmingCharacters(in: .whitespaces)
-            if let n = Double(t), n.isFinite { return (n * 1000).rounded() }
+            if let n = Double(t), n.isFinite { return try bare(n) }
             if let hz = FrequencyParser.parse(t) { return hz }
             throw ToolError("\(key) \"\(s)\" is not a frequency: give kHz as a number, or a string like \"9.435 MHz\".")
         default:

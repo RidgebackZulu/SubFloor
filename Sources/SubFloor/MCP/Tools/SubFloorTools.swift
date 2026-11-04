@@ -11,15 +11,20 @@ struct SubFloorTool {
     /// The call runs inside `withRadio`. Every tool that changes the radio does, except one that waits on the
     /// radio for a long time (`listen`), which takes the lock itself only for as long as it must.
     var locksRadio: Bool
+    /// The call changes the radio, so it is refused while a scheduled run has it (`Scheduler.busyMessage`). Most
+    /// tools that take the lock do; the bookmark tools take it only to keep to call order, and run during a run.
+    var changesRadio: Bool
     var run: @MainActor (SubFloorTools, ToolArguments, _ client: String) async throws -> [String: JSONValue]
 
-    init(_ name: String, title: String, readOnly: Bool, locksRadio: Bool? = nil, description: String,
+    init(_ name: String, title: String, readOnly: Bool, locksRadio: Bool? = nil, changesRadio: Bool? = nil,
+         description: String,
          properties: [String: JSONValue] = [:], required: [String] = [],
          run: @escaping @MainActor (SubFloorTools, ToolArguments, _ client: String) async throws -> [String: JSONValue]) {
         descriptor = MCPToolDescriptor(name: name, title: title, description: description,
                                        inputSchema: .inputSchema(properties: properties, required: required),
                                        readOnly: readOnly)
         self.locksRadio = locksRadio ?? !readOnly
+        self.changesRadio = changesRadio ?? self.locksRadio
         self.run = run
     }
 }
@@ -47,7 +52,8 @@ struct ToolError: Error {
 
 /// SubFloor's tools over the app's model. Read-only tools run at once; the others run one at a time, in the
 /// order they were called (`withRadio`), except `listen`, which holds the radio only while it starts. During a
-/// scheduled run the tools that change the radio, and `listen`, are refused with `Scheduler.busyMessage`.
+/// scheduled run the tools that change the radio (`changesRadio`), and `listen`, are refused with
+/// `Scheduler.busyMessage`.
 @MainActor
 final class SubFloorTools: MCPToolProvider {
     let model: AppModel
@@ -98,7 +104,7 @@ final class SubFloorTools: MCPToolProvider {
         let run = { () async -> MCPToolResult in
             // A scheduled run has the radio: nothing that changes it, or listens to it, runs meanwhile (checked once
             // the call has the lock, since a run may have started while it waited).
-            if tool.locksRadio || name == "listen", let busy = self.model.scheduler.busyMessage { return .failure(busy) }
+            if tool.changesRadio || name == "listen", let busy = self.model.scheduler.busyMessage { return .failure(busy) }
             // Only a tool that changes the radio, run under the lock, can be the change: whatever else changed
             // while a read or a listen was waiting was someone else's doing.
             let before = tool.locksRadio ? self.radioState : nil

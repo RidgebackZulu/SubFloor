@@ -233,13 +233,46 @@ struct MCPSchedulerToolsTests {
         #expect(night.content == "A watch can be at most 12 hours.")
         let many = await call(tools, "add_schedule", broadcastArgs(frequencies: (1...9).map { .number(Double(5_900 + $0 * 10)) }))
         #expect(many.content == "frequencies must be 1 to 8 frequencies between 1 kHz and 2000 MHz.")
-        let low = await call(tools, "add_schedule", broadcastArgs(frequencies: [.number(0.5)]))
+        let low = await call(tools, "add_schedule", broadcastArgs(frequencies: [.string("500 Hz")]))
         #expect(low.content == "frequencies must be 1 to 8 frequencies between 1 kHz and 2000 MHz.")
         #expect(m.scheduler.schedules.count == 1)
         for i in 1..<ScheduleStore.maxSchedules { _ = try ownersSchedule(m, name: "Station \(i)") }
         let full = await call(tools, "add_schedule", broadcastArgs())
         #expect(full.content == "There are already 200 schedules: delete some first.")
         #expect(m.scheduler.schedules.count == 200)
+    }
+
+    @Test func frequenciesUnder100kHzAreRefused() async {
+        let (m, _) = makeModel()
+        defer { m.shutdown() }
+        let tools = SubFloorTools(model: m)
+        let hint = "Frequencies are in kHz: 9435 means 9435 kHz (9.435 MHz)."
+        #expect(await call(tools, "add_schedule", broadcastArgs(frequencies: [.number(9.435)])).content == hint)
+        #expect(await call(tools, "add_schedule", broadcastArgs(frequencies: [.string("9.435")])).content == hint)
+        #expect(await call(tools, "add_schedule", watchArgs(low: 6.85, high: 7)).content == hint)
+        // With a unit it is what it says.
+        let unit = await call(tools, "add_schedule", broadcastArgs(frequencies: [.string("9.435 MHz"), .number(100)]))
+        #expect(!unit.isError, "\(unit.content)")
+        #expect(unit.structured?["schedule"]?["frequencies_khz"]?.array == [.number(9435), .number(100)])
+    }
+
+    @Test func timeZonesMustBeKnown() async {
+        let (m, _) = makeModel()
+        defer { m.shutdown() }
+        let tools = SubFloorTools(model: m)
+        for zone in ["EST", "UTC+5", "Mars/Olympus"] {
+            var a = broadcastArgs()
+            a["time_zone"] = .string(zone)
+            let r = await call(tools, "add_schedule", a)
+            #expect(r.content == "Unknown time zone \(zone): use an IANA name like America/Chicago.")
+        }
+        for zone in ["America/Chicago", "UTC"] {
+            var a = broadcastArgs()
+            a["time_zone"] = .string(zone)
+            let r = await call(tools, "add_schedule", a)
+            #expect(!r.isError, "\(zone): \(r.content)")
+            #expect(r.structured?["schedule"]?["time_zone"]?.string == zone)
+        }
     }
 
     @Test func addWhileOffSaysSo() async {
@@ -363,8 +396,16 @@ struct MCPSchedulerToolsTests {
         #expect(tune.content == busy)
         let listen = await call(tools, "listen", ["seconds": .number(2)])
         #expect(listen.isError && listen.content == busy)
-        let stop = await call(tools, "stop_radio")
-        #expect(stop.isError && stop.content == busy)
+        for name in ["stop_radio", "set_squelch", "set_decoder", "stop_recording"] {
+            let r = await call(tools, name, ["on": .bool(true)])
+            #expect(r.isError && r.content == busy, "\(name): \(r.content)")
+        }
+        // Bookmarks don't touch the radio: they still work.
+        let bookmark = await call(tools, "add_bookmark", ["name": .string("Habana"), "frequency": .number(6_000_000)])
+        #expect(!bookmark.isError, "\(bookmark.content)")
+        let id = bookmark.structured?["id"] ?? .null
+        #expect(!(await call(tools, "update_bookmark", ["id": id, "notes": .string("Heard well")])).isError)
+        #expect(!(await call(tools, "delete_bookmark", ["id": id])).isError)
         #expect(m.vfoHz != 7_200_000)
         // Reads and the schedule tools still run.
         let status = await call(tools, "get_status")
@@ -399,6 +440,67 @@ struct MCPSchedulerToolsTests {
         #expect(!r.isError, "\(r.content)")
         #expect(r.structured?["interrupted"]?.string == "a schedule took the radio")
         await stopRun(m)
+    }
+
+    /// `next` and `next_run` are the next window to open: never one under way (a watch a broadcast paused, the
+    /// run itself) or one the owner stopped.
+    @Test func nextSkipsWindowsUnderWay() async throws {
+        let (m, _) = makeModel()
+        defer { m.shutdown() }
+        guard canRun(m) else { return }
+        let tools = SubFloorTools(model: m)
+        // A watch open since 17:00 UTC (11:00 in Dallas), and a broadcast whose window opened at 17:59 running now.
+        let watch = Schedule(kind: .watch, name: "Day watch", lowHz: 6_850_000, highHz: 7_000_000, mode: .auto,
+                             start: TimeOfDay(hour: 11, minute: 0), durationMinutes: 360, timeZone: "America/Chicago",
+                             days: .weekly(Set(Weekday.allCases)), addedBy: "test-agent 1.0", source: .agent,
+                             created: m.scheduler.now())
+        let show = Schedule(kind: .broadcast, name: "Voice of Test", frequenciesHz: [10_000_000], mode: .am,
+                            start: TimeOfDay(hour: 18, minute: 0), durationMinutes: 30, timeZone: "UTC",
+                            days: .weekly(Set(Weekday.allCases)), created: m.scheduler.now())
+        try m.scheduler.add(watch)
+        try m.scheduler.add(show)
+        let window = try #require(ScheduleClock.nextWindow(of: show, after: m.scheduler.now()))
+        #expect(window.start < m.scheduler.now())
+        m.scheduler.startRun(show, window: window, early: false)
+
+        var status = await call(tools, "get_status")
+        var next = status.structured?["scheduler"]?["next"]
+        #expect(next?["name"]?.string == "Day watch")
+        #expect(next?["starts"]?.string == "2026-11-05T17:00:00Z")   // tomorrow's, not today's under way
+        #expect(status.structured?["scheduler"]?["running"]?["name"]?.string == "Voice of Test")
+        let list = await call(tools, "list_schedules")
+        let runs = Dictionary(uniqueKeysWithValues: (list.structured?["schedules"]?.array ?? []).compactMap { s in
+            s["name"]?.string.map { ($0, s["next_run"]?.string) }
+        })
+        #expect(runs["Day watch"] == "2026-11-05T17:00:00Z")
+        #expect(runs["Voice of Test"] == "2026-11-05T18:00:00Z")
+
+        // The owner stops the run: its window is settled, and the next is tomorrow's.
+        var off = watch
+        off.enabled = false
+        try m.scheduler.update(off)
+        await stopRun(m)
+        status = await call(tools, "get_status")
+        next = status.structured?["scheduler"]?["next"]
+        #expect(next?["name"]?.string == "Voice of Test")
+        #expect(next?["starts"]?.string == "2026-11-05T18:00:00Z")
+        #expect(status.structured?["scheduler"]?["running"] == .null)
+    }
+
+    @Test func runningNamesADeletedSchedulesRun() async throws {
+        let (m, _) = makeModel()
+        defer { m.shutdown() }
+        guard canRun(m) else { return }
+        let tools = SubFloorTools(model: m)
+        let s = try startRun(m)
+        m.scheduler.delete(s.id)           // the run ends, and gives the radio back meanwhile
+        #expect(m.scheduler.busyMessage != nil)
+        let status = await call(tools, "get_status")
+        let running = status.structured?["scheduler"]?["running"]
+        #expect(running?["name"]?.string == "Voice of Test")
+        #expect(running?["kind"]?.string == "broadcast")
+        #expect(running?["until"]?.string == "2026-11-05T03:30:00Z")
+        await m.scheduler.runTask?.value
     }
 
     // MARK: Status and the switch

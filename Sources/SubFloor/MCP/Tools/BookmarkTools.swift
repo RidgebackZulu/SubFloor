@@ -26,7 +26,7 @@ extension SubFloorTools {
                     "group": .schema("string", "Only this group (case-insensitive)."),
                 ]) { t, args, _ in try t.listBookmarks(args) },
 
-            SubFloorTool("add_bookmark", title: "Add bookmark", readOnly: false, description: """
+            SubFloorTool("add_bookmark", title: "Add bookmark", readOnly: false, changesRadio: false, description: """
                 Save a bookmark, marked as added by you. name and frequency are needed; mode defaults to the \
                 current one, bandwidth_hz to the current or the mode's default, hamitup to as it is now ("auto": \
                 on below 30 MHz). Returns {id}.
@@ -34,7 +34,7 @@ extension SubFloorTools {
                 try t.addBookmark(args, client: client)
             },
 
-            SubFloorTool("update_bookmark", title: "Update bookmark", readOnly: false, description: """
+            SubFloorTool("update_bookmark", title: "Update bookmark", readOnly: false, changesRadio: false, description: """
                 Change a bookmark an agent added (any agent): any of name, frequency, mode, bandwidth_hz, group, \
                 notes, hamitup. append_notes adds a line to the notes, and is the only change allowed on the \
                 owner's own bookmarks (added_by null). Returns {bookmark}.
@@ -42,7 +42,7 @@ extension SubFloorTools {
                                                   "append_notes": .schema("string", "A line to add to the notes.")]) { a, _ in a },
                 required: ["id"]) { t, args, _ in try t.updateBookmark(args) },
 
-            SubFloorTool("delete_bookmark", title: "Delete bookmark", readOnly: false, description: """
+            SubFloorTool("delete_bookmark", title: "Delete bookmark", readOnly: false, changesRadio: false, description: """
                 Delete a bookmark an agent added. The owner's bookmarks can't be deleted. Returns {deleted}.
                 """, properties: ["id": .schema("string", "The bookmark's id (list_bookmarks).")],
                 required: ["id"]) { t, args, _ in try t.deleteBookmark(args) },
