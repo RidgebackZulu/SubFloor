@@ -16,16 +16,27 @@ final class TimetableUpdater {
         self.scheduler = scheduler
     }
 
-    /// Loads the cache (a fetched copy replaces the bundled one), then checks now and every 24 hours.
+    /// Loads the cache, then checks now and every 24 hours.
     func start() {
         guard loop == nil else { return }
-        if files.meta?.fetchedAt != nil { scheduler.timetableUpdated(files.load()) }
-        scheduler.timetableCheckedAt = files.meta?.checkedAt
         loop = Task { [weak self] in
+            await self?.loadCached()
             while !Task.isCancelled {
                 await self?.check(now: Date())
                 try? await Task.sleep(for: Self.interval)
             }
+        }
+    }
+
+    /// A fetched copy replaces the bundled one, without relinking schedules (nothing changed since they were linked).
+    /// The parse runs off the main actor.
+    func loadCached() async {
+        let files = files
+        if files.meta?.fetchedAt != nil {
+            let loaded = await Task.detached { files.load() }.value
+            scheduler.timetableLoaded(loaded, checkedAt: files.meta?.checkedAt)
+        } else {
+            scheduler.timetableCheckedAt = files.meta?.checkedAt
         }
     }
 

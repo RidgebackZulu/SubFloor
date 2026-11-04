@@ -133,14 +133,15 @@ public struct Timetable: Sendable {
             let wanted = Self.weekdays(of: s.days)
             let minutes = s.start.hour * 60 + s.start.minute
             let best = broadcasts.filter { $0.station == key.station && $0.language == key.language }
-                .min { a, b in rank(a, minutes, wanted) < rank(b, minutes, wanted) }
+                .min { a, b in rank(a, minutes, wanted, s.days) < rank(b, minutes, wanted, s.days) }
             guard let best else {
                 out.enabled = false; out.timetableNote = .gone
                 return out
             }
             let frequencies = Array(best.frequenciesHz.prefix(8))
-            let changed = best.start != s.start || best.durationMinutes != s.durationMinutes || best.days != s.days
+            let changed = s.timeZone != "UTC" || best.start != s.start || best.durationMinutes != s.durationMinutes || best.days != s.days
                 || frequencies != s.frequenciesHz || s.timetableNote == .gone
+            out.timeZone = "UTC"   // the broadcast's times are UTC
             out.start = best.start; out.durationMinutes = best.durationMinutes; out.days = best.days
             out.startDate = best.startDate; out.endDate = best.endDate
             out.frequenciesHz = frequencies
@@ -150,10 +151,12 @@ public struct Timetable: Sendable {
         }
     }
 
-    private func rank(_ b: TimetableBroadcast, _ minutes: Int, _ wanted: Set<Weekday>) -> (Int, Int, Int) {
+    /// Shared weekday, then nearest start, then the same days, then the earlier start.
+    private func rank(_ b: TimetableBroadcast, _ minutes: Int, _ wanted: Set<Weekday>,
+                      _ days: ScheduleDays) -> (Int, Int, Int, Int) {
         let start = b.start.hour * 60 + b.start.minute
         let gap = abs(start - minutes)
-        return (wanted.isDisjoint(with: Self.weekdays(of: b.days)) ? 1 : 0, min(gap, 1440 - gap), start)
+        return (wanted.isDisjoint(with: Self.weekdays(of: b.days)) ? 1 : 0, min(gap, 1440 - gap), b.days == days ? 0 : 1, start)
     }
 
     private static func weekdays(of days: ScheduleDays) -> Set<Weekday> {

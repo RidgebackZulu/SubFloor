@@ -132,6 +132,25 @@ private func table(_ rows: [EiBiRow]) -> Timetable { Timetable(rows: rows, seaso
         #expect(new.relink([s], now: Date())[0].frequenciesHz == [8_000_000])
     }
 
+    @Test func relinkSetsTheScheduleBackToUTC() {
+        let t = table([row(5000, "0200-0300")])
+        var s = t.schedule(from: t.broadcasts[0], now: Date(), addedBy: nil)
+        s.timeZone = "America/Chicago"
+        let out = t.relink([s], now: Date())[0]
+        #expect(out.timeZone == "UTC" && out.start == TimeOfDay(hour: 2, minute: 0))
+    }
+
+    @Test func relinkPrefersTheSameDaysWhenStartsTie() {
+        let t = table([row(6000, "2300-2400", days: "Mo-Fr"), row(7000, "2300-2400")])
+        let daily = t.broadcasts.first { $0.frequenciesHz == [7_000_000] }!
+        let weekdays = t.broadcasts.first { $0.frequenciesHz == [6_000_000] }!
+        #expect(daily.days != weekdays.days)
+        for b in [daily, weekdays] {
+            let s = t.schedule(from: b, now: Date(), addedBy: nil)
+            #expect(t.relink([s], now: Date())[0].frequenciesHz == b.frequenciesHz)
+        }
+    }
+
     @Test func relinkKeepsTheNoteWhenNothingChanged() {
         let t = table([row(5000, "0200-0300", days: "irr")])
         let s = t.schedule(from: t.broadcasts[0], now: Date(), addedBy: nil)

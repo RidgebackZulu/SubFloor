@@ -210,7 +210,13 @@ final class Scheduler {
         schedulesChanged()
     }
 
-    /// Replaces the timetable (a weekly update): relinks timetable schedules and saves.
+    /// Installs the cached timetable at launch: no relinking (that would undo the owner's edits to linked schedules).
+    func timetableLoaded(_ t: Timetable, checkedAt: Date?) {
+        loadedTimetable = t
+        timetableCheckedAt = checkedAt
+    }
+
+    /// Replaces the timetable (an accepted fetch): relinks timetable schedules and saves.
     func timetableUpdated(_ t: Timetable) {
         loadedTimetable = t
         schedules = t.relink(schedules, now: now())

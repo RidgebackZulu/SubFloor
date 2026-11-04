@@ -81,9 +81,15 @@ enum ScheduleWhen {
             else if moved == [.mo, .tu, .we, .th, .fr] { days = "Mon–Fri" }
             else { days = moved.sorted().map(name).joined(separator: ", ") }
         case .monthly(let ordinal, let weekday):
-            let moved = Weekday(rawValue: (((weekday.rawValue - 1 + shift) % 7) + 7) % 7 + 1)!
             let ord = ordinal == -1 ? "Last" : ["1st", "2nd", "3rd", "4th", "5th"][max(0, min(4, ordinal - 1))]
-            days = "\(ord) \(name(moved))"
+            // "1st Saturday" doesn't carry over to another date, so a shifted one is shown in its own zone.
+            if shift != 0 {
+                let ownStart = own.dateComponents([.hour, .minute], from: start)
+                let ownEnd = own.dateComponents([.hour, .minute], from: end)
+                return String(format: "%@ %@ %02d:%02d–%02d:%02d (%@)", ord, name(weekday), ownStart.hour!, ownStart.minute!,
+                              ownEnd.hour!, ownEnd.minute!, s.timeZone)
+            }
+            days = "\(ord) \(name(weekday))"
         case .once:
             days = dayAndMonth(start, in: zone)
         }

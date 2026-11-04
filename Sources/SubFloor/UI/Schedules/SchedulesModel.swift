@@ -87,12 +87,12 @@ final class SchedulesModel {
         }
     }
 
-    /// A schedule carries the broadcast when its timetable key has the same station and language and it starts at
-    /// the same UTC time of day (frequencies and days may have been edited, and the key's season moves on).
+    /// A schedule carries the broadcast when its timetable key has the same station and language, starts at
+    /// the same UTC time of day and runs the same days (frequencies may have been edited, and the key's season moves on).
     static func isAdded(_ b: TimetableBroadcast, in schedules: [Schedule], now: Date) -> Bool {
         schedules.contains { s in
             guard let key = s.timetableKey, key.station == b.station, key.language == b.language else { return false }
-            return ScheduleWhen.utcMinutes(of: s, now: now) == b.start.hour * 60 + b.start.minute
+            return ScheduleWhen.utcMinutes(of: s, now: now) == b.start.hour * 60 + b.start.minute && s.days == b.days
         }
     }
 
@@ -124,7 +124,9 @@ final class SchedulesModel {
     /// Saves `draft` as a new schedule, or over `original`. Nil when it saved, else the text to show.
     func save(_ draft: ScheduleDraft, replacing original: Schedule?) -> String? {
         do {
-            let s = try draft.build(replacing: original, now: now)
+            // Onto the schedule as it is now: a run, an agent or a relink may have changed it since the editor opened.
+            let current = original.map { o in scheduler.schedules.first { $0.id == o.id } ?? o }
+            let s = try draft.build(replacing: current, now: now)
             if original == nil { try scheduler.add(s) } else { try scheduler.update(s) }
             return nil
         } catch { return Self.text(of: error) }
@@ -197,7 +199,7 @@ struct ScheduleDraft: Equatable {
     func build(replacing original: Schedule?, now: Date) throws -> Schedule {
         func bad(_ text: String) -> ScheduleError { .invalid(text) }
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { throw bad("Give the schedule a name.") }
+        guard !trimmed.isEmpty else { throw bad("name can't be empty.") }
         if let problem = Scheduler.timeZoneProblem(timeZone) { throw bad(problem) }
 
         func khz(_ text: String) -> Double? {

@@ -11,9 +11,22 @@ struct SchedulesWindowTests {
     private static let noon = ISO8601DateFormatter().date(from: "2026-11-04T18:00:00Z")!
     private static let dallas = TimeZone(identifier: "America/Chicago")!
 
-    private func makeScheduler() -> Scheduler {
-        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("SubFloorSchedUI-\(UUID().uuidString)", isDirectory: true)
+    /// Temp folders made by this test, removed when it ends (the suite value is created per test).
+    private final class Folders: @unchecked Sendable {
+        var urls: [URL] = []
+        deinit { for url in urls { try? FileManager.default.removeItem(at: url) } }
+    }
+    private let folders = Folders()
+
+    private func tempDir(_ prefix: String) -> URL {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("\(prefix)-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        folders.urls.append(dir)
+        return dir
+    }
+
+    private func makeScheduler() -> Scheduler {
+        let dir = tempDir("SubFloorSchedUI")
         let s = Scheduler(store: ScheduleStore(url: dir.appendingPathComponent("schedules.json")),
                           now: { Self.noon }, localZone: Self.dallas, autoTick: false)
         for existing in s.schedules { s.delete(existing.id) }   // the first-launch default watch
@@ -216,7 +229,7 @@ struct SchedulesWindowTests {
         d = draft(); d.weekdays = []
         #expect(m.save(d, replacing: nil) == "Pick at least one day.")
         d = draft(); d.name = "  "
-        #expect(m.save(d, replacing: nil) == "Give the schedule a name.")
+        #expect(m.save(d, replacing: nil) == "name can't be empty.")
     }
 
     @Test func theEditorShowsOverlapsLive() throws {
@@ -255,7 +268,7 @@ struct SchedulesWindowTests {
 
     @Test func theTimetableCheckTimeReachesTheScheduler() async throws {
         let scheduler = makeScheduler()
-        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("SubFloorTT-\(UUID().uuidString)", isDirectory: true)
+        let folder = tempDir("SubFloorTT")
         // A server that answers 404 to everything: no new file, but the check counts.
         let files = TimetableFiles(folder: folder, fetch: TimetableFetch { request in
             (Data(), HTTPURLResponse(url: request.url!, statusCode: 404, httpVersion: nil, headerFields: nil)!)
@@ -265,5 +278,57 @@ struct SchedulesWindowTests {
         await updater.check(now: Self.noon)
         #expect(scheduler.timetableCheckedAt == Self.noon)
         #expect(scheduler.timetable.season.name == "b26")
+    }
+
+    @Test func aMonthlyDateThatShiftsShowsItsOwnZone() {
+        let utc = schedule(start: TimeOfDay(hour: 1, minute: 0), minutes: 60, zone: "UTC", days: .monthly(ordinal: 1, weekday: .sa))
+        #expect(row(utc).when == "1st Sat 01:00–02:00 (UTC)")
+    }
+
+    @Test func aSiblingBroadcastWithOtherDaysKeepsItsAddButton() throws {
+        let m = model(makeScheduler())
+        let b = try #require(m.timetableRows.first { $0.broadcast.durationMinutes <= 360 }?.broadcast)
+        var other = b
+        other.days = b.days == .weekly([.mo]) ? .weekly([.tu]) : .weekly([.mo])
+        let s = m.scheduler.timetable.schedule(from: b, now: Self.noon, addedBy: nil)
+        #expect(SchedulesModel.isAdded(b, in: [s], now: Self.noon))
+        #expect(!SchedulesModel.isAdded(other, in: [s], now: Self.noon))
+    }
+
+    @Test func savingKeepsWhatChangedWhileTheEditorWasOpen() throws {
+        let scheduler = makeScheduler()
+        let m = model(scheduler)
+        try scheduler.add(schedule())
+        let opened = scheduler.schedules[0]
+        var changed = opened
+        changed.lastRun = LastRun(outcome: .stoppedByYou, at: Self.noon)
+        changed.addedBy = "Claude Code"
+        try scheduler.update(changed)
+        var edit = ScheduleDraft(opened)
+        edit.name = "Renamed"
+        #expect(m.save(edit, replacing: opened) == nil)
+        let saved = scheduler.schedules[0]
+        #expect(saved.name == "Renamed" && saved.lastRun?.outcome == .stoppedByYou && saved.addedBy == "Claude Code")
+    }
+
+    @Test func launchInstallsTheCacheWithoutRelinkingSchedules() async throws {
+        let scheduler = makeScheduler()
+        let folder = tempDir("SubFloorTT")
+        try FileManager.default.copyItem(at: TimetableFiles.bundledURL!, to: folder.appendingPathComponent("sked-b26.csv"))
+        let stamp = ISO8601DateFormatter().string(from: Self.noon)
+        try Data("{\"season\":\"b26\",\"checkedAt\":\"\(stamp)\",\"fetchedAt\":\"\(stamp)\"}".utf8)
+            .write(to: folder.appendingPathComponent("meta.json"))
+        // A linked schedule the owner moved to Dallas time: a relink would put it back to UTC.
+        let b = try #require(scheduler.timetable.broadcasts.first { $0.durationMinutes <= 360 })
+        var linked = scheduler.timetable.schedule(from: b, now: Self.noon, addedBy: nil)
+        linked.timeZone = "America/Chicago"
+        linked.start = TimeOfDay(hour: 3, minute: 15)
+        try scheduler.add(linked)
+        let updater = TimetableUpdater(files: TimetableFiles(folder: folder, fetch: TimetableFetch { r in
+            (Data(), HTTPURLResponse(url: r.url!, statusCode: 500, httpVersion: nil, headerFields: nil)!)
+        }), scheduler: scheduler)
+        await updater.loadCached()
+        #expect(scheduler.schedules == [linked])
+        #expect(scheduler.timetableCheckedAt == Self.noon)
     }
 }
