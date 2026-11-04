@@ -1,0 +1,49 @@
+{
+  "reviewed": "2026-11-03 (season B26)",
+  "notes": "Keyword \"Cathol\" added beyond the spec's list (coordinator ruling) so French catholique is caught.",
+  "denylist": [
+    "Trans World Radio",
+    "Adventist World Radio",
+    "FEBC",
+    "Radio Vaticana",
+    "Vatican",
+    "Bible Voice",
+    "Follow the Bible",
+    "Hope Radio",
+    "Brother Stair",
+    "Voz Missionaria",
+    "Mystery for Joy",
+    "Hope of Israel",
+    "Evang. Missionsgemeinden",
+    "HCJB",
+    "Family Radio",
+    "KNLS",
+    "Voice of Hope",
+    "WWCR",
+    "WTWW",
+    "WINB"
+  ],
+  "keywords": [
+    "Bible",
+    "Gospel",
+    "Christ",
+    "Faith",
+    "Mission",
+    "Vatican",
+    "Adventist",
+    "Evang",
+    "Jesus",
+    "Church",
+    "Catholic",
+    "Cathol",
+    "Islam",
+    "Quran",
+    "Hope"
+  ],
+  "allowlist": [
+    "WRMI",
+    "WBCQ",
+    "Sound of Hope",
+    "Hopen Island"
+  ]
+}
