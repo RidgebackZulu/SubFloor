@@ -160,13 +160,24 @@ private func table(_ rows: [EiBiRow]) -> Timetable { Timetable(rows: rows, seaso
         #expect(out.timetableNote == .irregular && out.timetableKey?.season == "b26")
     }
 
-    @Test func relinkRevivesNoteButNotSwitchForAGoneBroadcast() {
+    @Test func relinkSwitchesAGoneBroadcastBackOnWhenItReappears() {
         let t = table([row(5000, "0200-0300")])
         var s = t.schedule(from: t.broadcasts[0], now: Date(), addedBy: nil)
         s.enabled = false; s.timetableNote = .gone
         let now = utcDate("2026-11-03T12:00:00Z")
         let out = t.relink([s], now: now)[0]
-        #expect(out.timetableNote == .updated(now) && !out.enabled)
+        #expect(out.timetableNote == .updated(now) && out.enabled)
+        // One the owner switched off (no `.gone` note) stays off.
+        var off = t.schedule(from: t.broadcasts[0], now: Date(), addedBy: nil)
+        off.enabled = false
+        #expect(!t.relink([off], now: now)[0].enabled)
+    }
+
+    @Test func utilityAndDataRowsAreDropped() {
+        let t = table([row(5000, "0200-0300", station: "Spoken"), row(6000, "0200-0300", station: "No Language", lang: ""),
+                       row(7000, "0200-0300", station: "Time Signal", lang: "-TS"),
+                       row(8000, "0200-0300", station: "Morse", lang: "-CW")])
+        #expect(t.broadcasts.map(\.station) == ["Spoken"])
     }
 
     @Test func broadcastIdsIncludeTheEnd() {

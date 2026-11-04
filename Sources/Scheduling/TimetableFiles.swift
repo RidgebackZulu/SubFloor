@@ -31,7 +31,8 @@ public struct TimetableMeta: Codable, Equatable, Sendable {
 /// Files are `sked-<season>.csv` (the bytes as fetched) and `meta.json`. `meta` is guarded by a lock.
 public final class TimetableFiles: @unchecked Sendable {
     public static let checkInterval: TimeInterval = 7 * 86_400
-    /// A fetched file is used only if it has at least this many usable rows and at least half the rows of the one it replaces.
+    /// A fetched file is used only if it has at least this many usable rows, and at least 80 % of the rows of the one
+    /// it replaces when that is the same season (a refresh), or half when it is another season.
     public static let minimumRows = 1_000
 
     private let folder: URL
@@ -72,7 +73,8 @@ public final class TimetableFiles: @unchecked Sendable {
         return Timetable(data: data, season: season)
     }
 
-    /// Due when there's no meta, the last check is older than `checkInterval`, or the current season has begun since the
+    /// Due when there's no meta, the last check is older than `checkInterval` or stamped in the future (the Mac's clock
+    /// was ahead), or the current season has begun since the
     /// last check and isn't the cached one. Fetches the current season with If-None-Match / If-Modified-Since (only when
     /// that's the cached season). A 404 tries the previous season once. A 304 only stamps `checkedAt`. Returns the new
     /// timetable when one was accepted, else nil. A network error or a server error leaves `meta` alone, so the next
@@ -80,13 +82,14 @@ public final class TimetableFiles: @unchecked Sendable {
     public func updateIfDue(now: Date) async -> Timetable? {
         let current = EiBiSeason.current(at: now)
         let old = meta
-        if let old, now.timeIntervalSince(old.checkedAt) < Self.checkInterval,
+        if let old, old.checkedAt <= now, now.timeIntervalSince(old.checkedAt) < Self.checkInterval,
            old.season == current.name || old.checkedAt >= current.startsAt { return nil }
 
-        // What a fetched file must be at least half the size of.
+        // The file a fetched one replaces, which it is measured against.
         let cached = old.flatMap { m in (try? Data(contentsOf: cacheURL(m.season))).map { (m, $0) } }
         let (bundledBytes, bundledSeason) = bundledFile()
         let replacedRows = EiBi.parse(cached?.1 ?? bundledBytes).rows.count
+        let replacedSeason = cached?.0.season ?? bundledSeason.name
 
         var seasons = [current]
         var index = 0
@@ -110,7 +113,8 @@ public final class TimetableFiles: @unchecked Sendable {
                 let rows = EiBi.parse(body).rows.count
                 // Never go back a season (the 404 fallback could otherwise replace a newer cache with an older file).
                 let older = cached.flatMap { Self.season(named: $0.0.season) }.map { season.startsAt < $0.startsAt } ?? false
-                guard rows >= Self.minimumRows, rows * 2 >= replacedRows, !older else {
+                let enough = season.name == replacedSeason ? rows * 5 >= replacedRows * 4 : rows * 2 >= replacedRows
+                guard rows >= Self.minimumRows, enough, !older else {
                     stamp(old, season: cached?.0.season ?? bundledSeason.name, now: now)
                     return nil
                 }

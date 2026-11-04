@@ -163,6 +163,39 @@ private let good = Timetable.bundledData()
         #expect(await files.updateIfDue(now: nov3) == nil)
     }
 
+    @Test func aSameSeasonRefreshNeeds80PercentOfTheRows() async throws {
+        let rows = EiBi.parse(good).rows.count
+        // 75 % of the bundled b26 rows: more than half, but a refresh of the same season needs 80 %.
+        let short = firstLines(rows * 3 / 4)
+        let files = TimetableFiles(folder: tempFolder(), fetch: stub(Recorder()) { _ in (short, 200, [:]) })
+        #expect(await files.updateIfDue(now: nov3) == nil)
+        #expect(files.meta?.fetchedAt == nil)
+        let enough = firstLines(rows * 17 / 20)   // 85 %
+        let again = TimetableFiles(folder: tempFolder(), fetch: stub(Recorder()) { _ in (enough, 200, [:]) })
+        #expect(await again.updateIfDue(now: nov3) != nil)
+    }
+
+    @Test func aNewSeasonKeepsTheHalfRule() async throws {
+        // 60 % of the b26 rows, as a27: a new season may be smaller.
+        let smaller = firstLines(EiBi.parse(good).rows.count * 3 / 5)
+        let files = TimetableFiles(folder: tempFolder(), fetch: stub(Recorder()) { _ in (smaller, 200, [:]) })
+        let t = try #require(await files.updateIfDue(now: utc(2027, 3, 29)))
+        #expect(t.season.name == "a27")
+    }
+
+    @Test func aCheckStampedInTheFutureIsDue() async throws {
+        let rec = Recorder()
+        let folder = tempFolder()
+        // The Mac's clock was a month ahead at the last check.
+        let seed = TimetableFiles(folder: folder, fetch: stub(rec) { _ in (good, 200, [:]) })
+        _ = await seed.updateIfDue(now: nov3 + 30 * day)
+        #expect(seed.meta?.checkedAt == nov3 + 30 * day && rec.requests.count == 1)
+        let files = TimetableFiles(folder: folder, fetch: stub(rec) { _ in (Data(), 304, [:]) })
+        _ = await files.updateIfDue(now: nov3)
+        #expect(rec.requests.count == 2)
+        #expect(files.meta?.checkedAt == nov3)
+    }
+
     @Test func networkErrorLeavesMetaAloneSoTheNextLaunchRetries() async throws {
         struct Down: Error {}
         let rec = Recorder()

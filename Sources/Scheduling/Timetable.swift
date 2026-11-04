@@ -17,7 +17,7 @@ public struct TimetableBroadcast: Identifiable, Hashable, Sendable {
     public var frequenciesHz: [Double]     // ascending, distinct
 }
 
-/// The North America part of one EiBi season: audible here, on air this season, and not religious.
+/// The North America part of one EiBi season: audible here, on air this season, spoken, and not religious.
 public struct Timetable: Sendable {
     public static let northAmericaTargets: Set<String> = ["NAm", "ENA", "CNA", "WNA", "Am", "Car", "CAm", "USA"]
 
@@ -41,7 +41,8 @@ public struct Timetable: Sendable {
         self.season = season
         self.droppedRows = dropped
         var merged: [String: TimetableBroadcast] = [:]
-        for row in rows where Self.isActive(row, in: season) && Self.targetsNorthAmerica(row) && !filter.isReligious(row.station) {
+        for row in rows where Self.isActive(row, in: season) && Self.isSpoken(row) && Self.targetsNorthAmerica(row)
+                && !filter.isReligious(row.station) {
             // A days field mixing a monthly or once form with another day form is unusable: nil, so the row is skipped.
             guard let (days, irregular) = EiBi.days(row.daysField, season: season) else { continue }
             let start = row.start.hour * 60 + row.start.minute
@@ -72,6 +73,13 @@ public struct Timetable: Sendable {
         guard let p = row.persistence else { return true }
         if p == 8 || p >= 90 { return false }
         return !(p == 4 && season.half == .a) && !(p == 5 && season.half == .b)
+    }
+
+    /// A broadcast in a language: EiBi leaves the language empty, or starts it with `-` (`-TS`, `-CW`, `-HF`), for
+    /// utility and data stations.
+    private static func isSpoken(_ row: EiBiRow) -> Bool {
+        let language = row.language.trimmingCharacters(in: .whitespaces)
+        return !language.isEmpty && !language.hasPrefix("-")
     }
 
     private static func targetsNorthAmerica(_ row: EiBiRow) -> Bool {
@@ -124,7 +132,9 @@ public struct Timetable: Sendable {
 
     /// For each schedule with a `timetableKey`: the same station and language, the closest start time (preferring a
     /// shared weekday, the earlier start on a tie). When found, it takes that broadcast's times, days, dates and
-    /// frequencies, this season's key, and note `.updated(now)` only when the times, days or frequencies changed (or it was `.gone`). When not found, it's switched off with note `.gone`.
+    /// frequencies, this season's key, and note `.updated(now)` only when the times, days or frequencies changed. One
+    /// that was `.gone` (switched off by an earlier relink) is switched back on with note `.updated(now)`. When not
+    /// found, it's switched off with note `.gone`.
     /// Other schedules are untouched.
     public func relink(_ schedules: [Schedule], now: Date) -> [Schedule] {
         schedules.map { s in
@@ -146,6 +156,7 @@ public struct Timetable: Sendable {
             out.startDate = best.startDate; out.endDate = best.endDate
             out.frequenciesHz = frequencies
             out.timetableKey = TimetableKey(station: best.station, language: best.language, season: season.name)
+            if s.timetableNote == .gone { out.enabled = true }
             if changed { out.timetableNote = .updated(now) }
             return out
         }
