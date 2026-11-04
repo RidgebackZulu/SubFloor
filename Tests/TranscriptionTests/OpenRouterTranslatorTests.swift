@@ -100,6 +100,19 @@ private func body(_ request: URLRequest) throws -> [String: Any] {
         catch { #expect(error as? TranslationError == .malformed) }
     }
 
+    @Test func aFencedReplyIsRead() async throws {
+        let good = json([(0, "a"), (1, "b"), (2, "c")])
+        for content in ["```json\n\(good)\n```", "```\n\(good)\n```", "  ```JSON\n\(good)\n```\n", "```json\n\(good)", "```json\r\n\(good)\r\n```"] {
+            let transport = StubTransport(status: 200, body: completion(content))
+            let result = try await translator(transport).translate(korean())
+            #expect(result.text == "a b c", "\(content)")
+        }
+        // The shape check still applies inside a fence.
+        let short = StubTransport(status: 200, body: completion("```json\n\(json([(0, "a")]))\n```"))
+        do { _ = try await translator(short).translate(korean()); Issue.record("accepted a short fenced reply") }
+        catch { #expect(error as? TranslationError == .malformed) }
+    }
+
     @Test func costIsRead() async throws {
         let transport = StubTransport(status: 200, body: completion(json([(0, "a"), (1, "b"), (2, "c")]), cost: 0.00042))
         #expect(try await translator(transport).translate(korean()).costUSD == 0.00042)

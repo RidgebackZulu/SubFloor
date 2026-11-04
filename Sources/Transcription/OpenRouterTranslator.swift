@@ -124,7 +124,7 @@ public struct OpenRouterTranslator: Sendable {
         struct Translated: Decodable { var segments: [Line] }
         guard let reply = try? JSONDecoder().decode(Reply.self, from: data),
               let content = reply.choices?.first?.message?.content,
-              let translated = try? JSONDecoder().decode(Translated.self, from: Data(content.utf8)),
+              let translated = try? JSONDecoder().decode(Translated.self, from: Data(Self.unfenced(content).utf8)),
               translated.segments.count == sources.count,
               Set(translated.segments.map(\.i)) == Set(0..<sources.count)
         else { throw TranslationError.malformed }
@@ -143,6 +143,18 @@ public struct OpenRouterTranslator: Sendable {
             try await OpenRouterTranslator(apiKey: apiKey, model: model).translate(t)
         }
         return try await withTaskCancellationHandler { try await work.value } onCancel: { work.cancel() }
+    }
+
+    /// The content without one Markdown code fence around it: a leading ``` or ```json line and a trailing ``` line,
+    /// which some models add despite being asked for JSON only. Anything else is left as it is.
+    static func unfenced(_ content: String) -> String {
+        var lines = content.trimmingCharacters(in: .whitespacesAndNewlines).components(separatedBy: "\n")
+        guard let first = lines.first?.trimmingCharacters(in: .whitespacesAndNewlines), first.hasPrefix("```") else { return content }
+        let label = first.dropFirst(3).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard label.isEmpty || label.lowercased() == "json" else { return content }
+        lines.removeFirst()
+        if lines.last?.trimmingCharacters(in: .whitespacesAndNewlines) == "```" { lines.removeLast() }
+        return lines.joined(separator: "\n")
     }
 
     /// `{"error":{"message":"..."}}`, if the body has that shape.
