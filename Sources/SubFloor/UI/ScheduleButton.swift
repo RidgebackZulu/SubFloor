@@ -29,7 +29,7 @@ struct ScheduleButtonModel: Equatable {
     let leftAction: Action
     let tickerAction: Action
 
-    init(state: ScheduleButtonState, isOn: Bool, zone: TimeZone) {
+    init(state: ScheduleButtonState, zone: TimeZone) {
         tickerText = TickerText.text(state, zone: zone)
         switch state {
         case .off:
@@ -75,7 +75,7 @@ struct ScheduleButton: View {
 
     var body: some View {
         let scheduler = model.scheduler
-        let button = ScheduleButtonModel(state: scheduler.buttonState, isOn: scheduler.isOn, zone: .current)
+        let button = ScheduleButtonModel(state: scheduler.buttonState, zone: .current)
         // A narrow top bar drops the ticker first and keeps the left part.
         ViewThatFits(in: .horizontal) {
             HStack(spacing: 0) {
@@ -124,19 +124,23 @@ struct ScheduleButton: View {
         .accessibilityLabel(button.accessibilityLabel)
     }
 
+    @ViewBuilder
     private func ticker(_ button: ScheduleButtonModel) -> some View {
-        let tappable = button.tickerAction != .none
-        return Button { perform(button.tickerAction) } label: {
-            Ticker(text: button.tickerText, scrolls: button.look != .off && !reduceMotion)
-                .frame(width: Self.tickerWidth, height: 26)
-                .background(Color(red: 0.035, green: 0.047, blue: 0.067).opacity(0.85))
-                .overlay(alignment: .leading) { Rectangle().fill(Self.edge(button.look)).frame(width: 1) }
-                .contentShape(Rectangle())
+        let box = Ticker(text: button.tickerText, scrolls: button.look != .off && !reduceMotion)
+            .frame(width: Self.tickerWidth, height: 26)
+            .background(Color(red: 0.035, green: 0.047, blue: 0.067).opacity(0.85))
+            .overlay(alignment: .leading) { Rectangle().fill(Self.edge(button.look)).frame(width: 1) }
+            .contentShape(Rectangle())
+        if button.tickerAction == .none {
+            // Not clickable: plain text, so nothing dims it.
+            box.accessibilityElement(children: .ignore).accessibilityLabel(button.tickerText)
+                .help(button.tickerText)
+        } else {
+            Button { perform(button.tickerAction) } label: { box }
+                .buttonStyle(.plain)
+                .accessibilityLabel(button.tickerText)
+                .help("Tune now and start this schedule early")
         }
-        .buttonStyle(.plain)
-        .disabled(!tappable)
-        .accessibilityLabel(button.tickerText)
-        .help(tappable ? "Tune now and start this schedule early" : button.tickerText)
     }
 
     private static func foreground(_ look: ScheduleButtonModel.Look) -> Color {
@@ -171,7 +175,7 @@ struct ScheduleButton: View {
         func body(content: Content) -> some View {
             if look.pulses, !reduceMotion {
                 // ~1.4 s period, as in the mockup: the glow and the outline swell together.
-                TimelineView(.animation) { context in
+                TimelineView(.animation(minimumInterval: 1.0 / 30)) { context in
                     let phase = 0.5 - 0.5 * cos(2 * .pi * context.date.timeIntervalSinceReferenceDate / 1.4)
                     framed(content, outline: ScheduleButton.cyan.opacity(0.45 + 0.55 * phase), glow: 0.32 * phase)
                 }
@@ -214,10 +218,11 @@ private struct Ticker: View {
 
     var body: some View {
         GeometryReader { geo in
+            ZStack(alignment: .leading) {
             let overflows = textWidth + Self.inset > geo.size.width
             let cycle = textWidth + Self.gap
             if scrolls, overflows, cycle > 0 {
-                TimelineView(.animation) { context in
+                TimelineView(.animation(minimumInterval: 1.0 / 30)) { context in
                     let t = context.date.timeIntervalSinceReferenceDate
                     let offset = CGFloat(t * Double(Self.speed)).truncatingRemainder(dividingBy: cycle)
                     HStack(spacing: Self.gap) { label; label }
@@ -226,6 +231,8 @@ private struct Ticker: View {
             } else {
                 label.offset(x: Self.inset)
             }
+            }
+            .frame(width: geo.size.width, height: geo.size.height, alignment: .leading)
         }
         .clipped()
         .background { measure }
