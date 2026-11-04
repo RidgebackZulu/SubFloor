@@ -58,7 +58,7 @@ struct ScheduleEditor: View {
                 }
                 DatePicker("Start", selection: startBinding, displayedComponents: .hourAndMinute)
                     .environment(\.timeZone, zone)
-                TextField("Duration (minutes)", value: $draft.durationMinutes, format: .number)
+                TextField("Duration (minutes)", text: $draft.duration)
                 TextField("Time zone", text: $draft.timeZone)
                     .help("The zone the start time is in: UTC or an IANA name like America/Chicago")
                 Picker("Repeats", selection: $draft.repeats) {

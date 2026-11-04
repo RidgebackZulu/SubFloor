@@ -126,17 +126,10 @@ extension SubFloorTools {
         s.kind == .broadcast ? w.start.addingTimeInterval(ScheduleClock.broadcastLead) : w.start
     }
 
-    /// `s`'s next window that opens after now, or nil when disabled or none is left. A window already under way
-    /// (running, paused for a broadcast, stopped by the owner or turned away) is passed over.
+    /// `s`'s next window that opens after now (`ScheduleClock.upcomingWindow`), or nil when disabled or none is left.
     private func upcomingWindow(_ s: Schedule) -> DateInterval? {
         guard s.enabled else { return nil }
-        let now = model.scheduler.now()
-        var after = now
-        while let w = ScheduleClock.nextWindow(of: s, after: after) {
-            if w.start > now { return w }
-            after = w.end
-        }
-        return nil
+        return ScheduleClock.upcomingWindow(of: s, after: model.scheduler.now())
     }
 
     /// The scheduled start of `s`'s next run (`upcomingWindow`).

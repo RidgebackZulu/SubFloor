@@ -157,7 +157,8 @@ struct ScheduleDraft: Equatable {
     var highKHz = ""
     var mode: ScheduleMode = .am
     var start = TimeOfDay(hour: 20, minute: 0)
-    var durationMinutes = 30
+    /// Minutes, as typed: the field is text, so Save sees what's in it even before the field commits.
+    var duration = "30"
     var repeats: Repeat = .weekly
     var weekdays: Set<Weekday> = Set(Weekday.allCases)
     var ordinal = 1
@@ -185,7 +186,7 @@ struct ScheduleDraft: Equatable {
         highKHz = s.highHz.map(kHzText) ?? ""
         mode = s.mode
         start = s.start
-        durationMinutes = s.durationMinutes
+        duration = String(s.durationMinutes)
         timeZone = s.timeZone
         enabled = s.enabled
         marginDb = Double(s.squelchMarginDb)
@@ -201,6 +202,11 @@ struct ScheduleDraft: Equatable {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { throw bad("name can't be empty.") }
         if let problem = Scheduler.timeZoneProblem(timeZone) { throw bad(problem) }
+        guard let typed = Int(duration.trimmingCharacters(in: .whitespaces)) else {
+            throw bad("Duration is in whole minutes, e.g. 30.")
+        }
+        // Capped so the live overlap check can't overflow; `Scheduler.validate` gives the real limits.
+        let durationMinutes = min(typed, 1_000_000)
 
         func khz(_ text: String) -> Double? {
             Double(text.trimmingCharacters(in: .whitespaces)).map { ($0 * 1000).rounded() }

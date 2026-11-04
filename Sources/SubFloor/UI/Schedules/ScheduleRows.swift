@@ -115,7 +115,7 @@ struct ScheduleRow: Identifiable, Equatable {
     let tuning: String
     /// Local days and times, UTC in brackets.
     let when: String
-    /// "Fri 6 Nov 19:00", or "—" when off or there's none.
+    /// "Fri 6 Nov 19:00", or "—" when off or there's none. A window under way is passed over, as the MCP tools do.
     let nextRun: String
     /// "you" or the agent's client name.
     let addedBy: String
@@ -138,7 +138,7 @@ struct ScheduleRow: Identifiable, Equatable {
             tuning = "\(kHzText(s.lowHz ?? 0))–\(kHzText(s.highHz ?? 0)) kHz · \(s.mode.label)"
         }
         when = ScheduleWhen.text(of: s, now: now, zone: zone)
-        if s.enabled, let w = ScheduleClock.nextWindow(of: s, after: now) {
+        if s.enabled, let w = ScheduleClock.upcomingWindow(of: s, after: now) {
             let start = w.start.addingTimeInterval(s.kind == .broadcast ? ScheduleClock.broadcastLead : 0)
             nextRun = ScheduleWhen.runStart(start, in: zone)
         } else {

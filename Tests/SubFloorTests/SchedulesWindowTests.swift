@@ -76,6 +76,14 @@ struct SchedulesWindowTests {
         #expect(row(utc).nextRun == "Fri 6 Nov 19:00")
     }
 
+    @Test func nextSkipsAWindowUnderWay() {
+        // 11:00–13:00 daily in Dallas, and it's noon: the next run is tomorrow's, as the MCP tools say.
+        let daily = schedule(start: TimeOfDay(hour: 11, minute: 0), minutes: 120, days: .weekly(Set(Weekday.allCases)))
+        #expect(row(daily).nextRun == "Thu 5 Nov 11:00")
+        #expect(ScheduleClock.upcomingWindow(of: daily, after: Self.noon)?.start
+                == ISO8601DateFormatter().date(from: "2026-11-05T17:00:00Z"))
+    }
+
     @Test func rowShowsWhoAddedIt() {
         #expect(row(schedule()).addedBy == "you")
         #expect(row(schedule(addedBy: "Claude Code")).addedBy == "Claude Code")
@@ -185,7 +193,7 @@ struct SchedulesWindowTests {
         var d = ScheduleDraft(zone: Self.dallas, now: Self.noon)
         d.name = name
         d.frequencies = "6000, 6100.5"
-        d.durationMinutes = 30
+        d.duration = "30"
         return d
     }
 
@@ -218,7 +226,7 @@ struct SchedulesWindowTests {
         #expect(Scheduler.timeZoneProblem("UTC") == nil && Scheduler.timeZoneProblem("America/Chicago") == nil)
         d = draft("Trans World Radio")
         #expect(m.save(d, replacing: nil) == "The owner doesn't want religious broadcasts.")
-        d = draft(); d.durationMinutes = 7 * 60
+        d = draft(); d.duration = "420"
         #expect(m.save(d, replacing: nil) == "A broadcast can be at most 6 hours.")
         d = draft(); d.frequencies = "9 kHz"
         #expect(m.save(d, replacing: nil) == "Frequencies are in kHz, comma-separated, e.g. 9435, 9455.")
@@ -230,6 +238,22 @@ struct SchedulesWindowTests {
         #expect(m.save(d, replacing: nil) == "Pick at least one day.")
         d = draft(); d.name = "  "
         #expect(m.save(d, replacing: nil) == "name can't be empty.")
+        d = draft(); d.duration = "half an hour"
+        #expect(m.save(d, replacing: nil) == "Duration is in whole minutes, e.g. 30.")
+        d = draft(); d.duration = ""
+        #expect(m.save(d, replacing: nil) == "Duration is in whole minutes, e.g. 30.")
+        d = draft(); d.duration = "0"
+        #expect(m.save(d, replacing: nil) == "A schedule must last at least 1 minute.")
+    }
+
+    @Test func saveUsesTheTypedDuration() throws {
+        let scheduler = makeScheduler()
+        let m = model(scheduler)
+        var d = draft()
+        d.duration = " 45 "   // typed, not yet committed by the field
+        #expect(m.save(d, replacing: nil) == nil)
+        #expect(scheduler.schedules.first?.durationMinutes == 45)
+        #expect(ScheduleDraft(try #require(scheduler.schedules.first)).duration == "45")
     }
 
     @Test func theEditorShowsOverlapsLive() throws {
@@ -238,7 +262,7 @@ struct SchedulesWindowTests {
         try scheduler.add(schedule("Night pirates"))
         var d = ScheduleDraft(zone: Self.dallas, now: Self.noon)
         d.name = "Mine"; d.kind = .watch; d.lowKHz = "6850"; d.highKHz = "7000"; d.mode = .auto
-        d.start = TimeOfDay(hour: 20, minute: 0); d.durationMinutes = 60; d.weekdays = [.fr]
+        d.start = TimeOfDay(hour: 20, minute: 0); d.duration = "60"; d.weekdays = [.fr]
         #expect(m.overlapText(for: d, replacing: nil) == "Overlaps with Night pirates")
         d.weekdays = [.mo]
         #expect(m.overlapText(for: d, replacing: nil) == nil)

@@ -49,6 +49,17 @@ public enum ScheduleClock {
         return nil
     }
 
+    /// The next window that opens after `date`. One already under way (running, paused for a broadcast, stopped by
+    /// the owner or turned away) is passed over. The Schedules window's Next and the MCP tools' `next_run` use it.
+    public static func upcomingWindow(of s: Schedule, after date: Date) -> DateInterval? {
+        var after = date
+        while let w = nextWindow(of: s, after: after) {
+            if w.start > date { return w }
+            after = w.end
+        }
+        return nil
+    }
+
     /// A bound past which a `.once` or `endDate`-limited schedule has no windows (slack for zones and DST).
     private static func lastPossibleEnd(of s: Schedule) -> Date? {
         var calendar = Calendar(identifier: .gregorian)
