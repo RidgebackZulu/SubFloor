@@ -46,7 +46,8 @@ struct ToolError: Error {
 }
 
 /// SubFloor's tools over the app's model. Read-only tools run at once; the others run one at a time, in the
-/// order they were called (`withRadio`), except `listen`, which holds the radio only while it starts.
+/// order they were called (`withRadio`), except `listen`, which holds the radio only while it starts. During a
+/// scheduled run the tools that change the radio, and `listen`, are refused with `Scheduler.busyMessage`.
 @MainActor
 final class SubFloorTools: MCPToolProvider {
     let model: AppModel
@@ -79,7 +80,8 @@ final class SubFloorTools: MCPToolProvider {
     /// `extraTools`: a test's own tools, offered beside SubFloor's.
     init(model: AppModel, extraTools: [SubFloorTool] = []) {
         self.model = model
-        let all = Self.radioTools + Self.signalTools + Self.bookmarkTools + Self.recordingTools + Self.decodeTools + extraTools
+        let all = Self.radioTools + Self.signalTools + Self.bookmarkTools + Self.recordingTools + Self.decodeTools
+            + Self.schedulerTools + extraTools
         tools = all.map(\.descriptor)
         registry = Dictionary(all.map { ($0.descriptor.name, $0) }, uniquingKeysWith: { first, _ in first })
         ringReady = { [unowned model] seconds in
@@ -94,6 +96,9 @@ final class SubFloorTools: MCPToolProvider {
         guard let tool = registry[name] else { return .failure("Unknown tool \(name)") }
         let args = ToolArguments(arguments)
         let run = { () async -> MCPToolResult in
+            // A scheduled run has the radio: nothing that changes it, or listens to it, runs meanwhile (checked once
+            // the call has the lock, since a run may have started while it waited).
+            if tool.locksRadio || name == "listen", let busy = self.model.scheduler.busyMessage { return .failure(busy) }
             // Only a tool that changes the radio, run under the lock, can be the change: whatever else changed
             // while a read or a listen was waiting was someone else's doing.
             let before = tool.locksRadio ? self.radioState : nil

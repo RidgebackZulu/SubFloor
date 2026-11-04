@@ -12,7 +12,10 @@ extension SubFloorTools {
                 SubFloor's radio state in one call: running, source (rsp1b, demo or iq_file) and device; VFO, \
                 capture centre and span (Hz); mode and bandwidth; HamItUp on and its LO; squelch on and level, and \
                 the signal level now (dBFS, null while stopped); recording and Auto state; decoder mode; \
-                transcription on and key present; connected MCP clients. Call this first.
+                transcription on and key present; connected MCP clients; scheduler {on (the owner's switch), next \
+                ({name, starts (ISO 8601 UTC), frequency_khz; for a watch low_khz and high_khz} or null), running \
+                ({name, kind, until} or null: while a schedule runs, tools that change the radio are refused)}. \
+                Call this first.
                 """) { t, _, _ in t.status() },
 
             SubFloorTool("start_radio", title: "Start radio", readOnly: false, description: """
@@ -107,6 +110,7 @@ extension SubFloorTools {
             "decoder": .string(m.modemSettings.mode?.rawValue ?? "off"),
             "transcription": .object(["on": .bool(m.transcriptionSettings.enabled), "has_key": .bool(m.hasAPIKey)]),
             "mcp_clients": .array(connectedClients().map { .string($0) }),
+            "scheduler": schedulerStatusJSON,
         ]
     }
 

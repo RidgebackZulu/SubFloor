@@ -1,6 +1,7 @@
 import DSPCore
 import Foundation
 import Recording
+import Scheduling
 import SDRplayKit
 import SignalID
 import SubFloorCore
@@ -390,6 +391,35 @@ struct MCPSignalToolsTests {
         #expect(auto.content == exact)
         #expect(Tuning(m) == before)
         m.autoRecordEnabled = false
+    }
+
+    /// A scheduled run that takes the radio mid-scan stops it, and the scan leaves the radio to the run.
+    @Test func scanStopsWhenAScheduleTakesTheRadio() async {
+        guard let (m, tools) = runningModel() else { return }
+        defer { m.shutdown() }
+        m.tune(to: 7_150_000)
+        let span = m.sampleRate
+        let from = 6_000_000.0
+        tools.scanSpectrum = { Self.spectrum(of: m, lines: [from + 0.4 * span, from + 1.3 * span]) }
+        let s = Schedule(kind: .broadcast, name: "Voice of Test", frequenciesHz: [10_000_000], mode: .am,
+                         start: TimeOfDay(hour: 0, minute: 0), durationMinutes: 30, timeZone: "UTC",
+                         days: .weekly(Set(Weekday.allCases)), created: Date())
+        let calls = Shared(0)
+        tools.ringReady = { _ in
+            let n = calls.withLock { n -> Int in n += 1; return n }
+            if n == 2 { m.scheduler.startRun(s, window: DateInterval(start: Date(), duration: 600), early: false) }
+            return true
+        }
+        let r = await call(tools, "identify_signals", ["from_hz": .number(from), "to_hz": .number(from + 2.5 * span)])
+        #expect(!r.isError, "\(r.content)")
+        #expect(r.structured?["stopped_early"]?.string == "a schedule took the radio")
+        #expect(r.structured?["restored"]?.bool == false)
+        // A stepped scan asked for while the run has the radio is refused with what the scheduler is doing.
+        let again = await call(tools, "identify_signals", ["from_hz": .number(from), "to_hz": .number(from + 2.5 * span)])
+        #expect(again.isError)
+        #expect(again.content == m.scheduler.busyMessage)
+        m.scheduler.endRun(.stoppedByYou)
+        await m.scheduler.runTask?.value
     }
 
     @Test func scanStopsWhenTheOwnerRetunes() async {

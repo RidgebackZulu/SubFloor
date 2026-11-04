@@ -40,8 +40,9 @@ extension SubFloorTools {
                 transcribe: false skips it, and note says why there is none). keep: true saves the clip as a \
                 recording in the owner's Recordings and returns its file. Needs the radio running. If the owner \
                 or another agent retunes, changes mode or stops the radio meanwhile, it stops early and returns \
-                {interrupted} saying what changed and by whom, e.g. "retuned to 7.2 MHz by the owner". Returns {seconds, level_dbfs, squelch_open_seconds, transcribed, transcript?, note?, \
-                file?}.
+                {interrupted} saying what changed and by whom, e.g. "retuned to 7.2 MHz by the owner", or "a \
+                schedule took the radio"; it is refused while a schedule runs. Returns {seconds, level_dbfs, \
+                squelch_open_seconds, transcribed, transcript?, note?, file?}.
                 """, properties: [
                     "seconds": .schema("number", "How long to listen, 2–60 s (default 15)."),
                     "transcribe": .schema("boolean", "false: no transcript (default true, if the owner allows)."),
@@ -116,11 +117,15 @@ extension SubFloorTools {
     // MARK: Listen
 
     static let listenSeconds: ClosedRange<Double> = 2...60
+    /// What a `listen` or scan a scheduled run cut short says.
+    static let scheduleTookTheRadio = "a schedule took the radio"
     /// How often `listen` samples the signal level and checks the tuning.
     static let listenPoll: Duration = .milliseconds(200)
 
-    /// Why `listen` must stop, if the owner or an agent changed the radio from `start` since `since`.
-    private func interruption(from start: RadioState, since: Date) -> String? {
+    /// Why `listen` must stop, if a schedule took the radio since `scheduleSince` (the scheduler's clock), or the owner
+    /// or an agent changed the radio from `start` since `since`.
+    private func interruption(from start: RadioState, since: Date, scheduleSince: Date) -> String? {
+        if let taken = model.scheduler.radioTakenAt, taken >= scheduleSince { return Self.scheduleTookTheRadio }
         let now = radioState
         guard now != start else { return nil }
         let who = changedBy(now, since: since)
@@ -136,16 +141,17 @@ extension SubFloorTools {
         let m = model, tap = m.engine.audioTap
         // The radio lock only to start: after the changes queued before this call, and not in the way of those
         // that come while it listens, which interrupt it.
-        let (initial, mark, start) = try await withRadio { () throws -> (RadioState, AudioTap.Mark, Date) in
+        let (initial, mark, start, scheduleStart) = try await withRadio { () throws -> (RadioState, AudioTap.Mark, Date, Date) in
+            if let busy = m.scheduler.busyMessage { throw ToolError(busy) }   // a run began while this waited
             try requireRunning()
-            return (radioState, tap.mark(), Date())
+            return (radioState, tap.mark(), Date(), m.scheduler.now())
         }
         let vfo = initial.vfoHz, mode = initial.mode
         let end = ContinuousClock.now + .milliseconds(Int(seconds * 1000))
         var levels: [Float] = []
         while ContinuousClock.now < end {
             do { try await Task.sleep(for: min(Self.listenPoll, end - ContinuousClock.now)) } catch { break }
-            if let why = interruption(from: initial, since: start) {
+            if let why = interruption(from: initial, since: start, scheduleSince: scheduleStart) {
                 return ["interrupted": .string(why), "seconds": .num(Self.tenths(Date().timeIntervalSince(start)))]
             }
             levels.append(m.signalDb)
