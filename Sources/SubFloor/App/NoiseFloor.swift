@@ -9,7 +9,7 @@ enum QuietSpots {
     static func pick(_ s: SpectrumSnapshot, around hz: Double, radiusHz: Double = 50_000, bandwidthHz: Double,
                      count: Int) -> [Double] {
         let n = s.average.count
-        guard n > 0, count > 0, s.spanHz > 0 else { return [] }
+        guard n > 0, count > 0, s.spanHz > 0, bandwidthHz <= radiusHz else { return [] }
         let inRadius = (0..<n).filter { abs(s.hz(ofBin: $0) - hz) <= radiusHz }
         guard !inRadius.isEmpty else { return [] }
         let sorted = inRadius.map { s.average[$0] }.sorted()
@@ -21,6 +21,9 @@ enum QuietSpots {
             let c = s.hz(ofBin: i)
             guard abs(c - s.centerHz) <= usable, abs(c - hz) >= bandwidthHz else { continue }
             if hot.contains(where: { abs($0 - c) < bandwidthHz }) { continue }
+            // The whole channel (spot ± bandwidth / 2), not only its centre bin, sits at the median.
+            let channel = (0..<n).filter { abs(s.hz(ofBin: $0) - c) <= bandwidthHz / 2 }.map { s.average[$0] }
+            guard !channel.isEmpty, abs(channel.reduce(0, +) / Float(channel.count) - median) <= 3 else { continue }
             candidates.append(c)
         }
         candidates.sort { abs($0 - hz) < abs($1 - hz) }
@@ -41,7 +44,7 @@ extension AppModel {
     /// The level is measured before the squelch gate (Receiver.process), so the squelch is left alone. The level is
     /// read from the engine's stats: `signalDb` here is a 5 Hz copy that moves only in half-dB steps.
     func measureNoiseFloor(near hz: Double, spots: Int = 3, spotSeconds: Double = 3) async -> Float? {
-        guard isRunning, let snapshot = spectrumSnapshot() else { return nil }
+        guard isRunning, let snapshot = await currentSpectrumSnapshot() else { return nil }
         let picks = QuietSpots.pick(snapshot, around: hz, bandwidthHz: bandwidthHz, count: spots)
         guard !picks.isEmpty else { return nil }
         var medians: [Float] = []
@@ -64,6 +67,18 @@ extension AppModel {
         if isRunning { setVFO(hz) }
         guard completed, !medians.isEmpty else { return nil }
         return Self.median(medians)
+    }
+
+    /// The latest spectrum frame once it is of the current capture (its centre and span as the model's), polling for
+    /// up to a second after a retune; nil when none arrives or the task is cancelled.
+    private func currentSpectrumSnapshot() async -> SpectrumSnapshot? {
+        let end = Date().addingTimeInterval(1)
+        while isRunning, !Task.isCancelled {
+            if let s = spectrumSnapshot(), abs(s.centerHz - centerHz) < 1, abs(s.spanHz - sampleRate) < 1 { return s }
+            guard Date() < end else { return nil }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        return nil
     }
 
     private static func median(_ values: [Float]) -> Float {

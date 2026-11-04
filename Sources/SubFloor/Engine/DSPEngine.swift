@@ -24,14 +24,17 @@ final class SpectrumFrameStore: @unchecked Sendable {
         var average: [Float] = []
         var peak: [Float] = []
         var centerHz = Double.nan
+        var spanHz = Double.nan
     }
 
     private let state = Mutex(Frame())
 
     /// `centerHz`: the capture centre (display Hz) the frame was measured at, NaN if unknown.
-    func publish(average: [Float], peak: [Float], centerHz: Double = .nan) {
+    /// `spanHz`: the capture span (the sample rate) of the frame, NaN if unknown.
+    func publish(average: [Float], peak: [Float], centerHz: Double = .nan, spanHz: Double = .nan) {
         state.withLock { f in
             f.centerHz = centerHz
+            f.spanHz = spanHz
             if f.average.count != average.count {
                 f.average = average
                 f.peak = peak
@@ -49,7 +52,7 @@ final class SpectrumFrameStore: @unchecked Sendable {
     }
 
     /// As `read`, with the capture centre the frame was measured at (NaN if unknown).
-    func readFrame(after sequence: UInt64, average: inout [Float], peak: inout [Float]) -> (sequence: UInt64, centerHz: Double)? {
+    func readFrame(after sequence: UInt64, average: inout [Float], peak: inout [Float]) -> (sequence: UInt64, centerHz: Double, spanHz: Double)? {
         state.withLock { f in
             guard f.sequence != sequence, !f.average.isEmpty else { return nil }
             if average.count != f.average.count {
@@ -59,7 +62,7 @@ final class SpectrumFrameStore: @unchecked Sendable {
                 average.withUnsafeMutableBufferPointer { d in f.average.withUnsafeBufferPointer { d.baseAddress!.update(from: $0.baseAddress!, count: $0.count) } }
                 peak.withUnsafeMutableBufferPointer { d in f.peak.withUnsafeBufferPointer { d.baseAddress!.update(from: $0.baseAddress!, count: $0.count) } }
             }
-            return (f.sequence, f.centerHz)
+            return (f.sequence, f.centerHz, f.spanHz)
         }
     }
 }
@@ -496,7 +499,7 @@ final class DSPEngine: @unchecked Sendable {
                 }
                 linear.withUnsafeBufferPointer { src in db.withUnsafeMutableBufferPointer { analyzer.process(src, into: $0) } }
                 db.withUnsafeBufferPointer { averager.add($0) }
-                frames.publish(average: averager.average, peak: averager.peak, centerHz: frameCenter)
+                frames.publish(average: averager.average, peak: averager.peak, centerHz: frameCenter, spanHz: sampleRate)
             }
 
             // Audio.

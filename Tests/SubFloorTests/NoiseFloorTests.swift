@@ -39,6 +39,30 @@ struct NoiseFloorTests {
         #expect(abs(spots[0] - hz) <= 5_000 + 1_000)
     }
 
+    @Test func quietSpotsStayInsideTheUsableWindowOfAnOffCentreSnapshot() {
+        // Centre 10.2 MHz: the window is 9.7...10.7 MHz, usable 9.75...10.65 MHz; hz is near its lower edge.
+        let a = [Float](repeating: -100, count: 1000)
+        let s = SpectrumSnapshot(centerHz: 10_200_000, spanHz: 1_000_000, average: a)
+        let spots = QuietSpots.pick(s, around: 9_760_000, radiusHz: 50_000, bandwidthHz: 5_000, count: 10)
+        #expect(!spots.isEmpty)
+        for spot in spots { #expect(abs(spot - 10_200_000) <= 450_000) }
+    }
+
+    @Test func aChannelOnASkirtIsRejected() {
+        // Centre bin at the median, but the bins either side (inside the channel) are +5 dB.
+        var a = [Float](repeating: -100, count: 1000)
+        for i in 0..<1000 where abs(i - 520) >= 1 && abs(i - 520) <= 4 { a[i] = -95 }
+        let s = SpectrumSnapshot(centerHz: 10_000_000, spanHz: 1_000_000, average: a)
+        let spots = QuietSpots.pick(s, around: s.hz(ofBin: 500), radiusHz: 50_000, bandwidthHz: 9_000, count: 20)
+        #expect(!spots.contains(s.hz(ofBin: 520)))
+        #expect(!spots.isEmpty)
+    }
+
+    @Test func noSpotsWhenTheBandwidthExceedsTheRadius() {
+        let s = flat()
+        #expect(QuietSpots.pick(s, around: s.hz(ofBin: 500), radiusHz: 5_000, bandwidthHz: 10_000, count: 3).isEmpty)
+    }
+
     private func tempDir() -> URL {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("SubFloorNoiseFloor-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -108,5 +132,26 @@ struct NoiseFloorTests {
         let before = m.vfoHz
         _ = await m.measureNoiseFloor(near: before, spotSeconds: 1)
         #expect(m.vfoHz == before)
+    }
+
+    @Test func measuresRightAfterATuneAcrossARetune() async {
+        guard let m = await runningModel() else { return }
+        defer { m.shutdown() }
+        let before = m.centerHz
+        m.tune(to: 10_900_000)   // beyond the usable part of the 10 MHz capture: the hardware centre moves
+        let centre = m.centerHz
+        #expect(centre != before)
+        let floor = await m.measureNoiseFloor(near: 10_900_000, spotSeconds: 1)
+        #expect(floor != nil)
+        #expect(m.centerHz == centre)
+        #expect(m.vfoHz == 10_900_000)
+    }
+
+    @Test func noFloorWhenNoSpotExists() async {
+        guard let m = await runningModel() else { return }
+        defer { m.shutdown() }
+        // Asking for no spots leaves nothing to measure.
+        let floor = await m.measureNoiseFloor(near: 10_000_000, spots: 0, spotSeconds: 1)
+        #expect(floor == nil)
     }
 }

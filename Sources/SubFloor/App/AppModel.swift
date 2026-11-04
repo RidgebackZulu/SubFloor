@@ -1190,7 +1190,7 @@ final class AppModel {
     func spectrumSnapshot() -> SpectrumSnapshot? {
         var average: [Float] = [], peak: [Float] = []
         guard let frame = engine.frames.readFrame(after: 0, average: &average, peak: &peak) else { return nil }
-        return SpectrumSnapshot(centerHz: frame.centerHz.isFinite ? frame.centerHz : centerHz, spanHz: sampleRate,
+        return SpectrumSnapshot(centerHz: frame.centerHz.isFinite ? frame.centerHz : centerHz, spanHz: frame.spanHz.isFinite ? frame.spanHz : sampleRate,
                                 average: average)
     }
 
