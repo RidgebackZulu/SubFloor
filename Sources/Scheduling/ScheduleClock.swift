@@ -39,6 +39,7 @@ public enum ScheduleClock {
     /// The first window whose end is after `date` (it may already have begun), searching 400 days ahead in
     /// growing chunks so a frequent schedule answers from the first few days.
     public static func nextWindow(of s: Schedule, after date: Date) -> DateInterval? {
+        if let last = lastPossibleEnd(of: s), last < date { return nil }
         var from = date
         for days in [8, 32, 360] {
             let to = from.addingTimeInterval(TimeInterval(days) * 86_400)
@@ -46,6 +47,20 @@ public enum ScheduleClock {
             from = to
         }
         return nil
+    }
+
+    /// A bound past which a `.once` or `endDate`-limited schedule has no windows (slack for zones and DST).
+    private static func lastPossibleEnd(of s: Schedule) -> Date? {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(identifier: s.timeZone) ?? TimeZone(identifier: "UTC")!
+        var lastDay: ScheduleDate?
+        if case .once(let only) = s.days { lastDay = only }
+        if let end = s.endDate, lastDay == nil || key(end) < key(lastDay!) { lastDay = end }
+        guard let d = lastDay,
+              let noon = calendar.date(from: DateComponents(year: d.year, month: d.month, day: d.day, hour: 12))
+        else { return nil }
+        let reach = TimeInterval(max(0, s.durationMinutes) * 60) + broadcastLag
+        return noon.addingTimeInterval(2 * 86_400 + reach)
     }
 
     private static func runs(_ s: Schedule, on d: ScheduleDate, calendar: Calendar) -> Bool {

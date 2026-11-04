@@ -212,11 +212,23 @@ private func tick(_ schedules: [Schedule], on: Bool = true, now: String, lastTic
         #expect(launch == [.start(cuba.id, window: window(cuba, at: utc("2026-11-03T21:31:00Z")), late: true)])
     }
 
-    @Test func backToBackSameMomentBothWaitTheirTurn() {
+    @Test func sameMomentLiveBroadcastStartsAheadOfOneInItsLeadMinute() {
         let korea = make("Korea", hour: 21, minutes: 30, created: "2026-10-01T00:00:00Z")
-        let cuba = make("Cuba", hour: 21, minute: 30, minutes: 30, created: "2026-09-01T00:00:00Z")
-        let actions = tick([korea, cuba], now: "2026-11-03T21:29:30Z", lastTick: "2026-11-03T21:29:29Z")
-        #expect(actions.count == 1)        // one starts, the other is not logged overlapped
+        let cuba = make("Cuba", hour: 21, minute: 30, minutes: 30, created: "2026-09-01T00:00:00Z")   // earlier created
+        let first = tick([korea, cuba], now: "2026-11-03T21:29:30Z", lastTick: "2026-11-03T21:29:29Z")
+        #expect(first == [.start(korea.id, window: window(korea, at: utc("2026-11-03T21:29:30Z")), late: true)])
+        let running = run(korea, at: utc("2026-11-03T21:29:30Z"))
+        let handover = tick([korea, cuba], now: "2026-11-03T21:30:00Z", lastTick: "2026-11-03T21:29:59Z", running: running)
+        #expect(handover == [.end(korea.id), .start(cuba.id, window: window(cuba, at: utc("2026-11-03T21:30:00Z")), late: true)])
+    }
+
+    @Test func broadcastWhoseTailIsAllThatIsLeftOnWakingIsMissedOnce() {
+        let b = make("Korea", hour: 21, days: .once(.init(year: 2026, month: 11, day: 3)))   // 20:59 – 22:02, scheduled 21:00 – 22:00
+        let wake = tick([b], now: "2026-11-03T22:01:00Z", lastTick: "2026-11-03T20:00:00Z")
+        #expect(wake == [.log(b.id, .missedAsleep, at: utc("2026-11-03T20:59:00Z"))])
+        #expect(tick([b], now: "2026-11-03T22:01:01Z", lastTick: "2026-11-03T22:01:00Z").isEmpty)
+        let launch = tick([b], now: "2026-11-03T22:01:00Z", lastTick: nil, lastAlive: "2026-11-03T20:00:00Z")
+        #expect(launch == [.log(b.id, .missedNotRunning, at: utc("2026-11-03T20:59:00Z"))])
     }
 
     @Test func broadcastPastItsScheduledEndIsNotStartedLate() {

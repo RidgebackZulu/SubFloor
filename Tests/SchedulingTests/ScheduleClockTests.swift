@@ -104,4 +104,15 @@ private func schedule(kind: ScheduleKind = .broadcast, start: TimeOfDay, minutes
             #expect(s.tag == ScheduleTag(id: s.id, name: "Test"))
         }
     }
+
+    @Test func deadSchedulesHaveNoNextWindow() {
+        let once = schedule(start: .init(hour: 21, minute: 0), minutes: 30, days: .once(ScheduleDate(year: 2026, month: 10, day: 1)))
+        #expect(ScheduleClock.nextWindow(of: once, after: utc("2026-11-03T00:00:00Z")) == nil)
+        let ended = schedule(start: .init(hour: 21, minute: 0), minutes: 30, days: .weekly(Set(Weekday.allCases)),
+                             endDate: ScheduleDate(year: 2026, month: 10, day: 1))
+        #expect(ScheduleClock.nextWindow(of: ended, after: utc("2026-11-03T00:00:00Z")) == nil)
+        let live = schedule(start: .init(hour: 21, minute: 0), minutes: 30, days: .weekly(Set(Weekday.allCases)),
+                            endDate: ScheduleDate(year: 2026, month: 11, day: 5))
+        #expect(ScheduleClock.nextWindow(of: live, after: utc("2026-11-03T00:00:00Z")) != nil)
+    }
 }

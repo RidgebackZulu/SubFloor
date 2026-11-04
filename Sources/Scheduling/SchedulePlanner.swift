@@ -60,9 +60,14 @@ public enum SchedulePlanner {
                 candidates.append((s, w))
             }
         }
-        // Broadcasts first, then the earlier `created`.
+        // Broadcasts first; one on air by its scheduled time ahead of one still in its lead minute; then the
+        // earlier `created`.
+        func live(_ c: (schedule: Schedule, window: DateInterval)) -> Bool {
+            c.schedule.kind == .watch || nominal(c.window, .broadcast).start <= now
+        }
         candidates.sort {
             if $0.schedule.kind != $1.schedule.kind { return $0.schedule.kind == .broadcast }
+            if live($0) != live($1) { return live($0) }
             if $0.schedule.created != $1.schedule.created { return $0.schedule.created < $1.schedule.created }
             return $0.schedule.id.uuidString < $1.schedule.id.uuidString
         }
@@ -74,7 +79,8 @@ public enum SchedulePlanner {
             holder = nil
         }
 
-        // Windows that came and went unrun, whole: they started inside the gap and ended by now.
+        // Windows that came and went unrun, whole: they started inside the gap and (for a broadcast, by its scheduled
+        // end) were over by now.
         let missedFrom: Date?
         let missedOutcome: RunOutcome
         if let lastTick {
@@ -87,7 +93,7 @@ public enum SchedulePlanner {
         if let from = missedFrom, from < now {
             var missed: [(Date, UUID)] = []
             for s in enabled {
-                for w in ScheduleClock.windows(of: s, from: from, to: now) where w.start >= from && w.end <= now {
+                for w in ScheduleClock.windows(of: s, from: from, to: now) where w.start >= from && nominal(w, s.kind).end <= now {
                     let isRunning = running?.scheduleID == s.id && running?.window == w
                     if !isRunning && !settled.contains(RunKey(scheduleID: s.id, window: w)) { missed.append((w.start, s.id)) }
                 }
