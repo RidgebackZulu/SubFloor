@@ -34,6 +34,30 @@ enum QuietSpots {
         }
         return chosen
     }
+
+    /// Where to estimate the floor when no spot is quiet: the channel at the 20th percentile of the channel levels
+    /// within ±`radiusHz` of `hz`. A channel is a bin's frequency with its level the mean of the bins within
+    /// ±`bandwidthHz` / 2 (as `pick` reads a channel); it lies in the capture's usable part and at least `bandwidthHz`
+    /// from `hz`. The floor is then read as `signalDb` on it, which is already a channel power, so no conversion from
+    /// bin levels is needed; the 20th percentile rather than the lowest keeps a dip (a filter edge) from passing for
+    /// the floor. Nil when there is no such channel.
+    static func lowSpot(_ s: SpectrumSnapshot, around hz: Double, radiusHz: Double = 50_000,
+                        bandwidthHz: Double) -> Double? {
+        let n = s.average.count
+        guard n > 0, s.spanHz > 0, bandwidthHz <= radiusHz else { return nil }
+        let usable = s.spanHz * 0.45
+        var channels: [(hz: Double, level: Float)] = []
+        for i in 0..<n {
+            let c = s.hz(ofBin: i)
+            guard abs(c - hz) <= radiusHz, abs(c - s.centerHz) <= usable, abs(c - hz) >= bandwidthHz else { continue }
+            let levels = (0..<n).filter { abs(s.hz(ofBin: $0) - c) <= bandwidthHz / 2 }.map { s.average[$0] }
+            guard !levels.isEmpty else { continue }
+            channels.append((c, levels.reduce(0, +) / Float(levels.count)))
+        }
+        guard !channels.isEmpty else { return nil }
+        channels.sort { $0.level != $1.level ? $0.level < $1.level : abs($0.hz - hz) < abs($1.hz - hz) }
+        return channels[channels.count / 5].hz
+    }
 }
 
 extension AppModel {
@@ -50,8 +74,17 @@ extension AppModel {
                            radiusHz: Double = 50_000) async -> Float? {
         let start = (vfo: vfoHz, centre: centerHz)   // waiting for a frame, the owner may retune
         guard isRunning, let snapshot = await currentSpectrumSnapshot() else { return nil }
-        let picks = QuietSpots.pick(snapshot, around: hz, radiusHz: radiusHz, bandwidthHz: bandwidthHz, count: spots)
+        let picks = quietSpots(snapshot, hz, radiusHz, bandwidthHz, spots)
         return await readFloor(on: picks, returningTo: hz, spotSeconds: spotSeconds, from: start)
+    }
+
+    /// When no spot near `hz` is quiet: the level read for `spotSeconds` on the channel `QuietSpots.lowSpot` picks
+    /// within 50 kHz, with the VFO back on `hz` after, as `measureNoiseFloor` does. Nil when there is none or it stops.
+    func estimateNoiseFloor(near hz: Double, spotSeconds: Double = 3) async -> Float? {
+        let start = (vfo: vfoHz, centre: centerHz)
+        guard isRunning, let snapshot = await currentSpectrumSnapshot(),
+              let spot = lowSpot(snapshot, hz, bandwidthHz) else { return nil }
+        return await readFloor(on: [spot], returningTo: hz, spotSeconds: spotSeconds, from: start)
     }
 
     /// The median of the channel level read on each of `spots` (after half of `spotSeconds` to settle), then the VFO

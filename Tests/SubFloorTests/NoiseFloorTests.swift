@@ -63,6 +63,16 @@ struct NoiseFloorTests {
         #expect(QuietSpots.pick(s, around: s.hz(ofBin: 500), radiusHz: 5_000, bandwidthHz: 10_000, count: 3).isEmpty)
     }
 
+    @Test func lowSpotIsTheQuietestFifthOfTheChannels() {
+        // Levels rise 0.1 dB a bin, so the channels near 10 MHz sort by bin: the 92 within ±50 kHz (and 5 kHz or more
+        // from it) put the 20th percentile on the 19th from the bottom, bin 468.
+        let a = (0..<1000).map { Float(-150) + Float($0) * 0.1 }
+        let s = SpectrumSnapshot(centerHz: 10_000_000, spanHz: 1_000_000, average: a)
+        let spot = QuietSpots.lowSpot(s, around: s.hz(ofBin: 500), bandwidthHz: 5_000)
+        #expect(spot == s.hz(ofBin: 468))
+        #expect(QuietSpots.lowSpot(s, around: s.hz(ofBin: 500), radiusHz: 5_000, bandwidthHz: 10_000) == nil)
+    }
+
     private func tempDir() -> URL {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("SubFloorNoiseFloor-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
@@ -180,6 +190,19 @@ struct NoiseFloorTests {
         task.cancel()
         #expect(await task.value == nil)
         #expect(m.vfoHz == spot)
+    }
+
+    @Test func theEstimateReadsTheLevelOnALowChannel() async {
+        guard let m = await runningModel() else { return }
+        defer { m.shutdown() }
+        let ref = await reference(m, at: 10_300_000)
+        m.quietSpots = { _, _, _, _, _ in [] }   // no quiet spot anywhere
+        m.setVFO(10_300_000)
+        #expect(await m.measureNoiseFloor(near: 10_300_000, spotSeconds: 1) == nil)
+        let estimate = await m.estimateNoiseFloor(near: 10_300_000, spotSeconds: 1)
+        #expect(estimate != nil)
+        if let estimate { #expect(abs(estimate - ref) < 3) }
+        #expect(m.vfoHz == 10_300_000)
     }
 
     @Test func noFloorWhenNoSpotExists() async {

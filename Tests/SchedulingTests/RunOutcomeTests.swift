@@ -1,3 +1,4 @@
+import Foundation
 import Testing
 @testable import Scheduling
 
@@ -15,6 +16,12 @@ import Testing
     #expect(RunOutcome.overlapped(with: "Radio Habana Cuba").text == "Overlapped with Radio Habana Cuba")
     #expect(RunOutcome.rspLost(afterSeconds: 12 * 60).text == "The RSP disconnected after 12 min")
     #expect(RunOutcome.lowDisk.text == "Stopped: less than 100 MB free")
+    #expect(RunOutcome.noFloor.text == "Not recorded: no quiet spot to measure the noise floor")
+}
+
+@Test func noFloorRoundTrips() throws {
+    let data = try JSONEncoder().encode(LastRun(outcome: .noFloor, at: Date(timeIntervalSince1970: 0)))
+    #expect(try JSONDecoder().decode(LastRun.self, from: data).outcome == .noFloor)
 }
 
 @Test func hugeOrOddLengthsDoNotTrap() {

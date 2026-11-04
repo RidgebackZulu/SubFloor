@@ -18,6 +18,8 @@ final class BroadcastRun {
 
     enum EndReason: Equatable {
         case windowEnd, noRSP, rspLost, lowDisk
+        /// No floor on any frequency: nothing is recorded.
+        case noFloor
         /// The owner ended the run without touching the radio: the ticker's stop, the switch off, or the running
         /// schedule deleted, switched off or retuned.
         case stoppedByYou
@@ -168,13 +170,14 @@ final class BroadcastRun {
             guard proceed(m) else { return }
             tune(m, to: hz)
             note(m)
-            movingVFO = true
-            let floor = await m.measureNoiseFloor(near: hz, spots: frequencies.count > 1 ? 2 : 3,
-                                                  spotSeconds: timing.spotSeconds)
-            movingVFO = false
-            // The measurement puts the VFO back on `hz`; anything else is the owner's change, which ends the run.
-            guard proceed(m) else { return }
+            let floor = await broadcastFloor(m, near: hz, spots: frequencies.count > 1 ? 2 : 3, timing: timing)
+            guard live else { return }
             if let floor { floors[hz] = floor }
+        }
+        // With no floor anywhere the squelch would have nothing to stand on: nothing is recorded.
+        guard !floors.isEmpty else {
+            endReason = .noFloor
+            return
         }
 
         var chosen = frequencies[0]
@@ -193,7 +196,7 @@ final class BroadcastRun {
         guard proceed(m) else { return }
         tune(m, to: chosen)
         frequencyHz = chosen
-        // A frequency with no quiet spot near it borrows the others' floor; with none at all the squelch stays as set.
+        // A frequency with no floor borrows the others'.
         floorDb = floors[chosen] ?? Self.median(Array(floors.values))
         if let floorDb { m.squelchDb = floorDb + schedule.squelchMarginDb }
         let ownerTiming = m.recording.autoTiming
@@ -203,6 +206,25 @@ final class BroadcastRun {
                                      keepGapsUpTo: ownerTiming.keepGapsUpTo))
         note(m)
         phase = .recording
+    }
+
+    /// The floor near `hz` (the VFO there, noted): the quiet spots within 50 kHz, else within 100 kHz, else an estimate
+    /// on a low channel (`AppModel.estimateNoiseFloor`). A failed pick costs no time, so the fallbacks fit the lead.
+    /// Each attempt puts the VFO back on `hz`, and the radio is checked after it: nil, with `endReason` set, when the
+    /// run was ended or the owner changed the radio meanwhile; nil with the run going on when there's no floor.
+    private func broadcastFloor(_ m: AppModel, near hz: Double, spots: Int, timing: Scheduler.Timing) async -> Float? {
+        for attempt in 0..<3 {
+            movingVFO = true
+            let floor = switch attempt {
+            case 0: await m.measureNoiseFloor(near: hz, spots: spots, spotSeconds: timing.spotSeconds)
+            case 1: await m.measureNoiseFloor(near: hz, spots: spots, spotSeconds: timing.spotSeconds, radiusHz: 100_000)
+            default: await m.estimateNoiseFloor(near: hz, spotSeconds: timing.spotSeconds)
+            }
+            movingVFO = false
+            guard proceed(m) else { return nil }
+            if let floor { return floor }
+        }
+        return nil
     }
 
     /// The radio as the run has just left it.
@@ -347,6 +369,7 @@ final class BroadcastRun {
         case .noRSP: .missedNoRSP
         case .rspLost: .rspLost(afterSeconds: now.timeIntervalSince(takenAt))
         case .lowDisk: .lowDisk
+        case .noFloor: .noFloor
         case .preempted: nil
         }
     }

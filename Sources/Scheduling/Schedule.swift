@@ -63,6 +63,8 @@ public enum RunOutcome: Codable, Hashable, Sendable {
     case overlapped(with: String)
     case rspLost(afterSeconds: Double)
     case lowDisk
+    /// A broadcast with no floor on any of its frequencies: its squelch would have nothing to stand on.
+    case noFloor
 
     /// The row's text. Minutes round to the nearest whole minute, 1 to 1,000,000 (clamped before `Int()`, which traps
     /// outside its range; NaN reads as 1).
@@ -82,6 +84,7 @@ public enum RunOutcome: Codable, Hashable, Sendable {
         case .overlapped(let name): return "Overlapped with \(name)"
         case .rspLost(let seconds): return "The RSP disconnected after \(minutes(seconds)) min"
         case .lowDisk: return "Stopped: less than 100 MB free"
+        case .noFloor: return "Not recorded: no quiet spot to measure the noise floor"
         }
     }
 }

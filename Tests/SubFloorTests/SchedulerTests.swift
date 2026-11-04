@@ -367,6 +367,53 @@ struct SchedulerTests {
         await endWindow(m, s, clock)
     }
 
+    @Test func noQuietSpotNearbyRetriesWiderThenEstimates() async throws {
+        let (m, clock) = makeModel()
+        defer { m.shutdown() }
+        guard canRun(m) else { return }
+        // None within 50 kHz, some within 100 kHz.
+        var radii: [Double] = []
+        m.quietSpots = { s, hz, radius, bandwidth, count in
+            radii.append(radius)
+            return radius < 100_000 ? [] : QuietSpots.pick(s, around: hz, radiusHz: radius, bandwidthHz: bandwidth, count: count)
+        }
+        let s = broadcast([10_000_000], clock: clock)
+        guard try await startAndRecord(m, s) else { return }
+        #expect(radii == [50_000, 100_000])
+        let floor = try #require(m.scheduler.currentRun?.floorDb)
+        #expect(abs(m.squelchDb - (floor + 8)) <= 0.5)
+        await endWindow(m, s, clock)
+
+        // None within 100 kHz either: the floor is estimated on a low channel.
+        m.quietSpots = { _, _, _, _, _ in [] }
+        let estimated = broadcast([10_000_000], name: "Estimated", clock: clock)
+        guard try await startAndRecord(m, estimated) else { return }
+        let estimate = try #require(m.scheduler.currentRun?.floorDb)
+        #expect(abs(estimate - floor) < 3)
+        #expect(abs(m.squelchDb - (estimate + 8)) <= 0.5)
+        await endWindow(m, estimated, clock)
+    }
+
+    @Test func noFloorAtAllIsNotRecorded() async throws {
+        let (m, clock) = makeModel()
+        defer { m.shutdown() }
+        guard canRun(m) else { return }
+        m.quietSpots = { _, _, _, _, _ in [] }
+        m.lowSpot = { _, _, _ in nil }
+        m.squelchDb = -95
+        let s = broadcast([10_000_000], clock: clock)
+        try m.scheduler.add(s)
+        m.scheduler.isOn = true
+        await m.scheduler.tick()
+        #expect(await wait(upTo: 40) { m.scheduler.running == nil })
+        #expect(lastRun(m, s) == .noFloor)
+        #expect(m.scheduleRecording == nil && !m.scheduleMuted)
+        #expect(m.squelchDb == -95)   // put back
+        #expect(try labelled(m, s).isEmpty)
+        await m.scheduler.tick()
+        #expect(m.scheduler.running == nil)   // the window is settled
+    }
+
     @Test func radioIsRestoredIncludingStopped() async throws {
         let (m, clock) = makeModel()
         defer { m.shutdown() }

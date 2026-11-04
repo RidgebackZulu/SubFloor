@@ -395,6 +395,15 @@ final class AppModel {
 
     /// Test hook: the free bytes on the volume recordings go to (nil: unknown).
     @ObservationIgnored var freeSpaceProbe: (URL) -> Int64? = { AppModel.freeSpace(at: $0) }
+    /// Where a noise-floor measurement listens (`QuietSpots.pick`, and `lowSpot` for an estimate); tests replace them
+    /// to have no quiet spot.
+    @ObservationIgnored var quietSpots: (SpectrumSnapshot, _ hz: Double, _ radiusHz: Double, _ bandwidthHz: Double,
+                                         _ count: Int) -> [Double] = {
+        QuietSpots.pick($0, around: $1, radiusHz: $2, bandwidthHz: $3, count: $4)
+    }
+    @ObservationIgnored var lowSpot: (SpectrumSnapshot, _ hz: Double, _ bandwidthHz: Double) -> Double? = {
+        QuietSpots.lowSpot($0, around: $1, bandwidthHz: $2)
+    }
     @ObservationIgnored private var lastDiskCheck: ContinuousClock.Instant?
     /// Under 500 MB at the last check, so the warning is shown once per crossing.
     @ObservationIgnored private var diskLow = false
