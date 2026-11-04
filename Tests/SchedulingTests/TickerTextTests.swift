@@ -41,4 +41,9 @@ private func at(_ hhmm: String) -> Date {
         let item = TickerItem(name: "Test", start: at("21:00"), frequencyHz: 6_925_500, mode: "USB")
         #expect(TickerText.text(.soon(item, secondsLeft: 60), zone: chicago) == "in 1:00 · Test · 6925.5 kHz USB · click to start now")
     }
+
+    @Test func nearlyWholeKilohertzReadsWhole() {
+        let item = TickerItem(name: "Test", start: at("21:00"), frequencyHz: 9_435_040, mode: "AM")
+        #expect(TickerText.text(.soon(item, secondsLeft: 60), zone: chicago) == "in 1:00 · Test · 9435 kHz AM · click to start now")
+    }
 }

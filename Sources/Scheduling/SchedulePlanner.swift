@@ -49,7 +49,32 @@ public enum SchedulePlanner {
         guard on else { return actions }
         let enabled = schedules.filter(\.enabled)
 
-        // Windows that came and went unrun.
+        // Windows open now that aren't already running. A broadcast whose scheduled end has passed has only its
+        // lag tail left and is not started.
+        var candidates: [(schedule: Schedule, window: DateInterval)] = []
+        for s in enabled {
+            for w in ScheduleClock.windows(of: s, from: now, to: now.addingTimeInterval(1)) where w.start <= now {
+                let isRunning = running?.scheduleID == s.id && running?.window == w
+                if isRunning || settled.contains(RunKey(scheduleID: s.id, window: w)) { continue }
+                if s.kind == .broadcast && nominal(w, .broadcast).end <= now { continue }
+                candidates.append((s, w))
+            }
+        }
+        // Broadcasts first, then the earlier `created`.
+        candidates.sort {
+            if $0.schedule.kind != $1.schedule.kind { return $0.schedule.kind == .broadcast }
+            if $0.schedule.created != $1.schedule.created { return $0.schedule.created < $1.schedule.created }
+            return $0.schedule.id.uuidString < $1.schedule.id.uuidString
+        }
+
+        // A broadcast in its lag tail makes way for the next broadcast.
+        if let r = holder, r.kind == .broadcast, nominal(r.window, .broadcast).end <= now,
+           candidates.contains(where: { $0.schedule.kind == .broadcast }) {
+            actions.append(.end(r.scheduleID))
+            holder = nil
+        }
+
+        // Windows that came and went unrun, whole: they started inside the gap and ended by now.
         let missedFrom: Date?
         let missedOutcome: RunOutcome
         if let lastTick {
@@ -62,52 +87,48 @@ public enum SchedulePlanner {
         if let from = missedFrom, from < now {
             var missed: [(Date, UUID)] = []
             for s in enabled {
-                for w in ScheduleClock.windows(of: s, from: from, to: now) where w.end > from && w.end <= now {
+                for w in ScheduleClock.windows(of: s, from: from, to: now) where w.start >= from && w.end <= now {
                     let isRunning = running?.scheduleID == s.id && running?.window == w
-                    if !isRunning && !settled.contains(RunKey(scheduleID: s.id, window: w)) {
-                        missed.append((w.end, s.id))
-                    }
+                    if !isRunning && !settled.contains(RunKey(scheduleID: s.id, window: w)) { missed.append((w.start, s.id)) }
                 }
             }
-            for (_, id) in missed.sorted(by: { $0.0 < $1.0 }) { actions.append(.log(id, missedOutcome, at: now)) }
+            for (start, id) in missed.sorted(by: { $0.0 < $1.0 }) { actions.append(.log(id, missedOutcome, at: start)) }
         }
 
-        // Windows open now that nobody is running.
-        var candidates: [(schedule: Schedule, window: DateInterval)] = []
-        for s in enabled {
-            for w in ScheduleClock.windows(of: s, from: now, to: now.addingTimeInterval(1)) where w.start <= now {
-                let isRunning = holder?.scheduleID == s.id && holder?.window == w
-                if !isRunning && !settled.contains(RunKey(scheduleID: s.id, window: w)) { candidates.append((s, w)) }
+        // Who is turned away: same-kind rivals that truly overlap. Broadcasts are judged on scheduled times, so
+        // back-to-back ones don't clash. A watch never loses to a broadcast for good: it waits, unsettled.
+        func overlapped(_ losers: some Sequence<(schedule: Schedule, window: DateInterval)>,
+                        by winnerKind: ScheduleKind, window winner: DateInterval, name: String) {
+            for l in losers where l.schedule.kind == winnerKind {
+                if winnerKind == .broadcast {
+                    let (a, b) = (nominal(l.window, .broadcast), nominal(winner, .broadcast))
+                    if !(a.start < b.end && b.start < a.end) { continue }      // touching is not overlapping
+                }
+                actions.append(.log(l.schedule.id, .overlapped(with: name), at: now))
             }
-        }
-        // Broadcasts first, then the earlier `created`.
-        candidates.sort {
-            if $0.schedule.kind != $1.schedule.kind { return $0.schedule.kind == .broadcast }
-            if $0.schedule.created != $1.schedule.created { return $0.schedule.created < $1.schedule.created }
-            return $0.schedule.id.uuidString < $1.schedule.id.uuidString
-        }
-        func overlapped(_ losers: some Sequence<(schedule: Schedule, window: DateInterval)>, with name: String) {
-            for l in losers { actions.append(.log(l.schedule.id, .overlapped(with: name), at: now)) }
         }
 
         if let current = holder {
-            let name = schedules.first { $0.id == current.scheduleID }?.name ?? ""
+            let name = schedules.first { $0.id == current.scheduleID }?.name
             if current.kind == .watch, let winner = candidates.first, winner.schedule.kind == .broadcast {
                 actions.append(.preempt(running: current.scheduleID, by: winner.schedule.id, window: winner.window))
-                overlapped(candidates.dropFirst().filter { $0.schedule.kind == .broadcast }, with: winner.schedule.name)
-            } else if current.kind == .broadcast {
-                // A preempted watch just waits; only another broadcast is turned away.
-                overlapped(candidates.filter { $0.schedule.kind == .broadcast }, with: name)
-            } else {
-                overlapped(candidates, with: name)
+                overlapped(candidates.dropFirst(), by: .broadcast, window: winner.window, name: winner.schedule.name)
+            } else if let name {
+                overlapped(candidates, by: current.kind, window: current.window, name: name)
             }
         } else if let winner = candidates.first {
             actions.append(.start(winner.schedule.id, window: winner.window,
                                   late: now.timeIntervalSince(winner.window.start) > lateAfter))
-            // A watch never loses to a broadcast for good: it waits, unsettled, and resumes late.
-            overlapped(candidates.dropFirst().filter { $0.schedule.kind == winner.schedule.kind }, with: winner.schedule.name)
+            overlapped(candidates.dropFirst(), by: winner.schedule.kind, window: winner.window, name: winner.schedule.name)
         }
         return actions
+    }
+
+    /// The scheduled times inside a window: a broadcast's window is padded by a lead and a lag.
+    private static func nominal(_ w: DateInterval, _ kind: ScheduleKind) -> DateInterval {
+        guard kind == .broadcast else { return w }
+        let start = w.start.addingTimeInterval(ScheduleClock.broadcastLead)
+        return DateInterval(start: start, end: max(start, w.end.addingTimeInterval(-ScheduleClock.broadcastLag)))
     }
 
     /// The enabled schedules that run next (windows ending after `now`, so one running now counts), up to three,
@@ -126,9 +147,7 @@ public enum SchedulePlanner {
     public static func needsKeepAwake(_ schedules: [Schedule], on: Bool, now: Date) -> Bool {
         guard on else { return false }
         let horizon = now.addingTimeInterval(24 * 3600)
-        return schedules.filter(\.enabled).contains { s in
-            ScheduleClock.nextWindow(of: s, after: now).map { $0.start <= horizon } ?? false
-        }
+        return schedules.filter(\.enabled).contains { !ScheduleClock.windows(of: $0, from: now, to: horizon).isEmpty }
     }
 
     /// The names of other enabled schedules whose windows overlap `s`'s in the next 14 days.
@@ -138,7 +157,12 @@ public enum SchedulePlanner {
         var names: [String] = []
         for other in all where other.enabled && other.id != s.id && !names.contains(other.name) {
             let theirs = ScheduleClock.windows(of: other, from: now, to: end)
-            if mine.contains(where: { a in theirs.contains { b in a.start < b.end && b.start < a.end } }) {
+            let bothBroadcasts = s.kind == .broadcast && other.kind == .broadcast
+            func shape(_ w: DateInterval) -> DateInterval { bothBroadcasts ? nominal(w, .broadcast) : w }
+            if mine.contains(where: { a in theirs.contains { b in
+                let (x, y) = (shape(a), shape(b))
+                return x.start < y.end && y.start < x.end
+            } }) {
                 names.append(other.name)
             }
         }
@@ -208,7 +232,8 @@ public enum TickerText {
 
     /// No decimals when whole, else one.
     private static func number(_ value: Double) -> String {
-        value == value.rounded() ? String(format: "%.0f", value) : String(format: "%.1f", value)
+        let tenths = (value * 10).rounded() / 10
+        return tenths == tenths.rounded() ? String(format: "%.0f", tenths) : String(format: "%.1f", tenths)
     }
 
     private static func clock(_ date: Date, _ zone: TimeZone) -> String {

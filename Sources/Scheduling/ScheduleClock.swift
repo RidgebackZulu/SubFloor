@@ -36,9 +36,16 @@ public enum ScheduleClock {
         return found
     }
 
-    /// The first window whose end is after `date` (it may already have begun), searching 400 days ahead.
+    /// The first window whose end is after `date` (it may already have begun), searching 400 days ahead in
+    /// growing chunks so a frequent schedule answers from the first few days.
     public static func nextWindow(of s: Schedule, after date: Date) -> DateInterval? {
-        windows(of: s, from: date, to: date.addingTimeInterval(400 * 86_400)).first
+        var from = date
+        for days in [8, 32, 360] {
+            let to = from.addingTimeInterval(TimeInterval(days) * 86_400)
+            if let first = windows(of: s, from: from, to: to).first { return first }
+            from = to
+        }
+        return nil
     }
 
     private static func runs(_ s: Schedule, on d: ScheduleDate, calendar: Calendar) -> Bool {
