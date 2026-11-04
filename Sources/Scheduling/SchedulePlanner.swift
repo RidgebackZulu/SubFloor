@@ -104,7 +104,8 @@ public enum SchedulePlanner {
         } else if let winner = candidates.first {
             actions.append(.start(winner.schedule.id, window: winner.window,
                                   late: now.timeIntervalSince(winner.window.start) > lateAfter))
-            overlapped(candidates.dropFirst(), with: winner.schedule.name)
+            // A watch never loses to a broadcast for good: it waits, unsettled, and resumes late.
+            overlapped(candidates.dropFirst().filter { $0.schedule.kind == winner.schedule.kind }, with: winner.schedule.name)
         }
         return actions
     }

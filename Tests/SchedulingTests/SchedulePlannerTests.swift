@@ -122,11 +122,16 @@ private func tick(_ schedules: [Schedule], on: Bool = true, now: String, lastTic
     }
 
     @Test func sameMomentBroadcastBeatsWatch() {
-        let watch = make("Pirates", kind: .watch, hour: 21, created: "2026-10-01T00:00:00Z")
+        let watch = make("Pirates", kind: .watch, hour: 21, minutes: 180, created: "2026-10-01T00:00:00Z")
         let b = make("Korea", hour: 21, minute: 1, created: "2026-11-02T00:00:00Z")      // window opens 21:00
         let actions = tick([watch, b], now: "2026-11-03T21:00:03Z", lastTick: "2026-11-03T21:00:02Z")
-        #expect(actions == [.start(b.id, window: window(b, at: utc("2026-11-03T21:00:03Z")), late: false),
-                            .log(watch.id, .overlapped(with: "Korea"), at: utc("2026-11-03T21:00:03Z"))])
+        let bWindow = window(b, at: utc("2026-11-03T21:00:03Z"))
+        #expect(actions == [.start(b.id, window: bWindow, late: false)])      // the watch isn't logged; it waits
+
+        // The broadcast ends inside the watch's window: the watch starts late.
+        let running = ActiveRun(scheduleID: b.id, window: bWindow, kind: .broadcast, startedEarly: false)
+        let after = tick([watch, b], now: "2026-11-03T22:03:00Z", lastTick: "2026-11-03T22:02:59Z", running: running)
+        #expect(after == [.end(b.id), .start(watch.id, window: window(watch, at: utc("2026-11-03T22:03:00Z")), late: true)])
     }
 
     @Test func sameMomentEarlierCreatedWins() {
