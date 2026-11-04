@@ -262,7 +262,7 @@ extension SubFloorTools {
                 "irregular": .bool(b.irregular),
             ])
         }
-        return ["season": .string(timetable.season.name), "updated": .null, "broadcasts": .array(rows)]
+        return ["season": .string(timetable.season.name), "updated": sched.timetableCheckedAt.map { .time($0) }.orNull, "broadcasts": .array(rows)]
     }
 
     // MARK: Helpers
@@ -320,9 +320,7 @@ extension SubFloorTools {
         }
         if let minutes = try args.int("duration_minutes") { s.durationMinutes = minutes }
         if let zone = try args.string("time_zone") {
-            guard zone == "UTC" || TimeZone.knownTimeZoneIdentifiers.contains(zone) else {
-                throw ToolError("Unknown time zone \(zone): use an IANA name like America/Chicago.")
-            }
+            if let problem = Scheduler.timeZoneProblem(zone) { throw ToolError(problem) }
             s.timeZone = zone
         }
         if args.has("days") && args.has("date") { throw ToolError("Give days or date, not both.") }

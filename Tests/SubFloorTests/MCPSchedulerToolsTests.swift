@@ -334,6 +334,14 @@ struct MCPSchedulerToolsTests {
 
     // MARK: The timetable
 
+    @Test func searchTimetableSaysWhenItWasChecked() async {
+        let (m, _) = makeModel()
+        defer { m.shutdown() }
+        m.scheduler.timetableCheckedAt = Self.noon.addingTimeInterval(-3 * 86_400)
+        let result = await call(SubFloorTools(model: m), "search_timetable", ["query": .string("Radio Habana")])
+        #expect(result.structured?["updated"]?.string == Self.noon.addingTimeInterval(-3 * 86_400).formatted(.iso8601))
+    }
+
     @Test func searchTimetableHidesReligiousRows() async throws {
         let (m, _) = makeModel()
         defer { m.shutdown() }

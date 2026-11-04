@@ -115,6 +115,16 @@ final class Scheduler {
         return t
     }
 
+    /// When the timetable was last checked for an update (`TimetableFiles.meta`); nil while only the bundled copy is known.
+    var timetableCheckedAt: Date?
+
+    /// The one rule for a schedule's time zone, for the editor and the MCP tools: "UTC" or an IANA identifier.
+    /// Returns the message to show when `id` isn't one, else nil.
+    nonisolated static func timeZoneProblem(_ id: String) -> String? {
+        id == "UTC" || TimeZone.knownTimeZoneIdentifiers.contains(id)
+            ? nil : "Unknown time zone \(id): use an IANA name like America/Chicago."
+    }
+
     /// The session's switch and alive stamp, before `attach` (from `AppModel.restoreSession`).
     func restoreSession(on: Bool, alive: Date?) {
         isOn = on
