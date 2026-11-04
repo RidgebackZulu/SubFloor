@@ -71,7 +71,7 @@ extension AppModel {
 
     /// The latest spectrum frame once it is of the current capture (its centre and span as the model's), polling for
     /// up to a second after a retune; nil when none arrives or the task is cancelled.
-    private func currentSpectrumSnapshot() async -> SpectrumSnapshot? {
+    func currentSpectrumSnapshot() async -> SpectrumSnapshot? {
         let end = Date().addingTimeInterval(1)
         while isRunning, !Task.isCancelled {
             if let s = spectrumSnapshot(), abs(s.centerHz - centerHz) < 1, abs(s.spanHz - sampleRate) < 1 { return s }

@@ -1,6 +1,8 @@
+import DSPCore
 import Foundation
 import Observation
 import Scheduling
+import SignalID
 
 /// Why `Scheduler.add` or `update` refused a schedule. `message` is the text the owner and agents see.
 enum ScheduleError: Error, Equatable {
@@ -18,8 +20,8 @@ enum ScheduleError: Error, Equatable {
 }
 
 /// The run engine, owned by `AppModel` like `SignalIDService`: once a second it asks the planner what is due and
-/// carries it out, one run at a time (`BroadcastRun` drives the radio). Every outcome is saved on the schedule's
-/// `lastRun` and written to the store.
+/// carries it out, one run at a time (`BroadcastRun` drives the radio, for broadcasts and watches). Every outcome is
+/// saved on the schedule's `lastRun` and written to the store.
 ///
 /// The planner is stateless; the engine keeps the windows that must not start again (`settled`), the last tick and
 /// when SubFloor was last known running (`schedulerAlive` in the session). It keeps ticking while the switch is off,
@@ -69,8 +71,13 @@ final class Scheduler {
     /// Stamped once a minute while SubFloor runs and saved in the session; read at launch for windows missed while
     /// it wasn't running.
     @ObservationIgnored private(set) var aliveStamp: Date?
+    /// Signal ID for a watch's candidate (tests stub it).
+    @ObservationIgnored var identify: @MainActor (_ hz: Double) async -> SignalIdentity? = { _ in nil }
 
     @ObservationIgnored private var settled: Set<RunKey> = []
+    /// Watches a broadcast took the radio from, with what they had recorded in their window: carried into the run that
+    /// resumes the window, or logged as its outcome if the window ends first.
+    @ObservationIgnored private var pausedWatches: [RunKey: BroadcastRun.Recorded] = [:]
     @ObservationIgnored private var lastTick: Date?
     @ObservationIgnored private var launchAlive: Date?
     /// The window the ticker pulses for (`startEarly`).
@@ -95,6 +102,9 @@ final class Scheduler {
         schedules = loaded
         loadResult = result
         saveBlocked = result == .corruptNotPreserved
+        identify = { [weak self] hz in
+            await self?.model?.signalID.identify(atHz: hz, radiusHz: 5_000, longerRead: false, priority: .background)
+        }
     }
 
     /// The North America timetable: the bundled season, parsed on first use, until `timetableUpdated` replaces it.
@@ -295,6 +305,12 @@ final class Scheduler {
             aliveStamp = now
             model.saveSessionIfChanged()
         }
+        for (key, recorded) in pausedWatches where key.window.end <= now && running?.scheduleID != key.scheduleID {
+            pausedWatches[key] = nil
+            let seconds = recorded.files.compactMap { recorded.secondsByFile[$0] }.reduce(0, +)
+            record(recorded.files.isEmpty ? .nothingHeard(watch: true) : .recorded(seconds: seconds, files: recorded.files.count),
+                   for: key.scheduleID, at: now)
+        }
         settled = settled.filter { $0.window.end > now.addingTimeInterval(-86_400) }
         updateKeepAwake()
         refreshButton()
@@ -302,11 +318,12 @@ final class Scheduler {
 
     // MARK: Runs
 
-    /// Starts `s`'s `window` now: takes the radio and records (see `BroadcastRun`). Nothing happens while a run is
-    /// going. Watches are Task 10's.
+    /// Starts `s`'s `window` now: takes the radio and records, or watches (see `BroadcastRun`). Nothing happens while a
+    /// run is going. A watch resuming after a broadcast carries on with what it had recorded in the window.
     func startRun(_ s: Schedule, window: DateInterval, early: Bool) {
-        guard currentRun == nil, !isShutDown, let model, s.kind == .broadcast else { return }
+        guard currentRun == nil, !isShutDown, let model else { return }
         let run = BroadcastRun(schedule: s, window: window, early: early, takenAt: now())
+        if let paused = pausedWatches.removeValue(forKey: RunKey(scheduleID: s.id, window: window)) { run.carry(paused) }
         currentRun = run
         running = ActiveRun(scheduleID: s.id, window: window, kind: s.kind, startedEarly: early)
         radioTakenAt = run.takenAt
@@ -316,7 +333,8 @@ final class Scheduler {
         refreshButton()
         runTask = Task { [weak self] in
             let timing = self?.timing ?? Timing()
-            let setup = Task { await run.setUp(model, timing: timing) { self?.now() ?? Date() } }
+            let identify: @MainActor (Double) async -> SignalIdentity? = { hz in await self?.identify(hz) }
+            let setup = Task { await run.setUp(model, timing: timing, identify: identify) { self?.now() ?? Date() } }
             run.setupTask = setup
             await setup.value
             while run.endReason == nil {
@@ -343,6 +361,9 @@ final class Scheduler {
             lastOutcome = outcome
         }
         if run.endReason?.settles == true { settled.insert(RunKey(scheduleID: run.schedule.id, window: run.window)) }
+        if run.endReason == .preempted, run.schedule.kind == .watch {
+            pausedWatches[RunKey(scheduleID: run.schedule.id, window: run.window)] = run.recorded
+        }
         if outcome == .missedNoRSP {
             model?.show(Banner(kind: .error, message: "A schedule was missed: the RSP wasn't connected."))
         }
@@ -380,9 +401,13 @@ final class Scheduler {
         if !isOn {
             state = .off(waiting: schedules.filter(\.enabled).count)
         } else if let run = currentRun, let model {
-            state = .recording(Self.item(run.schedule, run.window, frequencyHz: run.frequencyHz),
-                               elapsed: Int(run.elapsed(model)), marginDb: run.schedule.squelchMarginDb,
-                               until: run.window.end)
+            if run.schedule.kind == .watch, run.phase != .recording {
+                state = .watching(Self.item(run.schedule, run.window), caught: run.files.count, until: run.window.end)
+            } else {
+                state = .recording(Self.item(run.schedule, run.window, frequencyHz: run.frequencyHz, mode: run.stationMode),
+                                   elapsed: Int(run.elapsed(model)), marginDb: run.schedule.squelchMarginDb,
+                                   until: run.window.end)
+            }
         } else {
             let next = SchedulePlanner.next(schedules, after: now)
                 .filter { !settled.contains(RunKey(scheduleID: $0.0.id, window: $0.1)) }
@@ -396,15 +421,21 @@ final class Scheduler {
         if state != buttonState { buttonState = state }
     }
 
-    /// A broadcast shows its scheduled start, frequency and mode; a watch its band, with no mode.
-    private static func item(_ s: Schedule, _ w: DateInterval, frequencyHz: Double? = nil) -> TickerItem {
+    /// A broadcast shows its scheduled start, frequency and mode; a watch its band, with no mode, or while it records
+    /// a station (`mode` given) that station's frequency and mode.
+    private static func item(_ s: Schedule, _ w: DateInterval, frequencyHz: Double? = nil,
+                             mode: DemodMode? = nil) -> TickerItem {
         switch s.kind {
         case .broadcast:
             TickerItem(name: s.name, start: w.start.addingTimeInterval(ScheduleClock.broadcastLead),
                        frequencyHz: frequencyHz ?? s.frequenciesHz.first,
                        mode: BroadcastRun.demodMode(s.mode).rawValue)
         case .watch:
-            TickerItem(name: s.name, start: w.start, lowHz: s.lowHz, highHz: s.highHz, mode: nil)
+            if let mode, let frequencyHz {
+                TickerItem(name: s.name, start: w.start, frequencyHz: frequencyHz, mode: mode.rawValue)
+            } else {
+                TickerItem(name: s.name, start: w.start, lowHz: s.lowHz, highHz: s.highHz, mode: nil)
+            }
         }
     }
 

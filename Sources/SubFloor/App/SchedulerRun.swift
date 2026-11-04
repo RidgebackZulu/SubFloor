@@ -2,15 +2,19 @@ import DSPCore
 import Foundation
 import Recording
 import Scheduling
+import SignalID
 
-/// One broadcast run's radio work: it takes the radio, starts the RSP, measures the noise floor on each frequency,
-/// picks the strongest, records with the squelch the margin above the floor, and gives the radio back.
+/// One run's radio work. It takes the radio and starts the RSP; a broadcast then measures the noise floor on each
+/// frequency, picks the strongest and records with the squelch the margin above the floor; a watch watches its span
+/// and records the stations that come on with voice (`SchedulerWatch.swift`). At the end it gives the radio back.
 ///
 /// `Scheduler` owns it: `setUp` runs as its own task (cancelled when the run is ended early, so a floor measurement
-/// stops at once), `check` is called every tick, and `tearDown` once the run has an `endReason`.
+/// stops at once; a watch's whole watching runs in it), `check` is called every tick, and `tearDown` once the run has
+/// an `endReason`.
 @MainActor
 final class BroadcastRun {
-    enum Phase: Equatable { case taking, measuring, picking, recording, ending, ended }
+    /// A watch is `watching` between stations and `recording` while one records.
+    enum Phase: Equatable { case taking, measuring, picking, watching, recording, ending, ended }
 
     enum EndReason: Equatable {
         case windowEnd, noRSP, rspLost, lowDisk
@@ -49,7 +53,7 @@ final class BroadcastRun {
     /// Started from the ticker: the live audio plays.
     let early: Bool
     let takenAt: Date
-    private(set) var phase: Phase = .taking
+    var phase: Phase = .taking
     var endReason: EndReason?
     var setupTask: Task<Void, Never>?
     /// The owner's radio, put back at the end.
@@ -58,16 +62,21 @@ final class BroadcastRun {
     private(set) var floors: [Double: Float] = [:]
     /// The level read on each frequency when there were several.
     private(set) var levels: [Double: Float] = [:]
-    /// The frequency recorded, and its floor, once chosen.
-    private(set) var frequencyHz: Double?
-    private(set) var floorDb: Float?
+    /// The frequency recorded, and its floor, once chosen; a watch's station while one records.
+    var frequencyHz: Double?
+    var floorDb: Float?
+    /// A watch's floor for each mode it has measured (USB's stands for LSB too).
+    var modeFloors: [DemodMode: Float] = [:]
+    /// The mode a watch's station is recorded in, while one records.
+    var stationMode: DemodMode?
     /// The files labelled with this schedule while the run was current, in order, and the length of each that ended.
+    /// A watch resumed after a broadcast starts with what it recorded before (`carry`).
     private(set) var files: [String] = []
     private var secondsByFile: [String: Double] = [:]
     private var rspLostBefore: Date?
     private var expected: Expected?
     /// A floor measurement is in flight: it moves the VFO, so only the mode and bandwidth are compared meanwhile.
-    private var movingVFO = false
+    var movingVFO = false
     /// Set once the radio runs on the RSP for the run: from then on a stopped radio or a manual recording is the
     /// owner's doing.
     private var radioIsOurs = false
@@ -87,11 +96,37 @@ final class BroadcastRun {
         }
     }
 
-    private var live: Bool { endReason == nil && !Task.isCancelled }
+    var live: Bool { endReason == nil && !Task.isCancelled }
+
+    /// What a run has recorded: a watch making way for a broadcast hands it to the run that resumes its window.
+    struct Recorded {
+        var files: [String]
+        var secondsByFile: [String: Double]
+    }
+
+    var recorded: Recorded { Recorded(files: files, secondsByFile: secondsByFile) }
+
+    func carry(_ r: Recorded) {
+        files = r.files + files.filter { !r.files.contains($0) }
+        secondsByFile.merge(r.secondsByFile) { mine, _ in mine }
+    }
 
     // MARK: Setup
 
-    func setUp(_ m: AppModel, timing: Scheduler.Timing, now: @escaping () -> Date) async {
+    /// Takes the radio, then runs the schedule's body: a broadcast's floor, pick and recording, or a watch's watching
+    /// (which lasts until the run is ended). `identify` is Signal ID for a watch's candidates.
+    func setUp(_ m: AppModel, timing: Scheduler.Timing, identify: @escaping @MainActor (Double) async -> SignalIdentity?,
+               now: @escaping () -> Date) async {
+        guard await takeRadio(m, timing: timing) else { return }
+        switch schedule.kind {
+        case .broadcast: await recordBroadcast(m, timing: timing, now: now)
+        case .watch: await watch(m, timing: timing, identify: identify)
+        }
+    }
+
+    /// Saves the owner's radio, mutes, pauses Auto, ends a manual recording and starts the RSP. False when the run
+    /// ended meanwhile or there is no RSP (`endReason` says which).
+    private func takeRadio(_ m: AppModel, timing: Scheduler.Timing) async -> Bool {
         let owner = m.saveRadio()
         saved = owner
         m.sessionRadioOverride = owner
@@ -103,15 +138,18 @@ final class BroadcastRun {
         m.stopRecording(.audio)
         m.stopRecording(.iq)
         await settle(m, upTo: 5) { !m.isRecording(.audio) && !m.isRecording(.iq) }
-        guard live else { return }
+        guard live else { return false }
 
         guard await m.startRSPForSchedule(timeout: timing.rspTimeout) else {
             if endReason == nil { endReason = .noRSP }
-            return
+            return false
         }
-        guard live else { return }
+        guard live else { return false }
         radioIsOurs = true
+        return true
+    }
 
+    private func recordBroadcast(_ m: AppModel, timing: Scheduler.Timing, now: () -> Date) async {
         let mode = Self.demodMode(schedule.mode)
         let frequencies = schedule.frequenciesHz
         m.setMode(mode)
@@ -163,13 +201,13 @@ final class BroadcastRun {
     }
 
     /// The radio as the run has just left it.
-    private func note(_ m: AppModel) {
+    func note(_ m: AppModel) {
         expected = Expected(vfoHz: m.vfoHz, centerHz: m.centerHz, mode: m.mode, bandwidthHz: m.bandwidthHz)
     }
 
     /// False when the run must stop setting up: it was ended, or the owner (or the RSP) has changed the radio since
     /// the run's last change, which then ends it.
-    private func proceed(_ m: AppModel) -> Bool {
+    func proceed(_ m: AppModel) -> Bool {
         guard live else { return false }
         if let reason = check(m) {
             endReason = reason
@@ -179,7 +217,7 @@ final class BroadcastRun {
     }
 
     /// HamItUp as the agents' `auto` sets it (on below 30 MHz when reachable through it), then the tune.
-    private func tune(_ m: AppModel, to hz: Double) {
+    func tune(_ m: AppModel, to hz: Double) {
         let up = SubFloorTools.upconverter(for: hz, setting: "auto", current: m.upconverter)
         if up.enabled != m.upconverter.enabled { m.setUpconverter(up.enabled) }
         m.tune(to: hz)
@@ -262,7 +300,9 @@ final class BroadcastRun {
         if radioIsOurs {
             await settle(m, upTo: 5) {
                 let open = m.engine.audioRecorder.status.isRecording && m.engine.audioRecorder.status.isAuto
-                return !open && (reason != .windowEnd || files.allSatisfy { secondsByFile[$0] != nil })
+                // At the window's end (and for a watch resuming later) the lengths are waited for.
+                let lengths = reason == .windowEnd || reason == .preempted
+                return !open && (!lengths || files.allSatisfy { secondsByFile[$0] != nil })
             }
         }
         let outcome = outcome(for: reason, now: now, recordedSeconds: files.compactMap { secondsByFile[$0] }.reduce(0, +))
@@ -285,7 +325,9 @@ final class BroadcastRun {
 
     private func outcome(for reason: EndReason, now: Date, recordedSeconds: Double) -> RunOutcome? {
         switch reason {
-        case .windowEnd: files.isEmpty ? .nothingHeard(watch: false) : .recorded(seconds: recordedSeconds, files: files.count)
+        case .windowEnd:
+            files.isEmpty ? .nothingHeard(watch: schedule.kind == .watch)
+                          : .recorded(seconds: recordedSeconds, files: files.count)
         case .stoppedByYou, .ownerChangedRadio: .stoppedByYou
         case .noRSP: .missedNoRSP
         case .rspLost: .rspLost(afterSeconds: now.timeIntervalSince(takenAt))
@@ -295,7 +337,7 @@ final class BroadcastRun {
     }
 
     /// Polls the recorders until `done`, for at most `seconds`.
-    private func settle(_ m: AppModel, upTo seconds: Double, until done: () -> Bool) async {
+    func settle(_ m: AppModel, upTo seconds: Double, until done: () -> Bool) async {
         let end = Date().addingTimeInterval(seconds)
         while true {
             m.refreshRecordingStatus()
@@ -305,7 +347,7 @@ final class BroadcastRun {
         }
     }
 
-    private static func median(_ values: [Float]) -> Float? {
+    static func median(_ values: [Float]) -> Float? {
         guard !values.isEmpty else { return nil }
         let s = values.sorted()
         return s[s.count / 2]
