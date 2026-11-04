@@ -43,9 +43,11 @@ public struct TranscriptIndex: Equatable, Sendable {
     /// original's words and the translation's.
     public mutating func set(_ t: StoredTranscript) {
         let c = TranscriptClassifier.classify(t.chunks)
+        // A translation whose words were all dropped has nothing to show: treat it as none for display.
+        let english = t.translation == nil ? [] : TranscriptClassifier.classify(t.englishChunks).words
         summaries[t.file] = TranscriptSummary(verdict: c.verdict, words: c.words, text: c.text,
                                               spokenLanguage: t.spokenLanguage, english: t.translation?.text,
-                                              englishWords: t.translation == nil ? nil : TranscriptClassifier.classify(t.englishChunks).words,
+                                              englishWords: english.isEmpty ? nil : english,
                                               translationNote: t.translationNote)
     }
 

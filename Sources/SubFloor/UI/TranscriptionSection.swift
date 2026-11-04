@@ -114,8 +114,7 @@ struct TranscriptionSection: View {
 
     /// An empty model name goes back to the default.
     private func commitModel() {
-        let trimmed = modelText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let chosen = trimmed.isEmpty ? OpenRouterTranscriber.defaultModel : trimmed
+        let chosen = TranscriptionFormat.modelToSave(modelText, default: OpenRouterTranscriber.defaultModel)
         modelText = chosen
         model.transcriptionSettings.model = chosen
     }

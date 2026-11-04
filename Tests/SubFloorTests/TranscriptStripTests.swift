@@ -146,6 +146,14 @@ import Transcription
                 == TranscriptStripHeader(text: "Translated from Korean", toggle: "Show English"))
     }
 
+    @Test func emptyTranslationShowsNoHeader() throws {
+        var t = try koreanTranscript(translation: true)
+        t.translation?.segments = [TranslatedSegment(start: 1, end: 3, text: "")]
+        let s = summary(t)
+        #expect(s?.englishWords == nil)
+        #expect(TranscriptStripHeader.make(summary: s, showOriginal: false) == nil)
+    }
+
     @Test func languageNameIsCapitalisedOrUpperCased() {
         #expect(TranscriptStripHeader.languageName("korean") == "Korean")
         #expect(TranscriptStripHeader.languageName("ko") == "KO")
