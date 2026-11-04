@@ -13,15 +13,21 @@ final class BroadcastRun {
     enum Phase: Equatable { case taking, measuring, picking, recording, ending, ended }
 
     enum EndReason: Equatable {
-        case windowEnd, stoppedByYou, noRSP, rspLost, lowDisk
+        case windowEnd, noRSP, rspLost, lowDisk
+        /// The owner ended the run without touching the radio: the ticker's stop, the switch off, or the running
+        /// schedule deleted, switched off or retuned.
+        case stoppedByYou
+        /// The owner changed the radio mid-run: retuned, changed mode or bandwidth, recorded, or stopped it.
+        case ownerChangedRadio
         /// A watch making way for a broadcast: no outcome, and its window may start again.
         case preempted
 
         /// The window must not start again.
         var settles: Bool { self != .windowEnd && self != .preempted }
-        /// Everything goes back, the tuning and running radio included. When the owner stopped the run, or the RSP or
-        /// the disk did, only what the owner didn't touch goes back (`AppModel.restoreRadio(_:full:)`).
-        var restoresFully: Bool { self == .windowEnd || self == .noRSP || self == .preempted }
+        /// Everything goes back, the tuning and running radio included, unless the owner changed the radio or the RSP or
+        /// the disk ended the run: then only what the owner didn't touch goes back (`AppModel.restoreRadio(_:full:)`),
+        /// so the scheduler never fights the owner and doesn't restart a lost RSP.
+        var restoresFully: Bool { self != .ownerChangedRadio && self != .rspLost && self != .lowDisk }
     }
 
     /// What the radio should show after the run's own last change. The VFO and centre aren't checked while the floor
@@ -187,9 +193,9 @@ final class BroadcastRun {
         m.refreshRecordingStatus()
         if m.rspLostAt != rspLostBefore { return .rspLost }
         guard radioIsOurs else { return nil }
-        if m.isRecording(.audio) || m.isRecording(.iq) { return .stoppedByYou }
-        if !m.isRunning || m.sourceKind != .sdrplay { return .stoppedByYou }
-        if let expected, !expected.matches(m) { return .stoppedByYou }
+        if m.isRecording(.audio) || m.isRecording(.iq) { return .ownerChangedRadio }
+        if !m.isRunning || m.sourceKind != .sdrplay { return .ownerChangedRadio }
+        if let expected, !expected.matches(m) { return .ownerChangedRadio }
         return nil
     }
 
@@ -236,7 +242,7 @@ final class BroadcastRun {
         case .windowEnd:
             files.isEmpty ? .nothingHeard(watch: false)
                           : .recorded(seconds: files.compactMap { secondsByFile[$0] }.reduce(0, +), files: files.count)
-        case .stoppedByYou: .stoppedByYou
+        case .stoppedByYou, .ownerChangedRadio: .stoppedByYou
         case .noRSP: .missedNoRSP
         case .rspLost: .rspLost(afterSeconds: now.timeIntervalSince(takenAt))
         case .lowDisk: .lowDisk

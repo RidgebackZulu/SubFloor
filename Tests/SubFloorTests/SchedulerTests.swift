@@ -388,7 +388,8 @@ struct SchedulerTests {
         await m.scheduler.runTask?.value
         #expect(m.scheduler.running == nil)
         #expect(lastRun(m, s) == .stoppedByYou)
-        #expect(m.vfoHz == 10_020_000)
+        #expect(m.vfoHz == 10_020_000)   // stays where the owner put it
+        #expect(m.isRunning && m.sourceKind == .sdrplay && m.mode == .am)
         #expect(!m.scheduleMuted)
         clock.now = clock.now.addingTimeInterval(5)
         await m.scheduler.tick()
@@ -400,19 +401,41 @@ struct SchedulerTests {
         defer { m.shutdown() }
         guard canRun(m) else { return }
         m.squelchDb = -97
+        let before = m.saveRadio()   // stopped, the RSP chosen, 14.2 MHz USB
         let s = broadcast([10_000_000], clock: clock)
         guard try await startAndRecord(m, s) else { return }
-        let vfo = m.vfoHz
         m.scheduler.delete(s.id)
         await m.scheduler.runTask?.value
         #expect(m.scheduler.running == nil)
         #expect(m.scheduler.lastOutcome == .stoppedByYou)
         #expect(!m.scheduler.schedules.contains { $0.id == s.id })
-        // A partial restore: the squelch and the mute back, the tuning and the running radio left.
-        #expect(m.squelchDb == -97 && !m.squelchEnabled)
+        // The owner didn't touch the radio: all of it goes back.
+        #expect(m.saveRadio() == before)
+        #expect(!m.isRunning)
         #expect(!m.scheduleMuted)
-        #expect(m.vfoHz == vfo && m.isRunning)
         #expect(m.scheduleRecording == nil)
+    }
+
+    @Test func stopRunRestoresAStoppedDemoRadio() async throws {
+        let (m, clock) = makeModel()
+        defer { m.shutdown() }
+        guard canRun(m) else { return }
+        m.useSource(.synthetic)
+        m.stop()
+        m.tune(to: 14_200_000)
+        m.setMode(.usb)
+        let before = m.saveRadio()
+        let s = broadcast([10_000_000], clock: clock)
+        guard try await startAndRecord(m, s) else { return }
+        m.scheduler.stopRun()
+        await m.scheduler.runTask?.value
+        #expect(lastRun(m, s) == .stoppedByYou)
+        #expect(m.saveRadio() == before)
+        #expect(!m.isRunning && m.preferredSource == .synthetic)
+        #expect(m.vfoHz == 14_200_000 && m.mode == .usb)
+        #expect(!m.scheduleMuted)
+        await m.scheduler.tick()
+        #expect(m.scheduler.running == nil)   // that window stays stopped
     }
 
     @Test func switchOffMidRunEndsIt() async throws {
@@ -421,11 +444,13 @@ struct SchedulerTests {
         guard canRun(m) else { return }
         let s = broadcast([10_000_000], clock: clock)
         guard try await startAndRecord(m, s) else { return }
+        let before = try #require(m.sessionRadioOverride)
         m.scheduler.isOn = false
         await m.scheduler.runTask?.value
         #expect(m.scheduler.running == nil)
         #expect(lastRun(m, s) == .stoppedByYou)
         #expect(!m.scheduleMuted && m.scheduleRecording == nil)
+        #expect(m.saveRadio() == before && !m.isRunning)   // put back fully
         m.scheduler.isOn = true
         await m.scheduler.tick()
         #expect(m.scheduler.running == nil)   // that window stays stopped
