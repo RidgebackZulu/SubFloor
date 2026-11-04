@@ -395,6 +395,7 @@ extension AppModel.AutoRecordState {
         case .needsRadio: "needs_radio"
         case .demoSource: "demo_source"
         case .paused: "paused"
+        case .scheduled: "scheduled"
         }
     }
 }

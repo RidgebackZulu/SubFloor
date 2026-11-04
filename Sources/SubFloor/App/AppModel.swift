@@ -3,6 +3,7 @@ import DSPCore
 import Modems
 import Observation
 import Recording
+import Scheduling
 import SDRplayKit
 import SubFloorCore
 import SwiftUI
@@ -186,8 +187,10 @@ final class AppModel {
     /// The live radio is also silent the whole time the Recordings window is open, playing or not, so
     /// listening back is never talked over; it returns when the window closes.
     var recordingsWindowOpen = false { didSet { engine.update(volume: effectiveVolume) } }
+    /// Mutes the live audio for a run (`effectiveVolume` is 0 while true). The volume knob keeps its place.
+    var scheduleMuted = false { didSet { engine.update(volume: effectiveVolume) } }
     /// What the engine plays the live radio at.
-    var effectiveVolume: Float { liveAudioMuted || recordingsWindowOpen ? 0 : volume }
+    var effectiveVolume: Float { liveAudioMuted || recordingsWindowOpen || scheduleMuted ? 0 : volume }
 
     // MARK: Recording
     /// Recording preferences (Settings). Kept valid; a change to a sample format starts the pre-roll
@@ -258,13 +261,36 @@ final class AppModel {
         }
     }
 
+    /// A scheduled run's recording: what it is for and the trigger's timing for it.
+    struct ScheduleRecording: Equatable {
+        var tag: ScheduleTag
+        var timing: AutoRecordTiming
+    }
+
+    /// While set, the engine's AutoRecorder is enabled with `timing` (the owner's Auto setting is left alone), each
+    /// auto recording that opens gets a `.scheduled` log line, and `autoRecordState` is `.scheduled`. The same
+    /// guards as Auto's apply: the radio running on a real source with the squelch on, and the disk check.
+    var scheduleRecording: ScheduleRecording? {
+        didSet {
+            guard scheduleRecording != oldValue else { return }
+            if oldValue == nil { lastDiskCheck = nil }   // check the disk at the next refresh
+            pushAutoRecord()
+        }
+    }
+
+    /// Called (on the main actor) when the low-disk check ends a schedule's recording: the scheduler ends the
+    /// run with `.lowDisk`. `scheduleRecording` is already nil by then.
+    @ObservationIgnored var onLowDiskStop: (() -> Void)?
+
     /// `paused`: Auto is on but a manual audio recording owns the recorder; the trigger resumes after it.
-    enum AutoRecordState: Equatable { case off, armed, recording, needsSquelch, needsRadio, demoSource, paused }
+    /// `scheduled`: a schedule's run is recording with the trigger (`scheduleRecording`).
+    enum AutoRecordState: Equatable { case off, armed, recording, needsSquelch, needsRadio, demoSource, paused, scheduled }
 
     /// What the Auto button shows: why it is waiting, if it is.
     var autoRecordState: AutoRecordState {
-        if !autoRecordEnabled { return .off }
+        if !autoRecordEnabled && scheduleRecording == nil { return .off }
         if !isRunning { return .needsRadio }
+        if scheduleRecording != nil { return .scheduled }
         if sourceKind == .synthetic { return .demoSource }
         if !squelchEnabled { return .needsSquelch }
         if isRecording(.audio) { return .paused }
@@ -440,6 +466,8 @@ final class AppModel {
     private var didAutoStart = false
     /// Set when opening the RSP failed; later start() calls fall back to demo without retrying until retry()/useSource(.sdrplay).
     private(set) var rspOpenFailed = false
+    /// Set to now whenever the RSP is removed or fails while open (`handle(.deviceRemoved/.deviceFailure)`).
+    private(set) var rspLostAt: Date?
 
     /// The RSP is opened on a background thread (`openRSPInBackground`): the SDRplay API blocks for
     /// ever when its service is stuck (a client died holding the API's cross-process lock), and on
@@ -459,6 +487,10 @@ final class AppModel {
     /// Signal ID: names the signal at a frequency from the IQ ring, and where the pointer rests.
     let signalID = SignalIDService()
     private var sdrplay: SDRplayDevice?
+    /// Tests: a stand-in RSP, used as an open device whenever the RSP is chosen. Gone once it is "removed"
+    /// (`simulateDeviceRemovedForTesting`), for the rest of the model's life.
+    private var fakeRSP: SyntheticSource?
+    static let fakeRSPName = "Test RSP"
     private let synthetic = SyntheticSource()
     private var fileSource: IQFileSource?
     private let bookmarkStore: BookmarkStore
@@ -479,12 +511,15 @@ final class AppModel {
     }
 
     /// `openRSP`, `rspOpenTimeout` and `transcribe`: tests replace the device, the wait and the transcription.
+    /// `fakeRSP`: a stand-in RSP for tests; choosing the RSP uses it as an open device (named "Test RSP").
     init(bookmarkStore: BookmarkStore, defaults: UserDefaults,
          apiKeyStore: any APIKeyStore = MemoryAPIKeyStore(),
          transcribe: @escaping TranscribeFunction = OpenRouterTranscriber.liveTranscribe,
          openRSP: @escaping @Sendable () throws -> SDRplayDevice = { try SDRplayDevice.open() },
          rspOpenTimeout: Duration = .seconds(10),
-         decodeHistoryFolder: URL? = nil) {
+         decodeHistoryFolder: URL? = nil,
+         fakeRSP: SyntheticSource? = nil) {
+        self.fakeRSP = fakeRSP
         self.bookmarkStore = bookmarkStore
         self.defaults = defaults
         self.apiKeyStore = apiKeyStore
@@ -542,10 +577,16 @@ final class AppModel {
 
     private var activeSource: any IQSource {
         switch sourceKind {
-        case .sdrplay: sdrplay ?? synthetic
+        case .sdrplay: sdrplay ?? fakeRSP ?? synthetic
         case .synthetic: synthetic
         case .file: fileSource ?? synthetic
         }
+    }
+
+    /// The running source's name, as the chip and the recordings' metadata show it.
+    private var activeSourceName: String {
+        if let fakeRSP, activeSource === fakeRSP { return Self.fakeRSPName }
+        return activeSource.name
     }
 
     var sampleRate: Double { sourceKind == .file ? (fileSource?.sampleRate ?? hardware.outputRate) : hardware.outputRate }
@@ -638,7 +679,7 @@ final class AppModel {
         stop()
         defer { pushAutoRecord() }
         var kind = preferredSource
-        if kind == .sdrplay && sdrplay == nil {
+        if kind == .sdrplay && sdrplay == nil && fakeRSP == nil {
             switch rspConnection {
             case .opening:
                 return
@@ -658,7 +699,11 @@ final class AppModel {
 
         switch kind {
         case .sdrplay:
-            do { try sdrplay?.apply(hardware) } catch { show(Banner(kind: .error, message: "\(error)")) }
+            if let sdrplay {
+                do { try sdrplay.apply(hardware) } catch { show(Banner(kind: .error, message: "\(error)")) }
+            } else {
+                fakeRSP?.setSampleRate(hardware.outputRate)
+            }
         case .synthetic:
             synthetic.setSampleRate(hardware.outputRate)
         case .file:
@@ -679,7 +724,7 @@ final class AppModel {
         do {
             try engine.start(source: activeSource, receiver: receiverConfig, spectrum: spectrum, volume: effectiveVolume)
             isRunning = true
-            deviceName = activeSource.name
+            deviceName = activeSourceName
             startClockCheckIfNeeded()
         } catch {
             show(Banner(kind: .error, message: "Could not start: \(error)", action: .retry))
@@ -862,14 +907,27 @@ final class AppModel {
         case .overload(let detected):
             handleOverload(detected)
         case .deviceRemoved, .deviceFailure:
-            stop()
-            overloaded = false
-            sdrplay?.close()
-            sdrplay = nil
-            show(Banner(kind: .error, message: event == .deviceRemoved ? "RSP1B disconnected." : "RSP1B reported a failure.", action: .retry))
+            lostRSP(removed: event == .deviceRemoved)
         case .gainChanged:
             break
         }
+    }
+
+    /// The open RSP was removed or failed: the radio stops, the device is let go and `rspLostAt` is noted.
+    private func lostRSP(removed: Bool) {
+        stop()
+        overloaded = false
+        sdrplay?.close()
+        sdrplay = nil
+        rspLostAt = Date()
+        show(Banner(kind: .error, message: removed ? "RSP1B disconnected." : "RSP1B reported a failure.", action: .retry))
+    }
+
+    /// Test seam: the open RSP (real or fake) is removed, as `handle(.deviceRemoved)` would see it. A fake RSP is
+    /// gone for the rest of the model's life, so a restart cannot use it.
+    func simulateDeviceRemovedForTesting() {
+        fakeRSP = nil
+        lostRSP(removed: true)
     }
 
     // MARK: Tuning
@@ -1010,6 +1068,7 @@ final class AppModel {
     private func retuneHardware() {
         guard sourceKind != .file else { return }
         synthetic.antennaOffset = upconverter.enabled ? upconverter.loHz : 0
+        fakeRSP?.antennaOffset = synthetic.antennaOffset
         let hardwareHz = upconverter.hardware(fromDisplay: centerHz)
         // Signal ID reads the IQ off the main thread: the barrier keeps it from a read across the retune. An LO
         // change with the hardware clamped moves only the display centre the IQ is at; that is a barrier too.
@@ -1322,7 +1381,7 @@ final class AppModel {
     /// File names: the IQ file carries the capture centre (a change rolls it), the audio file the VFO
     /// and mode. A new VFO or mode ends an auto recording; a new capture centre alone does not.
     private func pushRecordingContexts() {
-        let hardware = activeSource.name
+        let hardware = activeSourceName
         engine.iqRecorder.setContext(RecordingContext(frequencyHz: centerHz, label: "IQ", hardware: hardware))
         engine.audioRecorder.setContext(RecordingContext(frequencyHz: vfoHz, label: mode.label, hardware: hardware))
         if let last = audioTuning, last.hz != vfoHz || last.mode != mode.label { engine.autoRecorder.cut() }
@@ -1391,7 +1450,12 @@ final class AppModel {
             let tuning = s.isRecording ? recordingTuning ?? now : continued ? tuningBefore ?? now : now
             let entry = RecordingLogEntry.autoStarted(file: url.lastPathComponent, start: start, frequencyHz: tuning.hz, mode: tuning.mode)
             let end = entries.firstIndex { if case .recording(_, start, _, _, _, _) = $0 { true } else { false } }
-            entries.insert(entry, at: end ?? entries.endIndex)
+            var opened = [entry]
+            // A schedule's recording is labelled straight after its start.
+            if let tag = scheduleRecording?.tag {
+                opened.append(.scheduled(file: url.lastPathComponent, scheduleID: tag.id, name: tag.name))
+            }
+            entries.insert(contentsOf: opened, at: end ?? entries.endIndex)
         }
         return entries
     }
@@ -1436,7 +1500,7 @@ final class AppModel {
     func saveListenClip(_ samples: [Float], rate: Double, start: Date, frequencyHz hz: Double, mode: DemodMode,
                         transcript: StoredTranscript? = nil) async throws -> String {
         let folder = recording.folder, format = recording.audioFormat, sampleFormat = recording.audioSampleFormat
-        let label = mode.label, hardware = activeSource.name
+        let label = mode.label, hardware = activeSourceName
         let file = try await Task.detached(priority: .userInitiated) {
             try Self.writeClip(samples, rate: rate, start: start, folder: folder, format: format, sampleFormat: sampleFormat,
                                frequencyHz: hz, label: label, hardware: hardware)
@@ -1495,13 +1559,14 @@ final class AppModel {
     /// Test hook: the Mac is kept from idle sleep.
     var isPreventingSleep: Bool { sleepActivity != nil }
 
-    /// Tells the engine whether the squelch may record, and with what timing; holds off idle sleep
-    /// while Auto is on and the radio runs.
+    /// Tells the engine whether the squelch may record, and with what timing (a schedule's while it records);
+    /// holds off idle sleep while Auto or a schedule's recording is on and the radio runs.
     private func pushAutoRecord() {
-        let config = AutoRecorder.Config(enabled: autoRecordEnabled && isRunning && squelchEnabled && sourceKind != .synthetic,
-                                         timing: recording.autoTiming)
+        let wanted = autoRecordEnabled || scheduleRecording != nil
+        let config = AutoRecorder.Config(enabled: wanted && isRunning && squelchEnabled && sourceKind != .synthetic,
+                                         timing: scheduleRecording?.timing ?? recording.autoTiming)
         if config != engine.autoRecorder.config { engine.autoRecorder.configure(config) }
-        let hold = autoRecordEnabled && isRunning
+        let hold = wanted && isRunning
         if hold, sleepActivity == nil {
             sleepActivity = ProcessInfo.processInfo.beginActivity(options: .userInitiated, reason: "Auto-record is listening")
         } else if !hold, let activity = sleepActivity {
@@ -1516,31 +1581,110 @@ final class AppModel {
     static let lowDiskMessage = "Less than 500 MB free where recordings go."
     static let autoOffLowDiskReason = "less than 100 MB free"
 
-    /// Once a minute while Auto is on.
+    /// Once a minute while Auto or a schedule's recording is on.
     private func checkRecordingsDiskSpaceIfDue() {
-        guard autoRecordEnabled else { return }
+        guard autoRecordEnabled || scheduleRecording != nil else { return }
         if let last = lastDiskCheck, ContinuousClock.now - last < .seconds(60) { return }
         checkRecordingsDiskSpace()
     }
 
     /// Under 500 MB free where recordings go: a warning, once per crossing. Under 100 MB: Auto turns
-    /// off and ends its recording, rather than fail on every transmission. A manual recording runs on.
+    /// off and ends its recording, rather than fail on every transmission, and a schedule's recording ends
+    /// (`onLowDiskStop`). A manual recording runs on.
     func checkRecordingsDiskSpace() {
-        guard autoRecordEnabled else { return }
+        guard autoRecordEnabled || scheduleRecording != nil else { return }
         lastDiskCheck = .now
         guard let free = freeSpaceProbe(recording.folder) else { return }
         if free < Self.autoOffDiskBytes {
+            let autoWasOn = autoRecordEnabled, scheduled = scheduleRecording != nil
             autoRecordEnabled = false
+            scheduleRecording = nil
             if engine.audioRecorder.sessionKind == .auto { engine.audioRecorder.stop() }
             // Logged before the banner, so a failed log write cannot replace it.
             appendToLog([.autoOff(at: Date(), reason: Self.autoOffLowDiskReason)])
-            show(Banner(kind: .error, message: "Auto-record is off: less than 100 MB free where recordings go."))
+            show(Banner(kind: .error, message: autoWasOn ? "Auto-record is off: less than 100 MB free where recordings go."
+                                                         : "Scheduled recording stopped: less than 100 MB free where recordings go."))
+            if scheduled { onLowDiskStop?() }
         } else if free < Self.lowDiskBytes {
             if !diskLow { show(Banner(kind: .warning, message: Self.lowDiskMessage)) }
             diskLow = true
         } else {
             diskLow = false
         }
+    }
+
+    // MARK: Schedule runs
+
+    /// What a run saves and puts back. `source` is the source chosen (`preferredSource`).
+    struct SavedRadio: Equatable, Codable {
+        var vfoHz, centerHz: Double
+        var mode: DemodMode
+        var bandwidthHz: Double
+        var squelchEnabled: Bool
+        var squelchDb: Float
+        var autoRecord: Bool
+        var autoRecordOffAt: Date?
+        var upconverter: Bool
+        var source: SourceKind
+        var running: Bool
+    }
+
+    func saveRadio() -> SavedRadio {
+        SavedRadio(vfoHz: vfoHz, centerHz: centerHz, mode: mode, bandwidthHz: bandwidthHz,
+                   squelchEnabled: squelchEnabled, squelchDb: squelchDb, autoRecord: autoRecordEnabled,
+                   autoRecordOffAt: autoRecordOffAt, upconverter: upconverter.enabled, source: preferredSource,
+                   running: isRunning)
+    }
+
+    /// Puts back what `saveRadio` saved, and unmutes. `full` false: only the squelch, Auto (and its limit), HamItUp
+    /// and the mute (a run the owner stopped: the tuning, mode, source and running are theirs). HamItUp goes back
+    /// before the tuning, so the saved display frequencies mean what they meant.
+    func restoreRadio(_ s: SavedRadio, full: Bool) {
+        if full, s.source != preferredSource, s.source != .file || fileSource != nil { useSource(s.source) }
+        setUpconverter(s.upconverter)
+        if full {
+            if sourceKind == .file {
+                setVFO(s.vfoHz)
+            } else {
+                // The centre as saved (the VFO at the planner's offset above it), then the VFO within the capture.
+                tune(to: s.centerHz + TuningPlanner.dcOffset(sampleRate: sampleRate))
+                if vfoHz != s.vfoHz { setVFO(s.vfoHz) }
+            }
+            setMode(s.mode)
+            setBandwidth(s.bandwidthHz)
+        }
+        squelchEnabled = s.squelchEnabled
+        squelchDb = s.squelchDb
+        // Auto before its limit: a change of Auto clears the limit. A limit that has passed meanwhile ends Auto.
+        autoRecordEnabled = s.autoRecord
+        if s.autoRecord, let offAt = s.autoRecordOffAt, offAt <= Date() { autoRecordEnabled = false }
+        autoRecordOffAt = autoRecordEnabled ? s.autoRecordOffAt : nil
+        scheduleMuted = false
+        guard full else { return }
+        if !s.running { stop() } else if !isRunning { start() }
+    }
+
+    /// While set, `saveSessionIfChanged` writes these values in place of the live ones, so a quit mid-run saves the
+    /// owner's radio. The rest of the session (volume, display, recording settings…) stays live.
+    var sessionRadioOverride: SavedRadio? { didSet { saveSessionIfChanged() } }
+
+    /// Starts the radio on the RSP (switching from Demo or a file). True once it runs on the RSP. False if it ended
+    /// up on anything else (the open failed, the demo runs) or is not on the RSP within `timeout`; then the source
+    /// chosen and the running state are put back as they were.
+    func startRSPForSchedule(timeout: Duration) async -> Bool {
+        if isRunning && sourceKind == .sdrplay { return true }
+        let source = preferredSource, wasRunning = isRunning
+        useSource(.sdrplay)
+        if !isRunning { start() }
+        let deadline = ContinuousClock.now + timeout
+        while true {
+            if isRunning && sourceKind == .sdrplay { return true }
+            if rspOpenFailed || (isRunning && sourceKind == .synthetic) || ContinuousClock.now >= deadline { break }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        if source != preferredSource, source != .file || fileSource != nil { useSource(source) }
+        if !wasRunning { stop() } else if !isRunning { start() }
+        return false
     }
 
     /// Free bytes where recordings go, or nil when unknown.
@@ -1745,15 +1889,20 @@ final class AppModel {
         saveSessionIfChanged()
     }
 
+    /// Mid-run (`sessionRadioOverride`), the radio part is the owner's saved radio rather than the run's.
     private func saveSessionIfChanged() {
-        let state = SessionState(vfoHz: vfoHz, centerHz: centerHz, mode: mode, bandwidthHz: bandwidthHz, upconverter: upconverter,
+        let radio = sessionRadioOverride ?? saveRadio()
+        var upconverter = upconverter
+        upconverter.enabled = radio.upconverter
+        let state = SessionState(vfoHz: radio.vfoHz, centerHz: radio.centerHz, mode: radio.mode, bandwidthHz: radio.bandwidthHz,
+                                 upconverter: upconverter,
                                  hardware: hardware, spectrum: spectrum, dbMin: dbMin, dbMax: dbMax, colormap: colormap,
                                  showBookmarks: showBookmarks, volume: volume, agcSpeed: agcSpeed, cwPitchHz: cwPitchHz,
-                                 preferredSource: preferredSource == .file ? .sdrplay : preferredSource,
+                                 preferredSource: radio.source == .file ? .sdrplay : radio.source,
                                  modemBox: nil, modemSettings: modem.settings, recording: recording,
-                                 autoRecord: autoRecordEnabled, squelchEnabled: squelchEnabled, squelchDb: squelchDb,
+                                 autoRecord: radio.autoRecord, squelchEnabled: radio.squelchEnabled, squelchDb: radio.squelchDb,
                                  noiseReduction: noiseReduction, skipSilence: skipSilence,
-                                 transcription: transcriptionSettings, autoRecordOffAt: autoRecordOffAt)
+                                 transcription: transcriptionSettings, autoRecordOffAt: radio.autoRecordOffAt)
         guard let data = try? JSONEncoder().encode(state), data != lastSavedSession else { return }
         defaults.set(data, forKey: "session")
         lastSavedSession = data

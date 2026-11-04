@@ -184,16 +184,18 @@ private struct RecordButton: View {
 
 /// Squelch auto-record. Off: plain. Armed: a faint red ring. Recording: solid red with the elapsed
 /// time. Waiting (squelch off, radio stopped, demo source) or paused (a manual audio recording runs):
-/// a dashed, dimmed ring and help saying why.
+/// a dashed, dimmed ring and help saying why. A schedule's run looks like Recording while it records and
+/// Armed while it listens, with the schedule's name in the help.
 private struct AutoRecordButton: View {
     @Environment(AppModel.self) private var model
 
     var body: some View {
         let state = model.autoRecordState
-        let on = state == .recording
+        let on = state == .recording || (state == .scheduled && model.isAutoRecording)
         let ring: RecordButtonLabel.Ring = switch state {
         case .off, .recording: .none
         case .armed: .armed
+        case .scheduled: on ? .none : .armed
         case .needsSquelch, .needsRadio, .demoSource, .paused: .waiting
         }
         let timing = model.recording.autoTiming
@@ -209,7 +211,8 @@ private struct AutoRecordButton: View {
     }
 
     private func accessibilityValue(_ state: AppModel.AutoRecordState, duration: Double) -> String {
-        switch state {
+        let name = model.scheduleRecording?.tag.name ?? "a schedule"
+        return switch state {
         case .off: "off"
         case .armed: "listening"
         case .recording: "recording \(RecordingFormat.elapsed(duration))"
@@ -217,6 +220,7 @@ private struct AutoRecordButton: View {
         case .needsRadio: "waiting for the radio"
         case .demoSource: "demo source"
         case .paused: "paused"
+        case .scheduled: model.isAutoRecording ? "recording \(name) \(RecordingFormat.elapsed(duration))" : "listening for \(name)"
         }
     }
 
@@ -230,6 +234,7 @@ private struct AutoRecordButton: View {
         case .needsRadio: return "Waiting: start the radio"
         case .demoSource: return "Waiting: auto-record never records the demo source"
         case .paused: return "Paused while you record audio by hand"
+        case .scheduled: return "Recording for the schedule \(model.scheduleRecording?.tag.name ?? "")"
         }
     }
 }

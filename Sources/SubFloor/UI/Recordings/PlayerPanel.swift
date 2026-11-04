@@ -88,11 +88,12 @@ struct PlayerPanel: View {
         .task(id: audioURL) { await loadPeaks() }
     }
 
-    /// `11.175 MHz USB  07:48:12.4Z  7.8 s  Auto` … and the playhead clock on the right.
+    /// `11.175 MHz USB  07:48:12.4Z  7.8 s  Auto` … and the playhead clock on the right. A schedule's recording
+    /// reads `Voice of Korea · 9.435 MHz AM …`.
     private func titleLine(_ r: CatalogRecording) -> some View {
         let length = r.seconds ?? (player.file == r.file && player.duration > 0 ? player.duration : nil)
         return HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(RecordingsCatalog.laneTitle(frequencyHz: r.frequencyHz, mode: r.mode))
+            Text(Self.title(r))
                 .font(.system(size: 15, weight: .semibold))
                 .padding(.trailing, 4)
             tag(RecordingsFormat.clock(r.start), monospaced: true)
@@ -101,6 +102,12 @@ struct PlayerPanel: View {
             Spacer(minLength: 12)
             PlayheadClock(recording: r, player: player)
         }
+    }
+
+    /// The schedule's name, if it was recorded for one, then the frequency and mode.
+    static func title(_ r: CatalogRecording) -> String {
+        let lane = RecordingsCatalog.laneTitle(frequencyHz: r.frequencyHz, mode: r.mode)
+        return r.scheduleName.map { "\($0) · \(lane)" } ?? lane
     }
 
     /// The mockup's grey tag.

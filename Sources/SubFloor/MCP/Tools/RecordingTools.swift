@@ -81,10 +81,10 @@ extension SubFloorTools {
 
             SubFloorTool("list_recordings", title: "List recordings", readOnly: true, description: """
                 The audio recordings in the owner's Recordings, newest first: file, start, seconds (null while \
-                unknown), frequency_hz, mode, auto, heard, in_progress and transcript (null, or {verdict, words, \
-                excerpt}). Optionally only those started since and/or until (ISO 8601 times), within tolerance_hz \
-                (default 5000) of frequency, or with a "voice" transcript (voice_only). At most limit (default 50, \
-                up to 500). Returns {recordings}.
+                unknown), frequency_hz, mode, auto, heard, in_progress, schedule (the schedule it was recorded for, or \
+                null) and transcript (null, or {verdict, words, excerpt}). Optionally only those started since and/or \
+                until (ISO 8601 times), within tolerance_hz (default 5000) of frequency, or with a "voice" transcript \
+                (voice_only). At most limit (default 50, up to 500). Returns {recordings}.
                 """, properties: [
                     "since": .schema("string", "ISO 8601 time, e.g. \"2026-10-31T14:00:00Z\"."),
                     "until": .schema("string", "ISO 8601 time."),
@@ -407,7 +407,7 @@ extension SubFloorTools {
         return .object([
             "file": .string(r.file), "start": .time(r.start), "seconds": r.seconds.map { .num(tenths($0)) }.orNull,
             "frequency_hz": .hz(r.frequencyHz), "mode": .string(r.mode), "auto": .bool(r.auto), "heard": .bool(r.heard),
-            "in_progress": .bool(r.inProgress),
+            "in_progress": .bool(r.inProgress), "schedule": r.scheduleName.map { .string($0) }.orNull,
             "transcript": summary.map {
                 .object(["verdict": .string($0.verdict.toolName), "words": .number(Double($0.words.count)),
                          "excerpt": .string(excerpt($0.text))])
