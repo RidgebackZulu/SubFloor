@@ -30,18 +30,17 @@ final class BroadcastRun {
         var restoresFully: Bool { self != .ownerChangedRadio && self != .rspLost && self != .lowDisk }
     }
 
-    /// What the radio should show after the run's own last change. The VFO and centre aren't checked while the floor
-    /// is measured or the frequencies are compared (nil), since those move the VFO.
+    /// What the radio should show after the run's own last change (`note`).
     @MainActor private struct Expected {
-        var vfoHz: Double?
-        var centerHz: Double?
+        var vfoHz: Double
+        var centerHz: Double
         var mode: DemodMode
         var bandwidthHz: Double
 
-        func matches(_ m: AppModel) -> Bool {
-            func same(_ a: Double?, _ b: Double) -> Bool { a.map { abs($0 - b) < 0.5 } ?? true }
-            return same(vfoHz, m.vfoHz) && same(centerHz, m.centerHz) && m.mode == mode
-                && abs(m.bandwidthHz - bandwidthHz) < 0.5
+        /// `tuning` false: the VFO and centre aren't compared (a floor measurement is moving the VFO).
+        func matches(_ m: AppModel, tuning: Bool) -> Bool {
+            let tuned = abs(m.vfoHz - vfoHz) < 0.5 && abs(m.centerHz - centerHz) < 0.5
+            return (!tuning || tuned) && m.mode == mode && abs(m.bandwidthHz - bandwidthHz) < 0.5
         }
     }
 
@@ -67,6 +66,8 @@ final class BroadcastRun {
     private var secondsByFile: [String: Double] = [:]
     private var rspLostBefore: Date?
     private var expected: Expected?
+    /// A floor measurement is in flight: it moves the VFO, so only the mode and bandwidth are compared meanwhile.
+    private var movingVFO = false
     /// Set once the radio runs on the RSP for the run: from then on a stopped radio or a manual recording is the
     /// owner's doing.
     private var radioIsOurs = false
@@ -116,17 +117,21 @@ final class BroadcastRun {
         m.setMode(mode)
         m.setBandwidth(mode.defaultBandwidth)
         m.squelchEnabled = true
-        expected = Expected(mode: m.mode, bandwidthHz: m.bandwidthHz)
+        note(m)
 
-        // Several frequencies get 2 spots each, so up to 8 fit in the lead minute as nearly as they can.
+        // Several frequencies get 2 spots each, so up to 8 fit in the lead minute as nearly as they can. Before each
+        // of its own tunes the run checks the owner hasn't changed the radio, so it never retunes over them.
         phase = .measuring
         for hz in frequencies {
+            guard proceed(m) else { return }
             tune(m, to: hz)
-            if let floor = await m.measureNoiseFloor(near: hz, spots: frequencies.count > 1 ? 2 : 3,
-                                                     spotSeconds: timing.spotSeconds) {
-                floors[hz] = floor
-            }
+            movingVFO = true
+            let floor = await m.measureNoiseFloor(near: hz, spots: frequencies.count > 1 ? 2 : 3,
+                                                  spotSeconds: timing.spotSeconds)
+            movingVFO = false
             guard live else { return }
+            if let floor { floors[hz] = floor }
+            note(m)   // the measurement puts the VFO back on `hz`
         }
 
         var chosen = frequencies[0]
@@ -134,13 +139,15 @@ final class BroadcastRun {
             phase = .picking
             let onAir = window.start.addingTimeInterval(ScheduleClock.broadcastLead)
             while now() < onAir {
-                guard live else { return }
+                guard proceed(m) else { return }
                 try? await Task.sleep(for: .milliseconds(100))
             }
-            chosen = await strongest(m, of: frequencies, secondsEach: timing.pickSeconds / Double(frequencies.count))
-            guard live else { return }
+            guard let strongest = await strongest(m, of: frequencies,
+                                                  secondsEach: timing.pickSeconds / Double(frequencies.count)) else { return }
+            chosen = strongest
         }
 
+        guard proceed(m) else { return }
         tune(m, to: chosen)
         frequencyHz = chosen
         // A frequency with no quiet spot near it borrows the others' floor; with none at all the squelch stays as set.
@@ -151,8 +158,24 @@ final class BroadcastRun {
             tag: schedule.tag,
             timing: AutoRecordTiming(startAfter: ownerTiming.startAfter, stopAfter: timing.quietCloseSeconds,
                                      keepGapsUpTo: ownerTiming.keepGapsUpTo))
-        expected = Expected(vfoHz: m.vfoHz, centerHz: m.centerHz, mode: m.mode, bandwidthHz: m.bandwidthHz)
+        note(m)
         phase = .recording
+    }
+
+    /// The radio as the run has just left it.
+    private func note(_ m: AppModel) {
+        expected = Expected(vfoHz: m.vfoHz, centerHz: m.centerHz, mode: m.mode, bandwidthHz: m.bandwidthHz)
+    }
+
+    /// False when the run must stop setting up: it was ended, or the owner (or the RSP) has changed the radio since
+    /// the run's last change, which then ends it.
+    private func proceed(_ m: AppModel) -> Bool {
+        guard live else { return false }
+        if let reason = check(m) {
+            endReason = reason
+            return false
+        }
+        return true
     }
 
     /// HamItUp as the agents' `auto` sets it (on below 30 MHz when reachable through it), then the tune.
@@ -162,17 +185,20 @@ final class BroadcastRun {
         m.tune(to: hz)
     }
 
-    /// The frequency furthest above its floor among those at least the margin over it, else the first. Each is listened
-    /// to for `secondsEach`: the first third lets the AGC and the channel filter settle, the rest is read.
-    private func strongest(_ m: AppModel, of frequencies: [Double], secondsEach: Double) async -> Double {
+    /// The frequency furthest above its floor among those at least the margin over it, else the first; nil when the run
+    /// ended meanwhile. Each is listened to for `secondsEach`: the first third lets the AGC and the channel filter
+    /// settle, the rest is read. The owner's changes are watched throughout (a hop is the run's own `note`d tune).
+    private func strongest(_ m: AppModel, of frequencies: [Double], secondsEach: Double) async -> Double? {
         var best: (hz: Double, over: Float)?
         for hz in frequencies {
+            guard proceed(m) else { return nil }
             tune(m, to: hz)
+            note(m)
             try? await Task.sleep(for: .seconds(secondsEach / 3))
             var reads: [Float] = []
             let end = Date().addingTimeInterval(secondsEach * 2 / 3)
             repeat {
-                guard live else { return frequencies[0] }
+                guard proceed(m) else { return nil }
                 reads.append(m.engine.stats.withLock { $0.signalDb })
                 try? await Task.sleep(for: .milliseconds(100))
             } while Date() < end
@@ -195,7 +221,7 @@ final class BroadcastRun {
         guard radioIsOurs else { return nil }
         if m.isRecording(.audio) || m.isRecording(.iq) { return .ownerChangedRadio }
         if !m.isRunning || m.sourceKind != .sdrplay { return .ownerChangedRadio }
-        if let expected, !expected.matches(m) { return .ownerChangedRadio }
+        if let expected, !expected.matches(m, tuning: !movingVFO) { return .ownerChangedRadio }
         return nil
     }
 
@@ -213,10 +239,11 @@ final class BroadcastRun {
         }
     }
 
-    /// Seconds recorded so far: the files that ended, and the one being written if it is this run's.
+    /// Seconds recorded so far: the files whose length is logged, and the latest one (being written, or closed and
+    /// not logged yet) if it is this run's.
     func elapsed(_ m: AppModel) -> Double {
         var total = secondsByFile.values.reduce(0, +)
-        if let s = m.recordingStatus[.audio], s.isRecording, s.isAuto, let file = s.url?.lastPathComponent,
+        if let s = m.recordingStatus[.audio], let file = s.url?.lastPathComponent,
            files.contains(file), secondsByFile[file] == nil {
             total += s.duration
         }
@@ -238,16 +265,9 @@ final class BroadcastRun {
                 return !open && (reason != .windowEnd || files.allSatisfy { secondsByFile[$0] != nil })
             }
         }
-        let outcome: RunOutcome? = switch reason {
-        case .windowEnd:
-            files.isEmpty ? .nothingHeard(watch: false)
-                          : .recorded(seconds: files.compactMap { secondsByFile[$0] }.reduce(0, +), files: files.count)
-        case .stoppedByYou, .ownerChangedRadio: .stoppedByYou
-        case .noRSP: .missedNoRSP
-        case .rspLost: .rspLost(afterSeconds: now.timeIntervalSince(takenAt))
-        case .lowDisk: .lowDisk
-        case .preempted: nil
-        }
+        let outcome = outcome(for: reason, now: now, recordedSeconds: files.compactMap { secondsByFile[$0] }.reduce(0, +))
+        // Quitting meanwhile: the session already holds the owner's radio, and nothing may start the radio again.
+        guard !m.isShutDown else { return outcome }
         if let saved {
             m.restoreRadio(saved, full: reason.restoresFully)
         } else {
@@ -256,6 +276,22 @@ final class BroadcastRun {
         }
         phase = .ended
         return outcome
+    }
+
+    /// The outcome of a run cut short by quitting: what it has recorded so far, or what ended it.
+    func outcomeAtQuit(_ m: AppModel, now: Date) -> RunOutcome? {
+        outcome(for: endReason ?? .windowEnd, now: now, recordedSeconds: elapsed(m))
+    }
+
+    private func outcome(for reason: EndReason, now: Date, recordedSeconds: Double) -> RunOutcome? {
+        switch reason {
+        case .windowEnd: files.isEmpty ? .nothingHeard(watch: false) : .recorded(seconds: recordedSeconds, files: files.count)
+        case .stoppedByYou, .ownerChangedRadio: .stoppedByYou
+        case .noRSP: .missedNoRSP
+        case .rspLost: .rspLost(afterSeconds: now.timeIntervalSince(takenAt))
+        case .lowDisk: .lowDisk
+        case .preempted: nil
+        }
     }
 
     /// Polls the recorders until `done`, for at most `seconds`.

@@ -138,8 +138,15 @@ final class Scheduler {
     }
 
     /// App quit: the timer and a run in progress stop where they are (the session already holds the owner's radio).
+    /// A run cut short logs what it has recorded so far, and the store is saved.
     func shutdown() {
+        guard !isShutDown else { return }
         isShutDown = true
+        if let run = currentRun, let model, let outcome = run.outcomeAtQuit(model, now: now()) {
+            record(outcome, for: run.schedule.id, at: now())
+            lastOutcome = outcome
+        }
+        save()
         timerTask?.cancel()
         currentRun?.setupTask?.cancel()
         runTask?.cancel()
@@ -153,6 +160,9 @@ final class Scheduler {
 
     func add(_ s: Schedule) throws {
         guard schedules.count < ScheduleStore.maxSchedules else { throw ScheduleError.tooMany }
+        guard !schedules.contains(where: { $0.id == s.id }) else {
+            throw ScheduleError.invalid("A schedule with that id already exists.")
+        }
         try Self.validate(s)
         schedules.append(s)
         schedulesChanged()
@@ -192,14 +202,17 @@ final class Scheduler {
         if ReligiousFilter.bundled.isReligious(s.name) { throw ScheduleError.religious(s.name) }
         guard TimeZone(identifier: s.timeZone) != nil else { throw ScheduleError.invalid("Unknown time zone \(s.timeZone).") }
         guard s.durationMinutes >= 1 else { throw ScheduleError.invalid("A schedule must last at least 1 minute.") }
+        let tunable: (Double) -> Bool = { $0.isFinite && (1_000...2_000_000_000).contains($0) }
+        let frequencyText = "frequencies must be 1 to 8 frequencies between 1 kHz and 2000 MHz."
         switch s.kind {
         case .broadcast:
-            guard (1...8).contains(s.frequenciesHz.count),
-                  s.frequenciesHz.allSatisfy({ $0.isFinite && (1_000...2_000_000_000).contains($0) }) else {
-                throw ScheduleError.invalid("frequencies must be 1 to 8 frequencies between 1 kHz and 2000 MHz.")
+            guard (1...8).contains(s.frequenciesHz.count), s.frequenciesHz.allSatisfy(tunable) else {
+                throw ScheduleError.invalid(frequencyText)
             }
             guard s.durationMinutes <= 6 * 60 else { throw ScheduleError.invalid("A broadcast can be at most 6 hours.") }
         case .watch:
+            if let low = s.lowHz, !tunable(low) { throw ScheduleError.invalid(frequencyText) }
+            if let high = s.highHz, !tunable(high) { throw ScheduleError.invalid(frequencyText) }
             guard let low = s.lowHz, let high = s.highHz, low.isFinite, high.isFinite,
                   (10_000...400_000).contains(high - low) else {
                 throw ScheduleError.invalid("A watch's span must be 10 to 400 kHz.")
@@ -246,9 +259,13 @@ final class Scheduler {
 
     private func tickNow() async {
         guard let model, !isShutDown else { return }
-        let now = now()
+        var now = now()
         if let run = currentRun, run.endReason == nil, let reason = run.check(model) { endRun(reason) }
-        if currentRun?.endReason != nil { await runTask?.value }
+        if currentRun?.endReason != nil {
+            await runTask?.value
+            guard !isShutDown else { return }
+            now = self.now()   // the teardown took a while
+        }
 
         let actions = SchedulePlanner.tick(schedules: schedules, on: isOn, now: now, lastTick: lastTick,
                                            lastAlive: launchAlive, running: running, settled: settled)
@@ -320,7 +337,7 @@ final class Scheduler {
     }
 
     private func finish(_ run: BroadcastRun, _ outcome: RunOutcome?) {
-        guard currentRun === run else { return }
+        guard currentRun === run, !isShutDown else { return }   // quitting logged it already
         if let outcome {
             record(outcome, for: run.schedule.id, at: now())
             lastOutcome = outcome

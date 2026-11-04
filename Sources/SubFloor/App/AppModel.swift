@@ -487,7 +487,8 @@ final class AppModel {
     private var rspOpenAttempt = 0
     private let openRSP: @Sendable () throws -> SDRplayDevice
     private let rspOpenTimeout: Duration
-    private var isShutDown = false
+    /// Set by `shutdown()`: the app is quitting, and nothing may start the radio again.
+    private(set) var isShutDown = false
     static let serviceRestartCommand = "sudo launchctl kickstart -k system/com.sdrplay.service"
     static let serviceStalledMessage = "The SDRplay service is not responding, so the demo signal is running. Restart the service in Terminal, then reopen SubFloor."
 
@@ -1719,6 +1720,7 @@ final class AppModel {
             if ContinuousClock.now >= deadline && rspConnection != .opening { break }
             try? await Task.sleep(for: .milliseconds(50))
         }
+        guard !isShutDown else { return false }
         if source != preferredSource, source != .file || fileSource != nil { useSource(source) }
         if !wasRunning { stop() } else if !isRunning { start() }
         return false

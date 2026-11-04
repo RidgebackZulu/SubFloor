@@ -209,6 +209,20 @@ struct SchedulerTests {
         w.enabled = true
         try m.scheduler.update(w)
         #expect(m.scheduler.schedules[0].enabled)
+        // A watch's edges are tunable frequencies.
+        w.lowHz = 500
+        w.highHz = 100_500
+        #expect(throws: ScheduleError.invalid("frequencies must be 1 to 8 frequencies between 1 kHz and 2000 MHz.")) { try m.scheduler.update(w) }
+        w.lowHz = 1_999_990_000
+        w.highHz = 2_000_090_000
+        #expect(throws: ScheduleError.invalid("frequencies must be 1 to 8 frequencies between 1 kHz and 2000 MHz.")) { try m.scheduler.update(w) }
+        // An id already in use.
+        let first = broadcast(clock: clock)
+        try m.scheduler.add(first)
+        var copy = broadcast(name: "Another", clock: clock)
+        copy.id = first.id
+        #expect(throws: ScheduleError.invalid("A schedule with that id already exists.")) { try m.scheduler.add(copy) }
+        #expect(m.scheduler.schedules.filter { $0.id == first.id }.count == 1)
         #expect(ScheduleError.invalid("x").message == "x")
     }
 
@@ -284,6 +298,60 @@ struct SchedulerTests {
         await endWindow(m, s, clock)
         let lines = try labelled(m, s)
         #expect(lines.map { $0.frequencyHz } == [10_000_000])
+    }
+
+    @Test func ticksThroughASetupWithSeveralFrequencies() async throws {
+        let (m, clock) = makeModel()
+        defer { m.shutdown() }
+        guard canRun(m) else { return }
+        let s = broadcast([9_990_000, 9_500_000, 10_000_000], clock: clock)
+        clock.now = clock.now.addingTimeInterval(ScheduleClock.broadcastLead)
+        try m.scheduler.add(s)
+        m.scheduler.isOn = true
+        // The timer's ticks through the floor and the pick, at ten a second: the run's own tunes are not the owner's.
+        await m.scheduler.tick()
+        let end = Date().addingTimeInterval(40)
+        while m.scheduler.running != nil, m.scheduler.currentRun?.phase != .recording, Date() < end {
+            try? await Task.sleep(for: .milliseconds(100))
+            await m.scheduler.tick()
+        }
+        #expect(m.scheduler.currentRun?.phase == .recording)
+        #expect(m.scheduler.currentRun?.frequencyHz == 10_000_000)
+        await endWindow(m, s, clock)
+        #expect(lastRun(m, s) != .stoppedByYou)
+    }
+
+    @Test func ownerRetuneWhileWaitingToGoOnAirStopsTheRun() async throws {
+        let (m, clock) = makeModel()
+        defer { m.shutdown() }
+        guard canRun(m) else { return }
+        let s = broadcast([9_990_000, 10_000_000], clock: clock)   // the clock stays in the lead minute
+        try m.scheduler.add(s)
+        m.scheduler.isOn = true
+        await m.scheduler.tick()
+        #expect(await wait(upTo: 40) { m.scheduler.currentRun?.phase == .picking })
+        m.setVFO(10_020_000)
+        // Seen by the run itself, with no tick.
+        #expect(await wait(upTo: 5) { m.scheduler.running == nil })
+        #expect(lastRun(m, s) == .stoppedByYou)
+        #expect(m.vfoHz == 10_020_000)   // stays where the owner put it
+        #expect(m.isRunning && m.sourceKind == .sdrplay)
+    }
+
+    @Test func ownerRetuneDuringThePickStopsTheRun() async throws {
+        let (m, clock) = makeModel()
+        defer { m.shutdown() }
+        guard canRun(m) else { return }
+        let s = broadcast([9_990_000, 9_500_000, 10_000_000], clock: clock)
+        clock.now = clock.now.addingTimeInterval(ScheduleClock.broadcastLead)   // on air: the hops start at once
+        try m.scheduler.add(s)
+        m.scheduler.isOn = true
+        await m.scheduler.tick()
+        #expect(await wait(upTo: 40) { m.scheduler.currentRun?.phase == .picking })
+        m.setVFO(10_020_000)
+        #expect(await wait(upTo: 10) { m.scheduler.running == nil })
+        #expect(lastRun(m, s) == .stoppedByYou)
+        #expect(m.vfoHz == 10_020_000)
     }
 
     @Test func squelchIsFloorPlusMargin() async throws {
@@ -504,6 +572,46 @@ struct SchedulerTests {
         #expect(await wait(upTo: 5) { answer.value != nil })
         #expect(answer.value == false)
         #expect(!m.isRunning)
+    }
+
+    @Test func quitMidRunLogsWhatWasRecorded() async throws {
+        let (m, clock) = makeModel()
+        defer { m.shutdown() }
+        guard canRun(m) else { return }
+        let s = broadcast([10_000_000], clock: clock)
+        guard try await startAndRecord(m, s) else { return }
+        #expect(await wait(upTo: 15) { m.scheduler.currentRun?.files.count == 1 })
+        m.shutdown()
+        guard case .recorded(_, let files)? = lastRun(m, s) else {
+            Issue.record("lastRun \(String(describing: lastRun(m, s)))")
+            return
+        }
+        #expect(files == 1)
+        // Saved: a fresh read of the store has it.
+        let stored = m.scheduler.store.load(localZone: "UTC").0.first { $0.id == s.id }
+        #expect(stored?.lastRun?.outcome == lastRun(m, s))
+        await wait(upTo: 0.5) { false }
+        #expect(!m.isRunning)
+    }
+
+    @Test func quitMidTeardownDoesNotRestartTheRadio() async throws {
+        let (m, clock) = makeModel()
+        defer { m.shutdown() }
+        guard canRun(m) else { return }
+        m.useSource(.synthetic)   // running on Demo: a restore would start it again
+        #expect(m.isRunning)
+        let s = broadcast([10_000_000], clock: clock)
+        guard try await startAndRecord(m, s) else { return }
+        #expect(await wait(upTo: 15) { m.scheduler.currentRun?.files.count == 1 })
+        clock.now = window(s, clock).end
+        let ending = Task { await m.scheduler.tick() }
+        #expect(await wait(upTo: 5) { m.scheduler.currentRun?.phase == .ending })
+        m.shutdown()
+        await ending.value
+        await wait(upTo: 0.5) { false }
+        #expect(!m.isRunning)
+        if case .recorded(_, let files)? = lastRun(m, s) { #expect(files == 1) }
+        else { Issue.record("lastRun \(String(describing: lastRun(m, s)))") }
     }
 
     @Test func rspLostMidRun() async throws {
