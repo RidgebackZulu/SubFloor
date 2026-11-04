@@ -96,11 +96,20 @@ enum TranscriptStripContent: Equatable {
     /// A recording being sent right now says so even when it has an old transcript (Transcribe Again);
     /// otherwise a transcript wins over a queued retry, and a failure shows only for a recording with none.
     /// A queued one in a `blocked` queue is going nowhere until the key is saved again, so it gives the reason.
-    static func decide(summary: TranscriptSummary?, state: TranscriptionJobState?, blocked: TranscriptionError? = nil) -> Self {
+    ///
+    /// A translated transcript shows its English words unless `showOriginal`.
+    static func decide(summary: TranscriptSummary?, state: TranscriptionJobState?, blocked: TranscriptionError? = nil,
+                       showOriginal: Bool = false) -> Self {
         if state == .running { return .transcribing }
         // The verdict, as the badge has it: a transcript with under 3 kept words is possible noise, whatever
         // words it holds (they stay in the index for search).
-        if let summary { return summary.verdict == .possibleNoise ? .noise : .words(summary.words, text: summary.text) }
+        if let summary {
+            guard summary.verdict == .voice else { return .noise }
+            if !showOriginal, let english = summary.englishWords, !english.isEmpty {
+                return .words(english, text: english.map(\.text).joined(separator: " "))
+            }
+            return .words(summary.words, text: summary.text)
+        }
         switch state {
         case .failed(let reason)?: return .failed(reason)
         case .queued? where blocked != nil: return .failed(blocked?.message ?? "")
@@ -118,6 +127,31 @@ enum TranscriptStripContent: Equatable {
         case .transcribing: "Transcribing…"
         case .notTranscribed: "Not transcribed"
         }
+    }
+}
+
+/// The line above the strip for a translated transcript: what it says, and the switch's label.
+struct TranscriptStripHeader: Equatable {
+    /// "Translated from Korean", or the note saying why there is no translation.
+    var text: String
+    /// "Show original" / "Show English"; nil when there is nothing to switch to.
+    var toggle: String?
+
+    /// nil for an English or untranslated transcript.
+    static func make(summary: TranscriptSummary?, showOriginal: Bool) -> Self? {
+        guard let summary else { return nil }
+        if summary.englishWords != nil {
+            return Self(text: "Translated from \(languageName(summary.spokenLanguage))",
+                        toggle: showOriginal ? "Show English" : "Show original")
+        }
+        if let note = summary.translationNote, !note.isEmpty { return Self(text: note, toggle: nil) }
+        return nil
+    }
+
+    /// "korean" becomes "Korean"; a two-letter code ("ko") is upper-cased.
+    static func languageName(_ language: String?) -> String {
+        guard let language, !language.isEmpty else { return "another language" }
+        return language.count == 2 ? language.uppercased() : language.prefix(1).uppercased() + language.dropFirst()
     }
 }
 

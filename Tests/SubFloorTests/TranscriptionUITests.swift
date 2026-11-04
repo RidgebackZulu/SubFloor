@@ -22,4 +22,12 @@ import Testing
         #expect(TranscriptionFormat.keyToSave("  \n\t ") == nil)
         #expect(TranscriptionFormat.keyToSave("  sk-test \n") == "sk-test")
     }
+
+    @Test func settingsShowTheTranslateToggle() {
+        #expect(TranscriptionFormat.translateNote
+                == "Uses your OpenRouter key. Applies when the language is left to detect, and always for scheduled recordings.")
+        #expect(TranscriptionFormat.modelToSave("  ", default: "d") == "d")
+        #expect(TranscriptionFormat.modelToSave(" x/y \n", default: "d") == "x/y")
+        #expect(TranscriptionSettings().translate)
+    }
 }

@@ -11,14 +11,21 @@ public struct TranscriptSummary: Equatable, Sendable {
     public var spokenLanguage: String?
     /// The English translation's text, or nil when there is none. `searchText` covers it as well as `text`.
     public var english: String?
+    /// The translation's kept words, timed against the recording; nil when there is no translation.
+    public var englishWords: [TranscriptWord]?
+    /// Why a wanted translation is missing, or nil.
+    public var translationNote: String?
 
     public init(verdict: TranscriptVerdict, words: [TranscriptWord], text: String,
-                spokenLanguage: String? = nil, english: String? = nil) {
+                spokenLanguage: String? = nil, english: String? = nil,
+                englishWords: [TranscriptWord]? = nil, translationNote: String? = nil) {
         self.verdict = verdict
         self.words = words
         self.text = text
         self.spokenLanguage = spokenLanguage
         self.english = english
+        self.englishWords = englishWords
+        self.translationNote = translationNote
         self.searchText = TranscriptSearch.normalize(english.map { text + " " + $0 } ?? text)
     }
 }
@@ -37,7 +44,9 @@ public struct TranscriptIndex: Equatable, Sendable {
     public mutating func set(_ t: StoredTranscript) {
         let c = TranscriptClassifier.classify(t.chunks)
         summaries[t.file] = TranscriptSummary(verdict: c.verdict, words: c.words, text: c.text,
-                                              spokenLanguage: t.spokenLanguage, english: t.translation?.text)
+                                              spokenLanguage: t.spokenLanguage, english: t.translation?.text,
+                                              englishWords: t.translation == nil ? nil : TranscriptClassifier.classify(t.englishChunks).words,
+                                              translationNote: t.translationNote)
     }
 
     public func summary(_ file: String) -> TranscriptSummary? { summaries[file] }

@@ -215,17 +215,40 @@ private struct PlayerTranscript: View {
     let zoom: WaveformZoom
     let dragAnchor: Double?
     let terms: [String]
+    /// Whether the original words show instead of the English; back to English when another recording is picked.
+    @State private var showOriginal = false
 
     var body: some View {
         let loaded = player.file == recording.file
         let display = WaveformDisplay.decide(loaded: loaded, hasEnvelope: envelope != nil,
                                              loadError: loaded ? player.loadError : nil, peaksFailed: peaksFailed,
                                              duration: loaded ? player.duration : 0)
-        let file = recording.file, model = model
+        let file = recording.file
         let canTranscribe = model.hasAPIKey && model.transcriptionSettings.enabled
+        let summary = model.library.transcripts.summary(file)
+        let content = TranscriptStripContent.decide(summary: summary, state: model.transcription.states[file],
+                                                    blocked: model.transcription.blocked, showOriginal: showOriginal)
+        VStack(alignment: .leading, spacing: 2) {
+            if case .words = content, let header = TranscriptStripHeader.make(summary: summary, showOriginal: showOriginal) {
+                HStack(spacing: 8) {
+                    Text(header.text).font(.system(size: 10)).foregroundStyle(RecordingsTheme.muted)
+                    if let toggle = header.toggle {
+                        Button(toggle) { showOriginal.toggle() }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                            .underline()
+                    }
+                }
+            }
+            strip(content: content, loaded: loaded, display: display, file: file, canTranscribe: canTranscribe)
+        }
+        .onChange(of: recording.file) { showOriginal = false }
+    }
+
+    private func strip(content: TranscriptStripContent, loaded: Bool, display: WaveformDisplay, file: String,
+                       canTranscribe: Bool) -> some View {
         TranscriptStrip(
-            content: .decide(summary: model.library.transcripts.summary(file), state: model.transcription.states[file],
-                             blocked: model.transcription.blocked),
+            content: content,
             // The waveform's own extent and position, so a word sits above the signal it was spoken in.
             position: loaded ? player.position : 0,
             duration: display.shownDuration(playerDuration: loaded ? player.duration : 0, envelopeDuration: envelope?.duration),
