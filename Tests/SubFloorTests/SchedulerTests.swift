@@ -570,6 +570,20 @@ struct SchedulerTests {
         #expect(m.scheduler.running == nil)   // not taken back
     }
 
+    @Test func ownerTurningAutoOffDuringARunLeavesItOff() async throws {
+        let (m, clock) = makeModel()
+        defer { m.shutdown() }
+        guard canRun(m) else { return }
+        m.autoRecordEnabled = true   // on before the run; the run pauses it
+        let s = broadcast([10_000_000], clock: clock)
+        guard try await startAndRecord(m, s) else { return }
+        m.toggleAutoRecord()   // the owner means: turn my Auto off
+        #expect(await wait(upTo: 15) { m.scheduler.running == nil })
+        #expect(lastRun(m, s) == .stoppedByYou)
+        #expect(!m.autoRecordEnabled)
+        #expect(m.sessionRadioOverride == nil)
+    }
+
     @Test func deletingTheRunningScheduleEndsIt() async throws {
         let (m, clock) = makeModel()
         defer { m.shutdown() }

@@ -1591,7 +1591,12 @@ final class AppModel {
     /// The owner turns Auto on or off (the button or the menu). On with the squelch off, it says so and waits for the
     /// squelch. During a schedule's run it is an owner change: the run ends and the owner's new Auto stays.
     func toggleAutoRecord() {
-        autoRecordEnabled.toggle()
+        // A run pauses Auto, so the click flips the owner's Auto from before the run, not the paused one.
+        if let ownerAuto = scheduler.ownersAutoDuringRun {
+            autoRecordEnabled = !ownerAuto
+        } else {
+            autoRecordEnabled.toggle()
+        }
         scheduler.ownerChangedAuto()
         if autoRecordEnabled && !squelchEnabled {
             show(Banner(kind: .info, message: "Auto-record needs the squelch on."))
