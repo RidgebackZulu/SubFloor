@@ -2,7 +2,7 @@ import Foundation
 
 /// A station's transmission seen as one thing: the EiBi rows that differ only in frequency, merged.
 public struct TimetableBroadcast: Identifiable, Hashable, Sendable {
-    /// station|language|HHMM|days field
+    /// station|language|HHMM-HHMM|days field
     public var id: String
     public var station: String
     public var language: String
@@ -42,13 +42,15 @@ public struct Timetable: Sendable {
         self.droppedRows = dropped
         var merged: [String: TimetableBroadcast] = [:]
         for row in rows where Self.isActive(row, in: season) && Self.targetsNorthAmerica(row) && !filter.isReligious(row.station) {
+            // A days field mixing a monthly or once form with another day form is unusable: nil, so the row is skipped.
             guard let (days, irregular) = EiBi.days(row.daysField, season: season) else { continue }
             let start = row.start.hour * 60 + row.start.minute
             var length = row.end.hour * 60 + row.end.minute - start
             if length <= 0 { length += 1440 }
-            let id = String(format: "%@|%@|%02d%02d|%@", row.station, row.language, row.start.hour, row.start.minute, row.daysField)
+            let id = String(format: "%@|%@|%02d%02d-%02d%02d|%@", row.station, row.language, row.start.hour, row.start.minute,
+                            row.end.hour, row.end.minute, row.daysField)
             let hz = (row.kHz * 1000).rounded()
-            let key = "\(id)|\(length)"
+            let key = id
             if var existing = merged[key] {
                 if !existing.frequenciesHz.contains(hz) { existing.frequenciesHz.append(hz) }
                 merged[key] = existing
@@ -122,7 +124,7 @@ public struct Timetable: Sendable {
 
     /// For each schedule with a `timetableKey`: the same station and language, the closest start time (preferring a
     /// shared weekday, the earlier start on a tie). When found, it takes that broadcast's times, days, dates and
-    /// frequencies, this season's key, and note `.updated(now)`. When not found, it's switched off with note `.gone`.
+    /// frequencies, this season's key, and note `.updated(now)` only when the times, days or frequencies changed (or it was `.gone`). When not found, it's switched off with note `.gone`.
     /// Other schedules are untouched.
     public func relink(_ schedules: [Schedule], now: Date) -> [Schedule] {
         schedules.map { s in
@@ -136,11 +138,14 @@ public struct Timetable: Sendable {
                 out.enabled = false; out.timetableNote = .gone
                 return out
             }
+            let frequencies = Array(best.frequenciesHz.prefix(8))
+            let changed = best.start != s.start || best.durationMinutes != s.durationMinutes || best.days != s.days
+                || frequencies != s.frequenciesHz || s.timetableNote == .gone
             out.start = best.start; out.durationMinutes = best.durationMinutes; out.days = best.days
             out.startDate = best.startDate; out.endDate = best.endDate
-            out.frequenciesHz = Array(best.frequenciesHz.prefix(8))
+            out.frequenciesHz = frequencies
             out.timetableKey = TimetableKey(station: best.station, language: best.language, season: season.name)
-            out.timetableNote = .updated(now)
+            if changed { out.timetableNote = .updated(now) }
             return out
         }
     }

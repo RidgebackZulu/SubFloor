@@ -132,6 +132,30 @@ private func table(_ rows: [EiBiRow]) -> Timetable { Timetable(rows: rows, seaso
         #expect(new.relink([s], now: Date())[0].frequenciesHz == [8_000_000])
     }
 
+    @Test func relinkKeepsTheNoteWhenNothingChanged() {
+        let t = table([row(5000, "0200-0300", days: "irr")])
+        let s = t.schedule(from: t.broadcasts[0], now: Date(), addedBy: nil)
+        #expect(s.timetableNote == .irregular)
+        var older = s; older.timetableKey?.season = "a26"
+        let out = t.relink([older], now: utcDate("2026-11-03T12:00:00Z"))[0]
+        #expect(out.timetableNote == .irregular && out.timetableKey?.season == "b26")
+    }
+
+    @Test func relinkRevivesNoteButNotSwitchForAGoneBroadcast() {
+        let t = table([row(5000, "0200-0300")])
+        var s = t.schedule(from: t.broadcasts[0], now: Date(), addedBy: nil)
+        s.enabled = false; s.timetableNote = .gone
+        let now = utcDate("2026-11-03T12:00:00Z")
+        let out = t.relink([s], now: now)[0]
+        #expect(out.timetableNote == .updated(now) && !out.enabled)
+    }
+
+    @Test func broadcastIdsIncludeTheEnd() {
+        let t = table([row(5000, "0200-0300"), row(5000, "0200-0400")])
+        #expect(t.broadcasts.count == 2 && Set(t.broadcasts.map(\.id)).count == 2)
+        #expect(t.broadcasts[0].id.contains("0200-0300") || t.broadcasts[0].id.contains("0200-0400"))
+    }
+
     @Test func relinkSwitchesOffGoneBroadcasts() {
         let old = table([row(5000, "0200-0300")])
         let s = old.schedule(from: old.broadcasts[0], now: Date(), addedBy: nil)
@@ -155,5 +179,6 @@ private func table(_ rows: [EiBiRow]) -> Timetable { Timetable(rows: rows, seaso
         #expect(t.broadcasts.count >= 200)
         #expect(!t.broadcasts.contains { ReligiousFilter.bundled.isReligious($0.station) })
         #expect(t.droppedRows == dropped)
+        #expect(Set(t.broadcasts.map(\.id)).count == t.broadcasts.count)
     }
 }
