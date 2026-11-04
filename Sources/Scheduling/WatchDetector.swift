@@ -14,12 +14,15 @@ public struct WatchCandidate: Equatable, Sendable {
 }
 
 /// Finds a watch's candidates in its span's spectrum levels, fed about once a second: peaks at least `overFloorDb`
-/// over the span's median (its floor), at least `minWidthHz` wide (wider than a bare carrier), that have stood for
-/// `holdSeconds`. A peak is a run of adjacent points over the threshold; one seen again within `sameSpotHz` of where
+/// over the span's floor, at least `minWidthHz` wide (wider than a bare carrier), that have stood for `holdSeconds`.
+/// The floor is the `floorPercentile` of the frame's levels, not the median: a station can fill much of a narrow span,
+/// and a floor sloping toward a band edge would lift a median over the quieter side's stations. A peak is a run of adjacent points over the threshold; one seen again within `sameSpotHz` of where
 /// it was is the same spot, and one not seen for longer than `holdSeconds` (frames pause while a station records)
 /// holds again from scratch.
 public struct WatchDetector: Sendable {
     public static let overFloorDb: Float = 10
+    /// The fraction of the frame's levels at or below its floor.
+    public static let floorPercentile: Double = 0.2
     public static let holdSeconds: Double = 3
     public static let minWidthHz: Double = 1_000
     /// The 40 m ham band starts at 7000 kHz: peaks within this of the top edge, or running off it, are ignored.
@@ -45,14 +48,14 @@ public struct WatchDetector: Sendable {
     }
 
     /// One frame of levels from `fromHz` in steps of `binHz`. Returns the spots that have now stood ≥10 dB over the
-    /// span's median, at least `minWidthHz` wide, for `holdSeconds`, and aren't rejected or within `edgeGuardHz` of `highHz`.
+    /// span's floor (its 20th percentile), at least `minWidthHz` wide, for `holdSeconds`, and aren't rejected or within `edgeGuardHz` of `highHz`.
     public mutating func feed(levels: [Float], fromHz: Double, binHz: Double, at: Date) -> [WatchCandidate] {
         rejected.removeAll { $0.until <= at }
         guard !levels.isEmpty, binHz > 0 else {
             spots = []
             return []
         }
-        let floor = levels.sorted()[levels.count / 2]
+        let floor = levels.sorted()[min(levels.count - 1, Int(Double(levels.count) * Self.floorPercentile))]
         let threshold = floor + Self.overFloorDb
         var next: [Spot] = []
         var i = 0

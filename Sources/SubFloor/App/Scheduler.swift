@@ -307,6 +307,7 @@ final class Scheduler {
         }
         for (key, recorded) in pausedWatches where key.window.end <= now && running?.scheduleID != key.scheduleID {
             pausedWatches[key] = nil
+            settled.insert(key)
             let seconds = recorded.files.compactMap { recorded.secondsByFile[$0] }.reduce(0, +)
             record(recorded.files.isEmpty ? .nothingHeard(watch: true) : .recorded(seconds: seconds, files: recorded.files.count),
                    for: key.scheduleID, at: now)

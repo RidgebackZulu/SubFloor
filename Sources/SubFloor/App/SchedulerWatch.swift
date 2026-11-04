@@ -26,7 +26,18 @@ enum VoiceCheck {
 /// the span's spectrum through `WatchDetector`. A candidate Signal ID calls voice is recorded with the owner's Auto
 /// timing until it ends; then the watch goes back to watching. One station at a time: while one records the detector
 /// isn't fed. Every change the watch makes to the radio is `note`d, so an owner's change still ends the run.
+///
+/// Its durations (the hold, rejections, the refloor and the give-up) run on monotonic time, which a change of the
+/// Mac's clock doesn't move: `ContinuousClock` for its own deadlines, and `monotonicNow` for the detector's dates.
 extension BroadcastRun {
+    /// How long after Auto's start after a station's squelch may stay shut before the watch gives up on it.
+    static let squelchWaitSeconds: Double = 5
+    /// An SSB station's suppressed carrier lies about this far beyond the edge of its visible voice.
+    static let ssbCarrierGapHz: Double = 300
+
+    /// Monotonic time as a `Date` (the system uptime), for `WatchDetector`'s `at:` and `until:`.
+    static var monotonicNow: Date { Date(timeIntervalSinceReferenceDate: ProcessInfo.processInfo.systemUptime) }
+
     func watch(_ m: AppModel, timing: Scheduler.Timing,
                identify: @MainActor (Double) async -> SignalIdentity?) async {
         guard let low = schedule.lowHz, let high = schedule.highHz else { return }
@@ -42,13 +53,13 @@ extension BroadcastRun {
 
         phase = .measuring
         guard await measureFloors(m, near: middle, timing: timing) else { return }
-        var refloorAt = Date().addingTimeInterval(timing.watchRefloorSeconds)
+        var refloorAt = ContinuousClock.now + .seconds(timing.watchRefloorSeconds)
         phase = .watching
         while proceed(m) {
-            if Date() >= refloorAt {
+            if ContinuousClock.now >= refloorAt {
                 phase = .measuring
                 guard await measureFloors(m, near: middle, timing: timing) else { return }
-                refloorAt = Date().addingTimeInterval(timing.watchRefloorSeconds)
+                refloorAt = ContinuousClock.now + .seconds(timing.watchRefloorSeconds)
                 phase = .watching
             }
             guard let snapshot = await m.currentSpectrumSnapshot(), proceed(m) else {
@@ -56,7 +67,8 @@ extension BroadcastRun {
                 continue
             }
             let slice = SpectrumSlice(snapshot, from: from, to: to, points: max(1, Int((to - from) / 250)))
-            guard let c = detector.feed(levels: slice.levels, fromHz: from, binHz: slice.binHz, at: Date()).first else {
+            guard let c = detector.feed(levels: slice.levels, fromHz: from, binHz: slice.binHz,
+                                          at: Self.monotonicNow).first else {
                 try? await Task.sleep(for: .seconds(1))
                 continue
             }
@@ -65,26 +77,28 @@ extension BroadcastRun {
             guard let answer, let mode = VoiceCheck.recordMode(answer) else {
                 // No answer (the radio was busy): tried again shortly. Not voice: left alone for `rejectSeconds`.
                 let seconds = answer == nil ? WatchDetector.holdSeconds * 2 : timing.rejectSeconds
-                detector.reject(c.hz, until: Date().addingTimeInterval(seconds))
+                detector.reject(c.hz, until: Self.monotonicNow.addingTimeInterval(seconds))
                 continue
             }
             let heard = await record(c, in: mode, m, timing: timing)
             guard live else { return }
             // A station that was heard may come back soon as a new transmission; one that never opened the squelch
             // is left alone for `rejectSeconds`.
-            detector.reject(c.hz, until: Date().addingTimeInterval(heard ? WatchDetector.holdSeconds * 2 : timing.rejectSeconds))
+            let seconds = heard ? WatchDetector.holdSeconds * 2 : timing.rejectSeconds
+            detector.reject(c.hz, until: Self.monotonicNow.addingTimeInterval(seconds))
             m.setVFO(middle)
             note(m)
             phase = .watching
         }
     }
 
-    /// Where the VFO goes for a station: an SSB signal's dial is at its low (USB) or high (LSB) edge, so the passband
-    /// covers it; anything else is tuned at its centre.
+    /// Where the VFO goes for a station: an SSB signal's dial is its suppressed carrier, `ssbCarrierGapHz` below its
+    /// low edge (USB) or above its high edge (LSB), so the passband covers the voice; anything else is tuned at its
+    /// centre.
     static func dial(for c: WatchCandidate, mode: DemodMode) -> Double {
         switch mode {
-        case .usb: c.hz - c.widthHz / 2
-        case .lsb: c.hz + c.widthHz / 2
+        case .usb: c.hz - c.widthHz / 2 - ssbCarrierGapHz
+        case .lsb: c.hz + c.widthHz / 2 + ssbCarrierGapHz
         default: c.hz
         }
     }
@@ -114,9 +128,10 @@ extension BroadcastRun {
     }
 
     /// Records the station `c` in `mode`, with the squelch that mode's floor plus the margin and the owner's Auto timing
-    /// as it is, and waits for its recording to end (the squelch shut for Auto's stop after). True when a recording was
-    /// made; false when the squelch didn't open within Auto's start after and stop after, there is no floor for the
-    /// mode, or the run ended (whose teardown then closes the recording).
+    /// as it is, and waits for its recording to end (the squelch shut for Auto's stop after). The phase is `recording`
+    /// only once the recorder records. True when a recording was made; false when none opened within Auto's start
+    /// after plus `squelchWaitSeconds`, there is no floor for the mode, or the run ended (whose teardown then closes
+    /// the recording).
     private func record(_ c: WatchCandidate, in mode: DemodMode, _ m: AppModel, timing: Scheduler.Timing) async -> Bool {
         let hz = Self.dial(for: c, mode: mode)
         guard proceed(m) else { return false }
@@ -136,15 +151,15 @@ extension BroadcastRun {
         let auto = m.recording.autoTiming
         m.scheduleRecording = AppModel.ScheduleRecording(tag: schedule.tag, timing: auto)
         note(m)
-        phase = .recording
 
-        let giveUp = Date().addingTimeInterval(auto.startAfter + auto.stopAfter)
+        let giveUp = ContinuousClock.now + .seconds(auto.startAfter + Self.squelchWaitSeconds)
         var opened = false
         while proceed(m) {
             let status = m.engine.audioRecorder.status
             if status.isRecording && status.isAuto {
                 opened = true
-            } else if opened || Date() >= giveUp {
+                phase = .recording
+            } else if opened || ContinuousClock.now >= giveUp {
                 break
             }
             try? await Task.sleep(for: .milliseconds(200))

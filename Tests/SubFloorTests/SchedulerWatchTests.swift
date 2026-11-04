@@ -11,8 +11,8 @@ import Testing
 /// Pirate watches on the fake RSP: a watch over 6900–7000 kHz, with by default an AM tone at 6925 kHz and a bare carrier
 /// at 6955 kHz over noise. Signal ID is stubbed by frequency (the real one is never called here), so a tone AM stands in
 /// for voice. The scheduler's clock is a `TestClock` and `tick()` is called by hand, as in `SchedulerTests`; the watch's
-/// own timing (the hold, rejections, Auto's stop after) runs on the wall clock. Without an audio device the engine can't
-/// start and the run tests are skipped.
+/// own timing (the hold, rejections, the give-up, the refloor) runs on monotonic time, and Auto's on the recorder's, so
+/// the tests wait for them in real time. Without an audio device the engine can't start and the run tests are skipped.
 @MainActor
 @Suite(.serialized)
 struct SchedulerWatchTests {
@@ -213,7 +213,7 @@ struct SchedulerWatchTests {
         guard try await startWatching(m, s) else { return }
         #expect(await wait(upTo: 20) { m.scheduler.currentRun?.phase == .recording })
         #expect(m.mode == .usb && m.bandwidthHz == DemodMode.usb.defaultBandwidth)
-        // The dial sits at the signal's low edge, so the passband covers it.
+        // The dial sits 300 Hz below the signal's low edge (its suppressed carrier), so the passband covers it.
         #expect(m.vfoHz < 6_925_000 && m.vfoHz > 6_920_000, "vfo \(m.vfoHz)")
         let floor = try #require(m.scheduler.currentRun?.modeFloors[.usb])
         #expect(abs(m.squelchDb - (floor + 8)) <= 0.5)
@@ -236,8 +236,9 @@ struct SchedulerWatchTests {
         let s = watch(clock: clock)
         guard try await startWatching(m, s) else { return }
         #expect(await wait(upTo: 20) { stub.asked(near: 6_925_000) == 1 && stub.asked(near: 6_955_000) == 1 })
-        // Both still on and standing: each spot is rejected, so neither is asked about again.
-        await wait(upTo: 6) { false }
+        // Both still on and standing: each spot is rejected for `rejectSeconds`, so neither is asked about again
+        // (a nil answer's short rejection, 6 s, would have let them back by now).
+        await wait(upTo: 10) { false }
         #expect(stub.asked(near: 6_925_000) == 1 && stub.asked(near: 6_955_000) == 1, "\(stub.asked)")
         #expect(m.scheduler.currentRun?.phase == .watching)
         #expect(m.scheduleRecording == nil)
@@ -288,11 +289,13 @@ struct SchedulerWatchTests {
         stub.answers = [6_925_000: Self.identity(.am, envelope: .voice), 6_955_000: Self.identity(.carrier)]
         let s = watch(clock: clock)
         guard try await startWatching(m, s) else { return }
-        #expect(await wait(upTo: 20) { m.scheduler.currentRun?.files.count == 1 })
+        #expect(await wait(upTo: 20) {
+            m.scheduler.currentRun?.files.count == 1 && m.scheduler.currentRun?.phase == .recording
+        })
         // The station goes quiet (the squelch above it): after Auto's stop after the file closes and the watch goes back.
         m.squelchDb = 0
-        #expect(await wait(upTo: 15) { m.scheduler.currentRun?.phase == .watching })
-        #expect(m.scheduleRecording == nil)
+        #expect(await wait(upTo: 15) { m.scheduleRecording == nil })
+        #expect(m.scheduler.currentRun?.phase == .watching)
         #expect(m.vfoHz == 6_950_000)   // the span's middle
         await m.scheduler.tick()   // the button follows the run on each tick
         if case .watching(_, let caught, _) = m.scheduler.buttonState { #expect(caught == 1) }
@@ -312,11 +315,17 @@ struct SchedulerWatchTests {
         stub.answers = [6_925_000: Self.identity(.am, envelope: .voice), 6_955_000: Self.identity(.carrier)]
         let s = watch(marginDb: 200, clock: clock)   // a squelch nothing opens
         guard try await startWatching(m, s) else { return }
-        #expect(await wait(upTo: 20) { m.scheduler.currentRun?.phase == .recording })
-        // Start after + stop after (3.5 s) with nothing: back to watching, the spot rejected for `rejectSeconds`.
-        #expect(await wait(upTo: 15) { m.scheduler.currentRun?.phase == .watching })
-        #expect(m.scheduleRecording == nil)
-        await wait(upTo: 6) { false }
+        #expect(await wait(upTo: 20) { m.scheduleRecording != nil })   // tuned to the station
+        // Start after + 5 s (5.5 s) with nothing recorded: back to watching, the spot rejected for `rejectSeconds`.
+        // Never `recording` meanwhile, so the ticker doesn't say so.
+        var sawRecording = false
+        #expect(await wait(upTo: 15) {
+            if m.scheduler.currentRun?.phase == .recording { sawRecording = true }
+            return m.scheduleRecording == nil
+        })
+        #expect(!sawRecording)
+        #expect(m.scheduler.currentRun?.phase == .watching)
+        await wait(upTo: 10) { false }
         #expect(stub.asked(near: 6_925_000) == 1, "\(stub.asked)")
         #expect(m.scheduler.currentRun?.files.isEmpty == true)
         await endWindow(m, s, clock)
@@ -411,6 +420,14 @@ struct SchedulerWatchTests {
     }
 
     // MARK: Voice
+
+    @Test func ssbDialIsTheSuppressedCarrier() {
+        let c = WatchCandidate(hz: 6_925_000, widthHz: 2_400, overFloorDb: 20)
+        #expect(BroadcastRun.dial(for: c, mode: .usb) == 6_923_500)   // low edge 6923.8 − 300 Hz
+        #expect(BroadcastRun.dial(for: c, mode: .lsb) == 6_926_500)   // high edge 6926.2 + 300 Hz
+        #expect(BroadcastRun.dial(for: c, mode: .am) == 6_925_000)
+        #expect(BroadcastRun.dial(for: c, mode: .nfm) == 6_925_000)
+    }
 
     @Test(arguments: [SignalFamily.am, .usb, .lsb, .fm, .carrier, .fsk, .psk, .mfsk, .ofdm, .ook, .noise, .unknown])
     func voiceCheckFamilies(_ f: SignalFamily) {

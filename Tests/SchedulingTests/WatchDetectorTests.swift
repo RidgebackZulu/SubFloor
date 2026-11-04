@@ -94,6 +94,32 @@ struct WatchDetectorTests {
         #expect(feed(&d, both, second: 4).map(\.hz) == [6_963_000, 6_913_000])
     }
 
+    @Test func stationFillingANarrowSpanIsACandidate() {
+        // A 12 kHz span (48 points) with a 7.25 kHz AM station on 60% of it: a median floor would be the station.
+        let low = 6_900_000.0, high = 6_912_000.0
+        var d = WatchDetector(lowHz: low, highHz: high)
+        let levels = (0..<48).map { k -> Float in
+            let hz = low + Double(k) * Self.step
+            return hz >= 6_901_000 && hz < 6_908_250 ? -95 : -110
+        }
+        for s in 0..<3 { #expect(d.feed(levels: levels, fromHz: low, binHz: Self.step, at: Self.t0.addingTimeInterval(Double(s))).isEmpty) }
+        let found = d.feed(levels: levels, fromHz: low, binHz: Self.step, at: Self.t0.addingTimeInterval(3))
+        #expect(found == [WatchCandidate(hz: 6_904_625, widthHz: 7_250, overFloorDb: 15)])
+    }
+
+    @Test func stationOnTheQuietSideOfASlopingFloorIsFound() {
+        // The floor rises 15 dB across the span (−110 at 6900 kHz to −95 at 7000 kHz). A station 14 dB over its own
+        // noise on the low side stands under a median floor + 10 dB, but over the 20th percentile's.
+        var d = detector()
+        let levels = (0..<400).map { k -> Float in
+            let hz = Self.low + Double(k) * Self.step
+            return hz >= 6_910_000 && hz < 6_918_000 ? -94 : -110 + 15 * Float(k) / 399
+        }
+        for s in 0..<3 { _ = feed(&d, levels, second: Double(s)) }
+        // The top of the slope reaches the threshold too, but it runs off the span's top edge.
+        #expect(feed(&d, levels, second: 3).map(\.hz) == [6_914_000])
+    }
+
     @Test func aSpotSeenAgainAfterAGapHoldsAgain() {
         // Frames stop while a station is recorded; a spot seen again afterwards must stand its 3 s again.
         var d = detector()
