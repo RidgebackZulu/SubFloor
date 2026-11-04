@@ -116,4 +116,35 @@ private func lines(_ url: URL) throws -> [String] {
         try log.append([b])
         #expect(try log.entries(forUTCDay: day) == [a, b])
     }
+    @Test func scheduledLineRoundTrips() throws {
+        let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let log = RecordingLog(folder: dir)
+        let file = "SubFloor_20261103_120000Z_9435000Hz_AM.flac"
+        let id = UUID(uuidString: "6F9619FF-8B86-D011-B42D-00C04FC964FF")!
+        let entry = RecordingLogEntry.scheduled(file: file, scheduleID: id, name: "Voice of Korea")
+        #expect(entry.date == utc(2026, 11, 3, 12, 0, 0))   // the file's start, from its name
+        #expect(RecordingLogEntry.scheduled(file: "notes.txt", scheduleID: id, name: "x").date == .distantPast)
+        try log.append([entry])
+        #expect(try log.entries(forUTCDay: entry.date) == [entry])
+        #expect(try lines(log.fileURL(forUTCDay: entry.date)) == [
+            #"{"file":"SubFloor_20261103_120000Z_9435000Hz_AM.flac","name":"Voice of Korea","scheduleID":"6F9619FF-8B86-D011-B42D-00C04FC964FF","type":"scheduled"}"#,
+        ])
+    }
+
+    @Test func oldLogsStillDecode() throws {
+        let dir = tempDir(); defer { try? FileManager.default.removeItem(at: dir) }
+        let log = RecordingLog(folder: dir)
+        let day = utc(2026, 10, 26, 9, 15, 2.5)
+        let old = [
+            #"{"file":"SubFloor_20261026_091502Z_11175000Hz_USB.flac","frequencyHz":11175000,"mode":"USB","start":"2026-10-26T09:15:02.500Z","type":"autoStarted"}"#,
+            #"{"auto":true,"file":"SubFloor_20261026_091502Z_11175000Hz_USB.flac","frequencyHz":11175000,"mode":"USB","seconds":12.5,"start":"2026-10-26T09:15:02.500Z","type":"recording"}"#,
+        ]
+        try FileManager.default.createDirectory(at: log.fileURL(forUTCDay: day).deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data((old.joined(separator: "\n") + "\n").utf8).write(to: log.fileURL(forUTCDay: day))
+        let file = "SubFloor_20261026_091502Z_11175000Hz_USB.flac"
+        #expect(try log.entries(forUTCDay: day) == [
+            .autoStarted(file: file, start: day, frequencyHz: 11_175_000, mode: "USB"),
+            .recording(file: file, start: day, seconds: 12.5, frequencyHz: 11_175_000, mode: "USB", auto: true),
+        ])
+    }
 }

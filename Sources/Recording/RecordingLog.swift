@@ -18,8 +18,12 @@ public enum RecordingLogEntry: Codable, Equatable, Sendable {
     case autoStarted(file: String, start: Date, frequencyHz: Double, mode: String)
     /// Auto-record turned itself off, and why (low disk).
     case autoOff(at: Date, reason: String)
+    /// The auto recording `file` was made for the schedule `name` (written just after its `autoStarted`). An
+    /// older SubFloor skips the line, as it does any it cannot read.
+    case scheduled(file: String, scheduleID: UUID, name: String)
 
-    /// What the entry is filed under: a recording's start, or the entry's `at`.
+    /// What the entry is filed under: a recording's start, or the entry's `at`; a `scheduled` line, its
+    /// file's start as the name gives it, so it lands in that recording's day.
     public var date: Date {
         switch self {
         case .recording(_, let start, _, _, _, _): start
@@ -27,6 +31,7 @@ public enum RecordingLogEntry: Codable, Equatable, Sendable {
         case .heard(_, let at): at
         case .autoStarted(_, let start, _, _): start
         case .autoOff(let at, _): at
+        case .scheduled(let file, _, _): RecordingFileName.parse(file)?.start ?? .distantPast
         }
     }
 
@@ -38,10 +43,10 @@ public enum RecordingLogEntry: Codable, Equatable, Sendable {
         return back
     }
 
-    private enum Kind: String, Codable { case recording, pop, heard, autoStarted, autoOff }
+    private enum Kind: String, Codable { case recording, pop, heard, autoStarted, autoOff, scheduled }
 
     private enum Keys: String, CodingKey {
-        case type, file, start, at, seconds, frequencyHz, mode, auto, reason
+        case type, file, start, at, seconds, frequencyHz, mode, auto, reason, scheduleID, name
     }
 
     public init(from decoder: Decoder) throws {
@@ -71,6 +76,10 @@ public enum RecordingLogEntry: Codable, Equatable, Sendable {
                 mode: try c.decode(String.self, forKey: .mode))
         case .autoOff:
             self = .autoOff(at: try Self.decodeDate(c, .at), reason: try c.decode(String.self, forKey: .reason))
+        case .scheduled:
+            self = .scheduled(file: try c.decode(String.self, forKey: .file),
+                              scheduleID: try c.decode(UUID.self, forKey: .scheduleID),
+                              name: try c.decode(String.self, forKey: .name))
         }
     }
 
@@ -105,6 +114,11 @@ public enum RecordingLogEntry: Codable, Equatable, Sendable {
             try c.encode(Kind.autoOff, forKey: .type)
             try c.encode(Self.format.format(at), forKey: .at)
             try c.encode(reason, forKey: .reason)
+        case .scheduled(let file, let scheduleID, let name):
+            try c.encode(Kind.scheduled, forKey: .type)
+            try c.encode(file, forKey: .file)
+            try c.encode(scheduleID, forKey: .scheduleID)
+            try c.encode(name, forKey: .name)
         }
     }
 

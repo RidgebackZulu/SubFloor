@@ -597,4 +597,37 @@ struct MCPListenRecordingToolsTests {
         let blank = await call(tools, "search_transcripts", ["query": .string("  ")])
         #expect(blank.isError)
     }
+
+    /// A translated transcript shows its language and English beside the original's text; an English one shows nulls.
+    @Test func transcriptsCarryTheSpokenLanguageAndTheEnglish() async throws {
+        let (m, folder) = makeModel()
+        defer { m.shutdown() }
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let start = Date().addingTimeInterval(-7_200)
+        let ko = RecordingNames.base(firstSample: start, frequencyHz: 9_435_000, label: "AM") + ".flac"
+        let en = RecordingNames.base(firstSample: start.addingTimeInterval(600), frequencyHz: 9_435_000, label: "AM") + ".flac"
+        for f in [ko, en] { FileManager.default.createFile(atPath: folder.appendingPathComponent(f).path, contents: Data()) }
+        let reply = WhisperResponse(text: "안녕하세요", language: "korean", duration: 5, segments: [.init(start: 0, end: 5, text: "안녕하세요")])
+        try TranscriptStore.write(StoredTranscript(file: ko, model: "m", language: nil, createdAt: Date(), durationSeconds: 5, costUSD: nil,
+                                                   note: nil, chunks: [TranscriptChunk(offsetSeconds: 0, response: reply)],
+                                                   spokenLanguage: "korean",
+                                                   translation: TranscriptTranslation(model: "t", segments: [.init(start: 0, end: 5, text: "Hello")], costUSD: nil)),
+                                  in: folder)
+        try writeTranscript(en, fixture: "SubFloor_20261028_140122Z_11175000Hz_USB", in: folder)
+        await m.library.reload()
+        let tools = SubFloorTools(model: m)
+
+        let got = await call(tools, "get_transcript", ["file": .string(ko)])
+        #expect(!got.isError, "\(got.content)")
+        #expect(got.structured?["spoken_language"]?.string == "korean")
+        #expect(got.structured?["english"]?.string == "Hello")
+        #expect(got.structured?["text"]?.string == "안녕하세요")
+        let plain = await call(tools, "get_transcript", ["file": .string(en)])
+        #expect(plain.structured?["spoken_language"] == .null && plain.structured?["english"] == .null)
+
+        let rows = await call(tools, "list_recordings")
+        let row = rows.structured?["recordings"]?.array?.first { $0["file"]?.string == ko }
+        #expect(row?["transcript"]?["spoken_language"]?.string == "korean")
+        #expect(row?["transcript"]?["english"]?.string == "Hello")
+    }
 }

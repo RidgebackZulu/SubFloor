@@ -194,7 +194,7 @@ private func failure(_ t: OpenRouterTranscriber) async -> TranscriptionError? {
         #expect(s.chunks.isEmpty)
         #expect(s.durationSeconds == 0)
         #expect(s.costUSD == nil)
-        #expect(s.version == 1)
+        #expect(s.version == 2)
         #expect(s.file == "a.wav")
         #expect(s.createdAt == Date(timeIntervalSince1970: 5))
         #expect(s.language == "en")

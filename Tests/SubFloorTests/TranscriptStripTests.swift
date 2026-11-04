@@ -107,6 +107,74 @@ import Transcription
                                 durationSeconds: 32, costUSD: nil, note: voice ? nil : "silent", chunks: chunks)
     }
 
+    // MARK: Translated transcripts
+
+    private func koreanTranscript(translation: Bool, note: String? = nil, language: String? = "korean") throws -> StoredTranscript {
+        var t = try Self.stored("a.wav", voice: true)
+        t.spokenLanguage = language
+        if translation {
+            t.translation = TranscriptTranslation(model: "m", segments: [
+                TranslatedSegment(start: 1, end: 3, text: "Hello there my friend"),
+            ], costUSD: nil)
+        }
+        t.translationNote = note
+        return t
+    }
+
+    private func summary(_ t: StoredTranscript) -> TranscriptSummary? {
+        TranscriptIndex([t.file: t]).summary(t.file)
+    }
+
+    @Test func stripShowsTheEnglishWithItsHeader() throws {
+        let s = summary(try koreanTranscript(translation: true))
+        guard case .words(let words, let text) = TranscriptStripContent.decide(summary: s, state: nil) else {
+            Issue.record("expected words"); return
+        }
+        #expect(text == "Hello there my friend")
+        #expect(words.map(\.text) == ["Hello", "there", "my", "friend"])
+        #expect(words.first?.start == 1)
+        #expect(TranscriptStripHeader.make(summary: s, showOriginal: false)
+                == TranscriptStripHeader(text: "Translated from Korean", toggle: "Show original"))
+    }
+
+    @Test func toggleShowsTheOriginal() throws {
+        let t = try koreanTranscript(translation: true)
+        let s = summary(t)
+        let original = TranscriptStripContent.decide(summary: s, state: nil, showOriginal: true)
+        #expect(original == .words(TranscriptClassifier.classify(t.chunks).words, text: TranscriptClassifier.classify(t.chunks).text))
+        #expect(TranscriptStripHeader.make(summary: s, showOriginal: true)
+                == TranscriptStripHeader(text: "Translated from Korean", toggle: "Show English"))
+    }
+
+    @Test func emptyTranslationShowsNoHeader() throws {
+        var t = try koreanTranscript(translation: true)
+        t.translation?.segments = [TranslatedSegment(start: 1, end: 3, text: "")]
+        let s = summary(t)
+        #expect(s?.englishWords == nil)
+        #expect(TranscriptStripHeader.make(summary: s, showOriginal: false) == nil)
+    }
+
+    @Test func languageNameIsCapitalisedOrUpperCased() {
+        #expect(TranscriptStripHeader.languageName("korean") == "Korean")
+        #expect(TranscriptStripHeader.languageName("ko") == "KO")
+    }
+
+    @Test func untranslatedTranscriptHasNoHeader() throws {
+        let english = summary(try koreanTranscript(translation: false, language: "english"))
+        #expect(TranscriptStripHeader.make(summary: english, showOriginal: false) == nil)
+        let v1 = summary(try koreanTranscript(translation: false, language: nil))
+        #expect(TranscriptStripHeader.make(summary: v1, showOriginal: true) == nil)
+        #expect(TranscriptStripHeader.make(summary: nil, showOriginal: false) == nil)
+    }
+
+    @Test func noteShowsWhenTranslationFailed() throws {
+        let note = "Couldn't translate: the reply wasn't a translation."
+        let s = summary(try koreanTranscript(translation: false, note: note))
+        #expect(TranscriptStripHeader.make(summary: s, showOriginal: false) == TranscriptStripHeader(text: note, toggle: nil))
+        // The original words still show.
+        if case .words = TranscriptStripContent.decide(summary: s, state: nil) {} else { Issue.record("expected words") }
+    }
+
     // MARK: What the strip says
 
     @Test func stripContentFollowsTheStateOfTheRecording() {

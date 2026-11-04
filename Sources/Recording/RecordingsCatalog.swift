@@ -87,9 +87,11 @@ public struct CatalogRecording: Equatable, Sendable, Identifiable {
     public var heard: Bool
     public var inProgress: Bool
     public var laneID: String         // "11175000 USB"
+    /// The schedule it was recorded for; nil unless a `scheduled` log line names the file.
+    public var scheduleName: String?
 
     public init(file: String, start: Date, seconds: Double?, frequencyHz: Double, mode: String, auto: Bool,
-                heard: Bool, inProgress: Bool, laneID: String) {
+                heard: Bool, inProgress: Bool, laneID: String, scheduleName: String? = nil) {
         self.file = file
         self.start = start
         self.seconds = seconds
@@ -99,6 +101,7 @@ public struct CatalogRecording: Equatable, Sendable, Identifiable {
         self.heard = heard
         self.inProgress = inProgress
         self.laneID = laneID
+        self.scheduleName = scheduleName
     }
 }
 
@@ -120,7 +123,7 @@ public struct CatalogPop: Hashable, Sendable {
 }
 
 /// What the Recordings window shows, merged from three sources that each know part of it: the folder
-/// listing (which files exist), the day logs (when, how long, auto or manual, heard) and the recording in
+/// listing (which files exist), the day logs (when, how long, auto or manual, heard, the schedule it was for) and the recording in
 /// progress. A pure value, so the merge rules are testable without a folder.
 ///
 /// A recording's start, frequency, mode and auto flag come from the first source that has them: its
@@ -144,6 +147,7 @@ public struct RecordingsCatalog: Equatable, Sendable {
     private var finished: [String: Finished] = [:]         // from `recording` entries
     private var started: [String: Facts] = [:]             // from `autoStarted` entries
     private var heard: Set<String> = []
+    private var scheduleNames: [String: String] = [:]      // from `scheduled` entries
     /// A set, so a line applied twice (read back from the log after it was applied as written) is one pop.
     private var popsByDay: [Int: Set<CatalogPop>] = [:]
     private var measured: [String: Double] = [:]
@@ -194,6 +198,8 @@ public struct RecordingsCatalog: Equatable, Sendable {
                 if heard.insert(file).inserted, refiling { refresh(file) }
             case .pop(let at, let seconds, let frequencyHz, let mode):
                 popsByDay[Self.dayNumber(at), default: []].insert(CatalogPop(at: at, seconds: seconds, frequencyHz: frequencyHz, mode: mode))
+            case .scheduled(let file, _, let name):
+                scheduleNames[file] = name   // a name only: the file's day and unheard state are unchanged
             case .autoOff:
                 break
             }
@@ -242,6 +248,10 @@ public struct RecordingsCatalog: Equatable, Sendable {
     public func pops(onUTCDay day: Date) -> [CatalogPop] {
         (popsByDay[Self.dayNumber(day)] ?? []).sorted { ($0.at, $0.frequencyHz, $0.mode, $0.seconds) < ($1.at, $1.frequencyHz, $1.mode, $1.seconds) }
     }
+
+    /// The schedule `file` was recorded for, from its `scheduled` log line, whether or not the folder listing
+    /// has the file yet (a recording that has just ended may not be listed for a moment).
+    public func scheduleName(of file: String) -> String? { scheduleNames[file] }
 
     public func recording(_ file: String) -> CatalogRecording? {
         if let live, live.file == file { return liveRecording(live) }
@@ -310,13 +320,13 @@ public struct RecordingsCatalog: Equatable, Sendable {
         let logged = finished[file] != nil || started[file] != nil
         return CatalogRecording(file: file, start: facts.start, seconds: seconds, frequencyHz: facts.frequencyHz,
                                 mode: facts.mode, auto: auto, heard: !logged || heard.contains(file), inProgress: false,
-                                laneID: Self.laneID(facts.frequencyHz, facts.mode))
+                                laneID: Self.laneID(facts.frequencyHz, facts.mode), scheduleName: scheduleNames[file])
     }
 
     private func liveRecording(_ live: LiveRecording) -> CatalogRecording {
         CatalogRecording(file: live.file, start: live.start, seconds: live.seconds, frequencyHz: live.frequencyHz,
                          mode: live.mode, auto: live.auto, heard: false, inProgress: true,
-                         laneID: Self.laneID(live.frequencyHz, live.mode))
+                         laneID: Self.laneID(live.frequencyHz, live.mode), scheduleName: scheduleNames[live.file])
     }
 
     /// `11175000 USB`. A frequency too large for an `Int` (a damaged log line) keeps its own lane rather

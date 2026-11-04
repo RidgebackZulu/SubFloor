@@ -285,4 +285,21 @@ private let am = "SubFloor_20261027_090000Z_6925000Hz_AM.flac"
         #expect(back != [pop])            // the file keeps milliseconds
         #expect(back == [pop.asLogged])
     }
+    @Test func scheduledLineNamesTheRecording() {
+        let start = utc(2026, 10, 27, 18, 32, 19)
+        var c = RecordingsCatalog(files: [usb, am], entries: [
+            .autoStarted(file: usb, start: start, frequencyHz: 11_175_000, mode: "USB"),
+            .scheduled(file: usb, scheduleID: UUID(), name: "Voice of Korea"),
+            .recording(file: usb, start: start, seconds: 30, frequencyHz: 11_175_000, mode: "USB", auto: true),
+        ])
+        #expect(c.recording(usb)?.scheduleName == "Voice of Korea")
+        #expect(c.recording(am)?.scheduleName == nil)
+        #expect(c.recordings(onUTCDay: start).first { $0.file == usb }?.scheduleName == "Voice of Korea")
+        // A recording still being written is named too, once its line is in.
+        let live = "SubFloor_20261027_200000Z_9435000Hz_AM.flac"
+        c.setLive(LiveRecording(file: live, start: utc(2026, 10, 27, 20, 0, 0), seconds: 4, frequencyHz: 9_435_000, mode: "AM", auto: true))
+        #expect(c.recording(live)?.scheduleName == nil)
+        c.apply([.scheduled(file: live, scheduleID: UUID(), name: "KCBS")])
+        #expect(c.recording(live)?.scheduleName == "KCBS")
+    }
 }

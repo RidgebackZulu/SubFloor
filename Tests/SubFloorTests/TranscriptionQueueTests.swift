@@ -42,13 +42,18 @@ final class ScriptedTranscriber: @unchecked Sendable {
     private var gates: [String: TestGate] = [:]
     private var _calls: [String] = []
     private var _keys: [String] = []
+    private var _languages: [String?] = []
     private var current = 0, _peak = 0
     var fallback: Answer = .voice
+    /// The language Whisper "detects" in a voice answer; nil keeps the fixture's.
+    var spoken: String?
     /// Keys that OpenRouter would reject with 401.
     var rejected: Set<String> = []
 
     var calls: [String] { lock.withLock { _calls } }
     var keys: [String] { lock.withLock { _keys } }
+    /// The language each call was asked for (nil: auto-detect).
+    var languages: [String?] { lock.withLock { _languages } }
     var running: Int { lock.withLock { current } }
     var peak: Int { lock.withLock { _peak } }
 
@@ -68,6 +73,7 @@ final class ScriptedTranscriber: @unchecked Sendable {
         let (answer, gate): (Answer, TestGate?) = lock.withLock {
             _calls.append(file)
             _keys.append(key)
+            _languages.append(language)
             current += 1
             _peak = max(_peak, current)
             var list = script[file] ?? []
@@ -80,7 +86,8 @@ final class ScriptedTranscriber: @unchecked Sendable {
         switch answer {
         case .error(let e): throw e
         case .voice:
-            let reply = try JSONDecoder().decode(WhisperResponse.self, from: try Data(contentsOf: Self.voiceFixture))
+            var reply = try JSONDecoder().decode(WhisperResponse.self, from: try Data(contentsOf: Self.voiceFixture))
+            if let spoken { reply.language = spoken }
             return StoredTranscript(file: file, model: model, language: language, createdAt: Date(), durationSeconds: 32,
                                     costUSD: reply.usage?.cost, note: nil, chunks: [TranscriptChunk(offsetSeconds: 0, response: reply)])
         }
@@ -89,6 +96,27 @@ final class ScriptedTranscriber: @unchecked Sendable {
     /// The Transcription tests' saved reply for the 32 s voice clip.
     static let voiceFixture = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent()
         .appendingPathComponent("TranscriptionTests/Fixtures/voice-clip-32s.json")
+}
+
+/// A scripted `TranslateFunction`: answers with one translated segment per source segment, or throws.
+/// Records what it was asked. Never touches the network.
+final class ScriptedTranslator: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _calls: [(file: String, model: String, key: String)] = []
+    var failure: Error?
+    var cost: Double? = 0.0004
+    var calls: [(file: String, model: String, key: String)] { lock.withLock { _calls } }
+
+    var function: TranslateFunction {
+        { [self] t, model, key in
+            lock.withLock { _calls.append((t.file, model, key)) }
+            if let failure { throw failure }
+            let segments = t.chunks.flatMap { c in
+                (c.response.segments ?? []).map { TranslatedSegment(start: c.offsetSeconds + $0.start, end: c.offsetSeconds + $0.end, text: "EN: \($0.text)") }
+            }
+            return TranscriptTranslation(model: model, segments: segments, costUSD: cost)
+        }
+    }
 }
 
 /// The delays the queue asked to sleep; each returns at once, so no test waits real seconds.
@@ -152,8 +180,9 @@ struct TranscriptionQueueTests {
         return (m, m.library.folder)
     }
 
-    private func makeQueue(_ stub: ScriptedTranscriber, sleeps: SleepLog = SleepLog()) -> TranscriptionQueue {
-        let q = TranscriptionQueue(transcribe: stub.function, sleep: sleeps.function)
+    private func makeQueue(_ stub: ScriptedTranscriber, translator: ScriptedTranslator = ScriptedTranslator(),
+                           sleeps: SleepLog = SleepLog()) -> TranscriptionQueue {
+        let q = TranscriptionQueue(transcribe: stub.function, translate: translator.function, sleep: sleeps.function)
         q.settings = TranscriptionSettings(enabledSince: Date())
         q.apiKey = "sk-test"
         return q
@@ -189,6 +218,133 @@ struct TranscriptionQueueTests {
         m.appendToLog([finished(file)])
         await m.transcription.waitUntilIdle()
         #expect(stub.calls == [file])
+    }
+
+    /// Runs `file` through a queue whose settings language is "en" and returns the saved transcript.
+    private func transcribed(_ file: String, stub: ScriptedTranscriber, translator: ScriptedTranslator,
+                             autoDetect: Bool = true, translate: Bool = true) async throws -> StoredTranscript {
+        let q = makeQueue(stub, translator: translator)
+        q.settings.translate = translate
+        q.autoDetect = { _ in autoDetect }
+        let folder = tempFolder()
+        q.enqueue(file, folder: folder)
+        await q.waitUntilIdle()
+        return try #require(TranscriptStore.readAll(in: folder)[file])
+    }
+
+    @Test func scheduledFilesAreSentForAutoDetect() async throws {
+        let stub = ScriptedTranscriber()
+        let file = name(Date(timeIntervalSince1970: 1_792_000_000))
+        _ = try await transcribed(file, stub: stub, translator: ScriptedTranslator())
+        #expect(stub.languages == [nil])   // settings.language is "en"
+        // An ordinary recording keeps the setting.
+        let other = ScriptedTranscriber()
+        _ = try await transcribed(file, stub: other, translator: ScriptedTranslator(), autoDetect: false)
+        #expect(other.languages == ["en"])
+        // A setting of auto-detect sends nil for everything.
+        let q = makeQueue(other)
+        q.settings.language = nil
+        q.enqueue(name(Date(timeIntervalSince1970: 1_792_000_600)), folder: tempFolder())
+        await q.waitUntilIdle()
+        #expect(other.languages == ["en", nil])
+    }
+
+    /// End to end: the `.scheduled` line the recorder writes, read by the app's catalog, marks the file.
+    @Test func aScheduledRecordingIsSentWithTheLanguageLeftToDetect() async throws {
+        let stub = ScriptedTranscriber()
+        let (m, _) = await makeModel(stub)
+        defer { m.shutdown() }
+        let now = Date()
+        let (t1, t2) = (now.addingTimeInterval(60), now.addingTimeInterval(1_000))
+        let scheduled = name(t1), plain = name(t2)
+        m.appendToLog([.scheduled(file: scheduled, scheduleID: UUID(), name: "Voice of Korea"), finished(scheduled, start: t1)])
+        await m.transcription.waitUntilIdle()
+        m.appendToLog([finished(plain, start: t2)])
+        await m.transcription.waitUntilIdle()
+        #expect(stub.calls == [scheduled, plain])
+        #expect(stub.languages == [nil, "en"])
+    }
+
+    @Test func otherLanguagesAreTranslated() async throws {
+        let stub = ScriptedTranscriber()
+        stub.spoken = "korean"
+        let translator = ScriptedTranslator()
+        let file = name(Date(timeIntervalSince1970: 1_792_000_000))
+        let t = try await transcribed(file, stub: stub, translator: translator)
+        #expect(t.spokenLanguage == "korean")
+        #expect(translator.calls.count == 1 && translator.calls[0].key == "sk-test")
+        #expect(translator.calls[0].model == TranscriptionSettings().translationModel)
+        let translation = try #require(t.translation)
+        #expect(!translation.segments.isEmpty && translation.text.hasPrefix("EN: "))
+        #expect(t.translationNote == nil)
+        let whisperCost = try #require(t.chunks.first?.response.usage?.cost)
+        #expect(t.costUSD == whisperCost + 0.0004)
+    }
+
+    @Test func englishIsNotTranslated() async throws {
+        let stub = ScriptedTranscriber()
+        stub.spoken = "english"
+        let translator = ScriptedTranslator()
+        let t = try await transcribed(name(Date(timeIntervalSince1970: 1_792_000_000)), stub: stub, translator: translator)
+        #expect(t.spokenLanguage == "english")
+        #expect(translator.calls.isEmpty && t.translation == nil && t.translationNote == nil)
+    }
+
+    @Test func translationOffKeepsTheOriginalOnly() async throws {
+        let stub = ScriptedTranscriber()
+        stub.spoken = "korean"
+        let translator = ScriptedTranslator()
+        let t = try await transcribed(name(Date(timeIntervalSince1970: 1_792_000_000)), stub: stub, translator: translator, translate: false)
+        #expect(t.spokenLanguage == "korean")
+        #expect(translator.calls.isEmpty && t.translation == nil && t.translationNote == nil)
+    }
+
+    @Test func aFileSentWithTheSetLanguageIsNotTranslated() async throws {
+        let stub = ScriptedTranscriber()
+        stub.spoken = "korean"
+        let translator = ScriptedTranslator()
+        let t = try await transcribed(name(Date(timeIntervalSince1970: 1_792_000_000)), stub: stub, translator: translator, autoDetect: false)
+        #expect(translator.calls.isEmpty && t.translation == nil)
+    }
+
+    @Test func failedTranslationKeepsTheTranscriptWithANote() async throws {
+        let stub = ScriptedTranscriber()
+        stub.spoken = "korean"
+        let file = name(Date(timeIntervalSince1970: 1_792_000_000))
+        let whisperCost = try #require(try await transcribed(file, stub: stub, translator: ScriptedTranslator(), translate: false).costUSD)
+
+        let malformed = ScriptedTranslator()
+        malformed.failure = TranslationError.malformed
+        let a = try await transcribed(file, stub: stub, translator: malformed)
+        #expect(a.translation == nil)
+        #expect(a.translationNote == "Couldn't translate: the reply wasn't a translation.")
+        #expect(a.costUSD == whisperCost && a.spokenLanguage == "korean" && !a.chunks.isEmpty)
+        #expect(malformed.calls.count == 1)   // one attempt per transcript
+
+        let busy = ScriptedTranslator()
+        busy.failure = TranslationError.http(503, "Provider returned error")
+        let b = try await transcribed(file, stub: stub, translator: busy)
+        #expect(b.translation == nil)
+        #expect(b.translationNote == "Couldn't translate: Provider returned error")
+        let bare = ScriptedTranslator()
+        bare.failure = TranslationError.http(429, nil)
+        #expect(try await transcribed(file, stub: stub, translator: bare).translationNote == "Couldn't translate: HTTP 429")
+    }
+
+    @Test func aTranscriptWithNoSegmentsIsNotTranslated() async throws {
+        // A silent clip is labelled without being sent: nothing to translate.
+        let translator = ScriptedTranslator()
+        let q = TranscriptionQueue(transcribe: { file, _, model, _, _ in
+            StoredTranscript(file: file, model: model, language: nil, createdAt: Date(), durationSeconds: 0, costUSD: nil, note: "silent", chunks: [],
+                             spokenLanguage: "korean")
+        }, translate: translator.function, sleep: SleepLog().function)
+        q.settings = TranscriptionSettings(enabledSince: Date())
+        q.apiKey = "sk-test"
+        q.autoDetect = { _ in true }
+        let folder = tempFolder()
+        q.enqueue(name(Date(timeIntervalSince1970: 1_792_000_000)), folder: folder)
+        await q.waitUntilIdle()
+        #expect(translator.calls.isEmpty)
     }
 
     @Test func offOrNoKeyQueuesNothing() async throws {

@@ -325,10 +325,13 @@ extension SubFloorTools {
         var expected: ScanTuning
         /// A stepped scan's `dwell_seconds` (nil: the first read's wait, naming from tone numbers only; 0 is that too).
         let dwell: Double?
+        /// When the scan began, on the scheduler's clock: a run that took the radio since stops it.
+        let began: Date
 
-        init(stepping: Bool, expected: ScanTuning, dwell: Double?) {
+        init(stepping: Bool, expected: ScanTuning, dwell: Double?, began: Date) {
             self.stepping = stepping
             self.expected = expected
+            self.began = began
             self.dwell = stepping ? dwell.flatMap { $0 > 0 ? $0 : nil } : nil
         }
 
@@ -337,12 +340,14 @@ extension SubFloorTools {
         var reads: Bool { !stepping || dwell != nil }
     }
 
-    /// What has changed since `expected` that a scan must give way to, or nil: a different tuning, mode, bandwidth,
-    /// capture or HamItUp, or the radio stopped; and, for a scan that steps, a recording or Auto that has started
-    /// (a retune would split the IQ file or cut the Auto recording). A scan inside the capture (`stepping` false)
-    /// minds only a change of the capture itself: the VFO is the owner's to move. The owner's hover and card are no
-    /// change: they read the radio, and go first in Signal ID's queue anyway.
-    private func change(since expected: ScanTuning, stepping: Bool) -> String? {
+    /// What has changed since `expected` that a scan must give way to, or nil: a schedule that took the radio since
+    /// `began`, a different tuning, mode, bandwidth, capture or HamItUp, or the radio stopped; and, for a scan that
+    /// steps, a recording or Auto that has started (a retune would split the IQ file or cut the Auto recording). A
+    /// scan inside the capture (`stepping` false) minds only a change of the capture itself: the VFO is the owner's
+    /// to move. The owner's hover and card are no change: they read the radio, and go first in Signal ID's queue
+    /// anyway.
+    private func change(since expected: ScanTuning, stepping: Bool, began: Date) -> String? {
+        if let taken = model.scheduler.radioTakenAt, taken >= began { return Self.scheduleTookTheRadio }
         let now = scanTuning()
         let short = FrequencyFormatter.short
         if now != expected {
@@ -366,7 +371,7 @@ extension SubFloorTools {
     /// `run.stopped`). Once stopped it stays stopped. A scan that steps then leaves the radio as it found it.
     private func interrupted(_ run: ScanRun) -> Bool {
         if run.stopped != nil { return true }
-        guard let why = change(since: run.expected, stepping: run.stepping) else { return false }
+        guard let why = change(since: run.expected, stepping: run.stepping, began: run.began) else { return false }
         run.stopped = why
         run.abandoned = run.stepping
         return true
@@ -377,6 +382,11 @@ extension SubFloorTools {
     /// the steps (and the call's own radio-change bookkeeping, which would blame the agent for an owner's retune,
     /// is left out: `noteRadioChange` after each step does it).
     func identifySignals(_ args: ToolArguments, client: String) async throws -> [String: JSONValue] {
+        // A scheduled run has the radio: a scan that steps would retune it (said even while the run's radio is stopped).
+        if let busy = model.scheduler.busyMessage, let from = try? args.frequency("from_hz"),
+           let to = try? args.frequency("to_hz"), !withinCapture(from, to) {
+            throw ToolError(busy)
+        }
         try requireRunning()
         let from = try args.required("from_hz", args.frequency)
         let to = try args.required("to_hz", args.frequency)
@@ -431,6 +441,8 @@ extension SubFloorTools {
         let usable = span * TuningPlanner.usableFraction * 2
         let pieces = within ? 1 : Int(((to - from) / usable).rounded(.up))
         if !within {
+            // A scheduled run that began while this waited for the lock has the radio.
+            if let busy = m.scheduler.busyMessage { throw ToolError(busy) }
             // Retuning would split the owner's IQ file and cut an Auto recording.
             m.refreshRecordingStatus()
             if m.recordingStatus.values.contains(where: \.isRecording) || m.autoRecordEnabled {
@@ -447,7 +459,7 @@ extension SubFloorTools {
         }
 
         let start = scanTuning()
-        let run = ScanRun(stepping: !within, expected: scanTuning(), dwell: dwell)
+        let run = ScanRun(stepping: !within, expected: scanTuning(), dwell: dwell, began: m.scheduler.now())
         var found: [ScanRow] = []
         /// Rows that count towards `max_signals`: a group is one, a comb's line none.
         func counted() -> Int { found.filter(\.counts).count }

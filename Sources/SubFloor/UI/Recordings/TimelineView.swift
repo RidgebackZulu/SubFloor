@@ -71,10 +71,12 @@ struct DayTimelineView: View {
     }
 
     /// `18:32:19Z · 7.8 s · 11.175 MHz USB`, then `voice`, `possible noise` or `couldn't transcribe: <reason>`
-    /// for a recording with a transcript mark. The length is left out until it is known.
+    /// for a recording with a transcript mark. The length is left out until it is known; a schedule's recording
+    /// has the schedule's name before the frequency.
     static func hoverText(_ r: CatalogRecording, mark: TranscriptMark? = nil) -> String {
         var parts = [RecordingsFormat.time(r.start)]
         if let seconds = r.seconds { parts.append(RecordingsFormat.length(seconds)) }
+        if let name = r.scheduleName { parts.append(name) }
         parts.append(RecordingsCatalog.laneTitle(frequencyHz: r.frequencyHz, mode: r.mode))
         if r.inProgress { parts.append("recording") }
         switch mark {

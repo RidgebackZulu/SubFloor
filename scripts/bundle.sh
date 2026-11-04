@@ -51,6 +51,17 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>NSHighResolutionCapable</key><true/>
     <key>NSBluetoothAlwaysUsageDescription</key><string>SubFloor connects to the SubFloor Dial tuning knob over Bluetooth.</string>
     <key>NSPrincipalClass</key><string>NSApplication</string>
+    <key>NSAppTransportSecurity</key>
+    <dict>
+        <key>NSExceptionDomains</key>
+        <dict>
+            <key>eibispace.de</key>
+            <dict>
+                <key>NSExceptionAllowsInsecureHTTPLoads</key><true/>
+                <key>NSIncludesSubdomains</key><false/>
+            </dict>
+        </dict>
+    </dict>
 </dict>
 </plist>
 PLIST

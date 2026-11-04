@@ -14,6 +14,15 @@ enum TranscriptionFormat {
         return "Transcribe \(count) \(noun) (≈ $\(String(format: "%.2f", dollars)))"
     }
 
+    /// The footnote under the translate toggle.
+    static let translateNote = "Uses your OpenRouter key. Applies when the language is left to detect, and always for scheduled recordings."
+
+    /// A model field's committed value: the typed name, trimmed, or `default` when it is blank.
+    static func modelToSave(_ typed: String, default fallback: String) -> String {
+        let trimmed = typed.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? fallback : trimmed
+    }
+
     /// Whether a key is saved. Never the key itself.
     static func keyStatus(hasKey: Bool) -> String { hasKey ? "Key saved ✓" : "No key" }
 
@@ -36,6 +45,7 @@ struct TranscriptionSection: View {
     @State private var keyText = ""
     @State private var keyError: String?
     @State private var modelText = ""
+    @State private var translationModelText = ""
 
     var body: some View {
         @Bindable var model = model
@@ -62,6 +72,10 @@ struct TranscriptionSection: View {
             }
             TextField("Model", text: $modelText)
                 .onSubmit(commitModel)
+            Toggle("Translate other languages into English", isOn: $model.transcriptionSettings.translate)
+            Text(TranscriptionFormat.translateNote).font(.caption).foregroundStyle(.secondary)
+            TextField("Translation model", text: $translationModelText)
+                .onSubmit(commitTranslationModel)
             Picker("Language", selection: $model.transcriptionSettings.language) {
                 Text("English").tag(String?.some("en"))
                 Text("Auto-detect").tag(String?.none)
@@ -70,7 +84,10 @@ struct TranscriptionSection: View {
                 .font(.caption).foregroundStyle(.secondary)
             olderRow
         }
-        .onAppear { modelText = model.transcriptionSettings.model }
+        .onAppear {
+            modelText = model.transcriptionSettings.model
+            translationModelText = model.transcriptionSettings.translationModel
+        }
     }
 
     @ViewBuilder private var olderRow: some View {
@@ -97,10 +114,16 @@ struct TranscriptionSection: View {
 
     /// An empty model name goes back to the default.
     private func commitModel() {
-        let trimmed = modelText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let chosen = trimmed.isEmpty ? OpenRouterTranscriber.defaultModel : trimmed
+        let chosen = TranscriptionFormat.modelToSave(modelText, default: OpenRouterTranscriber.defaultModel)
         modelText = chosen
         model.transcriptionSettings.model = chosen
+    }
+
+    /// An empty translation model name goes back to the default.
+    private func commitTranslationModel() {
+        let chosen = TranscriptionFormat.modelToSave(translationModelText, default: OpenRouterTranslator.defaultModel)
+        translationModelText = chosen
+        model.transcriptionSettings.translationModel = chosen
     }
 
     private func importFromEnv() {

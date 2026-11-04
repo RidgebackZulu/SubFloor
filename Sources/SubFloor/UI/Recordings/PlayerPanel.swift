@@ -88,11 +88,12 @@ struct PlayerPanel: View {
         .task(id: audioURL) { await loadPeaks() }
     }
 
-    /// `11.175 MHz USB  07:48:12.4Z  7.8 s  Auto` … and the playhead clock on the right.
+    /// `11.175 MHz USB  07:48:12.4Z  7.8 s  Auto` … and the playhead clock on the right. A schedule's recording
+    /// reads `Voice of Korea · 9.435 MHz AM …`.
     private func titleLine(_ r: CatalogRecording) -> some View {
         let length = r.seconds ?? (player.file == r.file && player.duration > 0 ? player.duration : nil)
         return HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(RecordingsCatalog.laneTitle(frequencyHz: r.frequencyHz, mode: r.mode))
+            Text(Self.title(r))
                 .font(.system(size: 15, weight: .semibold))
                 .padding(.trailing, 4)
             tag(RecordingsFormat.clock(r.start), monospaced: true)
@@ -101,6 +102,12 @@ struct PlayerPanel: View {
             Spacer(minLength: 12)
             PlayheadClock(recording: r, player: player)
         }
+    }
+
+    /// The schedule's name, if it was recorded for one, then the frequency and mode.
+    static func title(_ r: CatalogRecording) -> String {
+        let lane = RecordingsCatalog.laneTitle(frequencyHz: r.frequencyHz, mode: r.mode)
+        return r.scheduleName.map { "\($0) · \(lane)" } ?? lane
     }
 
     /// The mockup's grey tag.
@@ -208,17 +215,40 @@ private struct PlayerTranscript: View {
     let zoom: WaveformZoom
     let dragAnchor: Double?
     let terms: [String]
+    /// Whether the original words show instead of the English; back to English when another recording is picked.
+    @State private var showOriginal = false
 
     var body: some View {
         let loaded = player.file == recording.file
         let display = WaveformDisplay.decide(loaded: loaded, hasEnvelope: envelope != nil,
                                              loadError: loaded ? player.loadError : nil, peaksFailed: peaksFailed,
                                              duration: loaded ? player.duration : 0)
-        let file = recording.file, model = model
+        let file = recording.file
         let canTranscribe = model.hasAPIKey && model.transcriptionSettings.enabled
+        let summary = model.library.transcripts.summary(file)
+        let content = TranscriptStripContent.decide(summary: summary, state: model.transcription.states[file],
+                                                    blocked: model.transcription.blocked, showOriginal: showOriginal)
+        VStack(alignment: .leading, spacing: 2) {
+            if case .words = content, let header = TranscriptStripHeader.make(summary: summary, showOriginal: showOriginal) {
+                HStack(spacing: 8) {
+                    Text(header.text).font(.system(size: 10)).foregroundStyle(RecordingsTheme.muted)
+                    if let toggle = header.toggle {
+                        Button(toggle) { showOriginal.toggle() }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 10)).foregroundStyle(.secondary)
+                            .underline()
+                    }
+                }
+            }
+            strip(content: content, loaded: loaded, display: display, file: file, canTranscribe: canTranscribe)
+        }
+        .onChange(of: recording.file) { showOriginal = false }
+    }
+
+    private func strip(content: TranscriptStripContent, loaded: Bool, display: WaveformDisplay, file: String,
+                       canTranscribe: Bool) -> some View {
         TranscriptStrip(
-            content: .decide(summary: model.library.transcripts.summary(file), state: model.transcription.states[file],
-                             blocked: model.transcription.blocked),
+            content: content,
             // The waveform's own extent and position, so a word sits above the signal it was spoken in.
             position: loaded ? player.position : 0,
             duration: display.shownDuration(playerDuration: loaded ? player.duration : 0, envelopeDuration: envelope?.duration),

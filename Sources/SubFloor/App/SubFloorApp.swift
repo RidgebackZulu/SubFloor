@@ -1,5 +1,6 @@
 import AppKit
 import Recording
+import Scheduling
 import SwiftUI
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -45,6 +46,7 @@ struct SubFloorApp: App {
     @State private var model: AppModel
     @State private var dial: DialController
     @State private var mcp: MCPServer
+    @State private var timetable: TimetableUpdater
     @AppStorage("appearance") private var appearance = "dark"
 
     init() {
@@ -57,6 +59,9 @@ struct SubFloorApp: App {
         tools.connectedClients = { [weak mcp] in mcp?.connectedClients ?? [] }
         tools.log = mcp.log
         _mcp = State(initialValue: mcp)
+        let timetable = TimetableUpdater(files: TimetableFiles(folder: TimetableFiles.defaultFolder), scheduler: model.scheduler)
+        _timetable = State(initialValue: timetable)
+        timetable.start()
     }
 
     private var scheme: ColorScheme? {
@@ -98,6 +103,15 @@ struct SubFloorApp: App {
         }
         .defaultSize(width: 1100, height: 640)
         .defaultLaunchBehavior(.suppressed)   // opened from the menu or the button, never restored at launch
+
+        Window("Schedules", id: "schedules") {
+            SchedulesWindow(model: model)
+                .environment(model)
+                .preferredColorScheme(scheme)
+                .tint(Theme.accent)
+        }
+        .defaultSize(width: 980, height: 640)
+        .defaultLaunchBehavior(.suppressed)
 
         Window("Bookmarks", id: "bookmarks") {
             BookmarkManagerWindow()
@@ -162,6 +176,8 @@ struct RadioCommands: Commands {
                                                           set: { model.transcriptionSettings.enabled = $0 }))
             Button("Recordings…") { openWindow(id: "recordings") }
                 .keyboardShortcut("l", modifiers: [.command, .shift])
+            Button("Schedules…") { openWindow(id: "schedules") }
+                .keyboardShortcut("s", modifiers: [.command, .shift])
             Button("Show Recordings in Finder") { model.revealRecordings() }
             Divider()
             Button("MCP Server…") { openWindow(id: "mcp") }
