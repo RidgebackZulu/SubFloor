@@ -32,10 +32,12 @@ let package = Package(
         .target(name: "SignalID", dependencies: ["DSPCore"], swiftSettings: fastMath),
         .target(name: "Recording", swiftSettings: fastMath),
         .target(name: "Transcription"),
+        /// Scheduler model: schedules, their run windows and the clock maths (pure, no AppKit).
+        .target(name: "Scheduling", resources: [.copy("Resources")]),
         .target(name: "SDRplayKit", dependencies: ["CSDRplay", "DSPCore"], linkerSettings: sdrplayLinker),
         .executableTarget(
             name: "SubFloor",
-            dependencies: ["DSPCore", "SubFloorCore", "SDRplayKit", "Modems", "Recording", "Transcription", "SignalID"],
+            dependencies: ["DSPCore", "SubFloorCore", "SDRplayKit", "Modems", "Recording", "Transcription", "SignalID", "Scheduling"],
             exclude: ["Info.plist"],
             resources: [.copy("Resources/AppIcon.png")],
             swiftSettings: fastMath,
@@ -50,6 +52,7 @@ let package = Package(
         .testTarget(name: "RecordingTests", dependencies: ["Recording", "DSPCore"]),
         .testTarget(name: "SignalIDTests", dependencies: ["SignalID", "DSPCore"], resources: [.copy("Fixtures")]),
         .testTarget(name: "TranscriptionTests", dependencies: ["Transcription"], resources: [.copy("Fixtures")]),
+        .testTarget(name: "SchedulingTests", dependencies: ["Scheduling"], resources: [.copy("Fixtures")]),
         .testTarget(name: "SDRplayKitTests", dependencies: ["SDRplayKit", "CSDRplay"], linkerSettings: sdrplayLinker),
         .testTarget(name: "SubFloorTests", dependencies: ["SubFloor"], linkerSettings: sdrplayLinker),
     ]
